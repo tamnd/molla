@@ -18,6 +18,8 @@ One language means one debugger, one build, one performance model, one binary, a
 
 We rejected a Go control plane, and then a Rust one. Rust remains the documented fallback because `axum`, `minijinja`, the Hugging Face `tokenizers` crate, and `oci-client` are all mature.
 
+**Decided at the M0 gate, 2026-08-31.** D1 holds. Throughput cleared the gate by at least 8x on the worst measurement taken, the TLS binding works in both directions across three libraries and two operating systems, and the borrow checker was not the problem anybody expected it to be. One condition could not be tested, because Mojo 1.0 has no threading module, and it moves to the M1 gate. Record and numbers in [adr/0001-network-edge-stays-in-mojo.md](adr/0001-network-edge-stays-in-mojo.md).
+
 **Reversal condition, decided at the M1 gate.** If sustained HTTP throughput on the M4 is under 5000 requests per second for a trivial handler, or the TLS FFI binding proves unstable across macOS and Linux, or memory safety diagnostics make a non blocking multi threaded socket server impractical in Mojo 1.0, then the network edge moves to Rust and Mojo keeps the engine and kernels. The module boundaries are drawn so that swap costs weeks rather than a rewrite.
 
 **TLS, answered at M0.** The binding holds. `molla pull` fetches and verifies a blob from ghcr.io through OpenSSL 3.x, OpenSSL 1.1.1 and Secure Transport, all dlopened, with no C in the build and no bundled CA list. One limit came out of it: Secure Transport has no TLS 1.3, and the Apple framework that does is built on Objective-C blocks, which Mojo cannot emit, so macOS caps at TLS 1.2 until someone solves that. Details in [validation/tls.md](validation/tls.md).
