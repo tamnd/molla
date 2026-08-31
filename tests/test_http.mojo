@@ -37,9 +37,7 @@ comptime MAX_STEPS = 200
 comptime SCRATCH = 65536
 
 
-def _load[
-    o: MutOrigin
-](buf: Pointer[UInt8, o], text: StringSpan) -> Int:
+def _load[o: MutOrigin](buf: Pointer[UInt8, o], text: StringSpan) -> Int:
     """Copy a literal into a buffer and return its length."""
     var p = text.unsafe_ptr()
     var n = text.byte_length()
@@ -75,7 +73,9 @@ def test_parse_request_line(mut suite: Suite) raises:
     suite.check(rc == PARSE_DONE, "HTTP/1.0 parses")
     suite.check(not req.keep_alive, "1.0 closes by default")
 
-    rc = _parse_text(buf, "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", req)
+    rc = _parse_text(
+        buf, "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", req
+    )
     suite.check(rc == PARSE_DONE, "1.0 with keep-alive parses")
     suite.check(req.keep_alive, "and it overrides the 1.0 default")
 
@@ -108,9 +108,14 @@ def test_parse_incremental(mut suite: Suite) raises:
     suite.check(
         all_need_more,
         "every prefix of a request is incomplete, not broken"
-        + (" (first bad length " + String(wrong_at) + ")" if wrong_at >= 0 else ""),
+        + (
+            " (first bad length " + String(wrong_at) + ")" if wrong_at
+            >= 0 else ""
+        ),
     )
-    suite.check(parse(buf, total, req) == PARSE_DONE, "the whole request parses")
+    suite.check(
+        parse(buf, total, req) == PARSE_DONE, "the whole request parses"
+    )
 
 
 def test_parse_body_and_pipelining(mut suite: Suite) raises:
@@ -154,7 +159,10 @@ def test_parse_rejects(mut suite: Suite) raises:
 
     var rc = _parse_text(
         buf,
-        "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+        (
+            "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding:"
+            " chunked\r\n\r\nhello"
+        ),
         req,
     )
     suite.check(
@@ -163,7 +171,12 @@ def test_parse_rejects(mut suite: Suite) raises:
     )
 
     rc = _parse_text(
-        buf, "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello", req
+        buf,
+        (
+            "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length:"
+            " 6\r\n\r\nhello"
+        ),
+        req,
     )
     suite.check(
         rc == PARSE_FAILED and req.error_status == 400,
@@ -201,7 +214,9 @@ def test_parse_rejects(mut suite: Suite) raises:
     )
 
     rc = _parse_text(
-        buf, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", req
+        buf,
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        req,
     )
     suite.check(
         rc == PARSE_FAILED and req.error_status == 501,
@@ -350,7 +365,8 @@ def test_server_keep_alive(mut suite: Suite) raises:
 
     # Two more in a single write, which is the pipelining case.
     _ = _send_text(
-        client, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"
+        client,
+        "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n",
     )
     var reply = _read_all(client, server, 200)
     suite.check(server.requests == 5, "both pipelined requests were handled")

@@ -68,9 +68,7 @@ def _lower(c: UInt8) -> UInt8:
     return c
 
 
-def _is_token[
-    o: MutOrigin
-](buf: Pointer[UInt8, o], span: Span) -> Bool:
+def _is_token[o: MutOrigin](buf: Pointer[UInt8, o], span: Span) -> Bool:
     """Whether a span is a valid RFC 9110 token.
 
     Used on the method and on header names. A separator or a control character
