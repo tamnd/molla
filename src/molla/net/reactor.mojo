@@ -331,15 +331,9 @@ struct Reactor[P: Protocol](Movable):
         if len(self.free_slots) > 0:
             slot = self.free_slots.pop()
             generation = self.conns[slot].generation + 1
-            self.conns[slot] = Connection(
-                fd,
-                slot,
-                generation,
-                self.read_capacity,
-                self.write_capacity,
-                self.counter,
-                now,
-            )
+            # Reused rather than rebuilt, so the buffers the last connection
+            # grew are the buffers this one starts with. See `Connection.reuse`.
+            self.conns[slot].reuse(fd, generation, now)
             self.live[slot] = True
         else:
             slot = len(self.conns)

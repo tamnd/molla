@@ -136,6 +136,13 @@ jobs:
             echo "an unknown command should exit nonzero"
             exit 1
           fi
+      # The suite runs a small version of this. The command runs a bigger one,
+      # on every commit and on every platform, so that a change which puts an
+      # allocation back on the request path fails in the pull request that made
+      # it rather than in a benchmark six weeks later. See issue #17 and
+      # docs/validation/allocations.md.
+      - name: Allocation assertion
+        run: ./build/molla allocs 16 4
 
   # Numerics and performance need real devices, so they run on the fleet
   # rather than on hosted runners. See D7 and D8 in docs/design.md.

@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla allocs`, which runs a mixed load twice against a real server and fails if the second pass allocated anything. The load is a pipelined batch of a GET, a HEAD, a 404, a Content-Length body, a chunked body, eight pipelined GETs and both streaming routes, so an allocation on the fifth kind of request is not invisible. Runs in CI on every commit on all three platforms, and a smaller version runs in the test suite. See [docs/validation/allocations.md](docs/validation/allocations.md).
+
+### Fixed
+
+- The reactor rebuilt a `Connection` when it reused a slot, which freed and re-allocated the read buffer and the write ring on every accept and then grew the read buffer again on the first request. That is three allocations per connection, and against a client that opens a connection per request it is a per request allocation. `Connection.reuse` now takes over the new socket and keeps the buffers at whatever size the traffic already paid for.
+
 ## [0.1.6] - 2026-09-01
 
 The operations surface. Config, structured logging, Prometheus metrics, and three `/molla` routes, none of which makes molla faster and all of which is what makes molla debuggable by somebody who is not holding the source open.
