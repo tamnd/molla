@@ -4,11 +4,23 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+Nothing yet.
+
+## [0.0.2] - 2026-08-31
+
+Four of the seven M0 spikes are done. molla can now map a model file and read what is in it, though it still cannot read a tensor.
+
 ### Added
 
 - `molla.sys.mmap`, a read only whole file memory map
 - `molla.model.gguf`, a GGUF v2 and v3 metadata reader that walks the header, the key value block and the tensor directory in place without copying the file, and `molla gguf <path>` to dump one
 - `docs/validation/gguf.md` with the comparison against `gguf-dump` on four models covering bert, llama, gemma3 and qwen2, and what the zero copy read is actually worth
+
+### Known issues
+
+- Carried over from 0.0.1 unchanged: the compiler is proprietary, so releases are source only. Build with `pixi run build`.
+- Nothing reads a tensor. The GGUF reader records where each one is and what type it is, and stops there.
+- Metadata arrays are measured and skipped rather than decoded, so there is no way to read a tokenizer vocabulary yet.
 
 ## [0.0.1] - 2026-08-31
 
