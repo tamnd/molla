@@ -56,6 +56,8 @@ molla implements its own executor: weight loading, layer composition, paged KV c
 
 **Reversal condition.** If our executor is more than twice as slow as MAX on the same hardware six months in, we flip the default to the MAX backend where it is available, keep the native engine as the portable path, and say so publicly.
 
+**Status: under review.** The M0 kernel spike found that the second paragraph above is wrong. `max/kernels` is Apache-2.0 source that does not compile or run without `max-core`, which is proprietary, and that is true of its CPU kernels as well as its GPU ones. It also found that molla already links a proprietary support library out of the compiler package, so the licensing split this decision was built on does not exist. `max/kernels` also has no quantized matmul that will launch on an Apple GPU below an M5. The evidence is in [docs/validation/kernels.md](validation/kernels.md) and the decision is issue #7.
+
 ## D7: one kernel source, four targets, numerics asserted
 
 Every operation has a single Mojo source compiled for CPU, NVIDIA, AMD, and Apple GPU. Divergence lives in tile parameters and small compile time branches inside one function, never in separate files, so a fix cannot be applied to three targets and forgotten on the fourth.
@@ -63,6 +65,8 @@ Every operation has a single Mojo source compiled for CPU, NVIDIA, AMD, and Appl
 Every operation has a naive reference implementation, an external oracle where one exists, and numerics tests that run on each target with tolerances stated per dtype. Portable is a claim that decays silently. Only per target tests keep it true.
 
 A target that cannot pass numerics is listed as unsupported. It does not ship as probably fine.
+
+**Status: achievable, not inherited.** The M0 kernel spike wrote one naive Q4_K matmul with no compile time branches at all, compiled it for Metal and for sm_89, and got byte identical output from an M4 and a 4090. So the claim holds for code we write. It is not how `max/kernels` is organised, which has three separate quantized matmul implementations in three separate places with different entry points, weight layouts and dtypes. The first two tolerances the second paragraph promised are also now stated, in [docs/validation/kernels.md](validation/kernels.md), because this decision asked for them without giving any.
 
 ## D8: real hardware gates every milestone
 

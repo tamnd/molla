@@ -4,7 +4,24 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
-Nothing yet.
+The M0 kernel spike ran, and it changed what the README is allowed to claim. Nothing in the shipped build changed.
+
+### Added
+
+- `spikes/qmatmul/`, the kernel spike for issue #5, with its own pixi manifest so its proprietary dependency stays out of the root build
+- `docs/validation/kernels.md` with the licence audit, the numbers from six machines, and the three options for what molla does next
+- Numerics tolerances for Q4_K matmul on CPU and on GPU, which D7 asked for and never gave
+
+### Changed
+
+- The README no longer claims there is no proprietary dependency in the stack, because there is, and it names it
+- D6 in `docs/design.md` is marked under review, since `max/kernels` does not build or run without proprietary `max-core`, its CPU kernels included
+- D7 in `docs/design.md` is marked achievable but not inherited, since one source did compile to Metal and sm_89 with byte identical output, but `max/kernels` is not organised that way
+
+### Known issues
+
+- `max/kernels` has no quantized matmul that will launch on an Apple GPU below an M5. On an M4 it raises at launch. The spike wrote its own kernel to get a Metal number at all.
+- What molla actually does about the licence finding is not decided here. That is issue #7.
 
 ## [0.0.2] - 2026-08-31
 
