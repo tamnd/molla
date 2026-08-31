@@ -30,10 +30,13 @@ from molla.sys.clock import monotonic_ms
 from molla.sys.fd import close
 from molla.sys.socket import (
     INADDR_LOOPBACK,
+    SO_RCVBUF,
+    SO_SNDBUF,
     connect,
     connect_unix,
     recv,
     send,
+    set_buffer_size,
     socket_tcp,
 )
 
@@ -210,17 +213,22 @@ def _check_reactor(mut suite: Suite) raises:
 def _check_backpressure(mut suite: Suite) raises:
     suite.group("net.reactor backpressure")
 
-    # Four megabytes, which is more than the ring holds and more than the socket
-    # buffers on either side will absorb, so the write path has to take a short
-    # write, keep the remainder, and leave the rest in the read buffer rather
-    # than dropping it.
-    var total = 4 * 1024 * 1024
+    # Half a megabyte, against sockets whose buffers are pinned small at both
+    # ends. Left to itself the kernel decides how much it will hold, that number
+    # differs by platform and grows over the life of a connection, and a test
+    # that pushes bytes until it happens to fill either passes by accident or
+    # tests nothing. An accepted socket inherits the listener's buffer sizes, so
+    # setting it there covers the connection the reactor ends up with.
+    var total = 512 * 1024
     var listener = open_listener(ListenAddress(UInt16(0)), False)
+    set_buffer_size(listener, SO_SNDBUF, 8192)
     var port = bound_port(listener)
     var reactor = Reactor[EchoProtocol](EchoProtocol(), 60000, 0)
     reactor.add_listener(listener)
 
-    var client = _client(port)
+    var client = socket_tcp()
+    set_buffer_size(client, SO_RCVBUF, 8192)
+    _ = connect(client, INADDR_LOOPBACK, port)
     _ = _step_until_accepted(reactor, 1)
 
     # Push without reading until the whole path is full: the client's send
@@ -268,7 +276,7 @@ def _check_backpressure(mut suite: Suite) raises:
             read_back += n
         steps += 1
 
-    suite.check(sent == total, "the client sent four megabytes")
+    suite.check(sent == total, "the client sent half a megabyte")
     suite.check(read_back == total, "and got every byte of it back")
     suite.check(steps < 200000, "without spinning")
 

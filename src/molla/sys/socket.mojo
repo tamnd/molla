@@ -193,6 +193,54 @@ def set_nodelay(fd: Int) raises:
         raise Error("setsockopt TCP_NODELAY failed: " + errno_name(get_errno()))
 
 
+def _so_sndbuf() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 0x1001
+    else:
+        return 7
+
+
+def _so_rcvbuf() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 0x1002
+    else:
+        return 8
+
+
+comptime SO_SNDBUF = _so_sndbuf()
+comptime SO_RCVBUF = _so_rcvbuf()
+
+
+def set_buffer_size(fd: Int, option: Int, bytes: Int) raises:
+    """Fix the kernel's send or receive buffer for a socket.
+
+    Normally worth leaving alone. Both platforms size these themselves and
+    Linux grows them over the life of a connection, and setting either one by
+    hand turns that off, so a number chosen today is the number a connection
+    still has when the network it runs on is faster.
+
+    It is here because a listening socket passes both down to every socket
+    accepted from it, which makes it the one honest way to test the write path
+    under backpressure. Without it a test has to push enough bytes to fill
+    whatever the kernel decided to give it, that number is different on every
+    machine, and the test either takes megabytes or quietly stops testing
+    anything.
+    """
+    var value = stack_allocation[1, c_int]()
+    value.unsafe_store(0, c_int(bytes))
+    var rc = Int(
+        external_call["setsockopt", c_int](
+            c_int(fd),
+            c_int(SOL_SOCKET),
+            c_int(option),
+            value,
+            c_int(4),
+        )
+    )
+    if rc < 0:
+        raise Error("setsockopt buffer size failed: " + errno_name(get_errno()))
+
+
 def set_keepalive(fd: Int) raises:
     """Ask the kernel to probe an idle connection.
 
