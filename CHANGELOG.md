@@ -4,6 +4,18 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.1.6] - 2026-09-01
+
+The operations surface. Config, structured logging, Prometheus metrics, and three `/molla` routes, none of which makes molla faster and all of which is what makes molla debuggable by somebody who is not holding the source open.
+
+Config carries where each value came from rather than only the value. The precedence is flag over environment over file over default, and `molla config get` prints both halves, because the value on its own is not the question anybody has at three in the morning.
+
+Logging is a byte ring per worker, written by that worker and read by the housekeeping thread, which makes it single producer single consumer and means nothing on the request path waits for anything. Records are built straight in the ring and become visible only when the length header is written last. The criterion was no allocations at a disabled level, and the cost turned out to be one atomic load and a comparison.
+
+Metrics are one set of counters per worker on its own cache line, summed only at scrape time, so a request never touches a line another core owns. Statuses are bucketed by class rather than per code, and durations are integer nanoseconds beside a count, with the HELP text admitting there is no histogram rather than exporting a number that looks like a quantile.
+
+The three admin routes share the main port. A second listener is the safer answer and is also a second thing to configure, expose in a container, and forget, and everything they return is already printed on startup.
+
 ### Added
 
 - `molla.ops.config`, settings with a precedence of flag over environment over file over default, and every setting carrying where its value came from.
