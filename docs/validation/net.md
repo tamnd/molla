@@ -48,13 +48,16 @@ So `_service` loops while it is making progress, measured as bytes actually movi
 
 ## What was run
 
-`tests/test_reactor.mojo` is 61 checks, and it runs as part of the same binary as the rest of the suite.
+`tests/test_reactor.mojo` is 61 checks on macOS and 62 on Linux, because the sharded accept path has one more thing to assert than the handoff path does, and it runs as part of the same binary as the rest of the suite. The counts below are the whole suite, since that is what the runner prints.
 
-| Machine | Kernel | Arch | Checks |
+| Machine | Kernel | Arch | Suite |
 | --- | --- | --- | --- |
-| macbook, M4 | Darwin 24.6 | arm64 | pending |
-| server1, doge-01 | Linux 6.8, Ubuntu 24.04, glibc 2.39 | x86-64 | pending |
-| CI, ubuntu-24.04 and ubuntu-24.04-arm | Linux, Ubuntu 24.04 | x86-64 and arm64 | pending |
+| macbook, M4 | Darwin 24.6 | arm64 | 474 passed |
+| server1, doge-01 | Linux 6.8, Ubuntu 24.04, glibc 2.39 | x86-64 | 475 passed |
+| server2, doge-02 | Linux 6.8, Ubuntu 24.04, glibc 2.39 | x86-64 | 475 passed |
+| CI, ubuntu-24.04 | Linux, Ubuntu 24.04 | x86-64 | 475 passed |
+| CI, ubuntu-24.04-arm | Linux, Ubuntu 24.04 | arm64 | 475 passed |
+| CI, macos-15 | Darwin | arm64 | 474 passed |
 
 The wheel is tested against an explicit clock rather than by sleeping, because a test that waits for a real deadline is a test that fails on a loaded CI runner. The reactor tests drive `poll_once` by hand and act as the client between passes, which is the only way to be both ends on one thread. The server tests use real threads, so the server side runs where it will really run.
 
@@ -66,10 +69,16 @@ Issue #10 is done when the reactor holds a thousand connections with mixed idle 
 
 Mixed means one connection in eight sends and the rest connect and stay silent, which is what a keep alive pool looks like between requests and is the shape that finds the bug where a reactor scans its whole table per pass. Drift is measured by cutting the run into ten segments and comparing the p99 of the last against the first. Descriptors are checked by opening a socket after teardown and reading the number the kernel hands back, which is the lowest free one on both platforms, so a run that leaked even one comes back high. Memory is `getrusage` peak, which is weaker than it sounds: it can show that nothing grew, not that nothing leaked and was reused.
 
-| Machine | Connections | Length | Result |
-| --- | --- | --- | --- |
-| macbook, M4 | 1000 | pending | pending |
-| server1, doge-01 | 1000 | pending | pending |
+| Machine | Conns | Round trips | Mismatched | p99 first | p99 last | Probe fd | Peak rss | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| macbook, M4 | 1000 | 657195369 | 0 | 1024 us | 1024 us | 3 before, 3 after | 90288 to 94352 kB | passed |
+| server1, doge-01 | 1000 | 59256042 | 0 | 65536 us | 65536 us | 3 before, 3 after | 26240 to 31232 kB | passed |
+
+Both ran the full hour with all thousand connections still held at the end, and the p99 is flat to the bucket across all ten segments on both, which is the thing being measured. The absolute latencies are not comparable between the two machines and are not meant to be: the M4 gave the soak ten workers and had nothing else to do, server1 has four cores and a desktop session on it, and the client is in the same process as the server on both. The soak is asking whether an hour changes anything, and on both machines the answer is that it does not.
+
+One caveat on provenance. The M4 soak ran the binary from the commit this document ships with. The server1 soak was already an hour into its run when the socket buffer fix landed, so its binary is one commit older, and that commit differs only in `tests/test_reactor.mojo`, `src/molla/sys/socket.mojo` and documentation. Nothing under `src/molla/net/` changed between them, so both soaks exercised the same reactor.
+
+The rss numbers are the honest weak point. Peak grew by about 4 MB on the M4 and about 5 MB on server1, both in the first segment as the wheel's slabs and the connection table reached their working size, and neither moved after that. Peak rss cannot tell the difference between memory that was freed and memory that leaked and was handed back out, so it is evidence that nothing is growing without bound rather than evidence that nothing leaks. Issue #17's allocation counter is what turns that into a number.
 
 ## What is not covered
 
