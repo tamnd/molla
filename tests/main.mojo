@@ -13,6 +13,7 @@ import test_gguf
 import test_host
 import test_http
 import test_io
+import test_json
 import test_net
 import test_reactor
 import test_registry
@@ -57,5 +58,6 @@ def main():
     except e:
         suite.fail("test_reactor", String(e))
     test_stream.run(suite)
+    test_json.run(suite)
 
     finish(suite)

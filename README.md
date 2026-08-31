@@ -53,7 +53,7 @@ Being honest about this up front. Mojo 1.0 has no async, no sockets, no HTTP, no
 | A reactor per core, with idle timeouts, backpressure and sharded accept | an event loop is not a server, done, see [docs/validation/net.md](docs/validation/net.md) |
 | Buffers, rings and arenas with a per request lifetime | Mojo allocates, but nothing tells you what a request cost, done, see [docs/validation/io.md](docs/validation/io.md) |
 | HTTP/1.1 with chunked, SSE, and NDJSON framing | no HTTP stack, parser, bodies, multipart, SSE and NDJSON done, no routing yet, see [docs/validation/http.md](docs/validation/http.md) |
-| A SIMD JSON parser and serializer | no `std.json` |
+| A SIMD JSON parser and serializer | no `std.json`, done, streaming and DOM modes, exact numbers, see [docs/validation/json.md](docs/validation/json.md) |
 | A Jinja2 subset for chat templates | no template engine |
 | BPE, Unigram, and WordPiece tokenizers | no tokenizer |
 | GGUF and safetensors readers | GGUF metadata and tensor directory done, no tensor reads, no safetensors, see [docs/validation/gguf.md](docs/validation/gguf.md) |

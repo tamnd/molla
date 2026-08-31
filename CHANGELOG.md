@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla.json`, a JSON parser and serializer with two modes over one SIMD scanner. `scan.mojo` classifies bytes a vector at a time and finds the quote, the backslash and any raw control byte with one mask, so validating a string costs nothing extra. `reader.mojo` is streaming mode, `dom.mojo` is DOM mode, `serialize.mojo` writes into a buffer with no intermediate allocation and keeps object keys in the order they arrived.
+- Exact integers and correctly rounded doubles with no `strtod` and no locale, in `number.mojo` and `decimal.mojo`. Three paths: an integer that fits in 64 bits stays an integer, a double with 53 bits of digits and a small exponent goes through Clinger's fast path, and anything else goes through an exact decimal expansion. Printing goes back through the same struct and gives the shortest form that reads back as the same double, with the two cutoffs JavaScript uses.
+- `molla jsonbench [kb] [n]`, the acceptance test for #13 as a command. On the M4 a 100 kB chat body parses at 2283 MB/s with zero allocations, against a gate of 1 GB/s. DOM mode is 1920 MB/s and five allocations for a 1234 node document.
+- `tests/test_json.mojo`, 154 checks over the scanner, both number directions, the reader, the DOM and the writer, including the inputs that break converters and a round trip over four thousand doubles built from random bit patterns.
+- `docs/validation/json.md`, with the numbers, the three places the design departs from what issue #13 describes, and why.
+
 ## [0.1.3] - 2026-09-01
 
 The request path. A parser, bodies, multipart, a serializer, and the two streaming writers a completion needs, all on the reactor from 0.1.2.
