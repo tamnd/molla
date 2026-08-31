@@ -56,6 +56,12 @@ jobs:
           persist-credentials: false
       # Catches unpinned actions, credential persistence, and template injection.
       - uses: zizmorcore/zizmor-action@e673c3917a1aef3c65c972347ed84ccd013ecda4 # v0.2.0
+      # zizmor accepts any 40 character hex string, so it cannot tell a commit
+      # from an annotated tag object. This can.
+      - name: Action pins are commits
+        run: ./scripts/check-action-pins.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   shell:
     name: Shell lint
