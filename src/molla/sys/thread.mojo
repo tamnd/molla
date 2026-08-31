@@ -296,7 +296,7 @@ struct Mutex(Movable):
         self.address = _alloc_sync()
         self.live = False
 
-    def __del__(deinit self):
+    def __deinit__(deinit self):
         """Frees the block. A move takes the address with it and does not run
         this, so a `Mutex` that has been moved into a list is not freed twice.
         """
@@ -359,7 +359,7 @@ struct Condvar(Movable):
         self.address = _alloc_sync()
         self.live = False
 
-    def __del__(deinit self):
+    def __deinit__(deinit self):
         if self.live:
             _ = external_call["pthread_cond_destroy", c_int](self.address)
         _free_sync(self.address)

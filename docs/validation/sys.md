@@ -24,8 +24,11 @@
 | --- | --- | --- | --- |
 | macbook, M4 | Darwin 24.6 | arm64 | 299 passed |
 | server1, doge-01 | Linux 6.8, Ubuntu 24.04, glibc 2.39 | x86-64 | 299 passed |
+| CI, ubuntu-24.04-arm | Linux, Ubuntu 24.04 | arm64 | 299 passed |
 
-The counting tests are the ones that matter. Four threads times two thousand increments under one mutex has to come to exactly eight thousand, and it did on both. A condition variable waiter has to see the value that was published before the broadcast, and it did. One signal has to produce exactly one byte on the channel, and it did.
+The arm64 Linux row is the one that was not expected to be there. Every machine in the fleet is x86-64 or Apple silicon, so the `struct stat` offsets for arm64 Linux were written from the headers with no way to run them, and GitHub's arm runner turned out to be exactly the machine that could. It runs on every push, so that layout stays covered rather than being covered once.
+
+The counting tests are the ones that matter. Four threads times two thousand increments under one mutex has to come to exactly eight thousand, and it did on all three. A condition variable waiter has to see the value that was published before the broadcast, and it did. One signal has to produce exactly one byte on the channel, and it did.
 
 ## Four things that went wrong
 
@@ -41,7 +44,9 @@ What works is the self pipe. Mojo 1.0 has no globals of any kind, so a handler c
 
 ## What is not covered
 
-Linux on arm64. The `struct stat` field offsets differ per architecture as well as per platform, and the arm64 Linux numbers are written from the headers and have never been run. Every machine in the fleet is x86-64 or Apple silicon, so the first arm64 Linux box to run this suite is doing real work, and `sys.file` is where it will fail if the numbers are wrong.
+Anything under load. Every test here is a correctness test taking milliseconds. A mutex that is correct for four threads and two thousand increments can still be the wrong shape for the request path, and that is issue #15's problem rather than this one's.
+
+Old glibc. `access`, `openat`, `pread` and the rest are all long stable, but the fleet and CI are both Ubuntu 24.04 with glibc 2.39, so nothing here has met a distribution that predates it.
 
 `sendmsg` and control messages. molla passes no descriptors between processes, so `writev` covers the vectored case and `struct msghdr`, whose layout differs between the platforms, never has to be described.
 
