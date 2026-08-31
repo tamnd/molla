@@ -18,12 +18,37 @@ from std.ffi import c_int, c_size_t, c_ssize_t, external_call
 from std.memory import stack_allocation
 from std.sys.info import CompilationTarget
 
-from molla.sys.errno import errno_name, get_errno
+from molla.sys.errno import EINVAL, ERANGE, errno_name, get_errno
 from molla.sys.fd import close, set_nonblocking
+from molla.sys.result import SysResult, checked, ok
 
 comptime AF_INET = 2
 comptime SOCK_STREAM = 1
 comptime SOCKADDR_IN_SIZE = 16
+
+
+def _af_unix() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 1
+    else:
+        return 1
+
+
+comptime AF_UNIX = _af_unix()
+"""One on both platforms. Written out anyway, because every other address
+family constant in this file needed a per platform answer and a reader should
+not have to guess which ones were checked."""
+
+comptime SOCKADDR_UN_PATH_OFF = 2
+"""Where the path starts in a sockaddr_un. BSD spends the first two bytes on a
+length and a one byte family, Linux spends them on a two byte family, so the
+path lands at the same offset for opposite reasons."""
+
+comptime SOCKADDR_UN_SIZE = 106
+"""macOS allows 104 path bytes and Linux allows 108. Using the smaller one
+everywhere means a path that works on macOS works on Linux, which is the
+direction that matters, and it is still longer than any socket path molla
+creates."""
 
 
 def _sol_socket() -> Int:
@@ -346,3 +371,187 @@ def dial(
         _ = close(fd)
         raise Error("connect failed: " + errno_name(code))
     return fd
+
+
+comptime SHUT_RD = 0
+comptime SHUT_WR = 1
+comptime SHUT_RDWR = 2
+"""Same three numbers on both platforms."""
+
+
+def shutdown(fd: Int, how: Int) -> Int:
+    """Half close a connection.
+
+    `SHUT_WR` is how a server says "that is the whole response" on a connection
+    it does not want to close yet, and it is the only one molla uses. Returns
+    -1 with errno set, and ENOTCONN here is normal rather than a fault, because
+    the peer may already have gone."""
+    return Int(external_call["shutdown", c_int](c_int(fd), c_int(how)))
+
+
+def get_peer_port(fd: Int) -> SysResult:
+    """The port at the other end. For logging a connection."""
+    var sa = stack_allocation[SOCKADDR_IN_SIZE, UInt8]()
+    var len_out = stack_allocation[1, c_int]()
+    len_out.unsafe_store(0, c_int(SOCKADDR_IN_SIZE))
+    var rc = checked(
+        Int(external_call["getpeername", c_int](c_int(fd), sa, len_out))
+    )
+    if rc.is_err():
+        return rc
+    return ok(Int(read_port(sa)))
+
+
+def socket_pair(mut out_ends: List[Int]) -> SysResult:
+    """A connected pair of Unix domain sockets.
+
+    Both ends are already connected, so this is the cheapest way to get a
+    channel between two threads that the reactor can poll. Appends the two
+    descriptors to `out_ends`, reading end first."""
+    var pair = stack_allocation[2, c_int]()
+    var rc = checked(
+        Int(
+            external_call["socketpair", c_int](
+                c_int(AF_UNIX), c_int(SOCK_STREAM), c_int(0), pair
+            )
+        )
+    )
+    if rc.is_err():
+        return rc
+    out_ends.append(Int(pair.unsafe_load(0)))
+    out_ends.append(Int(pair.unsafe_load(1)))
+    return ok(2)
+
+
+def write_sockaddr_un[
+    o: MutOrigin
+](buf: Pointer[UInt8, o], path: StringSpan) -> SysResult:
+    """Fill a sockaddr_un for a filesystem path.
+
+    Fails with ERANGE rather than truncating. A truncated socket path binds to
+    a different socket than the one that was asked for, silently, and the two
+    processes then wait for each other on different files."""
+    if path.byte_length() + 1 > SOCKADDR_UN_SIZE - SOCKADDR_UN_PATH_OFF:
+        return SysResult(-1, ERANGE)
+
+    for i in range(SOCKADDR_UN_SIZE):
+        buf.unsafe_store(i, UInt8(0))
+
+    comptime if CompilationTarget.is_macos():
+        buf.unsafe_store(0, UInt8(SOCKADDR_UN_SIZE))
+        buf.unsafe_store(1, UInt8(AF_UNIX))
+    else:
+        buf.unsafe_store(0, UInt8(AF_UNIX))
+        buf.unsafe_store(1, UInt8(0))
+
+    var p = path.unsafe_ptr()
+    for i in range(path.byte_length()):
+        buf.unsafe_store(SOCKADDR_UN_PATH_OFF + i, p.unsafe_load(i))
+    return ok(path.byte_length())
+
+
+def listen_unix(path: StringSpan, backlog: Int) raises -> Int:
+    """Open a listening Unix domain socket at a path.
+
+    The path has to be free. bind fails with EADDRINUSE on a leftover socket
+    file, including one left by a process that crashed, and unlinking it here
+    would race with a live server that is using it. That is the caller's
+    decision to make with a lock file, not this layer's."""
+    var fd = Int(
+        external_call["socket", c_int](
+            c_int(AF_UNIX), c_int(SOCK_STREAM), c_int(0)
+        )
+    )
+    if fd < 0:
+        raise Error("socket AF_UNIX failed: " + errno_name(get_errno()))
+    set_nonblocking(fd)
+
+    var sa = stack_allocation[SOCKADDR_UN_SIZE, UInt8]()
+    var written = write_sockaddr_un(sa, path)
+    if written.is_err():
+        _ = close(fd)
+        raise Error("socket path too long: " + String(path))
+
+    var rc = Int(
+        external_call["bind", c_int](c_int(fd), sa, c_int(SOCKADDR_UN_SIZE))
+    )
+    if rc < 0:
+        var code = get_errno()
+        _ = close(fd)
+        raise Error("bind to " + String(path) + " failed: " + errno_name(code))
+
+    rc = Int(external_call["listen", c_int](c_int(fd), c_int(backlog)))
+    if rc < 0:
+        var code = get_errno()
+        _ = close(fd)
+        raise Error("listen failed: " + errno_name(code))
+    return fd
+
+
+def connect_unix(path: StringSpan) raises -> Int:
+    """Connect to a Unix domain socket. Blocking, for the CLI talking to a
+    server on the same machine."""
+    var fd = Int(
+        external_call["socket", c_int](
+            c_int(AF_UNIX), c_int(SOCK_STREAM), c_int(0)
+        )
+    )
+    if fd < 0:
+        raise Error("socket AF_UNIX failed: " + errno_name(get_errno()))
+
+    var sa = stack_allocation[SOCKADDR_UN_SIZE, UInt8]()
+    var written = write_sockaddr_un(sa, path)
+    if written.is_err():
+        _ = close(fd)
+        raise Error("socket path too long: " + String(path))
+
+    var rc = Int(
+        external_call["connect", c_int](c_int(fd), sa, c_int(SOCKADDR_UN_SIZE))
+    )
+    if rc < 0:
+        var code = get_errno()
+        _ = close(fd)
+        raise Error(
+            "connect to " + String(path) + " failed: " + errno_name(code)
+        )
+    return fd
+
+
+comptime IOVEC_SIZE = 16
+"""struct iovec is a pointer and a length, so 16 bytes on both platforms."""
+
+comptime MAX_IOV = 8
+"""How many pieces one vectored write may have. Both platforms allow at least
+1024, but molla's writer never has more than a status line, headers and a body,
+and a fixed small number keeps the buffer on the stack."""
+
+
+def write_vectored(fd: Int, bases: List[Int], lengths: List[Int]) -> SysResult:
+    """Write several buffers in one call.
+
+    This is what keeps a response from being copied into one buffer before it
+    goes out. Headers live in one place and the body in another, and `writev`
+    puts them on the wire in order without either of them moving.
+
+    `writev` rather than `sendmsg`, because molla sends no control messages and
+    passes no file descriptors, and the two do the same thing for plain bytes
+    with `sendmsg` needing a `struct msghdr` whose layout differs across the
+    platforms. Partial writes are normal on a non blocking socket, so the
+    caller has to look at the count and resume."""
+    var count = len(bases)
+    if count != len(lengths):
+        return SysResult(-1, EINVAL)
+    if count == 0:
+        return ok(0)
+    if count > MAX_IOV:
+        return SysResult(-1, EINVAL)
+
+    var iov = stack_allocation[MAX_IOV * IOVEC_SIZE, UInt8]()
+    var slots = iov.unsafe_bitcast[Int64]()
+    for i in range(count):
+        slots.unsafe_store(i * 2, Int64(bases[i]))
+        slots.unsafe_store(i * 2 + 1, Int64(lengths[i]))
+
+    return checked(
+        Int(external_call["writev", c_ssize_t](c_int(fd), iov, c_int(count)))
+    )

@@ -13,41 +13,22 @@ as an integer instead, which is what the ABI does anyway on both x86_64 and
 aarch64, and the result comes back as an integer so it can be compared against
 MAP_FAILED before being turned into a pointer.
 
-Size comes from `lseek` to the end rather than `fstat`. `struct stat` has a
-different layout on macOS and Linux and a different one again per architecture,
-so declaring it correctly means writing out three layouts and getting all three
-right. `lseek` returns the same number with no struct at all.
+Size comes from `lseek` to the end rather than `fstat`. Both are in
+`molla.sys.file` now and either would do, and `lseek` stays because it is one
+call and one number rather than a struct with three layouts behind it.
 
-The file is opened with `openat` rather than `open`, which looks like an odd
-choice and is explained where the call is. Paths are also the first thing in
-molla that needs a C string, and Mojo strings are not null terminated, so the
-bytes get copied into a list with a zero on the end and that list has to
-outlive the call.
+Opening and closing go through `molla.sys.file` rather than being declared here
+a second time. Two declarations of `openat` with different argument counts in
+one build fail to lower, which is what happened the first time this module kept
+its own.
 """
 
 from std.ffi import c_int, external_call
-from std.sys.info import CompilationTarget
 
 from molla.sys.errno import errno_name, get_errno
+from molla.sys.file import SEEK_END, SEEK_SET, close_fd, lseek, open_read
 
 comptime RawPtr = Pointer[UInt8, MutAnyOrigin]
-
-comptime O_RDONLY = 0
-comptime SEEK_SET = 0
-comptime SEEK_END = 2
-
-
-def _at_fdcwd() -> Int:
-    comptime if CompilationTarget.is_macos():
-        return -2
-    else:
-        return -100
-
-
-comptime AT_FDCWD = _at_fdcwd()
-"""Tells openat to resolve a relative path against the working directory, which
-is what plain open does. One of the few constants where the two kernels picked
-different numbers for the same idea."""
 
 comptime PROT_READ = 0x01
 comptime MAP_PRIVATE = 0x02
@@ -56,21 +37,6 @@ comptime MAP_PRIVATE = 0x02
 comptime MAP_FAILED = -1
 """mmap reports failure as (void *)-1, not NULL, because NULL is a legal
 address to map at."""
-
-
-def _c_string(path: StringSpan) -> List[UInt8]:
-    """Copy a path into a null terminated buffer.
-
-    The returned list owns the bytes and has to stay alive across the call that
-    uses it. Taking `unsafe_ptr` of a temporary would dangle.
-    """
-    var out = List[UInt8]()
-    out.reserve(path.byte_length() + 1)
-    var p = path.unsafe_ptr()
-    for i in range(path.byte_length()):
-        out.append(p.unsafe_load(i))
-    out.append(0)
-    return out^
 
 
 struct Mapping(Movable):
@@ -91,37 +57,25 @@ struct Mapping(Movable):
     var mapped: Bool
 
     def __init__(out self, path: StringSpan) raises:
-        var buf = _c_string(path)
-        # openat rather than open, and not for any of the reasons openat
-        # usually exists. Declaring `open` here collides with the declaration
-        # the standard library's own file API makes, the two signatures
-        # disagree, and the compiler refuses the module with "existing function
-        # with conflicting signature". openat has no such declaration anywhere
-        # and AT_FDCWD makes it behave exactly like open.
-        var fd = Int(
-            external_call["openat", c_int](
-                c_int(AT_FDCWD), buf.unsafe_ptr(), c_int(O_RDONLY)
-            )
-        )
-        if fd < 0:
+        var opened = open_read(path)
+        if opened.is_err():
             raise Error(
                 "open failed for "
                 + String(path)
                 + ": "
-                + errno_name(get_errno())
+                + errno_name(opened.err)
             )
+        var fd = opened.value
 
-        var length = Int(
-            external_call["lseek", Int64](c_int(fd), Int64(0), c_int(SEEK_END))
-        )
-        if length < 0:
-            var code = get_errno()
-            _ = external_call["close", c_int](c_int(fd))
-            raise Error("lseek failed: " + errno_name(code))
+        var measured = lseek(fd, 0, SEEK_END)
+        if measured.is_err():
+            _ = close_fd(fd)
+            raise Error("lseek failed: " + errno_name(measured.err))
+        var length = measured.value
         if length == 0:
-            _ = external_call["close", c_int](c_int(fd))
+            _ = close_fd(fd)
             raise Error("refusing to map an empty file: " + String(path))
-        _ = external_call["lseek", Int64](c_int(fd), Int64(0), c_int(SEEK_SET))
+        _ = lseek(fd, 0, SEEK_SET)
 
         # The hint address goes over as an integer because there is no null
         # pointer to pass, and the result comes back as one so it can be
@@ -138,14 +92,13 @@ struct Mapping(Movable):
         )
         if addr == MAP_FAILED:
             var code = get_errno()
-            _ = external_call["close", c_int](c_int(fd))
+            _ = close_fd(fd)
             raise Error("mmap failed: " + errno_name(code))
 
         self.address = addr
         self.length = length
         self.fd = fd
         self.mapped = True
-        # `buf` dies here, after the open call that used it.
 
     def base(self) -> RawPtr:
         return RawPtr(unsafe_from_address=self.address)
@@ -154,7 +107,7 @@ struct Mapping(Movable):
         if not self.mapped:
             return
         _ = external_call["munmap", c_int](self.base(), self.length)
-        _ = external_call["close", c_int](c_int(self.fd))
+        _ = close_fd(self.fd)
         self.mapped = False
         self.length = 0
         self.fd = -1

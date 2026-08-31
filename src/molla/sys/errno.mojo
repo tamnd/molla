@@ -41,6 +41,23 @@ comptime EINTR = 4
 comptime EBADF = 9
 """Bad file descriptor. Always our bug, never the peer's."""
 
+comptime ENOENT = 2
+comptime ENOMEM = 12
+comptime EACCES = 13
+comptime EBUSY = 16
+comptime EEXIST = 17
+comptime EXDEV = 18
+comptime ENOTDIR = 20
+comptime EISDIR = 21
+comptime EINVAL = 22
+comptime EMFILE = 24
+comptime ENOSPC = 28
+comptime EPIPE = 32
+comptime ERANGE = 34
+"""These carry the same number on macOS and Linux, which is not a rule so much
+as an accident of both inheriting the early Unix table. The ones below did not
+survive that inheritance and have to be selected per platform."""
+
 
 def _eagain() -> Int:
     comptime if CompilationTarget.is_macos():
@@ -63,6 +80,34 @@ def _econnreset() -> Int:
         return 104
 
 
+def _enotsup() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 45
+    else:
+        return 95
+
+
+def _eaddrinuse() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 48
+    else:
+        return 98
+
+
+def _etimedout() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 60
+    else:
+        return 110
+
+
+def _econnrefused() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 61
+    else:
+        return 111
+
+
 comptime EAGAIN = _eagain()
 """Would block. On both platforms EWOULDBLOCK has the same value, so one
 constant covers both spellings."""
@@ -72,6 +117,14 @@ comptime EINPROGRESS = _einprogress()
 
 comptime ECONNRESET = _econnreset()
 """The peer went away rudely. Expected traffic, not a fault."""
+
+comptime ENOTSUP = _enotsup()
+"""What a wrapper returns for something the platform genuinely cannot do, such
+as pinning a thread to a core on macOS."""
+
+comptime EADDRINUSE = _eaddrinuse()
+comptime ETIMEDOUT = _etimedout()
+comptime ECONNREFUSED = _econnrefused()
 
 
 def errno_name(code: Int) -> String:
@@ -93,4 +146,32 @@ def errno_name(code: Int) -> String:
         return "EINPROGRESS"
     if code == ECONNRESET:
         return "ECONNRESET"
+    if code == ENOENT:
+        return "ENOENT"
+    if code == ENOMEM:
+        return "ENOMEM"
+    if code == EACCES:
+        return "EACCES"
+    if code == EBUSY:
+        return "EBUSY"
+    if code == EEXIST:
+        return "EEXIST"
+    if code == EXDEV:
+        return "EXDEV"
+    if code == EINVAL:
+        return "EINVAL"
+    if code == EMFILE:
+        return "EMFILE"
+    if code == ENOSPC:
+        return "ENOSPC"
+    if code == EPIPE:
+        return "EPIPE"
+    if code == ENOTSUP:
+        return "ENOTSUP"
+    if code == EADDRINUSE:
+        return "EADDRINUSE"
+    if code == ETIMEDOUT:
+        return "ETIMEDOUT"
+    if code == ECONNREFUSED:
+        return "ECONNREFUSED"
     return "errno " + String(code)
