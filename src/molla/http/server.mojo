@@ -279,7 +279,18 @@ struct HttpServer(Movable):
                 self._fail(index, self.scratch.error_status)
                 break
 
-            self.conns[index].input_at += self.scratch.consumed
+            # The parser stops at the blank line and does not read a body,
+            # because a body can be larger than memory and deciding what to do
+            # with one is policy. This spike has no policy: it exists to
+            # measure how fast the loop answers a GET, and a request with a
+            # body is refused rather than half read. `molla.http.protocol` is
+            # the one that reads bodies, and it is the one to benchmark
+            # anything other than a bare GET against.
+            if self.scratch.has_body():
+                self._fail(index, 501)
+                break
+
+            self.conns[index].input_at += self.scratch.header_bytes
             self.conns[index].requests += 1
             self.requests += 1
 
