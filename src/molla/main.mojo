@@ -13,6 +13,7 @@ from molla.http.server import run_http
 from molla.model.gguf import run_gguf
 from molla.net.echo import run_echo
 from molla.net.soak import run_soak
+from molla.net.soak_net import run_net_soak
 from molla.registry.pull import run_pull
 from molla.sys.poll import USES_KQUEUE
 from molla.tls.client import run_tls
@@ -41,6 +42,7 @@ def print_usage():
     print("  version         print the version, toolchain, and host details")
     print("  echo [port]     run the M0 TCP echo spike on 127.0.0.1")
     print("  soak [n] [sec]  hold n echo connections for sec seconds")
+    print("  netsoak [n] [s] hold n connections against the threaded reactor")
     print("  http [port]     run the M0 HTTP/1.1 spike on 127.0.0.1")
     print(
         "  gguf <path>     print the metadata and tensor directory of a model"
@@ -101,6 +103,27 @@ def main():
             exit(run_soak(connections, seconds))
         except e:
             print("molla soak:", e)
+            exit(1)
+    elif command == "netsoak":
+        # Defaults are the numbers issue #10 asks for. An hour is a long time to
+        # wait for a test, and it is the number in the acceptance criterion.
+        var net_connections = 1000
+        var net_seconds = 3600
+        try:
+            if len(args) > 2:
+                net_connections = Int(String(args[2]))
+            if len(args) > 3:
+                net_seconds = Int(String(args[3]))
+        except:
+            print(
+                "molla: netsoak takes a connection count and a duration in"
+                " seconds"
+            )
+            exit(2)
+        try:
+            exit(run_net_soak(net_connections, net_seconds))
+        except e:
+            print("molla netsoak:", e)
             exit(1)
     elif command == "http":
         var http_port: UInt16 = 0

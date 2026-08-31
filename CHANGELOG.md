@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla.net` gets a real reactor. One event loop per worker thread, each owning its poller, its connection table and its timers, with no shared state on the request path. `reactor.mojo` is the loop and the four call protocol trait everything above it will be written against. `conn.mojo` is one connection and the four states a non blocking socket can be in. `listener.mojo` decides how connections are spread, which is SO_REUSEPORT sharding on Linux and a round robin handoff on macOS because macOS gives the last binder every connection instead of balancing. `server.mojo` is N reactors on N threads behind one address, TCP or unix.
+- `molla.net.wheel`, a four level timing wheel at 100 ms resolution. An idle connection costs one entry in a slab and no timer descriptor, which is what makes a thousand idle keep alive connections free rather than a thousand syscalls per second.
+- `molla netsoak`, the acceptance test for issue #10. A thousand connections with mixed idle and active traffic, latency compared across ten segments of the run so drift shows up as a number, and descriptors and peak memory checked at the end.
+- `tests/test_reactor.mojo`, 61 checks on macOS and 62 on Linux over the wheel against an explicit clock, the reactor stepped by hand, backpressure, idle timeouts, unix sockets and the threaded server.
+- `set_keepalive` and `listen_tcp_shared` in `molla.sys.socket`, and `monotonic_ms` in `molla.sys.clock`.
+
 ## [0.1.1] - 2026-08-31
 
 Two layers of the standard library Mojo 1.0 does not have. The OS boundary, and the memory the request path will live in. Nothing above them exists yet, so nothing here changes what molla can do, and both are the kind of thing that is much cheaper to get right before there is a server on top of it.

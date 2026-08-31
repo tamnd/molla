@@ -51,6 +51,10 @@ comptime ENOTDIR = 20
 comptime EISDIR = 21
 comptime EINVAL = 22
 comptime EMFILE = 24
+comptime ENFILE = 23
+"""Out of descriptors for this process and for the whole machine. The accept
+loop treats both as a pause rather than a failure."""
+
 comptime ENOSPC = 28
 comptime EPIPE = 32
 comptime ERANGE = 34
