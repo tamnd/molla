@@ -118,11 +118,15 @@ The gap between 8197 requests and the 208 answers the clients had read before th
 | Machine | Kernel | Cores | Suite | drain 64, 20 runs |
 | --- | --- | --- | --- | --- |
 | macbook, M4 | Darwin 24.6, macOS 15.8 | 10 | 1018 passed | clean |
-| server1, EPYC | Linux 6.8, Ubuntu 24.04 | 4 | 1019 passed | clean |
-| server2, EPYC | Linux 6.8, Ubuntu 24.04 | 6 | 1019 passed | clean |
-| gpc, i9-13900K | Linux 6.18 on WSL2, Ubuntu 26.04 | 32 | 1018 passed, 1 failed | clean |
+| server1, EPYC | Linux 6.8, Ubuntu 24.04 | 4 | 1019 passed | 20 of 20 |
+| server2, EPYC | Linux 6.8, Ubuntu 24.04 | 6 | 1019 passed | 20 of 20 |
+| gpc, i9-13900K | Linux 6.18 on WSL2, Ubuntu 26.04 | 32 | 1018 passed, 1 failed | 20 of 20 |
+
+The suite is one check longer on Linux than on macOS, because sharded accept only exists there.
 
 The one failure on gpc is issue #87, the reactor backpressure test on WSL2, which fails on the commit before this one too.
+
+One flake was found and fixed on the way. Two of these tests read a log ring after the sink that owns it had been dropped, which Mojo is entitled to do at the sink's last mention, and which is not a use it can see when the thing holding the address is a copied `Logger`. It passed every time on macOS and failed about two runs in five on server1.
 
 ## What is not covered
 
