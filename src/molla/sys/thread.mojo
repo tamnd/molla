@@ -30,7 +30,8 @@ reports ENOTSUP rather than pretending.
 from std.ffi import c_int, c_size_t, external_call
 from std.sys.info import CompilationTarget
 
-from molla.sys.cstr import c_string
+from molla.sys.atomic import AtomicBlock
+from molla.sys.cstr import c_string, from_c_string
 from molla.sys.errno import ENOMEM, ENOTSUP
 from molla.sys.mem import allocate, release
 from molla.sys.result import SysResult, checked, ok
@@ -163,6 +164,29 @@ def set_thread_name(name: StringSpan) -> SysResult:
         )
     _ = buf^
     return _pthread_result(rc)
+
+
+def thread_name() -> String:
+    """What this thread is called, or an empty string if it has no name.
+
+    Here so `set_thread_name` can be tested rather than assumed. Both platforms
+    spell the getter the same way and both take the thread as an argument, even
+    though only Linux lets you pass one that is not your own."""
+    var buf = List[UInt8]()
+    for _ in range(MAX_THREAD_NAME + 1):
+        buf.append(0)
+    var rc = Int(
+        external_call["pthread_getname_np", c_int](
+            external_call["pthread_self", Int](),
+            buf.unsafe_ptr(),
+            c_size_t(MAX_THREAD_NAME + 1),
+        )
+    )
+    if rc != 0:
+        return String("")
+    var name = from_c_string(buf.unsafe_ptr(), MAX_THREAD_NAME + 1)
+    _ = buf^
+    return name^
 
 
 comptime CPU_SET_SIZE = 128
@@ -412,6 +436,67 @@ struct Condvar(Movable):
         return _pthread_result(
             Int(external_call["pthread_cond_destroy", c_int](self.raw()))
         )
+
+
+comptime ONCE_FRESH = 0
+comptime ONCE_RUNNING = 1
+comptime ONCE_DONE = 2
+
+comptime ONCE_SPIN_YIELDS = 64
+"""How many times a losing caller gives up its slice before it starts sleeping.
+An initialiser that opens a library takes microseconds and a caller that spins
+for those is cheaper than one that sleeps for a millisecond. An initialiser that
+does something slower than that is rare enough to sleep for."""
+
+
+struct Once(Movable):
+    """Run something exactly once, whichever thread gets there first.
+
+    Not `pthread_once`, and the reason is worth stating because pthread_once is
+    the obvious answer. Its callback takes no argument, so the only way for the
+    thing it initialises to be reachable afterwards is a global, and Mojo 1.0
+    has no globals at all. The initialiser would have nowhere to put its
+    result. So this takes the same `ThreadFunc` a spawned thread takes, with
+    the same single integer argument, and the caller hands it the address of
+    whatever is being set up.
+
+    Three states in one atomic. The winner of the compare and exchange runs the
+    function and publishes DONE, and everybody else waits for that publication
+    rather than trusting a flag that says the winner started.
+    """
+
+    var state: AtomicBlock
+
+    def __init__(out self):
+        self.state = AtomicBlock(1)
+
+    def is_done(self) -> Bool:
+        return self.state.slot(0).load() == ONCE_DONE
+
+    def call(mut self, work: ThreadFunc, arg: Int) -> SysResult:
+        """Run `work(arg)` if nobody has, and wait if somebody is.
+
+        Returns 1 if this call ran it and 0 if it did not, so a caller that
+        cares which one it was does not need a second flag. ENOMEM if the state
+        could not be allocated, which is the only failure there is.
+        """
+        if not self.state.is_valid():
+            return SysResult(-1, ENOMEM)
+        var slot = self.state.slot(0)
+        if slot.load() == ONCE_DONE:
+            return ok(0)
+        if slot.compare_exchange(ONCE_FRESH, ONCE_RUNNING):
+            _ = work(arg)
+            slot.store(ONCE_DONE)
+            return ok(1)
+        var spins = 0
+        while slot.load() != ONCE_DONE:
+            if spins < ONCE_SPIN_YIELDS:
+                spins += 1
+                _ = sched_yield()
+            else:
+                _ = sleep_ms(1)
+        return ok(0)
 
 
 comptime TIMESPEC_SIZE = 16

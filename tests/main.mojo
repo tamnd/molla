@@ -8,6 +8,7 @@ an unreachable except, so only wrap the ones that actually raise.
 from harness import Suite, finish
 
 import test_client
+import test_concurrency
 import test_dns
 import test_gguf
 import test_host
@@ -58,6 +59,10 @@ def main():
         test_reactor.run(suite)
     except e:
         suite.fail("test_reactor", String(e))
+    try:
+        test_concurrency.run(suite)
+    except e:
+        suite.fail("test_concurrency", String(e))
     test_stream.run(suite)
     test_json.run(suite)
     test_tls.run(suite)
