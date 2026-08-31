@@ -20,6 +20,7 @@ import test_registry
 import test_sha256
 import test_stream
 import test_sys
+import test_tls
 
 
 def main():
@@ -59,5 +60,6 @@ def main():
         suite.fail("test_reactor", String(e))
     test_stream.run(suite)
     test_json.run(suite)
+    test_tls.run(suite)
 
     finish(suite)

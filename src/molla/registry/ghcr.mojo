@@ -21,6 +21,7 @@ and fails loudly when the key is not there.
 
 from molla.http.client import get
 from molla.sys.sha256 import sha256_hex
+from molla.tls.policy import TlsPolicy
 
 comptime REGISTRY = "ghcr.io"
 
@@ -94,7 +95,7 @@ def _int_field(body: String, key: String, from_byte: Int = 0) raises -> Int:
     return Int(body[byte=start:i])
 
 
-def fetch_token(repo: String) raises -> String:
+def fetch_token(repo: String, policy: TlsPolicy = TlsPolicy()) raises -> String:
     """A pull scoped bearer token for `repo`.
 
     Anonymous. molla has no credential store yet and public images do not need
@@ -110,7 +111,7 @@ def fetch_token(repo: String) raises -> String:
         + repo
         + ":pull"
     )
-    var response = get(url, String("application/json"))
+    var response = get(url, String("application/json"), String(""), policy)
     if response.status != 200:
         raise Error(
             "token request for " + repo + " returned " + String(response.status)
@@ -130,13 +131,17 @@ def _manifest_url(repo: String, reference: String) -> String:
 
 
 def fetch_manifest(
-    repo: String, reference: String, token: String
+    repo: String,
+    reference: String,
+    token: String,
+    policy: TlsPolicy = TlsPolicy(),
 ) raises -> String:
     """The manifest or index for a tag or a digest, as text."""
     var response = get(
         _manifest_url(repo, reference),
         MANIFEST_ACCEPT,
         String("Bearer ") + token,
+        policy,
     )
     if response.status != 200:
         raise Error(
@@ -197,7 +202,10 @@ def select_platform(index: String, os: String, arch: String) raises -> String:
 
 
 def fetch_blob(
-    repo: String, digest: String, token: String
+    repo: String,
+    digest: String,
+    token: String,
+    policy: TlsPolicy = TlsPolicy(),
 ) raises -> List[UInt8]:
     """Pull one blob and check it against the digest that named it.
 
@@ -209,7 +217,7 @@ def fetch_blob(
         raise Error("only sha256 digests are supported: " + digest)
 
     var url = String("https://") + REGISTRY + "/v2/" + repo + "/blobs/" + digest
-    var response = get(url, String(""), String("Bearer ") + token)
+    var response = get(url, String(""), String("Bearer ") + token, policy)
     if response.status != 200:
         raise Error("blob " + digest + " returned " + String(response.status))
 

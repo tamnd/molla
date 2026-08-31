@@ -4,6 +4,13 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla.tls.policy`, which decides whether a certificate has to check out, by host name. There is no global insecure flag and there will not be one: a pull is not one connection, since ghcr.io answers a blob request with a redirect to a signed URL on a host it names, so a process wide switch would turn verification off for a host chosen by the response. `molla pull --insecure` and `molla tls --insecure` cover the host on the command line and nothing else, and every connection that skips verification says so on stdout.
+- `probe` in `molla.tls.client` and a `tls` line in `molla version`, saying which backend loaded and how high it can negotiate, or why there is none. TLS is dlopened, so a machine without it runs everything except HTTPS, and that is now a line of output rather than a promise in a document. It also puts the macOS TLS 1.2 cap on the screen of the machine it applies to.
+- `MOLLA_SECURITY` and `MOLLA_COREFOUNDATION` overrides for the two macOS framework paths, matching `MOLLA_LIBSSL` on the other platform. Nobody moves Security.framework, so these exist to point the loader at something that does not load, which is the only way to test what molla does on a host with no TLS library.
+- `tests/test_tls.mojo`, 17 checks over the policy and the probe, including the missing library case on every machine that runs the suite. The one that matters is negative: naming a registry insecure must leave the CDN it redirects to verified.
+
 ### Fixed
 
 - `molla version` prints the version it was built at. It said 0.1.2 for the 0.1.3 and 0.1.4 releases, because the release process bumps `pixi.toml` and the changelog and nothing was checking that `VERSION` in `build_info.mojo` came with them. `scripts/check-version.sh` now fails CI when the three disagree, which is cheaper than noticing it in a bug report six months from now.

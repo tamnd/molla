@@ -21,6 +21,7 @@ from molla.registry.ghcr import (
     select_platform,
 )
 from molla.sys.sha256 import sha256_hex
+from molla.tls.policy import TlsPolicy
 
 
 def _short(digest: String) -> String:
@@ -56,8 +57,14 @@ def split_reference(reference: String) raises -> List[String]:
     return out^
 
 
-def run_pull(reference: String) raises:
-    """Pull one blob and print every step on the way to it."""
+def run_pull(reference: String, insecure: Bool = False) raises:
+    """Pull one blob and print every step on the way to it.
+
+    `insecure` turns verification off for the registry host and nothing else.
+    A blob request is answered with a redirect to a host the registry names, so
+    a flag that also covered the redirect would be turning verification off for
+    a host chosen by the response.
+    """
     var parts = split_reference(reference)
     var repo = parts[0]
     var want = parts[1]
@@ -75,14 +82,18 @@ def run_pull(reference: String) raises:
 
     print("pull", REGISTRY + "/" + repo, "reference", want)
 
-    var token = fetch_token(repo)
+    var policy = TlsPolicy()
+    if insecure:
+        policy.allow_insecure(REGISTRY)
+
+    var token = fetch_token(repo, policy)
     print("  token     ", token.byte_length(), "bytes")
 
     var digest: String
     if want.startswith("sha256:"):
         digest = want
     else:
-        var manifest = fetch_manifest(repo, want, token)
+        var manifest = fetch_manifest(repo, want, token, policy)
         print("  manifest  ", manifest.byte_length(), "bytes")
 
         if is_index(manifest):
@@ -90,12 +101,12 @@ def run_pull(reference: String) raises:
                 manifest, String("linux"), String("amd64")
             )
             print("  platform   linux/amd64", _short(picked))
-            manifest = fetch_manifest(repo, picked, token)
+            manifest = fetch_manifest(repo, picked, token, policy)
             print("  manifest  ", manifest.byte_length(), "bytes")
 
         digest = config_digest(manifest)
         print("  config    ", _short(digest), config_size(manifest), "bytes")
 
-    var blob = fetch_blob(repo, digest, token)
+    var blob = fetch_blob(repo, digest, token, policy)
     print("  blob      ", len(blob), "bytes")
     print("  digest     sha256:" + sha256_hex(blob), "verified")

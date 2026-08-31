@@ -20,6 +20,7 @@ it cannot make sense of.
 
 from molla.build_info import VERSION
 from molla.tls.client import TlsClient
+from molla.tls.policy import TlsPolicy
 
 comptime CHUNK_SIZE = 16384
 """How much to ask TLS for at a time. Two TLS records, roughly."""
@@ -336,10 +337,13 @@ def _build_request(url: Url, accept: String, authorization: String) -> String:
 
 
 def get_once(
-    url: Url, accept: String, authorization: String
+    url: Url,
+    accept: String,
+    authorization: String,
+    policy: TlsPolicy = TlsPolicy(),
 ) raises -> Response:
     """One request, one connection, no redirect following."""
-    var conn = TlsClient(url.host, url.port)
+    var conn = TlsClient(url.host, url.port, policy)
     var reader = Reader(conn^)
 
     var request = _build_request(url, accept, authorization)
@@ -417,6 +421,7 @@ def get(
     url_text: String,
     accept: String = String(""),
     authorization: String = String(""),
+    policy: TlsPolicy = TlsPolicy(),
 ) raises -> Response:
     """GET a URL, following redirects.
 
@@ -425,13 +430,18 @@ def get(
     a signed URL on githubusercontent.com, and sending the registry bearer token
     to a different host would be handing a credential to whoever the redirect
     named.
+
+    The policy is carried across the redirect unchanged, which sounds like the
+    dangerous choice and is the safe one, because it names hosts rather than
+    holding a switch. Turning verification off for a registry leaves it on for
+    the CDN the registry redirected to, and that host is chosen by the response.
     """
     var url = parse_url(url_text)
     var auth = authorization
     var hops = 0
 
     while True:
-        var response = get_once(url, accept, auth)
+        var response = get_once(url, accept, auth, policy)
         if not _is_redirect(response.status):
             return response^
 
