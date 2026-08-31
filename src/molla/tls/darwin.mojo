@@ -28,6 +28,7 @@ CA list, which is the point.
 
 from std.ffi import OwnedDLHandle, c_int
 from std.memory import stack_allocation
+from std.os.env import getenv
 
 from molla.sys.cstr import c_string, from_c_string
 from molla.sys.errno import errno_name, get_errno
@@ -40,14 +41,34 @@ comptime COREFOUNDATION_PATH = (
     "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
 )
 
+comptime SECURITY_ENV = "MOLLA_SECURITY"
+comptime COREFOUNDATION_ENV = "MOLLA_COREFOUNDATION"
+"""Overrides for the two framework paths, matching `MOLLA_LIBSSL` on the other
+platform. Nobody moves Security.framework, so the reason these exist is the
+opposite one: pointing them at a path that does not load is the only way to see
+what molla does on a machine with no TLS library, and that behaviour is part of
+what issue #14 promises."""
+
+comptime MAX_PROTOCOL = "TLS 1.2"
+"""The ceiling Secure Transport can reach. `kTLSProtocol13` does not exist, so
+this is a real cap and not a setting. It is printed by `molla version` rather
+than left in a document, because the machine it matters on is the one somebody
+is looking at when a server stops accepting TLS 1.2."""
+
 comptime K_SSL_CLIENT_SIDE = 1
 comptime K_SSL_STREAM_TYPE = 0
 comptime K_TLS_PROTOCOL_12 = 8
+
+comptime K_SSL_SESSION_OPTION_BREAK_ON_SERVER_AUTH = 0
+"""Hands control back after the server's certificate arrives instead of
+evaluating it. That is how Secure Transport says "do not verify": there is no
+call that turns verification off, only one that makes it somebody else's job."""
 
 comptime NO_ERR = 0
 comptime ERR_SSL_WOULD_BLOCK = -9803
 comptime ERR_SSL_CLOSED_GRACEFUL = -9805
 comptime ERR_SSL_CLOSED_ABORT = -9806
+comptime ERR_SSL_PEER_AUTH_COMPLETED = -9841
 
 comptime K_CF_STRING_ENCODING_UTF8 = 0x08000100
 
@@ -89,6 +110,8 @@ def status_name(status: Int) -> String:
         return "errSSLPeerHandshakeFail"
     elif status == -9836:
         return "errSSLProtocol"
+    elif status == -9841:
+        return "errSSLPeerAuthCompleted"
     elif status == -9843:
         return "errSSLHostNameMismatch"
     return "OSStatus " + String(status)
@@ -168,15 +191,38 @@ comptime IoFunc = def(
 ) thin abi("C") -> Int32
 
 
+def _path(name: String, fallback: String) -> String:
+    """An environment override, or the framework's real path."""
+    var forced = getenv(name)
+    if forced.byte_length() > 0:
+        return forced^
+    return fallback
+
+
+def _open(path: String, what: String) raises -> OwnedDLHandle:
+    try:
+        return OwnedDLHandle(path)
+    except:
+        raise Error(
+            "no usable "
+            + what
+            + ", tried "
+            + path
+            + ". HTTPS needs Security.framework."
+        )
+
+
 def open_security() raises -> OwnedDLHandle:
     """dlopen Security.framework."""
-    return OwnedDLHandle(SECURITY_PATH)
+    return _open(_path(SECURITY_ENV, SECURITY_PATH), String("Security"))
 
 
 def open_corefoundation() raises -> OwnedDLHandle:
     """dlopen CoreFoundation, which is where the certificate chain accessors and
     CFRelease live."""
-    return OwnedDLHandle(COREFOUNDATION_PATH)
+    return _open(
+        _path(COREFOUNDATION_ENV, COREFOUNDATION_PATH), String("CoreFoundation")
+    )
 
 
 def create_context(security: OwnedDLHandle) raises -> Int:
@@ -190,9 +236,17 @@ def create_context(security: OwnedDLHandle) raises -> Int:
 
 
 def configure(
-    security: OwnedDLHandle, ctx: Int, fd: Int, host: StringSpan
+    security: OwnedDLHandle,
+    ctx: Int,
+    fd: Int,
+    host: StringSpan,
+    verify: Bool = True,
 ) raises:
-    """Wire the context to the socket and tell it who it is talking to."""
+    """Wire the context to the socket and tell it who it is talking to.
+
+    `verify` is false only for a host somebody named on the command line. See
+    `molla.tls.policy` for why that is a host and not a switch.
+    """
     var reader: IoFunc = st_read
     var writer: IoFunc = st_write
     var rc = Int(
@@ -205,9 +259,25 @@ def configure(
     if rc != NO_ERR:
         raise Error("SSLSetConnection: " + status_name(rc))
 
+    # Set before the peer name, because it changes what the handshake does with
+    # it. With this option Secure Transport stops when the certificate arrives
+    # and hands control back rather than evaluating the chain, which is the only
+    # way this API has of not verifying.
+    if not verify:
+        var opt = Int(
+            security.get_function[Int32]("SSLSetSessionOption")(
+                ctx,
+                c_int(K_SSL_SESSION_OPTION_BREAK_ON_SERVER_AUTH),
+                UInt8(1),
+            )
+        )
+        if opt != NO_ERR:
+            raise Error("SSLSetSessionOption: " + status_name(opt))
+
     # This is the line that makes verification mean anything. Without it the
     # chain is still checked but the name on the certificate is not, and a valid
-    # certificate for any host would be accepted for this one.
+    # certificate for any host would be accepted for this one. It is still set
+    # for an insecure host, because it is also what sends SNI.
     var name = c_string(host)
     rc = Int(
         security.get_function[Int32]("SSLSetPeerDomainName")(
@@ -226,18 +296,25 @@ def configure(
         raise Error("SSLSetProtocolVersionMin: " + status_name(rc))
 
 
-def handshake(security: OwnedDLHandle, ctx: Int) raises:
+def handshake(security: OwnedDLHandle, ctx: Int, verify: Bool = True) raises:
     """Run the handshake, including trust evaluation.
 
     `errSSLWouldBlock` comes back whenever the callbacks moved a short count,
     which on a blocking socket means a partial record arrived, so the loop just
     asks again.
+
+    `errSSLPeerAuthCompleted` only happens for an insecure host, because it is
+    the break option asking what we think of the certificate. Calling
+    `SSLHandshake` again is how you answer "carry on". It is treated as an error
+    when verifying, which it would be, since nothing asked for the break.
     """
     while True:
         var rc = Int(security.get_function[Int32]("SSLHandshake")(ctx))
         if rc == NO_ERR:
             return
         if rc == ERR_SSL_WOULD_BLOCK:
+            continue
+        if rc == ERR_SSL_PEER_AUTH_COMPLETED and not verify:
             continue
         raise Error("TLS handshake failed: " + status_name(rc))
 

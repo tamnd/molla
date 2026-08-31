@@ -57,7 +57,7 @@ Being honest about this up front. Mojo 1.0 has no async, no sockets, no HTTP, no
 | A Jinja2 subset for chat templates | no template engine |
 | BPE, Unigram, and WordPiece tokenizers | no tokenizer |
 | GGUF and safetensors readers | GGUF metadata and tensor directory done, no tensor reads, no safetensors, see [docs/validation/gguf.md](docs/validation/gguf.md) |
-| An OCI client, which needs TLS through FFI | no HTTP client |
+| An OCI client, which needs TLS through FFI | no HTTP client, client TLS and a verified ghcr.io pull done, see [docs/validation/tls.md](docs/validation/tls.md) |
 | A paged KV cache batching executor | `max/kernels` gives kernels, not an engine |
 | Quantized matmul on an Apple GPU | `max/kernels` has none that runs below an M5, see [docs/validation/kernels.md](docs/validation/kernels.md) |
 

@@ -29,7 +29,13 @@ from std.os.env import getenv
 
 from molla.sys.cstr import c_string, from_c_string
 
+comptime SSL_VERIFY_NONE = 0
 comptime SSL_VERIFY_PEER = 1
+
+comptime MAX_PROTOCOL = "TLS 1.3"
+"""The ceiling this binding can reach. OpenSSL 1.1.1 and 3.x both do TLS 1.3,
+and it is here so `molla version` can print the same field on both platforms,
+where the macOS answer is lower and worth seeing without reading a document."""
 
 comptime SSL_CTRL_SET_TLSEXT_HOSTNAME = 55
 comptime TLSEXT_NAMETYPE_HOST_NAME = 0
@@ -160,8 +166,14 @@ def last_error(crypto: OwnedDLHandle) raises -> String:
     return out^
 
 
-def create_context(ssl_lib: OwnedDLHandle, crypto: OwnedDLHandle) raises -> Int:
-    """A client SSL_CTX with the platform trust store and a TLS 1.2 floor."""
+def create_context(
+    ssl_lib: OwnedDLHandle, crypto: OwnedDLHandle, verify: Bool = True
+) raises -> Int:
+    """A client SSL_CTX with the platform trust store and a TLS 1.2 floor.
+
+    `verify` is false only for a host somebody named on the command line. See
+    `molla.tls.policy` for why that is a host and not a switch.
+    """
     var method = ssl_lib.get_function[Int]("TLS_client_method")()
     if method == 0:
         raise Error("TLS_client_method returned null")
@@ -170,6 +182,9 @@ def create_context(ssl_lib: OwnedDLHandle, crypto: OwnedDLHandle) raises -> Int:
     if ctx == 0:
         raise Error("SSL_CTX_new: " + last_error(crypto))
 
+    # Loaded even when this connection is not verifying, because the trust
+    # store is a property of the context and a missing one is worth reporting
+    # here rather than on the next connection that does verify.
     if (
         Int(
             ssl_lib.get_function[c_int]("SSL_CTX_set_default_verify_paths")(ctx)
@@ -184,7 +199,7 @@ def create_context(ssl_lib: OwnedDLHandle, crypto: OwnedDLHandle) raises -> Int:
     # the handshake rather than being reported through SSL_get_verify_result,
     # which is a call it is very easy to forget.
     _ = ssl_lib.get_function[NoneType]("SSL_CTX_set_verify")(
-        ctx, c_int(SSL_VERIFY_PEER), Int(0)
+        ctx, c_int(SSL_VERIFY_PEER if verify else SSL_VERIFY_NONE), Int(0)
     )
 
     # SSL_CTX_set_min_proto_version is a macro over SSL_CTX_ctrl, so there is no
@@ -204,6 +219,7 @@ def create_connection(
     ctx: Int,
     fd: Int,
     host: StringSpan,
+    verify: Bool = True,
 ) raises -> Int:
     """A new SSL bound to `fd`, with SNI and hostname verification set up."""
     var ssl = ssl_lib.get_function[Int]("SSL_new")(ctx)
@@ -226,14 +242,18 @@ def create_connection(
     )
 
     # Hostname verification. Separate from SNI, and the one that actually
-    # protects anything.
-    if (
-        Int(
-            ssl_lib.get_function[c_int]("SSL_set1_host")(ssl, name.unsafe_ptr())
-        )
-        != 1
-    ):
-        raise Error("SSL_set1_host: " + last_error(crypto))
+    # protects anything. Left off for an insecure host, because setting it and
+    # then not verifying is a check that silently does nothing.
+    if verify:
+        if (
+            Int(
+                ssl_lib.get_function[c_int]("SSL_set1_host")(
+                    ssl, name.unsafe_ptr()
+                )
+            )
+            != 1
+        ):
+            raise Error("SSL_set1_host: " + last_error(crypto))
 
     return ssl
 

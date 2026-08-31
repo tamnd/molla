@@ -1,6 +1,6 @@
 # Client TLS through dlopen
 
-The M0 TLS spike. Issue #6 asks whether molla can do HTTPS by loading the platform's TLS library at runtime rather than linking it, on macOS and on Linux, and it says the spike is done when a real blob comes down from ghcr.io over HTTPS on both. It does. The same 1744 byte blob, with the same SHA-256, on four machines and three different TLS libraries.
+Two issues, in order. Issue #6 is the M0 spike: can molla do HTTPS by loading the platform's TLS library at runtime rather than linking it, on macOS and on Linux, with the spike done when a real blob comes down from ghcr.io over HTTPS on both. It can. The same 1744 byte blob, with the same SHA-256, on four machines and three different TLS libraries. Issue #14 is the M1 job of making that fit to use, which is the insecure flag being per registry rather than global, and a machine with no TLS library starting anyway and losing only HTTPS. That part starts at [Productionising](#productionising-issue-14).
 
 There is one finding that is not good news and it is in the macOS section: the only usable Apple TLS API caps at TLS 1.2.
 
@@ -14,7 +14,8 @@ There is one finding that is not good news and it is in the macOS section: the o
 | `molla.sys.socket` | `dial`, a blocking connected socket with send and receive timeouts |
 | `molla.tls.openssl` | OpenSSL 3.x and 1.1.1 through dlopen |
 | `molla.tls.darwin` | Secure Transport and CoreFoundation through dlopen |
-| `molla.tls.client` | One `TlsClient` over both, and `molla tls <host>` |
+| `molla.tls.policy` | Which hosts skip verification, by name, added by #14 |
+| `molla.tls.client` | One `TlsClient` over both, the backend probe, and `molla tls <host>` |
 | `molla.http.client` | GET, redirects, `Content-Length` and chunked bodies |
 | `molla.registry.ghcr` | Token, manifest, index, blob, digest check |
 | `molla.registry.pull` | `molla pull <ref>` |
@@ -93,7 +94,78 @@ The digest check is the point of the whole exercise. Everything above the blob f
 
 The 1.1.1f row is the same machine with `MOLLA_LIBSSL=libssl.so.1.1`, which is how the fallback path gets exercised. 1.1.1f went out of support in 2023 and still negotiates TLS 1.3, because 1.1.1 was the release that added it.
 
-The test suite is 204 checks and passes on macOS, server1, server2 and server3. Fifty of those are new here: four SHA-256 vectors including one that crosses a block boundary, seven for DNS, ten for URL splitting, and the rest for the registry scanner against canned index and manifest bodies.
+The test suite was 204 checks at that point and passed on macOS, server1, server2 and server3. Fifty of those are new here: four SHA-256 vectors including one that crosses a block boundary, seven for DNS, ten for URL splitting, and the rest for the registry scanner against canned index and manifest bodies.
+
+## Productionising, issue #14
+
+Issue #14 asks for three things the spike did not have: an insecure flag that is per registry and never global, a binary that starts on a host with no TLS library and only loses HTTPS, and all of it behind one narrow interface. The interface was already there, so this is the other two.
+
+### The insecure flag is a host, not a switch
+
+`molla.tls.policy.TlsPolicy` holds the names of the hosts whose certificate is not checked. There is no boolean anywhere that means "do not verify", and that is the design rather than a preference.
+
+A pull is not one connection. ghcr.io answers a blob request with a 307 to a signed URL on `pkg-containers.githubusercontent.com`, so a process wide flag would also turn verification off for a host named by the response rather than by the operator. Naming the host makes that impossible to write by accident. It is the same reasoning that drops the bearer token on a cross host redirect, one layer down.
+
+The effect is visible in the output. Four connections say they are not verifying and the fifth, the one the redirect chose, says nothing:
+
+```text
+$ molla pull --insecure linuxcontainers/alpine:latest
+pull ghcr.io/linuxcontainers/alpine reference latest
+  insecure   not verifying the certificate for ghcr.io
+  token      60 bytes
+  insecure   not verifying the certificate for ghcr.io
+  manifest   5413 bytes
+  platform   linux/amd64 d22cb65d578e
+  insecure   not verifying the certificate for ghcr.io
+  manifest   670 bytes
+  config     1dd0f00d536d 1744 bytes
+  insecure   not verifying the certificate for ghcr.io
+  blob       1744 bytes
+  digest     sha256:1dd0f00d536d... verified
+```
+
+Matching is exact and case folded. No wildcards and no suffix rules, because a pattern language here is a way to turn off more verification than anybody intended, and the case that actually comes up is one registry on one name with a certificate the platform does not trust.
+
+Every insecure connection says so, once, on stdout. Four lines for one pull is noisy and it is deliberate. An insecure connection nobody can see is the one that is still insecure a year later.
+
+### Two different ways to not verify
+
+OpenSSL is the easy side. `SSL_VERIFY_NONE` and no `SSL_set1_host`, both rather than one, because setting the host name and then not verifying leaves a check in the source that silently does nothing.
+
+Secure Transport has no call that turns verification off. What it has is `kSSLSessionOptionBreakOnServerAuth`, which stops when the server's certificate arrives and hands control back, so evaluating the chain becomes the application's job and the application declines to do it. `SSLHandshake` then returns `errSSLPeerAuthCompleted`, and calling it again is how you say carry on. That return is an error when verifying, since nothing asked for the break.
+
+One thing worth knowing when reading a failure on macOS: Secure Transport reports a name mismatch as `errSSLXCertChainInvalid`, the same code as an untrusted root. `wrong.host.badssl.com` and `self-signed.badssl.com` fail with the identical message there, and with different ones on Linux, where OpenSSL hands back the X509 code as well.
+
+### A machine with no TLS library
+
+`probe()` loads the library and reports what it found without opening a socket, and `molla version` prints it. That turns a promise into a line of output, one of these three:
+
+```text
+  tls        OpenSSL 3.6.4 25 Aug 2026 via libssl.so.3 up to TLS 1.3
+  tls        Secure Transport up to TLS 1.2
+  tls        unavailable, HTTPS is off: no usable libssl, tried libssl.so.99. Install OpenSSL 3 or 1.1 to enable HTTPS.
+```
+
+The `up to` is the TLS 1.2 cap from the macOS section above, printed on every machine rather than left in a document, because the machine where it matters is the one somebody is looking at on the day a server stops accepting TLS 1.2.
+
+Security.framework now takes `MOLLA_SECURITY` and `MOLLA_COREFOUNDATION` overrides, matching `MOLLA_LIBSSL` and `MOLLA_LIBCRYPTO` on the other side. Nobody moves Security.framework, so these exist for the opposite reason to the Linux ones: pointing them at a path that does not load is the only way to see what molla does on a machine with no TLS library, and that behaviour is half of what the issue promises. The suite uses them, so every machine that runs the tests runs the missing library case.
+
+### Where it was run
+
+Every row is a real run of the commands rather than a claim, and the pull column is the same 1744 byte blob with the same digest as the M0 table.
+
+| Machine | Backend | ghcr.io | expired.badssl.com | the same with --insecure | pull |
+| --- | --- | --- | --- | --- | --- |
+| macbook, M4, macOS 15.8 | Secure Transport, TLS 1.2 | verified | refused | connects | verified |
+| server1, Ubuntu 24.04 | OpenSSL 3.6.4, TLS 1.3 | verified | refused | connects | verified |
+| server2, Ubuntu 24.04 | OpenSSL 3.6.4, TLS 1.3 | verified | refused | connects | verified |
+| gpc, WSL2 on Windows | OpenSSL 3.6.4, TLS 1.3 | verified | refused | connects | verified |
+
+server1 ran it again with `MOLLA_LIBSSL=libssl.so.1.1`, which still negotiates TLS 1.3 and still verifies, so the 1.1 fallback has not rotted.
+
+With the library taken away, all four print the unavailable line from `molla version` and exit 0, and `molla pull` fails with the same message and exits 1. That is the acceptance criterion of the issue, and it is also in the suite, so it is a test rather than a screenshot.
+
+The suite is 827 checks on Linux and 826 on macOS. gpc fails one of them, which is issue #87, the reactor backpressure test under WSL2, and it fails the same way on main.
 
 ## What is missing
 
@@ -108,6 +180,12 @@ Bodies are read into memory whole. A model file will not fit that way. M3 needs 
 One connection per request, `Connection: close`, no reuse. Five TCP connections and five handshakes for one blob pull, counting the redirect. That is slower than it needs to be and it makes the body framing two cases instead of six, which was the right trade for a spike and is the wrong one for a puller.
 
 No client certificates, no session resumption, no proxy support, no revocation checking beyond whatever the platform does on its own.
+
+No way to add a CA. Trust is the platform's, which is the right default and leaves one gap: a registry behind a private CA either has that CA in the machine's trust store, which is where it belongs, or it needs `--insecure`, which is a bigger hammer than the job wants. A per host CA file is the obvious fix and nothing needs it yet.
+
+No server side TLS, deliberately, and it is not planned for v1. molla binds loopback by default under D9, and terminating TLS for an exposed deployment is a job for whatever reverse proxy is already in front of it. Saying that is more honest than shipping a weak TLS server.
+
+Still TLS 1.2 on macOS. Unchanged by #14 and unchangeable without Network.framework, which needs Objective-C blocks. `molla version` now prints the cap on every machine, which is the mitigation available today.
 
 Only ghcr.io. The protocol is the OCI distribution spec and Docker Hub speaks the same one, so widening this is mostly about where the token comes from.
 

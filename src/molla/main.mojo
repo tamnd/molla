@@ -17,7 +17,7 @@ from molla.net.soak import run_soak
 from molla.net.soak_net import run_net_soak
 from molla.registry.pull import run_pull
 from molla.sys.poll import USES_KQUEUE
-from molla.tls.client import run_tls
+from molla.tls.client import probe, run_tls
 
 
 def print_version():
@@ -34,6 +34,15 @@ def print_version():
     )
     print("  simd width", host.simd_f32, "x f32,", host.simd_f16, "x f16")
     print("  poller    ", "kqueue" if USES_KQUEUE else "epoll")
+
+    # Printed here rather than left to the first pull that fails. TLS is loaded
+    # at runtime, so a machine without it runs everything except HTTPS, and the
+    # only honest way to say that is in the command everybody runs first.
+    var tls = probe()
+    if tls.available:
+        print("  tls       ", tls.backend, "up to", tls.max_protocol)
+    else:
+        print("  tls        unavailable, HTTPS is off:", tls.detail)
 
 
 def print_usage():
@@ -53,17 +62,43 @@ def print_usage():
     print("  pull <ref>      pull a blob from ghcr.io and check its digest")
     print("  help            print this message")
     print()
+    print("flags:")
+    print(
+        "  --insecure      do not check the certificate of the host named on"
+        " this"
+    )
+    print(
+        "                  command line. Accepted by tls and pull, and it"
+        " covers"
+    )
+    print("                  that one host, not a redirect it sends you to.")
+    print()
     print("Nothing serves yet. See the roadmap for what lands when:")
     print("  https://github.com/tamnd/molla/blob/main/docs/roadmap.md")
 
 
 def main():
-    var args = argv()
+    # --insecure is pulled out here rather than parsed per command, so it can
+    # be written before or after the argument it applies to. Everything else is
+    # positional, which is all the M0 commands need.
+    var raw = argv()
+    var args = List[String]()
+    var insecure = False
+    for i in range(len(raw)):
+        var arg = String(raw[i])
+        if arg == "--insecure":
+            insecure = True
+        else:
+            args.append(arg^)
+
     if len(args) < 2:
         print_usage()
         return
 
-    var command = String(args[1])
+    var command = args[1]
+    if insecure and command != "tls" and command != "pull":
+        print("molla: --insecure means nothing to '", command, "'", sep="")
+        exit(2)
     if command == "version" or command == "--version" or command == "-V":
         print_version()
     elif command == "help" or command == "--help" or command == "-h":
@@ -73,11 +108,11 @@ def main():
         var port: UInt16 = 0
         if len(args) > 2:
             try:
-                port = UInt16(Int(String(args[2])))
+                port = UInt16(Int(args[2]))
             except:
                 print(
                     "molla: '",
-                    String(args[2]),
+                    args[2],
                     "' is not a port number",
                     sep="",
                 )
@@ -93,9 +128,9 @@ def main():
         var seconds = 60
         try:
             if len(args) > 2:
-                connections = Int(String(args[2]))
+                connections = Int(args[2])
             if len(args) > 3:
-                seconds = Int(String(args[3]))
+                seconds = Int(args[3])
         except:
             print(
                 "molla: soak takes a connection count and a duration in seconds"
@@ -113,9 +148,9 @@ def main():
         var net_seconds = 3600
         try:
             if len(args) > 2:
-                net_connections = Int(String(args[2]))
+                net_connections = Int(args[2])
             if len(args) > 3:
-                net_seconds = Int(String(args[3]))
+                net_seconds = Int(args[3])
         except:
             print(
                 "molla: netsoak takes a connection count and a duration in"
@@ -133,9 +168,9 @@ def main():
         var json_rounds = 2000
         try:
             if len(args) > 2:
-                json_kb = Int(String(args[2]))
+                json_kb = Int(args[2])
             if len(args) > 3:
-                json_rounds = Int(String(args[3]))
+                json_rounds = Int(args[3])
         except:
             print("molla: jsonbench takes a body size in kB and a round count")
             exit(2)
@@ -144,11 +179,11 @@ def main():
         var http_port: UInt16 = 0
         if len(args) > 2:
             try:
-                http_port = UInt16(Int(String(args[2])))
+                http_port = UInt16(Int(args[2]))
             except:
                 print(
                     "molla: '",
-                    String(args[2]),
+                    args[2],
                     "' is not a port number",
                     sep="",
                 )
@@ -174,17 +209,17 @@ def main():
         var tls_port: UInt16 = 443
         if len(args) > 3:
             try:
-                tls_port = UInt16(Int(String(args[3])))
+                tls_port = UInt16(Int(args[3]))
             except:
                 print(
                     "molla: '",
-                    String(args[3]),
+                    args[3],
                     "' is not a port number",
                     sep="",
                 )
                 exit(2)
         try:
-            run_tls(String(args[2]), tls_port)
+            run_tls(args[2], tls_port, insecure)
         except e:
             print("molla tls:", e)
             exit(1)
@@ -194,7 +229,7 @@ def main():
             print("  for example: molla pull linuxcontainers/alpine:latest")
             exit(2)
         try:
-            run_pull(String(args[2]))
+            run_pull(args[2], insecure)
         except e:
             print("molla pull:", e)
             exit(1)

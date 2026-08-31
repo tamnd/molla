@@ -22,9 +22,64 @@ from molla.sys.dns import format_ipv4, resolve_ipv4
 from molla.sys.fd import close
 from molla.sys.socket import dial
 from molla.tls import darwin, openssl
+from molla.tls.policy import TlsPolicy
 
 comptime DEFAULT_TIMEOUT_SECONDS = 30
 comptime DEFAULT_PORT: UInt16 = 443
+
+
+struct TlsSupport(Copyable, ImplicitlyCopyable, Movable):
+    """What TLS this binary can do on this machine, without connecting."""
+
+    var available: Bool
+    var backend: String
+    """The library that loaded, or an empty string."""
+
+    var max_protocol: String
+    """The highest TLS version the backend can negotiate. Not the same on the
+    two platforms, which is the reason it is a field rather than a constant."""
+
+    var detail: String
+    """Why not, when `available` is false. Names what was tried."""
+
+    def __init__(out self):
+        self.available = False
+        self.backend = String("")
+        self.max_protocol = String("")
+        self.detail = String("")
+
+
+def probe() -> TlsSupport:
+    """Load the TLS library and report, without opening a socket.
+
+    This is the difference between a binary that does not start and one that
+    starts and loses HTTPS. Both are possible with dlopen and only one of them
+    is visible, so `molla version` prints this and a machine with no OpenSSL
+    says so in the first command anybody runs on it.
+
+    Does not raise. A missing library is an answer here, not a failure.
+    """
+    var out = TlsSupport()
+    try:
+        comptime if CompilationTarget.is_macos():
+            var security = darwin.open_security()
+            var cf = darwin.open_corefoundation()
+            out.backend = String("Secure Transport")
+            out.max_protocol = darwin.MAX_PROTOCOL
+            _ = security^
+            _ = cf^
+        else:
+            var soname = String("")
+            var ssl_lib = openssl.open_ssl(soname)
+            var crypto = openssl.open_crypto()
+            out.backend = openssl.library_version(crypto) + " via " + soname
+            out.max_protocol = openssl.MAX_PROTOCOL
+            _ = ssl_lib^
+            _ = crypto^
+        out.available = True
+    except e:
+        out.detail = String(e)
+    return out^
 
 
 struct TlsClient(Movable):
@@ -50,15 +105,29 @@ struct TlsClient(Movable):
 
     var host: String
     var open: Bool
+    var verified: Bool
+    """Whether the certificate was checked. False only for a host named on the
+    command line, and printed by every command that opens one of these."""
 
-    def __init__(out self, host: String, port: UInt16 = DEFAULT_PORT) raises:
+    def __init__(
+        out self,
+        host: String,
+        port: UInt16 = DEFAULT_PORT,
+        policy: TlsPolicy = TlsPolicy(),
+    ) raises:
         """Resolve, connect, handshake, verify. Any failure raises and leaves
-        nothing open."""
+        nothing open.
+
+        The policy is asked here rather than by the caller, so a caller that
+        follows a redirect cannot forget to re-ask it for the new host. The
+        default policy verifies everything.
+        """
         self.host = host
         self.fd = 0
         self.ctx = 0
         self.conn = 0
         self.open = False
+        self.verified = policy.verifies(host)
 
         comptime if CompilationTarget.is_macos():
             self.primary = darwin.open_security()
@@ -72,18 +141,32 @@ struct TlsClient(Movable):
                 openssl.library_version(self.secondary) + " via " + soname
             )
 
+        if not self.verified:
+            # Said out loud, once per connection. An insecure connection nobody
+            # can see is the one that is still insecure a year later.
+            print("  insecure   not verifying the certificate for", host)
+
         var addr = resolve_ipv4(host)
         self.fd = dial(addr, port, DEFAULT_TIMEOUT_SECONDS)
 
         try:
             comptime if CompilationTarget.is_macos():
                 self.conn = darwin.create_context(self.primary)
-                darwin.configure(self.primary, self.conn, self.fd, host)
-                darwin.handshake(self.primary, self.conn)
+                darwin.configure(
+                    self.primary, self.conn, self.fd, host, self.verified
+                )
+                darwin.handshake(self.primary, self.conn, self.verified)
             else:
-                self.ctx = openssl.create_context(self.primary, self.secondary)
+                self.ctx = openssl.create_context(
+                    self.primary, self.secondary, self.verified
+                )
                 self.conn = openssl.create_connection(
-                    self.primary, self.secondary, self.ctx, self.fd, host
+                    self.primary,
+                    self.secondary,
+                    self.ctx,
+                    self.fd,
+                    host,
+                    self.verified,
                 )
                 openssl.handshake(self.primary, self.secondary, self.conn)
         except e:
@@ -179,17 +262,27 @@ struct TlsClient(Movable):
             return openssl.peer_chain(self.primary, self.secondary, self.conn)
 
 
-def run_tls(host: String, port: UInt16 = DEFAULT_PORT) raises:
+def run_tls(
+    host: String, port: UInt16 = DEFAULT_PORT, insecure: Bool = False
+) raises:
     """The `molla tls` command: connect, verify, print what was negotiated.
 
     This is the first thing to run on a machine where a pull fails. It
     separates the three ways TLS goes wrong on a new host, which are no library
     to load, a library that loads but cannot verify, and a peer that verifies
     but presents a chain nobody expected.
+
+    `insecure` names this host and only this host. There is no port in the
+    policy, because a certificate is issued to a name and not to a port.
     """
-    var conn = TlsClient(host, port)
+    var policy = TlsPolicy()
+    if insecure:
+        policy.allow_insecure(host)
+
     print("tls", host, "port", port)
+    var conn = TlsClient(host, port, policy)
     print("  backend  ", conn.backend)
+    print("  verified ", "yes" if conn.verified else "no")
     print("  protocol ", conn.protocol())
     print("  cipher   ", conn.cipher())
     var chain = conn.peer_chain()
