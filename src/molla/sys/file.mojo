@@ -100,6 +100,11 @@ expected to read, per the second commitment in the README."""
 
 comptime MODE_755 = 0o755
 
+comptime MODE_600 = 0o600
+"""What molla creates temporary files with. A spilled request body is one
+client's data sitting in a world readable directory, so it is readable by the
+user molla runs as and by nobody else."""
+
 
 def open_at(path: StringSpan, flags: Int, mode: Int) -> SysResult:
     """Open a path. Returns the descriptor, or the errno that stopped it.

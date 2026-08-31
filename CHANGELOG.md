@@ -4,6 +4,18 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla.http` gets the parser the request path will actually run on. `scan.mojo` finds delimiters sixteen bytes at a time, `request.mojo` parses a request line and a header block into zero copy spans and stops at the blank line, `body.mojo` reads the body after that, `serialize.mojo` writes responses without allocating, `multipart.mojo` streams multipart/form-data, and `protocol.mojo` puts all of it on the reactor from #10.
+- Bodies are read separately from headers, so a body larger than the read buffer is no longer a contradiction. Content-Length, chunked and multipart all go through one call that says how much it took and whether it is done. Over a megabyte the body spills to a file opened `O_EXCL` with mode 600, so peak memory for an upload is bounded by the threshold rather than by the upload.
+- A hostile input corpus in `tests/test_http.mojo`, one case per refusal, asserting the status and not just the rejection. Bare LF, bare CR, Content-Length with Transfer-Encoding, duplicate framing headers, a Transfer-Encoding that is not chunked, whitespace before a colon, obsolete line folding, zero or two Host headers, control characters in a field, an Expect we cannot answer, and the 8 KiB, 64 KiB and 128 header bounds.
+- An assertion that two thousand responses allocate nothing, measured after a warmup so the number does not hide the first few responses growing the buffer.
+- `MODE_600` in `molla.sys.file`.
+
+### Changed
+
+- `molla.http.server`, the M0 spike, answers 501 to a request with a body instead of half reading one. The parser it calls no longer consumes bodies, and the spike is kept as the evidence behind the M0 throughput numbers rather than as something to build on. Benchmark anything other than a bare GET against `molla.http.protocol`.
+
 ## [0.1.2] - 2026-09-01
 
 The event loop the request path will run on. One reactor per worker thread, each owning its poller, its connection table and its timers, with nothing shared on the request path.
