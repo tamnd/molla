@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+# Least privilege by default. Jobs opt into more where they need it.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Bump this to move the whole matrix onto a new toolchain in one commit.
+  MOJO_VERSION: "1.0"
+
+jobs:
+  docs:
+    name: Docs and links
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Lint markdown
+        uses: DavidAnson/markdownlint-cli2-action@992badcdf24e3b8eb7e87ff9287fe931bcb00c6e # v20
+        with:
+          globs: "**/*.md"
+      - name: Check links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
+        with:
+          args: "--no-progress --max-concurrency 4 --accept 200,206,429 ."
+          fail: true
+
+  workflows:
+    name: Workflow lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      # Catches unpinned actions, credential persistence, and template injection.
+      - uses: zizmorcore/zizmor-action@e673c3917a1aef3c65c972347ed84ccd013ecda4 # v0.2.0
+
+  shell:
+    name: Shell lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: |
+          shopt -s nullglob globstar
+          files=(scripts/**/*.sh **/*.bash)
+          if [ ${#files[@]} -eq 0 ]; then echo "no shell scripts yet"; exit 0; fi
+          shellcheck "${files[@]}"
+
+  # Activates automatically once the first Mojo source lands in M0.
+  # Until then it reports skipped rather than red, because a build job
+  # with nothing to build is not a failure.
+  build:
+    name: Build and test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - name: macos-aarch64
+            runner: macos-15
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Check for sources
+        id: sources
+        shell: bash
+        run: |
+          if [ -f pixi.toml ] && compgen -G "src/**/*.mojo" > /dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No Mojo sources yet, skipping. This job activates with M0."
+          fi
+      - uses: prefix-dev/setup-pixi@194d461b21b6c5717c722ffc597fa91ed2ff29fa # v0.9.1
+        if: steps.sources.outputs.present == 'true'
+        with:
+          cache: true
+      - name: Build
+        if: steps.sources.outputs.present == 'true'
+        run: pixi run build
+      - name: Test
+        if: steps.sources.outputs.present == 'true'
+        run: pixi run test
+      - name: Upload test results
+        if: steps.sources.outputs.present == 'true' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-results-${{ matrix.name }}
+          path: target/test-results/
+          if-no-files-found: ignore
+
+  # Numerics and performance need real devices, so they run on the fleet
+  # rather than on hosted runners. See D7 and D8 in docs/design.md.
+  # Gated on the label so forks and doc changes do not queue on hardware.
+  hardware:
+    name: Hardware suite (${{ matrix.device }})
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'needs: hardware')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: apple-gpu
+            runner: [self-hosted, macos, arm64, metal]
+          - device: nvidia-sm89
+            runner: [self-hosted, linux, x64, cuda]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Check for sources
+        id: sources
+        shell: bash
+        run: |
+          if [ -f pixi.toml ] && compgen -G "src/**/*.mojo" > /dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Numerics
+        if: steps.sources.outputs.present == 'true'
+        run: pixi run test-numerics
+      - name: Benchmarks
+        if: steps.sources.outputs.present == 'true'
+        run: pixi run bench --json target/bench.json
+      - name: Upload benchmark results
+        if: steps.sources.outputs.present == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-${{ matrix.device }}
+          path: target/bench.json
+          if-no-files-found: ignore
+
+  # Single required check, so branch protection needs one entry and the
+  # matrix can change without editing repo settings.
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [docs, workflows, shell, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail if any dependency failed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -qE '"result": *"(failure|cancelled)"'; then
+            echo "at least one required job did not pass"
+            exit 1
+          fi
+          echo "all required jobs passed"

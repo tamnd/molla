@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Actions are pinned to commit SHAs, so this is how they move.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    labels:
+      - "type: chore"
+      - "area: ci"
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - "type: chore"
+      - "area: ci"
+    commit-message:
+      prefix: "ci"

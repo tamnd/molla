@@ -1,0 +1,17 @@
+config:
+  # Prose is written as one line per paragraph, so line length is not a rule.
+  MD013: false
+  # Duplicate headings are fine across different sections.
+  MD024:
+    siblings_only: true
+  # Bare URLs show up in error message examples.
+  MD034: false
+  # We use HTML comments in templates.
+  MD033:
+    allowed_elements: [br, details, summary]
+  # The first line of an issue body is not always a heading.
+  MD041: false
+
+globs:
+  - "**/*.md"
+  - "!.github/PULL_REQUEST_TEMPLATE.md"

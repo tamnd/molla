@@ -1,0 +1,8 @@
+# Default owner for everything.
+*                       @tamnd
+
+# Anything that changes how the project is built, released, or trusted.
+/.github/               @tamnd
+/docs/design.md         @tamnd
+/LICENSE                @tamnd
+/NOTICE                 @tamnd

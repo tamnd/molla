@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose something molla should do.
+labels: ["type: feature", "status: needs triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that molla makes hard or impossible? Describe the situation, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you want
+      description: What should happen instead.
+    validations:
+      required: true
+  - type: checkboxes
+    id: charter
+    attributes:
+      label: Openness check
+      description: These are the five commitments in docs/design.md. A feature that breaks one needs a decision record, not just a pull request.
+      options:
+        - label: This does not add a format only molla can read.
+        - label: This does not require an account, telemetry, or a network call the user did not ask for.
+        - label: This does not add a required proprietary dependency.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

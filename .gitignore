@@ -1,0 +1,27 @@
+# Build output
+/target/
+/dist/
+*.mojopkg
+*.o
+*.a
+
+# Pixi
+/.pixi/
+pixi.lock.bak
+
+# Local state. Never commit a model store.
+/.molla/
+*.gguf
+*.safetensors
+*.bin
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Test and bench output
+/target/test-results/
+*.sarif
+bench.json

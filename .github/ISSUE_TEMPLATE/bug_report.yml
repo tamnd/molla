@@ -1,0 +1,54 @@
+name: Bug report
+description: Something behaves differently than documented.
+labels: ["type: bug", "status: needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        molla is pre-release and most of it is not built yet. Check the milestone the feature belongs to before filing.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The exact commands or requests. A curl line is ideal.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - HTTP and networking
+        - API surface (OpenAI, Anthropic, MCP)
+        - Prompt rendering or tokenizer
+        - Model plane (store, OCI, GGUF)
+        - Engine (KV cache, batching, sampling)
+        - Kernels and numerics
+        - Scheduler and memory
+        - CLI and config
+        - Build and CI
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `molla devices` and `molla config get`, plus OS and driver versions.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run with `MOLLA_DEBUG=1` and paste the relevant part.
+      render: shell

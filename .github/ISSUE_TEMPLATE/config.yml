@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/tamnd/molla/discussions
+    about: Ask a question or float an idea before it becomes an issue.
+  - name: Security report
+    url: https://github.com/tamnd/molla/security/advisories/new
+    about: Report a vulnerability privately. Do not open a public issue.
