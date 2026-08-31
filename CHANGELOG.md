@@ -4,7 +4,13 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- `docs/adr/`, for decisions taken at a gate against measurements, and `docs/adr/0001-network-edge-stays-in-mojo.md`, the M0 gate record on D1
+
+### Changed
+
+- D1 in `docs/design.md` records the M0 gate outcome. The network edge stays in Mojo. The multi threaded half of the third reversal condition moves to the M1 gate, because Mojo 1.0 has no threading module to test it with.
 
 ## [0.0.3] - 2026-08-31
 
