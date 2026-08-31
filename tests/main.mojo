@@ -15,6 +15,7 @@ import test_http
 import test_net
 import test_registry
 import test_sha256
+import test_sys
 
 
 def main():
@@ -40,5 +41,9 @@ def main():
         test_registry.run(suite)
     except e:
         suite.fail("test_registry", String(e))
+    try:
+        test_sys.run(suite)
+    except e:
+        suite.fail("test_sys", String(e))
 
     finish(suite)
