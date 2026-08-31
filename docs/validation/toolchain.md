@@ -9,7 +9,7 @@ The pin lives in two places. `pixi.toml` is the one that matters, and `src/molla
 | Item | Value |
 | --- | --- |
 | Mojo | 1.0.0, build ed45d567 |
-| Channel | https://conda.modular.com/max |
+| Channel | `https://conda.modular.com/max` |
 | Package license | LicenseRef-Modular-Proprietary |
 | Pinned in | `pixi.toml` |
 
