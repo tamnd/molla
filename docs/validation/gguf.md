@@ -67,14 +67,21 @@ The file is opened with `openat` and AT_FDCWD rather than with `open`, which loo
 
 ## The fleet
 
-Per D8 this was built and the suite was run on the Linux machines, which is what exercises the AT_FDCWD value for Linux and the Linux mmap path rather than the macOS one. The full suite is 167 checks.
+Per D8 this was built and the suite was run on every Linux machine, which is what exercises the Linux AT_FDCWD value and the Linux mmap path rather than the macOS ones. The full suite is 167 checks and it passes everywhere.
 
-| Machine | Result |
-| --- | --- |
-| M4, aarch64-apple-darwin | 167 passed |
-| server2, x86_64-linux-gnu | 167 passed |
+| Machine | Threads | Result |
+| --- | --- | --- |
+| M4, aarch64-apple-darwin | 10 | 167 passed |
+| gpc, i9-13900K on WSL2, x86_64-linux-gnu | 32 | 167 passed |
+| server1, EPYC, x86_64-linux-gnu | 4 | 167 passed |
+| server2, EPYC, x86_64-linux-gnu | 6 | 167 passed |
+| server3, EPYC, x86_64-linux-gnu | 8 | 167 passed |
 
-CI covers aarch64-linux-gnu on every push, which is the fourth combination and the one no machine here has.
+The bert fixture was also copied to server2 and dumped there. The output is byte for byte identical to the macOS output across all 232 lines, which is the check that matters for a reader that assembles its own integers: if the byte order handling were wrong on one platform the two dumps would disagree. Peak RSS on Linux was 10112 kB against 9552 kB on the M4 for the same file.
+
+No timing is quoted for the fleet. These machines run other people's work, as recorded in `docs/validation/http.md`, and this operation is measured in milliseconds, so any number from them would be noise.
+
+CI covers aarch64-linux-gnu on every push, which is the sixth combination and the one no machine here has.
 
 ## What is not covered
 
