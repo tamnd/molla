@@ -308,7 +308,9 @@ def parse(mut doc: Document, mut reader: Reader, data: Span[UInt8, _]) -> Bool:
     """Fill a document from a buffer.
 
     The buffer has to outlive the document, because the strings that did not
-    need decoding are spans into it.
+    need decoding are spans into it. Only the address is kept, so a buffer held
+    in a local has to be kept alive explicitly with `keep(buf)` from
+    `molla.sys.mem` after the last read of the document.
     """
     doc.clear()
     doc.source = Int(data.unsafe_ptr())

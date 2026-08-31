@@ -31,7 +31,7 @@ from molla.json.reader import (
 )
 from molla.json.serialize import Writer
 from molla.sys.clock import monotonic_ms
-from molla.sys.mem import AllocCounter
+from molla.sys.mem import AllocCounter, keep
 
 comptime _WORDS = StaticString(
     "the quick brown fox jumps over a lazy dog while the server holds one"
@@ -249,6 +249,11 @@ def _run(mut counter: AllocCounter, size: Int, rounds: Int) -> Int:
     if dom_elapsed > 0:
         print("dom throughput", bytes_done // dom_elapsed // 1000, "MB/s")
     print("dom allocations", counter.total() - dom_before)
+
+    # The reader and the document hold the body as an address, so nothing above
+    # counts as a use of the writer that owns those bytes. Without this the
+    # compiler frees it before the first parse.
+    keep(writer)
 
     if allocations != 0:
         print()

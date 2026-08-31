@@ -192,8 +192,15 @@ struct Reader(Movable):
         self.max_depth = want
 
     def begin(mut self, data: Span[UInt8, _]):
-        """Point at a document. The buffer has to outlive the reader, which is
-        the same rule the header table follows."""
+        """Point at a document.
+
+        The buffer has to outlive the reader, which is the same rule the header
+        table follows. Only the address is kept, so this call is the last thing
+        the compiler sees using the buffer: a buffer held in a local is freed
+        here unless the caller ends the scope with `keep(buf)` from
+        `molla.sys.mem`. A buffer that is a field of a connection has no such
+        problem, which is why the server never hits it and a test does.
+        """
         self.base = Int(data.unsafe_ptr())
         self.length = len(data)
         self.at = 0

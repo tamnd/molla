@@ -77,7 +77,7 @@ from molla.json.scan import (
     validate_utf8,
 )
 from molla.json.serialize import Writer, write_json_double, write_json_string
-from molla.sys.mem import AllocCounter
+from molla.sys.mem import AllocCounter, keep
 
 
 def _load(mut buf: Buffer, text: StringSpan):
@@ -558,6 +558,12 @@ def test_reader_events(mut suite: Suite, counter: Int):
     )
     suite.check(reader.next() == EV_END, "and then it is over")
 
+    # `buf` is not read again after this, and Mojo destroys a local at its last
+    # use, so without a keep the reader would be walking a freed block. It reads
+    # correctly on the M4 and fails on x86_64 Linux, which is what the fleet run
+    # is for.
+    keep(buf)
+
 
 def test_reader_strings(mut suite: Suite, counter: Int):
     suite.group("json strings are spans until they cannot be")
@@ -652,6 +658,7 @@ def test_reader_strings(mut suite: Suite, counter: Int):
         reader.next() == EV_STRING and len(reader.text()) == 3001,
         "three thousand bytes and one escape decode in one copy",
     )
+    keep(buf)
 
 
 def _fails(
@@ -774,6 +781,7 @@ def test_reader_errors(mut suite: Suite, counter: Int):
         if e == EV_END:
             break
     suite.check(saw_depth, "two hundred open brackets hits the depth limit")
+    keep(buf)
 
 
 def test_skipping(mut suite: Suite, counter: Int):
@@ -808,6 +816,7 @@ def test_skipping(mut suite: Suite, counter: Int):
     )
     suite.check(seen_keys == 4, "and every key at that level was still seen")
     suite.check(reader.finish(), "and the rest of the document still parses")
+    keep(buf)
 
 
 def test_dom(mut suite: Suite, counter: Int):
@@ -899,6 +908,7 @@ def test_dom(mut suite: Suite, counter: Int):
         not parse(doc, reader, buf.bytes()) and not doc.ok(),
         "a bad document fails and says so rather than half filling",
     )
+    keep(buf)
 
 
 def test_writer(mut suite: Suite, counter: Int):
@@ -1026,6 +1036,7 @@ def test_writer_reader_round_trip(mut suite: Suite, counter: Int):
         doc.get_int(doc.root, "big") == 9223372036854775807,
         "and the largest integer is still an integer",
     )
+    keep(w)
 
 
 def test_no_allocations(mut suite: Suite):
@@ -1067,6 +1078,7 @@ def test_no_allocations(mut suite: Suite):
         reader.decoded > 0,
         "including the strings that had to be decoded into the scratch",
     )
+    keep(buf)
     counter.close()
 
 
