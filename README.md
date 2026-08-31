@@ -83,13 +83,16 @@ Windows is WSL only, matching the toolchain.
 
 ## Building
 
-There is nothing to build yet. Once M0 lands:
+You need [pixi](https://pixi.sh). It pulls the pinned Mojo toolchain, so there is nothing else to install.
 
 ```
 pixi install
 pixi run build
 pixi run test
+./build/molla version
 ```
+
+That builds and runs today on macOS arm64, Linux x86_64, and Linux arm64. It does not serve anything yet. `molla version` prints the toolchain and what it detected about your machine, which is all M0 promises. See [docs/validation/toolchain.md](docs/validation/toolchain.md) for the pinned version, the machines it has actually been run on, and the notes on what Mojo 1.0 turned out to look like in practice.
 
 ## Contributing
 

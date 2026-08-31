@@ -1,0 +1,18 @@
+"""Entry point for the test suite. Add new test modules here.
+
+Modules that can raise should be wrapped in try and except, reporting through
+`suite.fail` so one bad module does not hide the rest of the run. Mojo warns on
+an unreachable except, so only wrap the ones that actually raise.
+"""
+
+from harness import Suite, finish
+
+import test_host
+
+
+def main():
+    var suite = Suite()
+
+    test_host.run(suite)
+
+    finish(suite)
