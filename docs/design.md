@@ -54,13 +54,17 @@ This makes model distribution a solved infrastructure problem. Deduplication, re
 
 ## D6: the engine is ours, built on max/kernels
 
-molla implements its own executor: weight loading, layer composition, paged KV cache, continuous batching, sampling, speculative decoding, and LoRA. It calls kernels from `max/kernels`, which is Apache-2.0, and adds its own where there are gaps. The MAX runtime is an optional backend and never required.
+molla implements its own executor: weight loading, layer composition, paged KV cache, continuous batching, sampling, speculative decoding, and LoRA. It calls kernels from `max/kernels` and adds its own where there are gaps.
 
-`max/kernels` supplies the hard math under a permissive license. The engine around it is systems work we want to own anyway, because it defines scheduling behaviour and memory policy. Owning it is also what keeps molla clear of the Modular Community License.
+`max/kernels` requires `max-core`, which is proprietary, at runtime and not only at build time. molla therefore requires it too, to generate a token, on every target. That is the cost of this decision and it is named in the README rather than left to be found.
 
-**Reversal condition.** If our executor is more than twice as slow as MAX on the same hardware six months in, we flip the default to the MAX backend where it is available, keep the native engine as the portable path, and say so publicly.
+The engine around the kernels is systems work we want to own anyway, because it defines scheduling behaviour and memory policy. That is the half of this decision that was never in doubt.
 
-**Status: under review.** The M0 kernel spike found that the second paragraph above is wrong. `max/kernels` is Apache-2.0 source that does not compile or run without `max-core`, which is proprietary, and that is true of its CPU kernels as well as its GPU ones. It also found that molla already links a proprietary support library out of the compiler package, so the licensing split this decision was built on does not exist. `max/kernels` also has no quantized matmul that will launch on an Apple GPU below an M5. The evidence is in [docs/validation/kernels.md](validation/kernels.md) and the decision is issue #7.
+`max/kernels` has no quantized matmul that will launch on an Apple GPU below an M5, and the M4 is the reference machine. Every quantized matmul that runs on an M4 GPU is one molla writes. `max-core` covers CPU and CUDA and does not cover that.
+
+**Reversal condition.** If our executor is more than twice as slow as MAX on the same hardware six months in, we flip the default to MAX's own execution path where it is available, keep the native engine as the portable path, and say so publicly. That is an engineering call rather than a licensing one now, because the runtime is a dependency either way.
+
+**Decided at the M0 gate, 2026-08-31.** The version of D6 that promised an optional MAX runtime described a seam that does not exist. `max/kernels` does not build or run without proprietary `max-core`, its CPU kernels included, and the molla binary has linked a proprietary support library out of the compiler package since the first commit. The choice was to accept the dependency or to write every kernel ourselves before anything generates a token, and the dependency won on the grounds that a runner that serves models helps people and a licence story with no kernels behind it does not. Record, evidence and the rejected alternative in [adr/0002-accept-max-core.md](adr/0002-accept-max-core.md) and [validation/kernels.md](validation/kernels.md).
 
 ## D7: one kernel source, four targets, numerics asserted
 
@@ -69,6 +73,8 @@ Every operation has a single Mojo source compiled for CPU, NVIDIA, AMD, and Appl
 Every operation has a naive reference implementation, an external oracle where one exists, and numerics tests that run on each target with tolerances stated per dtype. Portable is a claim that decays silently. Only per target tests keep it true.
 
 A target that cannot pass numerics is listed as unsupported. It does not ship as probably fine.
+
+**Load bearing as of the D6 gate.** D6 accepts `max-core` for CPU and CUDA, and `max/kernels` has no quantized matmul that will launch on an Apple GPU below an M5, so the Apple GPU kernels are ours. The per target numerics tests this decision asks for are now the only thing standing between portable and a claim that decays quietly.
 
 **Status: achievable, not inherited.** The M0 kernel spike wrote one naive Q4_K matmul with no compile time branches at all, compiled it for Metal and for sm_89, and got byte identical output from an M4 and a 4090. So the claim holds for code we write. It is not how `max/kernels` is organised, which has three separate quantized matmul implementations in three separate places with different entry points, weight layouts and dtypes. The first two tolerances the second paragraph promised are also now stated, in [docs/validation/kernels.md](validation/kernels.md), because this decision asked for them without giving any.
 

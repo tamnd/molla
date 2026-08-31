@@ -9,3 +9,4 @@ One file per decision, numbered in the order they were taken. A record never cha
 | Record | Decision | Status |
 | --- | --- | --- |
 | [0001](0001-network-edge-stays-in-mojo.md) | The network edge stays in Mojo, D1 holds | Accepted, 2026-08-31 |
+| [0002](0002-accept-max-core.md) | `max-core` is a required dependency, D6 rewritten | Accepted, 2026-08-31 |
