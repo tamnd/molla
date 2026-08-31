@@ -49,6 +49,7 @@ Being honest about this up front. Mojo 1.0 has no async, no sockets, no HTTP, no
 | Layer | Why |
 | --- | --- |
 | Sockets and an event loop over epoll and kqueue | no `std.net`, done, see [docs/validation/sockets.md](docs/validation/sockets.md) |
+| Files, threads, mutexes and signals over libc | no `std.thread` and no signal handling, done, see [docs/validation/sys.md](docs/validation/sys.md) |
 | HTTP/1.1 with chunked, SSE, and NDJSON framing | no HTTP stack, parse and respond done, see [docs/validation/http.md](docs/validation/http.md) |
 | A SIMD JSON parser and serializer | no `std.json` |
 | A Jinja2 subset for chat templates | no template engine |
