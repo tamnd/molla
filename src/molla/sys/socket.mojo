@@ -47,6 +47,10 @@ def _so_reuseport() -> Int:
         return 15
 
 
+comptime IPPROTO_TCP = 6
+comptime TCP_NODELAY = 1
+"""Same numbers on macOS and Linux, unlike most of the socket option space."""
+
 comptime SOL_SOCKET = _sol_socket()
 comptime SO_REUSEADDR = _so_reuseaddr()
 comptime SO_REUSEPORT = _so_reuseport()
@@ -121,6 +125,37 @@ def set_reuse(fd: Int, option: Int) raises:
     )
     if rc < 0:
         raise Error("setsockopt failed: " + errno_name(get_errno()))
+
+
+def set_nodelay(fd: Int) raises:
+    """Turn off Nagle's algorithm on an accepted socket.
+
+    Nagle holds a small write back until the previous small segment has been
+    acknowledged, and the peer's stack delays that acknowledgement hoping to
+    piggyback it on data going the other way. For bulk transfer that trade is
+    worth it. For a request and response server it stalls a path that otherwise
+    answers in tens of microseconds.
+
+    Measured on the M4 against the fixed body, with the buffer churn described
+    in `http/server.mojo` already fixed, this is worth 39006 to 95102 requests
+    per second at 64 connections and takes the p99 at one connection from
+    14.81ms to 2.29ms. The first time it was measured the buffer churn was
+    still there, it swamped this completely, and turning Nagle off looked like
+    it did nothing. Worth remembering before concluding a knob does not matter.
+    """
+    var on = stack_allocation[1, c_int]()
+    on.unsafe_store(0, c_int(1))
+    var rc = Int(
+        external_call["setsockopt", c_int](
+            c_int(fd),
+            c_int(IPPROTO_TCP),
+            c_int(TCP_NODELAY),
+            on,
+            c_int(4),
+        )
+    )
+    if rc < 0:
+        raise Error("setsockopt TCP_NODELAY failed: " + errno_name(get_errno()))
 
 
 def listen_tcp(

@@ -8,6 +8,7 @@ an unreachable except, so only wrap the ones that actually raise.
 from harness import Suite, finish
 
 import test_host
+import test_http
 import test_net
 
 
@@ -16,5 +17,6 @@ def main():
 
     test_host.run(suite)
     test_net.run(suite)
+    test_http.run(suite)
 
     finish(suite)

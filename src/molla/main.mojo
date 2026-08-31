@@ -9,6 +9,7 @@ from std.sys import argv, exit
 
 from molla.build_info import MOJO_PIN, VERSION
 from molla.host import detect
+from molla.http.server import run_http
 from molla.net.echo import run_echo
 from molla.net.soak import run_soak
 from molla.sys.poll import USES_KQUEUE
@@ -37,6 +38,7 @@ def print_usage():
     print("  version         print the version, toolchain, and host details")
     print("  echo [port]     run the M0 TCP echo spike on 127.0.0.1")
     print("  soak [n] [sec]  hold n echo connections for sec seconds")
+    print("  http [port]     run the M0 HTTP/1.1 spike on 127.0.0.1")
     print("  help            print this message")
     print()
     print("Nothing serves yet. See the roadmap for what lands when:")
@@ -91,6 +93,24 @@ def main():
             exit(run_soak(connections, seconds))
         except e:
             print("molla soak:", e)
+            exit(1)
+    elif command == "http":
+        var http_port: UInt16 = 0
+        if len(args) > 2:
+            try:
+                http_port = UInt16(Int(String(args[2])))
+            except:
+                print(
+                    "molla: '",
+                    String(args[2]),
+                    "' is not a port number",
+                    sep="",
+                )
+                exit(2)
+        try:
+            run_http(http_port)
+        except e:
+            print("molla http:", e)
             exit(1)
     else:
         print("molla: unknown command '", command, "'", sep="")

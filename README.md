@@ -39,7 +39,7 @@ Being honest about this up front. Mojo 1.0 has no async, no sockets, no HTTP, no
 | Layer | Why |
 | --- | --- |
 | Sockets and an event loop over epoll and kqueue | no `std.net`, done, see [docs/validation/sockets.md](docs/validation/sockets.md) |
-| HTTP/1.1 with chunked, SSE, and NDJSON framing | no HTTP stack |
+| HTTP/1.1 with chunked, SSE, and NDJSON framing | no HTTP stack, parse and respond done, see [docs/validation/http.md](docs/validation/http.md) |
 | A SIMD JSON parser and serializer | no `std.json` |
 | A Jinja2 subset for chat templates | no template engine |
 | BPE, Unigram, and WordPiece tokenizers | no tokenizer |
@@ -92,7 +92,7 @@ pixi run test
 ./build/molla version
 ```
 
-That builds and runs today on macOS arm64, Linux x86_64, and Linux arm64. It does not serve anything yet. `molla version` prints the toolchain and what it detected about your machine, and `molla echo` runs the M0 socket spike, which is a TCP echo server and not a molla feature. See [docs/validation/toolchain.md](docs/validation/toolchain.md) for the pinned version, the machines it has actually been run on, and the notes on what Mojo 1.0 turned out to look like in practice.
+That builds and runs today on macOS arm64, Linux x86_64, and Linux arm64. It does not serve a model yet. `molla version` prints the toolchain and what it detected about your machine. `molla echo` runs the M0 socket spike, which is a TCP echo server, and `molla http` runs the M0 throughput spike, which answers every request with the same fixed body. Neither is a molla feature. See [docs/validation/toolchain.md](docs/validation/toolchain.md) for the pinned version, the machines it has actually been run on, and the notes on what Mojo 1.0 turned out to look like in practice.
 
 ## Contributing
 
