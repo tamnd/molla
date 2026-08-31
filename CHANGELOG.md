@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Fixed
+
+- `molla version` prints the version it was built at. It said 0.1.2 for the 0.1.3 and 0.1.4 releases, because the release process bumps `pixi.toml` and the changelog and nothing was checking that `VERSION` in `build_info.mojo` came with them. `scripts/check-version.sh` now fails CI when the three disagree, which is cheaper than noticing it in a bug report six months from now.
+
 ## [0.1.4] - 2026-09-01
 
 JSON, in both directions, at a bit over 2 GB/s on the M4. Two modes over one SIMD scanner: a pull loop for request bodies, which is nearly all of the traffic, and a small tree for config and manifests. Object keys keep the order they arrived in, which matters because a tool call's arguments came from a model and the order is part of what it said.
