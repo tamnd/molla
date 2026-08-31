@@ -39,6 +39,7 @@ from molla.sys.socket import (
     set_buffer_size,
     socket_tcp,
 )
+from molla.sys.thread import sleep_ms
 
 comptime MAX_STEPS = 400
 """Passes to wait for something before calling it a failure. At a 5 ms timeout
@@ -74,17 +75,26 @@ def _send_pattern(fd: Int, first: Int, count: Int) -> Int:
 
 
 def _drain(fd: Int, want: Int) -> Int:
-    """Read up to `want` bytes, stopping when the socket goes quiet."""
+    """Read up to `want` bytes from a server that is running on its own threads,
+    giving up on a wall clock deadline.
+
+    The first version gave up after a fixed number of empty reads instead, and
+    that is a budget in spins rather than in time. On a shared runner with two
+    cores and four workers, two thousand non blocking reads that all return
+    EAGAIN can burn through before the thread that owes the answer is scheduled
+    at all, and the harder the machine is working the fewer real milliseconds
+    the budget buys. It passed everywhere and then failed once in CI. Sleeping a
+    millisecond between empty reads also stops the spin from competing with the
+    worker for the core it needs."""
     var buf = stack_allocation[4096, UInt8]()
     var got = 0
-    var idle = 0
-    while got < want and idle < 2000:
+    var deadline = monotonic_ms() + WAIT_MS
+    while got < want and monotonic_ms() < deadline:
         var n = recv(fd, buf, min(4096, want - got))
         if n > 0:
             got += n
-            idle = 0
             continue
-        idle += 1
+        _ = sleep_ms(1)
     return got
 
 
@@ -370,7 +380,7 @@ def _check_server(mut suite: Suite) raises:
 
     var deadline = monotonic_ms() + WAIT_MS
     while server.accepted() < 16 and monotonic_ms() < deadline:
-        pass
+        _ = sleep_ms(1)
     suite.check(server.accepted() == 16, "sixteen connections were accepted")
 
     var echoed = 0
@@ -411,7 +421,7 @@ def _check_server_unix(mut suite: Suite) raises:
     var client = connect_unix(path)
     var deadline = monotonic_ms() + WAIT_MS
     while server.accepted() < 1 and monotonic_ms() < deadline:
-        pass
+        _ = sleep_ms(1)
     suite.check(server.accepted() == 1, "a unix client reaches the server")
 
     _ = _send_pattern(client, 1, 32)
