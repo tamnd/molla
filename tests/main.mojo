@@ -16,6 +16,7 @@ import test_http
 import test_io
 import test_json
 import test_net
+import test_ops
 import test_reactor
 import test_registry
 import test_sha256
@@ -63,6 +64,10 @@ def main():
         test_concurrency.run(suite)
     except e:
         suite.fail("test_concurrency", String(e))
+    try:
+        test_ops.run(suite)
+    except e:
+        suite.fail("test_ops", String(e))
     test_stream.run(suite)
     test_json.run(suite)
     test_tls.run(suite)

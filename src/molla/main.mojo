@@ -16,6 +16,7 @@ from molla.net.drain import run_drain
 from molla.net.echo import run_echo
 from molla.net.soak import run_soak
 from molla.net.soak_net import run_net_soak
+from molla.ops.config import describe_setting, load_config
 from molla.registry.pull import run_pull
 from molla.sys.poll import USES_KQUEUE
 from molla.tls.client import probe, run_tls
@@ -63,11 +64,19 @@ def print_usage():
     print(
         "  gguf <path>     print the metadata and tensor directory of a model"
     )
+    print("  config get [key] print a setting and where its value came from")
     print("  tls <host>      connect over TLS and print what was negotiated")
     print("  pull <ref>      pull a blob from ghcr.io and check its digest")
     print("  help            print this message")
     print()
     print("flags:")
+    print(
+        "  --config=PATH   read settings from this file rather than molla.conf"
+    )
+    print(
+        "  --<key>=VALUE   set any configuration key, and beat the environment"
+        " and the file"
+    )
     print(
         "  --insecure      do not check the certificate of the host named on"
         " this"
@@ -80,6 +89,45 @@ def print_usage():
     print()
     print("Nothing serves yet. See the roadmap for what lands when:")
     print("  https://github.com/tamnd/molla/blob/main/docs/roadmap.md")
+
+
+def run_config(args: List[String]):
+    """`molla config get [key]`.
+
+    Prints the effective value and the reason it is the effective value, which
+    is the half that matters. Anybody can print a number. The question somebody
+    has at three in the morning is why the number is that and not what the file
+    says, and the answer is nearly always that a flag or an environment
+    variable is quietly winning.
+    """
+    if len(args) < 3 or args[2] != "get":
+        print("usage: molla config get [key]")
+        print()
+        print("Prints every setting when no key is named. Settings are read")
+        print("from the file, then the environment, then the flags, and the")
+        print("last one to speak wins.")
+        exit(2)
+
+    var config = load_config(args)
+    var problems = config.problems()
+    for i in range(len(problems)):
+        print("molla config: " + problems[i])
+
+    if len(args) < 4:
+        print(config.describe(), end="")
+        if len(problems) > 0:
+            exit(1)
+        return
+
+    var key = args[3]
+    var at = config.index_of(key)
+    if at < 0:
+        print("molla config: there is no setting called '", key, "'", sep="")
+        print("Run 'molla config get' for the ones there are.")
+        exit(2)
+    print(describe_setting(config.get(key)))
+    if len(problems) > 0:
+        exit(1)
 
 
 def main():
@@ -259,6 +307,8 @@ def main():
         except e:
             print("molla pull:", e)
             exit(1)
+    elif command == "config":
+        run_config(args)
     else:
         print("molla: unknown command '", command, "'", sep="")
         print("Run 'molla help' for the list of commands.")
