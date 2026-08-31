@@ -11,9 +11,15 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 - A hostile input corpus in `tests/test_http.mojo`, one case per refusal, asserting the status and not just the rejection. Bare LF, bare CR, Content-Length with Transfer-Encoding, duplicate framing headers, a Transfer-Encoding that is not chunked, whitespace before a colon, obsolete line folding, zero or two Host headers, control characters in a field, an Expect we cannot answer, and the 8 KiB, 64 KiB and 128 header bounds.
 - An assertion that two thousand responses allocate nothing, measured after a warmup so the number does not hide the first few responses growing the buffer.
 - `MODE_600` in `molla.sys.file`.
+- `molla.http.stream`, the SSE and NDJSON writers, over chunked transfer encoding. An event is flushed on its own as soon as it exists and events are only combined into one chunk when the socket cannot take them, which falls out of holding framed payload and chunk framed bytes in separate buffers. Past the staging limit a producer gets `STREAM_FULL` rather than a bigger buffer. Event names, ids and NDJSON records are refused if they contain a line break, since either one silently desynchronises the client rather than failing.
+- The SSE heartbeat, as `heartbeat_due` and `heartbeat` taking the current time rather than reading a clock, so it fits a protocol trait with no tick in it and so the test is deterministic. NDJSON deliberately has none, because it has no comment syntax and a blank line is not portably ignored.
+- `Connection.produce`, one bit saying the protocol has more to write on its own initiative, and `/stream/sse` and `/stream/ndjson` on the M1 protocol.
+- `tests/test_stream.mojo`, 59 checks over framing, validation, backpressure, the heartbeat, a reader taking one byte at a time against pinned 8 kB socket buffers and a 2 kB output ring, and a client that hangs up mid stream.
 
 ### Changed
 
+- The reactor calls `on_writable` for a connection whose protocol says it is producing, not only for one the poller reported writable, and counts bytes leaving the output ring as progress for the service loop. Without both, a streaming response stops after one ring's worth: the client is not going to send anything else, so there is no read edge, and once the ring drains there is no write edge either. Nothing before #12 produced without being asked, so nothing had exercised it.
+- `write_decimal` is a free function in `molla.http.serialize` rather than a method, since the streaming writers need the same non allocating decimal into their own buffers.
 - `molla.http.server`, the M0 spike, answers 501 to a request with a body instead of half reading one. The parser it calls no longer consumes bodies, and the spike is kept as the evidence behind the M0 throughput numbers rather than as something to build on. Benchmark anything other than a bare GET against `molla.http.protocol`.
 
 ## [0.1.2] - 2026-09-01
