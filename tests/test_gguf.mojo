@@ -399,6 +399,19 @@ def run(mut suite: Suite) raises:
     suite.check(_raises(bad_version_path), "version 1")
     _remove(bad_version_path)
 
+    # Version 2 has the same layout as 3, so the same parser reads it. Version
+    # 1 does not, because it counted strings and arrays in 32 bits, which is
+    # why 1 is rejected above rather than tolerated.
+    var v2 = sample.copy()
+    v2[4] = 2
+    var v2_path = _temp_path("v2")
+    _write(v2_path, v2)
+    var two = Gguf(v2_path)
+    suite.check(two.version == 2, "version 2 is accepted")
+    suite.check(two.context_length() == 512, "version 2 parses the same way")
+    two.close()
+    _remove(v2_path)
+
     # Cut in the middle of the key value block, so the header says there are
     # fourteen keys and the file runs out somewhere around the fourth.
     var short_path = _temp_path("short")
