@@ -7,7 +7,7 @@ is the first thing anyone pastes into a bug report and it was reporting a
 version that was two tags old.
 """
 
-comptime VERSION = "0.1.5"
+comptime VERSION = "0.1.6"
 
 comptime MOJO_PIN = "1.0.0"
 """The Mojo toolchain version pinned in pixi.toml. Duplicated here so a binary
