@@ -10,6 +10,7 @@ from std.sys import argv, exit
 from molla.build_info import MOJO_PIN, VERSION
 from molla.host import detect
 from molla.http.server import run_http
+from molla.json.bench import run_json_bench
 from molla.model.gguf import run_gguf
 from molla.net.echo import run_echo
 from molla.net.soak import run_soak
@@ -43,6 +44,7 @@ def print_usage():
     print("  echo [port]     run the M0 TCP echo spike on 127.0.0.1")
     print("  soak [n] [sec]  hold n echo connections for sec seconds")
     print("  netsoak [n] [s] hold n connections against the threaded reactor")
+    print("  jsonbench [kb] [n] parse an n round chat body and print the rate")
     print("  http [port]     run the M0 HTTP/1.1 spike on 127.0.0.1")
     print(
         "  gguf <path>     print the metadata and tensor directory of a model"
@@ -125,6 +127,19 @@ def main():
         except e:
             print("molla netsoak:", e)
             exit(1)
+    elif command == "jsonbench":
+        # The two numbers issue #13 asks for, on whatever machine is running it.
+        var json_kb = 100
+        var json_rounds = 2000
+        try:
+            if len(args) > 2:
+                json_kb = Int(String(args[2]))
+            if len(args) > 3:
+                json_rounds = Int(String(args[3]))
+        except:
+            print("molla: jsonbench takes a body size in kB and a round count")
+            exit(2)
+        exit(run_json_bench(json_kb * 1024, json_rounds))
     elif command == "http":
         var http_port: UInt16 = 0
         if len(args) > 2:

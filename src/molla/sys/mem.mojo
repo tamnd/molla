@@ -50,6 +50,27 @@ def as_ptr(address: Int) -> RawPtr:
     return RawPtr(unsafe_from_address=address)
 
 
+def keep[T: AnyType](ref value: T):
+    """Count as a use of `value`, so it is not destroyed before this point.
+
+    Mojo destroys a local at its last use, not at the end of the scope. That is
+    usually what you want and is a problem for everything in this codebase that
+    holds an address rather than a reference: once a buffer's address has been
+    handed to a parser, the buffer itself looks dead to the compiler, so it is
+    freed while the parser is still reading it.
+
+    A field of a longer lived struct has no such problem, which is why this
+    almost never comes up in the server and comes up immediately in a test that
+    keeps its buffer in a local. Put `keep(buf)` after the last read of anything
+    pointing into `buf` and the lifetime covers the whole parse.
+
+    It was found by running the JSON suite on x86_64 Linux, where the freed
+    block gets reused straight away. On the M4 the same code passed, because
+    the block still held the old bytes.
+    """
+    pass
+
+
 def copy_bytes(dest: Int, src: Int, count: Int):
     """Copy `count` bytes. The regions must not overlap, which is true of every
     caller here: buffers copy into their own tail from somewhere else, and the
