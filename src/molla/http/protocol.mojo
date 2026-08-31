@@ -50,6 +50,20 @@ because a connection that never closes never releases its slot, its buffers or
 its file descriptor, and on a long running server that is how one client's
 misbehaviour becomes everyone's problem. The cap is high enough that a normal
 client never reaches it.
+
+## Streaming
+
+A streaming response is the only case where the protocol produces without being
+asked, which is what `on_writable` is for. The state is one flag and a
+`StreamWriter` per slot, and the pump loop runs the stream to completion or to
+backpressure before it looks at the input again.
+
+The two things that needed care are both about ordering. `_push_out` marks a
+connection as closing once the last byte of a response is queued, and a
+streaming response is only a header block at that point, so it does not count
+as closing until the stream is done. And a stream produces into a bounded
+staging buffer, so the pump has to stop on `STREAM_FULL` and hand back to the
+reactor rather than growing the buffer until the reader catches up.
 """
 
 from molla.http.body import (
@@ -66,10 +80,18 @@ from molla.http.request import (
     span_eq,
 )
 from molla.http.request import parse as parse_request
-from molla.http.serialize import ResponseWriter
+from molla.http.serialize import ResponseWriter, write_decimal
+from molla.http.stream import (
+    STREAM_FULL,
+    STREAM_OK,
+    StreamWriter,
+    ndjson_headers,
+    sse_headers,
+)
 from molla.io.buffer import Buffer
 from molla.net.conn import Connection
 from molla.net.reactor import Protocol
+from molla.sys.clock import monotonic_ms
 from molla.sys.mem import as_ptr
 
 comptime DEFAULT_MAX_REQUESTS = 10000
@@ -86,6 +108,10 @@ connection and dribbling header bytes forever."""
 comptime MAX_TARGET_BYTES = 8192
 """Copied target length. Longer than this was already a 414 in the parser, so
 reaching the cap here means something changed there."""
+
+comptime DEFAULT_STREAM_EVENTS = 8
+"""Events the stand in streaming routes emit before ending. A demo number, and
+the seam where a token loop goes in M2."""
 
 
 struct ConnState(Movable):
@@ -113,6 +139,16 @@ struct ConnState(Movable):
     var counter: Int
     var max_body: Int
 
+    var stream: StreamWriter
+    var streaming: Bool
+    """A response whose headers are out and whose body is still being made."""
+
+    var stream_left: Int
+    var stream_index: Int
+    var scratch: Buffer
+    """Where a stream event's payload is built, reused like everything else
+    here, so producing an event does not allocate."""
+
     def __init__(out self, counter: Int, max_body: Int):
         self.writer = ResponseWriter(counter)
         self.out_at = 0
@@ -127,6 +163,11 @@ struct ConnState(Movable):
         self.requests = 0
         self.counter = counter
         self.max_body = max_body
+        self.stream = StreamWriter(counter)
+        self.streaming = False
+        self.stream_left = 0
+        self.stream_index = 0
+        self.scratch = Buffer(256, counter)
 
     def reset(mut self):
         """Ready for a new connection in this slot, keeping every buffer."""
@@ -141,6 +182,11 @@ struct ConnState(Movable):
         self.is_head = False
         self.closing = False
         self.requests = 0
+        self.stream.abort()
+        self.streaming = False
+        self.stream_left = 0
+        self.stream_index = 0
+        self.scratch.clear()
 
     def method(self) -> Span[UInt8, MutAnyOrigin]:
         return Span[UInt8, MutAnyOrigin](
@@ -175,6 +221,7 @@ struct HttpProtocol(Movable, Protocol):
     var counter: Int
     var max_requests: Int
     var max_body: Int
+    var stream_events: Int
 
     var opened: Int
     var closed: Int
@@ -183,16 +230,23 @@ struct HttpProtocol(Movable, Protocol):
     """Responses with a 4xx or 5xx status that molla produced itself, which is
     the number that says the input was bad rather than the handler was."""
 
+    var streams: Int
+    var aborted: Int
+    """Streams whose client went away before the last chunk."""
+
     def __init__(out self):
         self.states = List[ConnState]()
         self.req = Request()
         self.counter = 0
         self.max_requests = DEFAULT_MAX_REQUESTS
         self.max_body = DEFAULT_MAX_BODY
+        self.stream_events = DEFAULT_STREAM_EVENTS
         self.opened = 0
         self.closed = 0
         self.requests = 0
         self.errors = 0
+        self.streams = 0
+        self.aborted = 0
 
     def configure(mut self, counter: Int, max_requests: Int, max_body: Int):
         """Set the limits before the reactor starts.
@@ -205,6 +259,11 @@ struct HttpProtocol(Movable, Protocol):
         self.max_requests = max_requests
         self.max_body = max_body
 
+    def configure_stream(mut self, events: Int):
+        """How many events the stand in streaming routes emit. Separate from
+        `configure` so a test can turn one knob without restating the rest."""
+        self.stream_events = events
+
     def _ensure(mut self, slot: Int):
         while len(self.states) <= slot:
             self.states.append(ConnState(self.counter, self.max_body))
@@ -215,6 +274,18 @@ struct HttpProtocol(Movable, Protocol):
         self.opened += 1
 
     def on_close(mut self, mut conn: Connection):
+        """The socket is going away, so a stream in flight is over.
+
+        `abort` rather than `end`, because there is nothing to write a terminal
+        chunk into. A client that hangs up in the middle of a completion is the
+        ordinary case, not an error, and the only thing owed to it is releasing
+        what was staged for it.
+        """
+        if conn.slot < len(self.states):
+            if self.states[conn.slot].streaming:
+                self.aborted += 1
+                self.states[conn.slot].stream.abort()
+                self.states[conn.slot].streaming = False
         self.closed += 1
 
     def on_writable(mut self, mut conn: Connection) -> Bool:
@@ -237,6 +308,7 @@ struct HttpProtocol(Movable, Protocol):
         while True:
             if not self._push_out(slot, conn):
                 # The ring is full. `on_writable` picks this up.
+                conn.produce(self.states[slot].streaming)
                 return True
             if self.states[slot].closing:
                 # `finish` rather than returning False, and the difference
@@ -247,6 +319,15 @@ struct HttpProtocol(Movable, Protocol):
                 # the reactor drains what is queued and closes after.
                 conn.finish()
                 return True
+
+            if self.states[slot].streaming:
+                # The headers are out and the body is still being made. Run it
+                # until it finishes or until the reader stops keeping up.
+                if not self._pump_stream(slot, conn):
+                    conn.produce(True)
+                    return True
+                conn.produce(False)
+                continue
 
             if self.states[slot].reading_body:
                 if not self._read_body(slot, conn):
@@ -383,9 +464,67 @@ struct HttpProtocol(Movable, Protocol):
         # having to remember to.
         self.states[slot].writer.reset()
         self.states[slot].out_at = 0
+        if not self.states[slot].keep_alive and not self.states[slot].streaming:
+            # A streaming response has only had its headers queued at this
+            # point, so it is not finished and the connection is not closing
+            # yet. `_pump_stream` sets the flag when the last chunk is out.
+            self.states[slot].closing = True
+        return True
+
+    def _pump_stream(mut self, slot: Int, mut conn: Connection) -> Bool:
+        """Produce and flush until the stream ends or the reader falls behind.
+
+        True means the stream is complete and the pump can look at the input
+        again. False means there are bytes the ring would not take, and
+        `on_writable` comes back to this.
+        """
+        var now = monotonic_ms()
+        while True:
+            # Flush before producing rather than after, so a single event on an
+            # idle connection is framed and queued on its own instead of waiting
+            # for a second one that may be thirty seconds away.
+            _ = self.states[slot].stream.flush(conn)
+            if self.states[slot].stream.is_done():
+                break
+            if self.states[slot].stream_left <= 0:
+                if self.states[slot].stream.ended:
+                    # The terminal chunk is staged and the ring would not take
+                    # it, which is the only thing left to wait for.
+                    return False
+                _ = self.states[slot].stream.end(now)
+                continue
+            # Producing while the ring is full is deliberate and is what the
+            # staging limit is for. A token generator that stalls because a
+            # socket is momentarily full is a generator running at the speed of
+            # the slowest reader, and the events that pile up go out as one
+            # chunk rather than as one chunk each.
+            if self._write_stream_event(slot, now) == STREAM_FULL:
+                return False
+            self.states[slot].stream_left -= 1
+
+        self.states[slot].streaming = False
+        self.states[slot].stream_left = 0
         if not self.states[slot].keep_alive:
             self.states[slot].closing = True
         return True
+
+    def _write_stream_event(mut self, slot: Int, now: Int) -> Int:
+        """One event from the stand in generator.
+
+        The payload is built into the connection's scratch buffer rather than
+        into a String, so the streaming path allocates as little as the plain
+        response path does. In M2 this is where a token goes.
+        """
+        var index = self.states[slot].stream_index
+        self.states[slot].stream_index = index + 1
+        self.states[slot].scratch.clear()
+        _ = self.states[slot].scratch.append_str('{"i":')
+        _ = write_decimal(self.states[slot].scratch, index)
+        _ = self.states[slot].scratch.append_str("}")
+        var payload = self.states[slot].scratch.bytes()
+        if self.states[slot].stream.sse:
+            return self.states[slot].stream.event("token", payload, "", now)
+        return self.states[slot].stream.record(payload, now)
 
     def _error(mut self, slot: Int, mut conn: Connection, status: Int):
         """Answer with a status and stop reading.
@@ -412,8 +551,10 @@ struct HttpProtocol(Movable, Protocol):
         var is_get = span_eq(base, self.req.method, "GET") or head
         var root = span_eq(base, self.req.target, "/")
         var health = span_eq(base, self.req.target, "/healthz")
+        var sse = span_eq(base, self.req.target, "/stream/sse")
+        var ndjson = span_eq(base, self.req.target, "/stream/ndjson")
         self.states[slot].out_at = 0
-        self._write_default(slot, is_get, root, health, keep, head)
+        self._write_default(slot, is_get, root, health, sse, ndjson, keep, head)
 
     def _respond_after_body(mut self, slot: Int, mut conn: Connection):
         """Answer a request whose body has just finished arriving."""
@@ -424,8 +565,10 @@ struct HttpProtocol(Movable, Protocol):
         var is_get = _span_is(method, "GET") or head
         var root = _span_is(target, "/")
         var health = _span_is(target, "/healthz")
+        var sse = _span_is(target, "/stream/sse")
+        var ndjson = _span_is(target, "/stream/ndjson")
         self.states[slot].out_at = 0
-        self._write_default(slot, is_get, root, health, keep, head)
+        self._write_default(slot, is_get, root, health, sse, ndjson, keep, head)
 
     def _write_default(
         mut self,
@@ -433,12 +576,14 @@ struct HttpProtocol(Movable, Protocol):
         is_get: Bool,
         root: Bool,
         health: Bool,
+        sse: Bool,
+        ndjson: Bool,
         keep: Bool,
         head: Bool,
     ):
         """The stand in handler.
 
-        Three routes and a 404, which is enough to exercise framing end to end
+        Five routes and a 404, which is enough to exercise framing end to end
         and is deliberately not a router. The API routes in M2 replace this
         with one, and the seam is here so that when they do, nothing above or
         below has to move.
@@ -447,6 +592,14 @@ struct HttpProtocol(Movable, Protocol):
             _ = self.states[slot].writer.respond_str(
                 200, "text/plain", "ok\n", keep, head
             )
+            return
+        if sse or ndjson:
+            if not is_get:
+                self.errors += 1
+                _ = self.states[slot].writer.respond_error(405, head)
+                self.states[slot].keep_alive = False
+                return
+            self._start_stream(slot, sse, keep, head)
             return
         if not root:
             self.errors += 1
@@ -461,3 +614,26 @@ struct HttpProtocol(Movable, Protocol):
         _ = self.states[slot].writer.respond_str(
             200, "text/plain", "Hello from molla.\n", keep, head
         )
+
+    def _start_stream(mut self, slot: Int, sse: Bool, keep: Bool, head: Bool):
+        """Write the header block and arm the stream.
+
+        The headers go through the ordinary writer and out through `_push_out`
+        like any other response. Only the body is different, which is the point
+        of keeping streaming out of `ResponseWriter` entirely.
+        """
+        var ok: Bool
+        if sse:
+            ok = sse_headers(self.states[slot].writer, keep, head)
+        else:
+            ok = ndjson_headers(self.states[slot].writer, keep, head)
+        if not ok:
+            self.errors += 1
+            _ = self.states[slot].writer.respond_error(500, head)
+            self.states[slot].keep_alive = False
+            return
+        self.streams += 1
+        self.states[slot].stream.begin(sse, head, monotonic_ms())
+        self.states[slot].streaming = True
+        self.states[slot].stream_left = self.stream_events
+        self.states[slot].stream_index = 0

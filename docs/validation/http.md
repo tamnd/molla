@@ -173,6 +173,61 @@ Header spans are offsets into the read buffer, so they are valid only until it i
 
 Linux runs one more check than macOS because the reactor suite has a Linux only case for SO_REUSEPORT sharding. The gpc failure is `net.reactor backpressure, and the ring filled up behind it`, it is not in this issue's code, and it fails the same way on main at 474 passed and 1 failed. WSL2 does not honour the 8 kB SO_SNDBUF the test pins, so the kernel takes the whole write and the ring never fills. That is a test portability bug against WSL2 rather than a reactor bug, and it is filed as #87.
 
+## M2 note on streaming
+
+Issue #12 added `molla.http.stream`, which is the other kind of response. A completion is not a response, it is a response that takes thirty seconds to arrive, and the length is unknown when the headers go out.
+
+### Flush per event, coalesce only when the socket is full
+
+The rule is that an event goes out on its own as soon as it exists, and that events are only combined when the socket cannot take them. It falls out of holding two buffers instead of one. `pending` holds framed payload with no chunk framing on it, `wire` holds chunk framed bytes the ring has not accepted, and the caller flushes before producing rather than after. With room in the ring that gives one chunk per event and no waiting for a second event that may be thirty seconds away. With the ring full, later events pile up in `pending` and the next flush that gets room wraps all of them into one chunk.
+
+The producer keeps going while the ring is full rather than stalling with it, up to the staging limit. A token generator that stops because a socket is momentarily full is a generator running at the speed of the slowest reader connected to it. That is what the limit is for, and past it the answer is `STREAM_FULL` rather than a bigger buffer, because growing until the reader catches up is how a server with one slow client runs out of memory.
+
+### The bit the reactor was missing
+
+A streaming response is the only case where the protocol produces without being asked, and the first version of it stopped after exactly one ring's worth of bytes. The reason is worth writing down because it is the same class of bug as the one in #10 and it did not look like it.
+
+`on_writable` was only called in a pass where the poller reported the socket writable. For a request and response that is right: the reactor is there because of a read edge, and if the ring fills there is a write edge coming. For a stream there is neither. The client sent one request and is not going to send another, and once the ring drains into the socket the write interest goes off, so no edge is ever coming and the connection sits with a stream half written.
+
+`Connection.produce` is one bit that says there is more, and `_service` now calls `on_writable` when the poller said writable or the protocol said it is producing. The service loop also needed bytes leaving the ring to count as progress. Without that, a round that fills the ring and has it drained by the flush at the bottom of the same round starts and ends with an empty ring and looks identical to a round that did nothing, so the loop stops.
+
+This is not a fifth call on the `Protocol` trait, which is deliberately four. It is one field on the object the reactor already hands over on every call.
+
+### Validation, because this is where clients quietly break
+
+A newline in an SSE event name or id ends the event early and the rest arrives as fields of the next one. A newline in an NDJSON record is two records, and the second one is not valid JSON. Both are refused rather than written, because both produce a client that misbehaves with no error anywhere.
+
+Data is the opposite case. A payload with newlines in it is legal SSE and is split across several `data:` lines, which is what the format is for. All three line endings are split on, since a lone CR is a line break to an SSE client and is not one to a writer that only looks for LF.
+
+### The heartbeat
+
+`heartbeat_due` takes the time and answers, and `heartbeat` stages the comment. Neither reads a clock, because the `Protocol` trait has no tick and the wakeup belongs to whatever is producing tokens, and because a test with an injected clock is deterministic and one with a sleep is not.
+
+A heartbeat is only due when nothing is staged. A stream with bytes waiting for a slow reader is busy rather than silent. There are two reasons to send one: proxies drop a connection with no traffic on it and a long prefill produces none, and our own reactor touches a connection when a flush actually writes, so a stream that never writes looks idle to the server it is running on.
+
+NDJSON gets no heartbeat. There is no comment syntax to hide one in and a blank line is not portably ignored, so an NDJSON stream that has to survive a proxy needs the application to send a real progress record.
+
+### The slow reader
+
+The acceptance test the issue asks for is a reader that reads one byte per second. That is run as one byte per pass of the loop against a server with the socket buffers pinned at 8 kB and the output ring at 2 kB, which puts the writer into backpressure on nearly every pass and keeps it there for the whole stream. It is the state a one byte per second client would put it in, reached in a second rather than in ten minutes.
+
+Four hundred events go out and all four hundred arrive, in order, with the chunk framing intact, and the coalescing counter is above zero, which is the assertion that the backpressure path is the one being exercised rather than the fast one.
+
+A client that hangs up mid stream is the other half. The connection is released, the stream is recorded as aborted, and nothing is left staged for a client that is gone. That is the ordinary case for a completion rather than an error: a browser tab closes.
+
+### Where the streaming work was run
+
+`tests/test_stream.mojo` is 59 checks and takes the suite from 596 to 655. The reactor change is in code every protocol runs on, so the Linux runs matter more here than they usually do.
+
+| Machine | Result |
+| --- | --- |
+| M4, macOS, kqueue | 655 passed, 0 failed |
+| server1, EPYC, epoll | 656 passed, 0 failed |
+| server2, EPYC, epoll | 656 passed, 0 failed |
+| gpc, i9-13900K on WSL2, epoll | 655 passed, 1 failed |
+
+The gpc failure is #87, the reactor backpressure test that WSL2 cannot provoke because it does not honour the pinned 8 kB SO_SNDBUF. It fails identically on main and predates all of this.
+
 ### What is still not covered
 
 No routing, no compression, no TLS termination, no HTTP/2. Routing arrives with the API routes in M2, `molla.tls` is a client and has nothing to do with terminating TLS on the listener, and HTTP/2 is refused by the issue for reasons that have not changed: it buys nothing for a loopback inference server with one long stream per request and costs HPACK, flow control and a settings state machine.
