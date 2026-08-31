@@ -79,7 +79,7 @@ See [docs/design.md](docs/design.md) for the reasoning and [docs/roadmap.md](doc
 
 Tier 1 means every kernel is tuned, numerics run in CI on real hardware, and performance regressions block merges. Tier 2 means correct and tested at milestone boundaries, but not performance gated. AMD is tier 2 because we do not have the hardware, which is a real gap and not a hedge. Apple GPU is tier 1 but carries the most risk, because the toolchain supports it while upstream nightly CI does not cover it.
 
-Windows is WSL only, matching the toolchain.
+Windows is WSL only, matching the toolchain. That is not a hypothetical: the only NVIDIA GPU we develop against is an RTX 4090 in a Windows machine, reached through WSL2. So every CUDA result molla publishes is a WSL2 result until someone puts a card in a Linux box, and we label them that way rather than rounding up to "Linux CUDA". The machines are listed in [docs/validation/toolchain.md](docs/validation/toolchain.md).
 
 ## Building
 

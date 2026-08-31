@@ -66,7 +66,9 @@ A target that cannot pass numerics is listed as unsupported. It does not ship as
 
 ## D8: real hardware gates every milestone
 
-No milestone closes without passing on at least two device classes, one of which is a GPU. The fleet is an M4 MacBook Air, a box with an RTX 4090, and Linux servers. CI runs on the Linux servers, with M4 and 4090 runs required at milestone boundaries.
+No milestone closes without passing on at least two device classes, one of which is a GPU. The fleet is an M4 MacBook Air, three CPU only Linux servers, and an RTX 4090 reached through WSL2 on a Windows machine. CI runs on the Linux servers, with M4 and 4090 runs required at milestone boundaries. See [docs/validation/toolchain.md](validation/toolchain.md) for what each machine actually is.
+
+Two consequences of that fleet are worth stating plainly rather than discovering later. Every CUDA number we produce is a WSL2 number, because that is the only NVIDIA GPU we have, and WSL2 does not have the same transfer or pinned memory behaviour as a bare metal Linux host. We label those results as WSL2 results. And three of the five machines have no GPU at all, which keeps the CPU path honest but also means CPU is the path that gets the most incidental testing while the GPU paths get the least.
 
 This exists because Apple GPU support is documented but not covered by upstream nightly CI, and consumer NVIDIA is described upstream as known compatible for development rather than tested for serving. Those are exactly the conditions where paper support and real support drift apart.
 

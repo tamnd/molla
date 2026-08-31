@@ -134,7 +134,9 @@ jobs:
   # Gated on the label so forks and doc changes do not queue on hardware.
   hardware:
     name: Hardware suite (${{ matrix.device }})
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'needs: hardware')
+    # Quoted because the label name contains a colon and space, which would
+    # otherwise end the YAML scalar right here.
+    if: "github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'needs: hardware')"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
