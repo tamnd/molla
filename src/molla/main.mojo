@@ -10,6 +10,7 @@ from std.sys import argv, exit
 from molla.build_info import MOJO_PIN, VERSION
 from molla.host import detect
 from molla.net.echo import run_echo
+from molla.net.soak import run_soak
 from molla.sys.poll import USES_KQUEUE
 
 
@@ -35,6 +36,7 @@ def print_usage():
     print("commands:")
     print("  version         print the version, toolchain, and host details")
     print("  echo [port]     run the M0 TCP echo spike on 127.0.0.1")
+    print("  soak [n] [sec]  hold n echo connections for sec seconds")
     print("  help            print this message")
     print()
     print("Nothing serves yet. See the roadmap for what lands when:")
@@ -70,6 +72,25 @@ def main():
             run_echo(port)
         except e:
             print("molla echo:", e)
+            exit(1)
+    elif command == "soak":
+        # Defaults are the numbers issue #2 asks for.
+        var connections = 1000
+        var seconds = 60
+        try:
+            if len(args) > 2:
+                connections = Int(String(args[2]))
+            if len(args) > 3:
+                seconds = Int(String(args[3]))
+        except:
+            print(
+                "molla: soak takes a connection count and a duration in seconds"
+            )
+            exit(2)
+        try:
+            exit(run_soak(connections, seconds))
+        except e:
+            print("molla soak:", e)
             exit(1)
     else:
         print("molla: unknown command '", command, "'", sep="")
