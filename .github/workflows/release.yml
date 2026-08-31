@@ -1,5 +1,26 @@
 name: Release
 
+# Releases are source only, and that is a licensing constraint rather than a
+# packaging one.
+#
+# A Mojo 1.0 binary is not self contained. It links libKGENCompilerRTShared
+# plus libMSupportGlobals and libAsyncRTRuntimeGlobals, those ship only as
+# shared objects with no static archive anywhere in the toolchain, and they
+# come from the mojo-compiler conda package under LicenseRef-Modular-
+# Proprietary. On top of that the linker bakes RUNPATH to whatever pixi
+# directory did the build, so the bare binary does not start on any other
+# machine. Copying a Linux build to another box gives "cannot open shared
+# object file: libKGENCompilerRTShared.so".
+#
+# Shipping a working tarball would therefore mean redistributing Modular's
+# proprietary runtime inside molla's own release artifacts, which contradicts
+# the fourth commitment in the README. So this workflow proves the tag builds
+# and passes on all three platforms, publishes an SBOM and a signature, and
+# publishes no binaries. See the known issue in CHANGELOG.md.
+#
+# When that changes, whether because the runtime becomes redistributable or
+# because D1 moves the network edge, the binary and container jobs come back.
+
 on:
   push:
     tags: ["v*"]
@@ -17,8 +38,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  binaries:
-    name: Binary (${{ matrix.target }})
+  verify:
+    name: Verify (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -39,67 +60,55 @@ jobs:
           egress-policy: audit
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          # A manual dispatch names the tag, a tag push already is one.
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
       - uses: prefix-dev/setup-pixi@194d461b21b6c5717c722ffc597fa91ed2ff29fa # v0.9.1
         with:
           cache: true
-      - name: Build release binary
-        run: pixi run build --release
-      - name: Package
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          tar -C target/release -czf "dist/molla-${{ matrix.target }}.tar.gz" molla
-          cd dist && shasum -a 256 "molla-${{ matrix.target }}.tar.gz" > "molla-${{ matrix.target }}.tar.gz.sha256"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dist-${{ matrix.target }}
-          path: dist/
-          retention-days: 7
+      # No --release flag exists. mojo build already defaults to -O3, and
+      # passing --release is an unrecognized argument error.
+      - name: Build
+        run: pixi run build
+      - name: Test
+        run: pixi run test
+      - name: Smoke test the binary
+        run: ./build/molla version
 
   publish:
     name: Publish release
-    needs: [binaries]
+    needs: [verify]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
-      contents: write      # create the release
-      id-token: write      # keyless signing and provenance
-      attestations: write  # build provenance attestation
+      contents: write  # create the release
+      id-token: write  # keyless signing
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
         with:
           egress-policy: audit
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          path: dist
-          pattern: dist-*
-          merge-multiple: true
+      # sbom-action writes to the path it is given and does not create it.
+      - name: Prepare dist
+        run: mkdir -p dist
       - name: Generate SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: .
           format: spdx-json
           output-file: dist/molla.spdx.json
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-path: dist/*.tar.gz
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
-      - name: Sign artifacts
+      - name: Sign the SBOM
         shell: bash
         run: |
           set -euo pipefail
-          for f in dist/*.tar.gz; do
-            cosign sign-blob --yes \
-              --output-signature "$f.sig" \
-              --output-certificate "$f.pem" \
-              "$f"
-          done
+          cosign sign-blob --yes \
+            --output-signature dist/molla.spdx.json.sig \
+            --output-certificate dist/molla.spdx.json.pem \
+            dist/molla.spdx.json
       - name: Create release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -107,53 +116,3 @@ jobs:
           generate_release_notes: true
           draft: true
           fail_on_unmatched_files: true
-
-  container:
-    name: Container image
-    needs: [binaries]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    steps:
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
-        with:
-          egress-policy: audit
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-      - id: push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Attest image provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-name: ghcr.io/${{ github.repository }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
