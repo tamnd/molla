@@ -8,11 +8,13 @@ an unreachable except, so only wrap the ones that actually raise.
 from harness import Suite, finish
 
 import test_host
+import test_net
 
 
 def main():
     var suite = Suite()
 
     test_host.run(suite)
+    test_net.run(suite)
 
     finish(suite)

@@ -9,6 +9,8 @@ from std.sys import argv, exit
 
 from molla.build_info import MOJO_PIN, VERSION
 from molla.host import detect
+from molla.net.echo import run_echo
+from molla.sys.poll import USES_KQUEUE
 
 
 def print_version():
@@ -24,14 +26,16 @@ def print_version():
         "logical",
     )
     print("  simd width", host.simd_f32, "x f32,", host.simd_f16, "x f16")
+    print("  poller    ", "kqueue" if USES_KQUEUE else "epoll")
 
 
 def print_usage():
     print("usage: molla <command>")
     print()
     print("commands:")
-    print("  version   print the version, toolchain, and host details")
-    print("  help      print this message")
+    print("  version         print the version, toolchain, and host details")
+    print("  echo [port]     run the M0 TCP echo spike on 127.0.0.1")
+    print("  help            print this message")
     print()
     print("Nothing serves yet. See the roadmap for what lands when:")
     print("  https://github.com/tamnd/molla/blob/main/docs/roadmap.md")
@@ -48,6 +52,25 @@ def main():
         print_version()
     elif command == "help" or command == "--help" or command == "-h":
         print_usage()
+    elif command == "echo":
+        # Port 0 means let the kernel choose, and the server prints what it got.
+        var port: UInt16 = 0
+        if len(args) > 2:
+            try:
+                port = UInt16(Int(String(args[2])))
+            except:
+                print(
+                    "molla: '",
+                    String(args[2]),
+                    "' is not a port number",
+                    sep="",
+                )
+                exit(2)
+        try:
+            run_echo(port)
+        except e:
+            print("molla echo:", e)
+            exit(1)
     else:
         print("molla: unknown command '", command, "'", sep="")
         print("Run 'molla help' for the list of commands.")
