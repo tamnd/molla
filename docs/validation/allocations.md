@@ -22,11 +22,17 @@ The load is mixed on purpose, because the interesting allocation is the one on a
 | `POST /` chunked | a body that arrives without one, through the chunked decoder |
 | eight pipelined `GET /` | a batch in one segment, which takes the parse loop round again with no new readiness event |
 | `GET /stream/ndjson` | a streaming response, several events per request |
-| `GET /stream/sse` | the other framing, and the one that asks the server to close |
+| `GET /stream/sse` | the other framing, which frames the same events differently |
 
 Anything that allocates on the fifth kind of request is invisible to a test that only sends the first.
 
-Every connection in a round is opened before any of them is written to, and all of them are written to before any of them is read. That ordering is the difference between exercising the reactor's whole slot table and exercising one slot. Opening and finishing one connection at a time lets the server accept, answer and free the same slot every time, which proves that one slot is reused and nothing about the other sixty three. This was not a hypothetical either, it is how the first version of the command was written, and it reported three allocations of warm up at sixty four connections, which should have been the giveaway.
+The client ordering matters more than the load does, and it took three tries to get right.
+
+Every connection in a round is opened before any of them is written to, all of them are written to before any of them is read, and every one of them has been answered before any of them is asked to close. The first version opened and finished one connection at a time, which let the server accept, answer and free the same slot every time, so it proved that one slot gets reused and nothing about the other sixty three. It reported three allocations of warm up at sixty four connections, which should have been the giveaway.
+
+Opening all of them first fixed that and left a flake behind. The batch ended with `Connection: close`, so the server was closing the early connections while the late ones were still in the accept queue, and the reactor served the whole load out of fifty five or sixty or sixty four slots depending on how the scheduler felt. A slot costs three allocations the first time and nothing afterwards, so a warm up that happened to build fifty five of them left nine for the steady pass to build, and the run failed about half the time. The closing request is now sent separately, after every connection has been answered once, and the slot count is the connection count on every run.
+
+That is worth spelling out because the failure mode is the bad one: an assertion that fails half the time gets an exception added to it, and then it is not an assertion.
 
 The byte count read back is compared between the two passes as well. A pass that quietly answered nothing would allocate nothing too, and would otherwise be the best result this command could produce.
 
@@ -41,23 +47,25 @@ The fix is `Connection.reuse`, which sets everything back to what a new connecti
 Before, at sixty four connections:
 
 ```text
-  warm up        48 allocations, 114432 bytes
-  steady state   48 allocations, 114432 bytes read
+  warm up        768 allocations, 152576 bytes read
+  steady state   768 allocations, 152576 bytes read
+  heap grew by   29360128 bytes
+  result         fail
 ```
 
 After:
 
 ```console
-$ molla allocs 64 3
-allocs 64 connections, 3 rounds
+$ molla allocs 64 4
+allocs 64 connections, 4 rounds
   workers        1
-  warm up        192 allocations, 114432 bytes read
-  steady state   0 allocations, 114432 bytes read
+  warm up        192 allocations, 152576 bytes read
+  steady state   0 allocations, 152576 bytes read
   heap grew by   0 bytes
   result         pass
 ```
 
-Warm up went up because the slot table is now genuinely exercised, and that number is the one that should be there: three allocations for each of sixty four slots, paid once.
+Three allocations per connection, two hundred and fifty six connections, and twenty eight megabytes of churn to serve a hundred and fifty kilobytes of answers. Afterwards the warm up number is the one that should be there, which is three allocations for each of sixty four slots, paid once.
 
 ## What it cannot see
 
