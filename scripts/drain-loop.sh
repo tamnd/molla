@@ -13,7 +13,7 @@
 #
 # Usage: scripts/drain-loop.sh [runs] [connections] [deadline_ms]
 
-set -uo pipefail
+set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
