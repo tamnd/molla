@@ -4,6 +4,16 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.1.3] - 2026-09-01
+
+The request path. A parser, bodies, multipart, a serializer, and the two streaming writers a completion needs, all on the reactor from 0.1.2.
+
+The parser stops at the blank line and the body is read separately after it, which sounds like a detail and is the reason a body larger than the read buffer is no longer a contradiction. Content-Length, chunked and multipart all go through one call that says how much it took and whether it is done, and over a megabyte the body spills to a file, so an upload costs bounded memory rather than its own size.
+
+The streaming writers are the half of the request path an inference server actually spends its time in. An event is flushed on its own as soon as it exists and events are only combined into one chunk when the socket cannot take them. Writing them found a real hole in 0.1.2: the reactor only called `on_writable` when the poller reported a socket writable, which is correct for a request and a response and leaves a stream stopped after one ring's worth of bytes, because a client that sent one request and is waiting produces no read edge and a drained ring produces no write edge. Nothing before this produced without being asked, so nothing had caught it.
+
+There is still no routing and no JSON. Both are M1 work and neither is here.
+
 ### Added
 
 - `molla.http` gets the parser the request path will actually run on. `scan.mojo` finds delimiters sixteen bytes at a time, `request.mojo` parses a request line and a header block into zero copy spans and stops at the blank line, `body.mojo` reads the body after that, `serialize.mojo` writes responses without allocating, `multipart.mojo` streams multipart/form-data, and `protocol.mojo` puts all of it on the reactor from #10.
