@@ -64,12 +64,16 @@ With that in place, a run of 32 connections on the M4 has every connection holdi
 
 ## What was run
 
-| Machine | Kernel | Arch | Suite | drain-loop 100 |
+| Machine | Kernel | Cores | Suite | drain-loop, 100 runs of 32 connections |
 | --- | --- | --- | --- | --- |
-| macbook, M4 | Darwin 24.6 | arm64 | 907 passed | 100 clean, 3s |
-| server1, doge-01 | Linux 6.8, Ubuntu 24.04, glibc 2.39 | x86-64 | | |
-| server2, doge-02 | Linux 6.8, Ubuntu 24.04, glibc 2.39 | x86-64 | | |
-| gamingpc, WSL2 | Linux 6.6, Ubuntu 24.04 | x86-64 | | |
+| macbook, M4 | Darwin 24.6, macOS 15.8 | 10 | 907 passed | clean, 3s |
+| server1, EPYC | Linux 6.8, Ubuntu 24.04 | 4 | 908 passed | clean, 41s |
+| server2, EPYC | Linux 6.8, Ubuntu 24.04 | 6 | 908 passed | clean, 108s |
+| gpc, i9-13900K | Linux 6.18 on WSL2, Ubuntu 26.04 | 32 | 907 passed, 1 failed | clean, 49s |
+
+Linux runs one check more than macOS because sharded accept only exists there. The one failure on `gpc` is #87, the reactor backpressure check that has been failing on WSL2 since before this work and fails on the previous commit too. Every other check passes on every machine, and the drain loop is clean on all four.
+
+The spread in the drain loop times is the interesting column. The M4 does a hundred shutdowns in three seconds and server2 takes a hundred and eight, which is not a slower drain so much as a slower everything: fewer cores, a slower loopback, and a hundred process starts. What matters is that the number is bounded and that no run in four hundred lost an answer.
 
 `tests/test_concurrency.mojo` is 80 of those checks and every one of them that can race does. Four threads and twenty thousand increments each is checked against exactly eighty thousand rather than against something plausible. The MPSC queue is filled by three producer threads with a capacity smaller than one producer's share, so every producer meets a full queue and the retry path is what is under test, and the consumer checks that each of the 1500 distinct values comes out exactly once. The SPSC ring is checked for order as well as for count, since order is the property it exists to have.
 
