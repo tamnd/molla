@@ -134,6 +134,7 @@ def test_parse_request_line(mut suite: Suite) raises:
         "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade, close\r\n\r\n",
         req,
     )
+    suite.check(rc == PARSE_DONE, "a list holding close still parses")
     suite.check(not req.keep_alive, "close is found inside a list too")
 
     rc = _parse_text(buf, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n", req)
