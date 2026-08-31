@@ -22,7 +22,7 @@ An optional Ollama compatibility adapter exists behind `--compat ollama`. It is 
 
 There are good local runners already. The gap this fills is a runner that runs the same source on CPU, NVIDIA, AMD, and Apple GPUs, that stores nothing you cannot read with other tools, and that never asks you to sign in.
 
-This section used to claim there was no proprietary dependency anywhere in the stack, on the grounds that Mojo and `max/kernels` are Apache-2.0 and only the MAX runtime is not. The M0 kernel spike went looking for the seam and there isn't one. The Mojo standard library is Apache-2.0 and so is the `max/kernels` source, but the compiler is proprietary and links a proprietary support library into every binary it produces, and `max/kernels` does not build or run without a proprietary runtime package, including its CPU only kernels. The measurements and the exact packages are in [docs/validation/kernels.md](docs/validation/kernels.md), and what molla does about it is being decided in issue #7.
+This section used to claim there was no proprietary dependency anywhere in the stack, on the grounds that Mojo and `max/kernels` are Apache-2.0 and only the MAX runtime is not. The M0 kernel spike went looking for the seam and there isn't one, so that claim is gone and molla does not get to make it.
 
 What is left of the original argument is the part about the engine. Weight loading, scheduling, the KV cache and sampling are ours either way, and that is the part that decides how molla behaves.
 
@@ -33,7 +33,14 @@ Four things we commit to, and test in CI:
 3. No account, no telemetry, no network traffic you did not ask for.
 4. The exit is one command and it is tested.
 
-Every proprietary dependency gets named here with what it is needed for, rather than being left out of the pitch. Today that is `mojo-compiler`, which is the toolchain and the runtime support library in every binary.
+Every proprietary dependency gets named here with what it is needed for, rather than being left out of the pitch. There are two.
+
+| Package | Licence | Needed for |
+| --- | --- | --- |
+| `mojo-compiler` | LicenseRef-Modular-Proprietary | the toolchain, and a runtime support library linked into every binary molla produces |
+| `max-core` | LicenseRef-Modular-Proprietary | the runtime that `max/kernels` calls into, including its CPU kernels, so it is required to generate a token |
+
+So running molla means installing a proprietary runtime. The measurements and the exact packages are in [docs/validation/kernels.md](docs/validation/kernels.md), and the decision to accept it, with the alternative that was rejected and what it would have cost, is in [docs/adr/0002-accept-max-core.md](docs/adr/0002-accept-max-core.md).
 
 ## What it costs
 
@@ -64,7 +71,7 @@ Each of these has a full writeup with the alternatives we rejected and the evide
 | D3 | Ollama compatibility is an optional adapter, off by default. |
 | D4 | Model semantics come from the model's own artifacts, not from per family code we maintain. |
 | D5 | Distribution is OCI. No molla registry, ever. |
-| D6 | The engine is ours, built on `max/kernels`. MAX runtime interop is optional. Under review, see [docs/validation/kernels.md](docs/validation/kernels.md). |
+| D6 | The engine is ours, built on `max/kernels`, which means `max-core` is required to run molla. |
 | D7 | One kernel source per op, four targets, numerics asserted on each. |
 | D8 | Every milestone is validated on at least two device classes, one of them a GPU. |
 | D9 | Local, offline, and accountless by default. |
@@ -104,4 +111,6 @@ Issues are grouped by milestone and labelled by area. Anything tagged `good firs
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+molla's own source is Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Running it is a different question and the answer is above: `mojo-compiler` and `max-core` are both proprietary and both are needed, one to build and one to generate a token. Neither is redistributable, which is why releases are source only.
