@@ -19,7 +19,7 @@ The acceptance criterion was two things: the admin routes respond correctly, and
 
 Anybody can print a number. The question somebody has at three in the morning is why the number is that and not what the file says, and the answer is nearly always that a flag or an environment variable is quietly winning. So every setting carries where its value came from, and `molla config get` prints both.
 
-```
+```console
 $ molla config get
 workers = 0 (default)
 idle_timeout_ms = 60000 (default)
@@ -47,7 +47,7 @@ A worker that finds its ring full drops the record and counts the drop. A server
 
 The criterion was no allocations at a disabled level, and the cost is lower than that: one atomic load and a comparison. `begin` returns an entry with `ok` false and every method on it returns immediately, so a call site writes the fields it wants without asking first.
 
-```
+```text
 ops log costs nothing when off
   ok       a thousand calls at a disabled level allocate nothing at all
   ok       and write nothing
@@ -58,7 +58,7 @@ The last line is there because a check that only measures zero cannot tell the d
 
 The format is logfmt, not JSON. Both are structured and only one of them can be read by a person with grep and no tools.
 
-```
+```text
 ts=1788217700657000000 level=error worker=0 msg="handler raised" slot=0 detail=the handler for /boom raised, which is its whole job
 ```
 
@@ -92,7 +92,7 @@ The exposition goes out with the content type the format asks for, down to the v
 
 `molla drain` turns all of it on, so a drain run is now also an operations run: the three routes are asked for before the load starts, and the counters are printed after the drain so they include everything it flushed.
 
-```
+```console
 $ molla drain 8 3000
 drain 8 connections, 3000 ms deadline
   workers        10
