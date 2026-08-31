@@ -4,7 +4,7 @@ Version is bumped by the release process. Keep it in step with the tag, because
 `molla version` is the first thing anyone will paste into a bug report.
 """
 
-comptime VERSION = "0.0.2"
+comptime VERSION = "0.0.3"
 
 comptime MOJO_PIN = "1.0.0"
 """The Mojo toolchain version pinned in pixi.toml. Duplicated here so a binary
