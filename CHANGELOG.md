@@ -15,14 +15,18 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 - `molla.net.echo`, a non blocking edge triggered TCP echo server, and `molla echo` to run it
 - `molla soak`, which holds a thousand connections for sixty seconds and checks for descriptor and memory leaks
 - `docs/validation/sockets.md` with the soak results on all three platforms and what the spike says about D1
-
 - Design document, roadmap, and milestone plan
 - CI with docs linting, workflow linting, CodeQL on workflow definitions, OpenSSF Scorecard, and dependency review
 - Release pipeline with SBOM, build provenance attestation, and keyless signing
+- `scripts/check-action-pins.sh`, run in CI, which fails if an action is pinned to an annotated tag object rather than a commit
 
 ### Changed
 
 - The toolchain version lives only in `pixi.toml` now, rather than also in a CI environment variable
+
+### Fixed
+
+- Six actions were pinned to annotated tag object SHAs instead of commit SHAs, which made the OpenSSF Scorecard workflow fail on publish with an imposter commit error even though the scan itself succeeded
 
 ### Known issues
 
