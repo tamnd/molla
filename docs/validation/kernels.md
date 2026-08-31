@@ -87,7 +87,7 @@ This is the finding that matters most for the roadmap.
 
 Asked directly on the M4, with `max-core` 26.5.0 rather than by reading the source:
 
-```
+```text
 api metal name Apple M4 cc 4
 refused: Apple int8 W8A8 matmul requires Apple M5 (compute_capability == 5); got compute_capability=4
 ```
