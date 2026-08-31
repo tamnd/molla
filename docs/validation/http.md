@@ -162,14 +162,14 @@ Header spans are offsets into the read buffer, so they are valid only until it i
 
 ### Where it was run
 
-`tests/test_http.mojo` grew from 472 lines to roughly 1370 and the suite from 474 checks to 595. The whole suite was run on the M4 and on three Linux machines.
+`tests/test_http.mojo` grew from 472 lines to roughly 1370 and the suite from 474 checks to 596. The whole suite was run on the M4 and on three Linux machines.
 
 | Machine | Result |
 | --- | --- |
-| M4, macOS, kqueue | 595 passed, 0 failed |
-| server1, EPYC, epoll | 596 passed, 0 failed |
-| server2, EPYC, epoll | 596 passed, 0 failed |
-| gpc, i9-13900K on WSL2, epoll | 595 passed, 1 failed |
+| M4, macOS, kqueue | 596 passed, 0 failed |
+| server1, EPYC, epoll | 597 passed, 0 failed |
+| server2, EPYC, epoll | 597 passed, 0 failed |
+| gpc, i9-13900K on WSL2, epoll | 596 passed, 1 failed |
 
 Linux runs one more check than macOS because the reactor suite has a Linux only case for SO_REUSEPORT sharding. The gpc failure is `net.reactor backpressure, and the ring filled up behind it`, it is not in this issue's code, and it fails the same way on main at 474 passed and 1 failed. WSL2 does not honour the 8 kB SO_SNDBUF the test pins, so the kernel takes the whole write and the ring never fills. That is a test portability bug against WSL2 rather than a reactor bug, and it is filed as #87.
 
