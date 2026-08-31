@@ -166,10 +166,18 @@ struct ResponseWriter(Movable):
 
     var date_second: Int
 
+    var status: Int
+    """The status of the response being written, or 0 before `start`.
+
+    Here rather than returned out of the handler, because the writer is the
+    thing that actually decided and every path through the handler goes through
+    `start`. It is what the metrics and the log line read."""
+
     def __init__(out self, counter: Int, capacity: Int = 1024):
         self.out = Buffer(capacity, counter)
         self.head_only = False
         self.body_bytes = 0
+        self.status = 0
         self.date = Buffer(DATE_LENGTH, counter)
         self.date.commit(DATE_LENGTH)
         self.date_second = 0
@@ -187,6 +195,7 @@ struct ResponseWriter(Movable):
         self.out.clear()
         self.head_only = False
         self.body_bytes = 0
+        self.status = 0
 
     def bytes(self) -> Span[UInt8, MutAnyOrigin]:
         return self.out.bytes()
@@ -199,6 +208,7 @@ struct ResponseWriter(Movable):
         request, which RFC 9110 allows and which is what every server does."""
         self.reset()
         self.head_only = head_only
+        self.status = status
         if not self.out.append_str("HTTP/1.1 "):
             return False
         if not self.write_int(status):

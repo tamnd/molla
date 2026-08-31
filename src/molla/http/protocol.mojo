@@ -91,7 +91,19 @@ from molla.http.stream import (
 from molla.io.buffer import Buffer
 from molla.net.conn import Connection
 from molla.net.reactor import Protocol
-from molla.sys.clock import monotonic_ms
+from molla.ops.log import LEVEL_DEBUG, LEVEL_ERROR, Logger
+from molla.ops.metrics import (
+    M_BYTES_READ,
+    M_BYTES_WRITTEN,
+    M_CONNECTIONS_ACCEPTED,
+    M_CONNECTIONS_OPEN,
+    M_HANDLER_ERRORS,
+    M_REQUESTS,
+    Meter,
+    MetricsView,
+)
+from molla.build_info import MOJO_PIN, VERSION
+from molla.sys.clock import monotonic_ms, monotonic_ns
 from molla.sys.mem import as_ptr
 
 comptime DEFAULT_MAX_REQUESTS = 10000
@@ -149,6 +161,18 @@ struct ConnState(Movable):
     """Where a stream event's payload is built, reused like everything else
     here, so producing an event does not allocate."""
 
+    var metered_in: Int
+    var metered_out: Int
+    """How much of this connection's byte totals has already been added to the
+    meter. A `Connection` counts bytes for its whole life, so the protocol
+    reports the difference each time it looks and the counter advances while a
+    keep alive connection is still open rather than in one jump when it
+    closes."""
+
+    var started_ns: Int
+    """When the request being answered arrived, on the monotonic clock. Zero
+    between requests."""
+
     def __init__(out self, counter: Int, max_body: Int):
         self.writer = ResponseWriter(counter)
         self.out_at = 0
@@ -168,6 +192,9 @@ struct ConnState(Movable):
         self.stream_left = 0
         self.stream_index = 0
         self.scratch = Buffer(256, counter)
+        self.metered_in = 0
+        self.metered_out = 0
+        self.started_ns = 0
 
     def reset(mut self):
         """Ready for a new connection in this slot, keeping every buffer."""
@@ -187,6 +214,9 @@ struct ConnState(Movable):
         self.stream_left = 0
         self.stream_index = 0
         self.scratch.clear()
+        self.metered_in = 0
+        self.metered_out = 0
+        self.started_ns = 0
 
     def method(self) -> Span[UInt8, MutAnyOrigin]:
         return Span[UInt8, MutAnyOrigin](
@@ -208,6 +238,60 @@ def _span_is[o: MutOrigin](data: Span[UInt8, o], text: StringSpan) -> Bool:
         if data[i] != p.unsafe_load(i):
             return False
     return True
+
+
+comptime ROUTE_NONE = 0
+comptime ROUTE_ROOT = 1
+comptime ROUTE_HEALTHZ = 2
+comptime ROUTE_SSE = 3
+comptime ROUTE_NDJSON = 4
+comptime ROUTE_BOOM = 5
+comptime ROUTE_ADMIN_VERSION = 6
+comptime ROUTE_ADMIN_HEALTH = 7
+comptime ROUTE_ADMIN_METRICS = 8
+"""One integer per path this stand in answers.
+
+It used to be one Bool per route passed down through three functions, which was
+fine at four routes and would have been nine arguments at nine. Resolving once
+into an integer also means the two callers, the one that has spans into the read
+buffer and the one that has them copied out, agree on the answer by
+construction rather than by both being edited the same way.
+"""
+
+
+def _route_of[o: MutOrigin](target: Span[UInt8, o]) -> Int:
+    """Which route a target names, or `ROUTE_NONE` for a 404.
+
+    A chain of comparisons rather than a router. Nine paths, all short, all
+    known at compile time, and M2 replaces the whole thing with a real router.
+    Building one now would be building it twice.
+    """
+    if _span_is(target, "/"):
+        return ROUTE_ROOT
+    if _span_is(target, "/healthz"):
+        return ROUTE_HEALTHZ
+    if _span_is(target, "/stream/sse"):
+        return ROUTE_SSE
+    if _span_is(target, "/stream/ndjson"):
+        return ROUTE_NDJSON
+    if _span_is(target, "/boom"):
+        return ROUTE_BOOM
+    if _span_is(target, "/molla/version"):
+        return ROUTE_ADMIN_VERSION
+    if _span_is(target, "/molla/health"):
+        return ROUTE_ADMIN_HEALTH
+    if _span_is(target, "/molla/metrics"):
+        return ROUTE_ADMIN_METRICS
+    return ROUTE_NONE
+
+
+def _is_admin(route: Int) -> Bool:
+    """Whether a route id is one of the `/molla` three."""
+    return (
+        route == ROUTE_ADMIN_VERSION
+        or route == ROUTE_ADMIN_HEALTH
+        or route == ROUTE_ADMIN_METRICS
+    )
 
 
 struct HttpProtocol(Movable, Protocol):
@@ -241,6 +325,19 @@ struct HttpProtocol(Movable, Protocol):
     var allow_fault: Bool
     """Whether the `/boom` route exists. Off unless a caller asks."""
 
+    var admin: Bool
+    """Whether the `/molla` routes exist. Off unless a caller asks, so that a
+    server nobody configured does not answer questions about itself."""
+
+    var logger: Logger
+    var meter: Meter
+    """This worker's end of the log ring and of the counters. Both are
+    addresses, both are safe to copy into a reactor, and both do nothing at all
+    when they were never configured, which is why no call site checks."""
+
+    var metrics: MetricsView
+    """Every worker's counters, for the one route that adds them up."""
+
     def __init__(out self):
         self.states = List[ConnState]()
         self.req = Request()
@@ -256,6 +353,10 @@ struct HttpProtocol(Movable, Protocol):
         self.aborted = 0
         self.handler_errors = 0
         self.allow_fault = False
+        self.admin = False
+        self.logger = Logger()
+        self.meter = Meter()
+        self.metrics = MetricsView()
 
     def configure_fault(mut self, enabled: Bool):
         """Turn the raising route on. Only a test or `molla drain` does this."""
@@ -272,6 +373,25 @@ struct HttpProtocol(Movable, Protocol):
         self.max_requests = max_requests
         self.max_body = max_body
 
+    def configure_ops(
+        mut self,
+        logger: Logger,
+        meter: Meter,
+        metrics: MetricsView,
+        admin: Bool,
+    ):
+        """Hand this worker its log ring, its counters, and the shared view.
+
+        A method for the same reason `configure` is one: the trait needs a no
+        argument constructor. The default is a logger and a meter that write
+        nowhere, so a server that never calls this is a server that spends
+        nothing on either.
+        """
+        self.logger = logger
+        self.meter = meter
+        self.metrics = metrics
+        self.admin = admin
+
     def configure_stream(mut self, events: Int):
         """How many events the stand in streaming routes emit. Separate from
         `configure` so a test can turn one knob without restating the rest."""
@@ -285,6 +405,8 @@ struct HttpProtocol(Movable, Protocol):
         self._ensure(conn.slot)
         self.states[conn.slot].reset()
         self.opened += 1
+        self.meter.inc(M_CONNECTIONS_ACCEPTED)
+        self.meter.inc(M_CONNECTIONS_OPEN)
 
     def on_close(mut self, mut conn: Connection):
         """The socket is going away, so a stream in flight is over.
@@ -299,7 +421,9 @@ struct HttpProtocol(Movable, Protocol):
                 self.aborted += 1
                 self.states[conn.slot].stream.abort()
                 self.states[conn.slot].streaming = False
+            self._meter_bytes(conn.slot, conn)
         self.closed += 1
+        self.meter.dec(M_CONNECTIONS_OPEN)
 
     def on_writable(mut self, mut conn: Connection) -> Bool:
         """The ring drained. Push the rest of the response and carry on."""
@@ -307,6 +431,23 @@ struct HttpProtocol(Movable, Protocol):
 
     def on_readable(mut self, mut conn: Connection) -> Bool:
         return self._pump(conn)
+
+    def _meter_bytes(mut self, slot: Int, mut conn: Connection):
+        """Add whatever this connection has moved since the last look.
+
+        A `Connection` counts bytes for its whole life, so the difference is
+        what belongs to the meter. Doing it this way rather than once at close
+        means a keep alive connection that stays open for an hour shows up in
+        the counters during that hour instead of in one jump at the end.
+        """
+        var moved_in = conn.bytes_in - self.states[slot].metered_in
+        if moved_in > 0:
+            self.meter.add(M_BYTES_READ, moved_in)
+            self.states[slot].metered_in = conn.bytes_in
+        var moved_out = conn.bytes_out - self.states[slot].metered_out
+        if moved_out > 0:
+            self.meter.add(M_BYTES_WRITTEN, moved_out)
+            self.states[slot].metered_out = conn.bytes_out
 
     def _pump(mut self, mut conn: Connection) -> Bool:
         """Move the connection forward as far as it will go.
@@ -322,6 +463,7 @@ struct HttpProtocol(Movable, Protocol):
             if not self._push_out(slot, conn):
                 # The ring is full. `on_writable` picks this up.
                 conn.produce(self.states[slot].streaming)
+                self._meter_bytes(slot, conn)
                 return True
             if self.states[slot].closing:
                 # `finish` rather than returning False, and the difference
@@ -330,6 +472,7 @@ struct HttpProtocol(Movable, Protocol):
                 # that says the connection is closing never leaves the ring.
                 # `finish` says the same thing without cutting the write short:
                 # the reactor drains what is queued and closes after.
+                self._meter_bytes(slot, conn)
                 conn.finish()
                 return True
 
@@ -348,6 +491,7 @@ struct HttpProtocol(Movable, Protocol):
                 continue
 
             if conn.input.length == 0:
+                self._meter_bytes(slot, conn)
                 return True
 
             var rc = parse_request(
@@ -358,6 +502,7 @@ struct HttpProtocol(Movable, Protocol):
                 if conn.input.length > MAX_PENDING_HEADER_BYTES:
                     self._error(slot, conn, 431)
                     continue
+                self._meter_bytes(slot, conn)
                 return True
 
             if rc == PARSE_FAILED:
@@ -376,6 +521,8 @@ struct HttpProtocol(Movable, Protocol):
         self.states[slot].is_head = self.req.is_head
         self.states[slot].requests += 1
         self.requests += 1
+        self.meter.inc(M_REQUESTS)
+        self.states[slot].started_ns = monotonic_ns()
         if self.states[slot].requests >= self.max_requests:
             self.states[slot].keep_alive = False
 
@@ -562,42 +709,27 @@ struct HttpProtocol(Movable, Protocol):
         var keep = self.states[slot].keep_alive
         var base = as_ptr(conn.input.base())
         var is_get = span_eq(base, self.req.method, "GET") or head
-        var root = span_eq(base, self.req.target, "/")
-        var health = span_eq(base, self.req.target, "/healthz")
-        var sse = span_eq(base, self.req.target, "/stream/sse")
-        var ndjson = span_eq(base, self.req.target, "/stream/ndjson")
-        var fault = span_eq(base, self.req.target, "/boom")
-        self.states[slot].out_at = 0
-        self._write_default(
-            slot, is_get, root, health, sse, ndjson, fault, keep, head
+        var target = Span[UInt8, MutAnyOrigin](
+            unsafe_ptr=base.unsafe_offset(self.req.target.start),
+            length=self.req.target.length,
         )
+        self.states[slot].out_at = 0
+        self._write_default(slot, _route_of(target), is_get, keep, head)
 
     def _respond_after_body(mut self, slot: Int, mut conn: Connection):
         """Answer a request whose body has just finished arriving."""
         var head = self.states[slot].is_head
         var keep = self.states[slot].keep_alive
-        var method = self.states[slot].method()
-        var target = self.states[slot].target()
-        var is_get = _span_is(method, "GET") or head
-        var root = _span_is(target, "/")
-        var health = _span_is(target, "/healthz")
-        var sse = _span_is(target, "/stream/sse")
-        var ndjson = _span_is(target, "/stream/ndjson")
-        var fault = _span_is(target, "/boom")
+        var is_get = _span_is(self.states[slot].method(), "GET") or head
+        var route = _route_of(self.states[slot].target())
         self.states[slot].out_at = 0
-        self._write_default(
-            slot, is_get, root, health, sse, ndjson, fault, keep, head
-        )
+        self._write_default(slot, route, is_get, keep, head)
 
     def _write_default(
         mut self,
         slot: Int,
+        route: Int,
         is_get: Bool,
-        root: Bool,
-        health: Bool,
-        sse: Bool,
-        ndjson: Bool,
-        fault: Bool,
         keep: Bool,
         head: Bool,
     ):
@@ -617,69 +749,150 @@ struct HttpProtocol(Movable, Protocol):
         `molla.sys.mem` matter more here than the error handling does.
         """
         try:
-            self._route(
-                slot, is_get, root, health, sse, ndjson, fault, keep, head
-            )
+            self._route(slot, route, is_get, keep, head)
         except e:
             self.handler_errors += 1
             self.errors += 1
+            self.meter.inc(M_HANDLER_ERRORS)
+            var entry = self.logger.begin(LEVEL_ERROR)
+            entry.message("handler raised")
+            entry.field_int("slot", slot)
+            entry.field("detail", String(e))
+            _ = entry.end()
             _ = self.states[slot].writer.respond_error(500, head)
             self.states[slot].keep_alive = False
             self.states[slot].streaming = False
+        self._account(slot)
+
+    def _account(mut self, slot: Int):
+        """Record what the response was and how long it took.
+
+        Called once per request from `_write_default`, after the handler has
+        run and whether or not it raised, which is why it is here and not at
+        the end of `_route`. The status comes off the writer rather than being
+        threaded back out of the handler, since the writer is the thing that
+        actually decided.
+        """
+        var status = self.states[slot].writer.status
+        self.meter.observe_status(status)
+        if self.states[slot].started_ns > 0:
+            self.meter.observe_request_ns(
+                monotonic_ns() - self.states[slot].started_ns
+            )
+            self.states[slot].started_ns = 0
+        if status >= 500 or self.logger.enabled(LEVEL_DEBUG):
+            var entry = self.logger.begin(
+                LEVEL_ERROR if status >= 500 else LEVEL_DEBUG
+            )
+            entry.message("request")
+            entry.field_int("status", status)
+            entry.field_int("slot", slot)
+            _ = entry.end()
 
     def _route(
         mut self,
         slot: Int,
+        route: Int,
         is_get: Bool,
-        root: Bool,
-        health: Bool,
-        sse: Bool,
-        ndjson: Bool,
-        fault: Bool,
         keep: Bool,
         head: Bool,
     ) raises:
-        """The stand in handler.
+        """The stand in handler, and the three admin routes that are real.
 
-        Five routes and a 404, which is enough to exercise framing end to end
-        and is deliberately not a router. The API routes in M2 replace this
-        with one, and the seam is here so that when they do, nothing above or
-        below has to move.
+        The application routes are a stand in: a root, a health check and two
+        streams, which is enough to exercise framing end to end and is
+        deliberately not a router. M2 replaces them with one, and the seam is
+        here so that when it does, nothing above or below has to move.
 
-        The sixth route is `/boom`, which raises, and it only exists when a
-        caller has asked for it with `configure_fault`. A server that answers
-        an unauthenticated request by running the error path on purpose is not
-        something to ship on by default, and a property nobody can trigger is
-        not something to claim either, so the tests and `molla drain` turn it
-        on and nothing else does.
+        The `/molla` routes are not a stand in. They are what #16 asks for and
+        what an operator gets: a version, a health check that answers before
+        anything else is ready, and the Prometheus exposition. They are served
+        on the same port as everything else, which is a decision worth being
+        explicit about. A second listener on a second port is the safer answer
+        and it is also a second thing to configure, a second thing to expose in
+        a container, and a second thing to forget. Everything here is
+        information molla already prints on startup, and the day one of these
+        routes can change something is the day the port question gets asked
+        again.
+
+        `/boom` raises, and only exists when a caller has asked for it with
+        `configure_fault`. A server that answers an unauthenticated request by
+        running the error path on purpose is not something to ship on by
+        default, and a property nobody can trigger is not something to claim
+        either, so the tests and `molla drain` turn it on and nothing else
+        does.
         """
-        if fault and self.allow_fault:
+        if route == ROUTE_BOOM and self.allow_fault:
             raise Error("the handler for /boom raised, which is its whole job")
-        if health:
+        if route == ROUTE_HEALTHZ:
             _ = self.states[slot].writer.respond_str(
                 200, "text/plain", "ok\n", keep, head
             )
             return
-        if sse or ndjson:
+        if route == ROUTE_SSE or route == ROUTE_NDJSON:
             if not is_get:
-                self.errors += 1
-                _ = self.states[slot].writer.respond_error(405, head)
-                self.states[slot].keep_alive = False
+                self._refuse(slot, 405, head)
                 return
-            self._start_stream(slot, sse, keep, head)
+            self._start_stream(slot, route == ROUTE_SSE, keep, head)
             return
-        if not root:
-            self.errors += 1
-            _ = self.states[slot].writer.respond_error(404, head)
-            self.states[slot].keep_alive = False
+        if _is_admin(route):
+            if not self.admin:
+                self._refuse(slot, 404, head)
+                return
+            if not is_get:
+                self._refuse(slot, 405, head)
+                return
+            self._admin(slot, route, keep, head)
+            return
+        if route != ROUTE_ROOT:
+            self._refuse(slot, 404, head)
             return
         if not is_get:
-            self.errors += 1
-            _ = self.states[slot].writer.respond_error(405, head)
-            self.states[slot].keep_alive = False
+            self._refuse(slot, 405, head)
             return
         _ = self.states[slot].writer.respond_str(
             200, "text/plain", "Hello from molla.\n", keep, head
+        )
+
+    def _refuse(mut self, slot: Int, status: Int, head: Bool):
+        """Answer with a status molla chose and stop reading this connection.
+
+        Every refusal in the handler did these same three things and one of
+        them forgot the keep alive once, so they are one call now.
+        """
+        self.errors += 1
+        _ = self.states[slot].writer.respond_error(status, head)
+        self.states[slot].keep_alive = False
+
+    def _admin(mut self, slot: Int, route: Int, keep: Bool, head: Bool):
+        """Answer one of the `/molla` routes.
+
+        The body is built in the connection's scratch buffer, which is the same
+        buffer a stream event uses and is reused across requests, so a scrape
+        costs a memcpy rather than an allocation. A metrics exposition is a few
+        kilobytes and the buffer grows to that on the first scrape and stays
+        there.
+        """
+        self.states[slot].scratch.clear()
+        var kind = StaticString("text/plain")
+        if route == ROUTE_ADMIN_HEALTH:
+            _ = self.states[slot].scratch.append_str("ok\n")
+        elif route == ROUTE_ADMIN_VERSION:
+            # Not JSON, on purpose. This is the answer to a person running
+            # curl, it is the same information `molla version` prints, and
+            # anything that wants to parse it wants /molla/metrics instead.
+            _ = self.states[slot].scratch.append_str("molla ")
+            _ = self.states[slot].scratch.append_str(VERSION)
+            _ = self.states[slot].scratch.append_str("\nmojo ")
+            _ = self.states[slot].scratch.append_str(MOJO_PIN)
+            _ = self.states[slot].scratch.append_str("\n")
+        else:
+            # The exposition format wants this exact content type, down to the
+            # version parameter, or Prometheus falls back to a guess.
+            kind = "text/plain; version=0.0.4; charset=utf-8"
+            _ = self.metrics.render(self.states[slot].scratch, VERSION)
+        _ = self.states[slot].writer.respond(
+            200, kind, self.states[slot].scratch.bytes(), keep, head
         )
 
     def _start_stream(mut self, slot: Int, sse: Bool, keep: Bool, head: Bool):

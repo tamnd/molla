@@ -46,6 +46,16 @@ from molla.net.context import ServerContext
 from molla.net.listener import ListenAddress
 from molla.net.server import Server
 from molla.net.supervisor import SignalWatcher, serve_until_signal
+from molla.ops.config import LEVEL_WARN
+from molla.ops.log import LogPump, LogSink
+from molla.ops.metrics import (
+    M_CONNECTIONS_ACCEPTED,
+    M_HANDLER_ERRORS,
+    M_REQUESTS,
+    M_RESPONSES_2XX,
+    M_RESPONSES_5XX,
+    Metrics,
+)
 from molla.sys.clock import monotonic_ms
 from molla.sys.fd import close
 from molla.sys.mem import keep
@@ -221,8 +231,21 @@ def run_drain(connections: Int, deadline_ms: Int) raises -> Int:
 
     var context = ServerContext(0, 60000, 0, deadline_ms, SERVER_SNDBUF)
     var server = Server[HttpProtocol](ListenAddress(UInt16(0)), context)
+
+    # The operations surface, on, because a run of this is the only place
+    # outside the tests where all of it is under load at once. The level is
+    # warn so a hundred runs in a loop do not bury the report they are there to
+    # print, and it is still a level, so the drain is doing the enabled check
+    # on every request the same way a real server would.
+    var sink = LogSink(server.workers, 65536, LEVEL_WARN)
+    var metrics = Metrics(server.workers)
     for i in range(len(server.reactors)):
         server.reactors[i].proto.configure_fault(True)
+        server.reactors[i].proto.configure_ops(
+            sink.logger(i), metrics.meter(i), metrics.view(), True
+        )
+    var pump = LogPump(Int(Pointer(to=sink)))
+    pump.start()
     var port = server.port
     print("  workers       ", server.workers)
     print("  port          ", port)
@@ -257,6 +280,30 @@ def run_drain(connections: Int, deadline_ms: Int) raises -> Int:
     var alive_ok = _count(after_reply, "HTTP/1.1 200") == 1
     print("  still serving ", "yes" if alive_ok else "no")
     _ = close(after)
+
+    # The three admin routes, on one connection, before the load. Checked here
+    # rather than only in the tests because this is the server a person can
+    # point curl at, and a route that answers under a unit test and not under
+    # four worker threads is the failure worth catching.
+    var admin = _client(port)
+    _ = _send_text(admin, _request("/molla/version"))
+    _ = _send_text(admin, _request("/molla/health"))
+    _ = _send_text(admin, _request("/molla/metrics"))
+    var admin_reply = List[UInt8]()
+    var admin_deadline = monotonic_ms() + SETUP_MS
+    while (
+        _count(admin_reply, "molla_build_info") == 0
+        and monotonic_ms() < admin_deadline
+        and _read_more(admin, admin_reply, admin_deadline)
+    ):
+        pass
+    var admin_ok = (
+        _count(admin_reply, "HTTP/1.1 200 OK") == 3
+        and _count(admin_reply, "molla ") >= 1
+        and _count(admin_reply, "molla_http_requests_total") >= 1
+    )
+    print("  admin routes  ", "3 of 3" if admin_ok else "not all three")
+    _ = close(admin)
 
     var batch = String("")
     for _ in range(REQUESTS_PER_CONNECTION):
@@ -330,9 +377,33 @@ def run_drain(connections: Int, deadline_ms: Int) raises -> Int:
     print("  answered      ", complete, "of", connections, "connections")
     print("  truncated     ", truncated)
 
+    # After the drain, so the counters include everything the drain flushed.
+    # The requests total is what the server parsed, which is larger than the
+    # answers the clients read, and that gap is the drain's whole subject.
+    pump.stop()
+    print("  accepted      ", metrics.total(M_CONNECTIONS_ACCEPTED))
+    print("  requests      ", metrics.total(M_REQUESTS))
+    print(
+        "  responses     ",
+        metrics.total(M_RESPONSES_2XX),
+        "2xx,",
+        metrics.total(M_RESPONSES_5XX),
+        "5xx",
+    )
+    print("  handler raises", metrics.total(M_HANDLER_ERRORS))
+    print("  logs dropped  ", sink.dropped())
+    var metrics_ok = (
+        metrics.total(M_REQUESTS) >= delivered
+        and metrics.total(M_RESPONSES_5XX) >= 1
+        and metrics.total(M_HANDLER_ERRORS) == 1
+        and sink.dropped() == 0
+    )
+
     var ok = (
         boom_ok
         and alive_ok
+        and admin_ok
+        and metrics_ok
         and first_ok == connections
         and complete == connections
         and truncated == 0

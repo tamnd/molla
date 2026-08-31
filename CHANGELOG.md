@@ -4,6 +4,21 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla.ops.config`, settings with a precedence of flag over environment over file over default, and every setting carrying where its value came from.
+- `molla config get [key]`, which prints the effective value and the source, because the value on its own is not the question anybody has.
+- `molla.ops.log`, structured logfmt logging on a byte ring per worker, written by the worker and flushed by the housekeeping thread. A disabled level costs one atomic load and no allocations at all.
+- `molla.ops.metrics`, Prometheus counters with one set per worker on its own cache line, summed only when somebody scrapes them. Durations are exported as integer nanoseconds.
+- `GET /molla/version`, `/molla/health` and `/molla/metrics`, served on the main port and off unless a caller turns them on.
+- `sys.clock.monotonic_ns` and `sys.clock.realtime_ns`, so durations and timestamps stop sharing a clock.
+- `tests/test_ops.mojo`, including the check that a thousand log calls at a disabled level allocate exactly nothing.
+- `docs/validation/ops.md`.
+
+### Changed
+
+- `molla drain` now runs with logging, metrics and the admin routes on, asks for all three routes before the load starts, and prints the counters after the drain.
+
 ## [0.1.5] - 2026-09-01
 
 The concurrency layer, and a shutdown that finishes what it started. Also the TLS policy work, which decides per host whether a certificate has to check out.
