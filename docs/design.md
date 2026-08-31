@@ -80,7 +80,7 @@ No telemetry. No account. No outbound connection except pulls you asked for. Loo
 
 One process, one language, layered so each layer could be replaced. Arrows point downward only. The API layer never touches the engine directly, it goes through the scheduler, and the engine never parses HTTP or JSON. A build lint checks this, because layering that is not enforced does not exist.
 
-```
+```text
 edge        sys, tls, io, net, http, json, uri, time, log, metrics
 api         openai, anthropic, mcp, admin, compat.ollama
 semantics   jinja, chat, tokenizer, parse, grammar

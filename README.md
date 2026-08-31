@@ -85,7 +85,7 @@ Windows is WSL only, matching the toolchain. That is not a hypothetical: the onl
 
 You need [pixi](https://pixi.sh). It pulls the pinned Mojo toolchain, so there is nothing else to install.
 
-```
+```console
 pixi install
 pixi run build
 pixi run test

@@ -61,7 +61,7 @@ One thing that is not pinned: pixi itself. The fleet currently runs 0.77.1 and 0
 
 ## Reproducing
 
-```
+```console
 pixi install
 pixi run build
 build/molla version
@@ -70,7 +70,7 @@ pixi run test
 
 Expected output on the M4:
 
-```
+```text
 molla 0.0.1
   mojo       1.0.0
   target     macos arm64 (apple silicon)
