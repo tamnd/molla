@@ -31,6 +31,7 @@ run that leaked even one comes back high.
 from std.memory import stack_allocation
 from std.time import monotonic
 
+from molla.net.context import ServerContext
 from molla.net.listener import ListenAddress
 from molla.net.protocol import EchoProtocol
 from molla.net.server import Server
@@ -113,7 +114,7 @@ def run_net_soak(connections: Int, seconds: Int) raises -> Int:
     var fd_before = probe_fd()
     var idle_timeout = seconds * 1000 + IDLE_MARGIN_MS
     var server = Server[EchoProtocol](
-        ListenAddress(UInt16(0)), 0, idle_timeout, 0
+        ListenAddress(UInt16(0)), ServerContext(0, idle_timeout, 0)
     )
     var port = server.port
     print("  workers        " + String(server.workers))

@@ -16,6 +16,7 @@ from std.memory import stack_allocation
 
 from harness import Suite
 
+from molla.net.context import ServerContext
 from molla.net.listener import (
     SHARDED_ACCEPT,
     ListenAddress,
@@ -366,7 +367,7 @@ def _check_server(mut suite: Suite) raises:
 
     var workers = 4
     var server = Server[EchoProtocol](
-        ListenAddress(UInt16(0)), workers, 60000, 0
+        ListenAddress(UInt16(0)), ServerContext(workers, 60000, 0)
     )
     var port = server.port
     suite.check(port != 0, "the server bound a port")
@@ -415,7 +416,9 @@ def _check_server_unix(mut suite: Suite) raises:
     suite.group("net.server unix socket")
 
     var path = String("/tmp/molla-server-test.sock")
-    var server = Server[EchoProtocol](ListenAddress(path), 2, 60000, 0)
+    var server = Server[EchoProtocol](
+        ListenAddress(path), ServerContext(2, 60000, 0)
+    )
     server.start()
 
     var client = connect_unix(path)

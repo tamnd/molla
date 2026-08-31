@@ -50,6 +50,7 @@ Being honest about this up front. Mojo 1.0 has no async, no sockets, no HTTP, no
 | --- | --- |
 | Sockets and an event loop over epoll and kqueue | no `std.net`, done, see [docs/validation/sockets.md](docs/validation/sockets.md) |
 | Files, threads, mutexes and signals over libc | no `std.thread` and no signal handling, done, see [docs/validation/sys.md](docs/validation/sys.md) |
+| Atomics, lock free queues, and a shutdown that finishes what it started | nothing above works without them, done, see [docs/validation/threading.md](docs/validation/threading.md) |
 | A reactor per core, with idle timeouts, backpressure and sharded accept | an event loop is not a server, done, see [docs/validation/net.md](docs/validation/net.md) |
 | Buffers, rings and arenas with a per request lifetime | Mojo allocates, but nothing tells you what a request cost, done, see [docs/validation/io.md](docs/validation/io.md) |
 | HTTP/1.1 with chunked, SSE, and NDJSON framing | no HTTP stack, parser, bodies, multipart, SSE and NDJSON done, no routing yet, see [docs/validation/http.md](docs/validation/http.md) |
@@ -106,7 +107,7 @@ pixi run test
 ./build/molla version
 ```
 
-That builds and runs today on macOS arm64, Linux x86_64, and Linux arm64. It does not serve a model yet. `molla version` prints the toolchain and what it detected about your machine. `molla echo` runs the M0 socket spike, which is a TCP echo server, `molla http` runs the M0 throughput spike, which answers every request with the same fixed body, `molla gguf <path>` prints the metadata and tensor directory of a model file, `molla tls <host>` connects over HTTPS and prints what was negotiated, and `molla pull <ref>` fetches a blob from ghcr.io and checks its digest. None of them is a molla feature. See [docs/validation/toolchain.md](docs/validation/toolchain.md) for the pinned version, the machines it has actually been run on, and the notes on what Mojo 1.0 turned out to look like in practice.
+That builds and runs today on macOS arm64, Linux x86_64, and Linux arm64. It does not serve a model yet. `molla version` prints the toolchain and what it detected about your machine. `molla echo` runs the M0 socket spike, which is a TCP echo server, `molla http` runs the M0 throughput spike, which answers every request with the same fixed body, `molla gguf <path>` prints the metadata and tensor directory of a model file, `molla tls <host>` connects over HTTPS and prints what was negotiated, `molla pull <ref>` fetches a blob from ghcr.io and checks its digest, and `molla drain` loads a server up, sends itself SIGTERM, and checks every client got every answer. None of them is a molla feature. See [docs/validation/toolchain.md](docs/validation/toolchain.md) for the pinned version, the machines it has actually been run on, and the notes on what Mojo 1.0 turned out to look like in practice.
 
 ## Contributing
 

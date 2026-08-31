@@ -234,6 +234,13 @@ struct HttpProtocol(Movable, Protocol):
     var aborted: Int
     """Streams whose client went away before the last chunk."""
 
+    var handler_errors: Int
+    """Requests whose handler raised. Counted apart from `errors`, because a
+    bad request and a broken handler are somebody else's problem and ours."""
+
+    var allow_fault: Bool
+    """Whether the `/boom` route exists. Off unless a caller asks."""
+
     def __init__(out self):
         self.states = List[ConnState]()
         self.req = Request()
@@ -247,6 +254,12 @@ struct HttpProtocol(Movable, Protocol):
         self.errors = 0
         self.streams = 0
         self.aborted = 0
+        self.handler_errors = 0
+        self.allow_fault = False
+
+    def configure_fault(mut self, enabled: Bool):
+        """Turn the raising route on. Only a test or `molla drain` does this."""
+        self.allow_fault = enabled
 
     def configure(mut self, counter: Int, max_requests: Int, max_body: Int):
         """Set the limits before the reactor starts.
@@ -553,8 +566,11 @@ struct HttpProtocol(Movable, Protocol):
         var health = span_eq(base, self.req.target, "/healthz")
         var sse = span_eq(base, self.req.target, "/stream/sse")
         var ndjson = span_eq(base, self.req.target, "/stream/ndjson")
+        var fault = span_eq(base, self.req.target, "/boom")
         self.states[slot].out_at = 0
-        self._write_default(slot, is_get, root, health, sse, ndjson, keep, head)
+        self._write_default(
+            slot, is_get, root, health, sse, ndjson, fault, keep, head
+        )
 
     def _respond_after_body(mut self, slot: Int, mut conn: Connection):
         """Answer a request whose body has just finished arriving."""
@@ -567,8 +583,11 @@ struct HttpProtocol(Movable, Protocol):
         var health = _span_is(target, "/healthz")
         var sse = _span_is(target, "/stream/sse")
         var ndjson = _span_is(target, "/stream/ndjson")
+        var fault = _span_is(target, "/boom")
         self.states[slot].out_at = 0
-        self._write_default(slot, is_get, root, health, sse, ndjson, keep, head)
+        self._write_default(
+            slot, is_get, root, health, sse, ndjson, fault, keep, head
+        )
 
     def _write_default(
         mut self,
@@ -578,16 +597,64 @@ struct HttpProtocol(Movable, Protocol):
         health: Bool,
         sse: Bool,
         ndjson: Bool,
+        fault: Bool,
         keep: Bool,
         head: Bool,
     ):
+        """Run the handler, and answer with a 500 if it blows up.
+
+        This is the boundary the whole server depends on and it is three lines.
+        A handler that raises is a bug in that handler, and the two things that
+        must not follow from it are a client left hanging on a connection that
+        will never answer, and a process that takes everybody else's requests
+        down with it. So the failure is turned into a 500, the connection is
+        closed because nothing knows how much of a response was already
+        written, and the reactor never finds out.
+
+        What it does not cover is a genuine crash. A null dereference or a
+        stack overflow in a handler takes the process down and no language
+        level construct can catch it, which is why the memory rules in
+        `molla.sys.mem` matter more here than the error handling does.
+        """
+        try:
+            self._route(
+                slot, is_get, root, health, sse, ndjson, fault, keep, head
+            )
+        except e:
+            self.handler_errors += 1
+            self.errors += 1
+            _ = self.states[slot].writer.respond_error(500, head)
+            self.states[slot].keep_alive = False
+            self.states[slot].streaming = False
+
+    def _route(
+        mut self,
+        slot: Int,
+        is_get: Bool,
+        root: Bool,
+        health: Bool,
+        sse: Bool,
+        ndjson: Bool,
+        fault: Bool,
+        keep: Bool,
+        head: Bool,
+    ) raises:
         """The stand in handler.
 
         Five routes and a 404, which is enough to exercise framing end to end
         and is deliberately not a router. The API routes in M2 replace this
         with one, and the seam is here so that when they do, nothing above or
         below has to move.
+
+        The sixth route is `/boom`, which raises, and it only exists when a
+        caller has asked for it with `configure_fault`. A server that answers
+        an unauthenticated request by running the error path on purpose is not
+        something to ship on by default, and a property nobody can trigger is
+        not something to claim either, so the tests and `molla drain` turn it
+        on and nothing else does.
         """
+        if fault and self.allow_fault:
+            raise Error("the handler for /boom raised, which is its whole job")
         if health:
             _ = self.states[slot].writer.respond_str(
                 200, "text/plain", "ok\n", keep, head

@@ -27,6 +27,20 @@ connection that connects and says nothing must not hold a descriptor forever,
 and that is not a hypothetical: it is the shape of the simplest denial of
 service there is, and it costs the attacker one socket.
 
+Draining is the other thing another thread can ask for. A reactor that is
+draining has closed its listeners, so nothing new arrives, and closes each
+connection at the first moment that connection owes the client nothing: no
+bytes in its output ring, nothing half read in its input, no stream in flight.
+A request that is being served when the drain starts is served to the end. When
+the deadline passes, whatever is left is closed anyway and counted, because a
+shutdown that waits forever for one stuck client is not a shutdown.
+
+The flags another thread touches are atomics rather than plain fields. They
+were plain `Bool` until #15 and it worked on both machines, which is the
+dangerous kind of working: a non atomic store read from another thread is
+undefined rather than merely stale, and the reason to fix it is that the
+compiler is allowed to keep `stopping` in a register across the whole loop.
+
 The poller is edge triggered on both platforms, which is a deliberate deviation
 from what issue #10 asked for. The issue said edge triggered on Linux and level
 triggered on macOS. Running kqueue level triggered would mean the two platforms
@@ -52,14 +66,18 @@ from molla.sys.errno import EAGAIN, EINTR, EMFILE, ENFILE, errno_name, get_errno
 from molla.sys.fd import close, set_nonblocking
 from molla.sys.poll import Poller, Ready
 from molla.sys.socket import (
+    SO_SNDBUF,
     accept,
     recv,
     send,
+    set_buffer_size,
     set_keepalive,
     set_nodelay,
     socket_pair,
 )
-from molla.sys.thread import Mutex
+from molla.sys.atomic import AtomicBlock, AtomicRef
+from molla.sys.queue import MpscQueue
+from molla.sys.thread import self_id, set_thread_name
 
 comptime MAX_EVENTS = 256
 """Events pulled from the kernel per pass. Larger batches mean fewer syscalls
@@ -74,6 +92,46 @@ next deploy happens."""
 
 comptime WAKE_DRAIN = 64
 comptime NO_SLOT = -1
+
+comptime HANDOFF_CAPACITY = 1024
+"""Connections one reactor may have waiting to be adopted by another. A full
+queue is not a dropped connection: the accepting thread serves it itself, which
+is worse balance and better than a refusal."""
+
+comptime DRAIN_TICK_MS = 5
+"""How long a draining reactor waits in the poller. Short, because the last
+thing a drain waits on is often a connection that has already flushed and needs
+one more pass to notice, and a drain that takes a second to see that is a
+second on every deploy."""
+
+comptime FLAG_STOPPING = 0
+comptime FLAG_DRAINING = 1
+comptime FLAG_DEADLINE = 2
+comptime FLAG_OPEN = 3
+comptime FLAG_DROPPED = 4
+comptime FLAG_THREAD = 5
+comptime FLAG_COUNT = 6
+"""The control block. Six counters, each alone on a cache line, and the only
+memory two threads write to. Three are asks from outside, `stopping`,
+`draining` and the drain deadline, and three are answers this reactor
+publishes, the open connection count, what it had to drop at the deadline, and
+which thread it is running on."""
+
+comptime STATE_NEW = 0
+comptime STATE_RUNNING = 1
+comptime STATE_DRAINING = 2
+comptime STATE_STOPPED = 3
+
+
+def state_name(state: Int) -> String:
+    if state == STATE_RUNNING:
+        return "running"
+    if state == STATE_DRAINING:
+        return "draining"
+    if state == STATE_STOPPED:
+        return "stopped"
+    return "new"
+
 
 comptime SERVICE_ROUNDS = 8
 """How many times one connection may go round the read, produce, write cycle in
@@ -137,13 +195,33 @@ struct Reactor[P: Protocol](Movable):
     """A socketpair. Another thread writes one byte to make this reactor come
     back from the poller, which is how a handoff and a shutdown both arrive."""
 
-    var handoff: List[Int]
-    var handoff_lock: Mutex
+    var handoff: MpscQueue
+    """Descriptors another thread has given this one. A ticket queue rather
+    than a mutex and a list, so an accepting thread never waits on a reactor
+    that happens to be in the middle of a pass."""
+
+    var control: AtomicBlock
+    """The flags another thread reads and writes. See `FLAG_STOPPING`."""
+
+    var index: Int
+    """Which reactor this is, for the thread name and the SIGQUIT dump."""
+
     var idle_timeout_ms: Int
     var read_capacity: Int
     var write_capacity: Int
     var counter: Int
-    var stopping: Bool
+    var send_buffer_bytes: Int
+    """Kernel send buffer for accepted sockets, or zero to leave it alone.
+
+    Set on the accepted socket rather than on the listener. A listener does pass
+    the option down, but macOS then autotunes the inherited buffer back up, so a
+    test that asked for eight kilobytes gets a hundred and fifty and quietly
+    stops testing backpressure. Setting it after accept sticks on both."""
+
+    var listeners_closed: Bool
+    """Set once the drain has closed them, so a drain that takes several passes
+    does not try to close a descriptor twice."""
+
     var accepted: Int
     var closed_count: Int
     var timed_out: Int
@@ -186,13 +264,15 @@ struct Reactor[P: Protocol](Movable):
         self.listeners = List[Int]()
         self.wake_read = -1
         self.wake_write = -1
-        self.handoff = List[Int]()
-        self.handoff_lock = Mutex()
+        self.handoff = MpscQueue(HANDOFF_CAPACITY)
+        self.control = AtomicBlock(FLAG_COUNT)
+        self.index = 0
         self.idle_timeout_ms = idle_timeout_ms
         self.read_capacity = DEFAULT_READ_CAPACITY
         self.write_capacity = DEFAULT_WRITE_CAPACITY
         self.counter = counter
-        self.stopping = False
+        self.send_buffer_bytes = 0
+        self.listeners_closed = False
         self.accepted = 0
         self.closed_count = 0
         self.timed_out = 0
@@ -203,8 +283,10 @@ struct Reactor[P: Protocol](Movable):
         self.peers = List[Int]()
         self.next_peer = 0
 
-        if not self.handoff_lock.init().is_ok():
-            raise Error("the reactor could not initialise its handoff lock")
+        if not self.handoff.is_valid():
+            raise Error("the reactor could not allocate its handoff queue")
+        if not self.control.is_valid():
+            raise Error("the reactor could not allocate its control block")
 
         var ends = List[Int]()
         if not socket_pair(ends).is_ok():
@@ -283,10 +365,17 @@ struct Reactor[P: Protocol](Movable):
             self.refused += 1
             return NO_SLOT
 
+        if self.send_buffer_bytes > 0:
+            set_buffer_size(fd, SO_SNDBUF, self.send_buffer_bytes)
+
         self._remember(fd, slot)
         self.poller.add_read(fd)
         self.conns[slot].timer = self.wheel.add(slot, self.idle_timeout_ms)
         self.accepted += 1
+        # Published rather than counted on demand, because the thread that
+        # wants this number is not this one and walking the slot table from
+        # another thread is a race.
+        _ = self._flag(FLAG_OPEN).add(1)
         self.proto.on_open(self.conns[slot])
         return slot
 
@@ -353,14 +442,16 @@ struct Reactor[P: Protocol](Movable):
     def handoff_push(mut self, fd: Int) -> Bool:
         """Give this reactor a descriptor from another thread.
 
-        The macOS path. The acceptor thread calls this, the queue is guarded by
-        a mutex held for a push, and one byte on the wakeup socket brings the
-        reactor back out of the poller to collect it.
+        The macOS path. The acceptor thread claims a cell in the ticket queue
+        and one byte on the wakeup socket brings the reactor back out of the
+        poller to collect it. Nothing here can block, so an accepting thread
+        never waits on a reactor that is busy.
+
+        False means the queue is full, which is the caller's cue to serve the
+        connection itself rather than to retry.
         """
-        if not self.handoff_lock.lock().is_ok():
+        if not self.handoff.push(fd):
             return False
-        self.handoff.append(fd)
-        _ = self.handoff_lock.unlock()
         self.wake()
         return True
 
@@ -384,16 +475,15 @@ struct Reactor[P: Protocol](Movable):
             if recv(self.wake_read, scratch, WAKE_DRAIN) <= 0:
                 break
 
-        if not self.handoff_lock.lock().is_ok():
-            return
-        var taken = List[Int]()
-        for i in range(len(self.handoff)):
-            taken.append(self.handoff[i])
-        self.handoff.clear()
-        _ = self.handoff_lock.unlock()
-
-        for i in range(len(taken)):
-            _ = self.adopt(taken[i])
+        var fd = 0
+        while self.handoff.pop(fd):
+            if self.is_draining():
+                # Accepted a moment before the drain started and handed to a
+                # reactor that is now closing. Taking it would mean answering a
+                # request on a server that has already said it is going away.
+                _ = close(fd)
+                continue
+            _ = self.adopt(fd)
 
     def _close_slot(mut self, slot: Int):
         """Close one connection and give its slot back.
@@ -415,6 +505,7 @@ struct Reactor[P: Protocol](Movable):
         self.live[slot] = False
         self.free_slots.append(slot)
         self.closed_count += 1
+        _ = self._flag(FLAG_OPEN).sub(1)
 
     def _sync_write_interest(mut self, slot: Int) raises:
         var wanted = self.conns[slot].wants_write()
@@ -574,18 +665,140 @@ struct Reactor[P: Protocol](Movable):
         self._expire()
         return count
 
+    def _flag(self, which: Int) -> AtomicRef:
+        return self.control.slot(which)
+
+    def is_stopping(self) -> Bool:
+        return self._flag(FLAG_STOPPING).load() != 0
+
+    def is_draining(self) -> Bool:
+        return self._flag(FLAG_DRAINING).load() != 0
+
+    def state(self) -> Int:
+        """What this reactor is doing, as seen from another thread."""
+        if self._flag(FLAG_STOPPING).load() != 0:
+            return STATE_STOPPED
+        if self._flag(FLAG_DRAINING).load() != 0:
+            return STATE_DRAINING
+        if self._flag(FLAG_THREAD).load() != 0:
+            return STATE_RUNNING
+        return STATE_NEW
+
+    def open_published(self) -> Int:
+        """The open connection count this reactor last published.
+
+        Read by the supervisor thread while the reactor is running, which is
+        why it is an atomic and why `connection_count` is not the thing to
+        call from outside."""
+        return self._flag(FLAG_OPEN).load()
+
+    def dropped(self) -> Int:
+        """Connections cut because the drain deadline passed."""
+        return self._flag(FLAG_DROPPED).load()
+
+    def thread_id(self) -> Int:
+        return self._flag(FLAG_THREAD).load()
+
+    def handoff_depth(self) -> Int:
+        return self.handoff.depth()
+
     def run(mut self) raises:
         """Serve until told to stop. One thread lives in here."""
-        while not self.stopping:
+        _ = set_thread_name("molla-io-" + String(self.index))
+        self._flag(FLAG_THREAD).store(self_id())
+        while not self.is_stopping():
             var wait = self.wheel.next_timeout_ms()
             if wait < 0:
                 wait = TICK_MS * 10
+            if self.is_draining():
+                wait = DRAIN_TICK_MS
             _ = self.poll_once(wait)
+            if self.is_draining():
+                self._drain_step()
 
     def stop(mut self):
-        """Ask the loop to finish its pass and return. Safe from any thread."""
-        self.stopping = True
+        """Ask the loop to finish its pass and return. Safe from any thread.
+
+        Abrupt. Connections in flight lose whatever was still queued for them,
+        which is what a test wants at the end and not what a running server
+        wants. `begin_drain` is the polite one."""
+        self._flag(FLAG_STOPPING).store(1)
         self.wake()
+
+    def begin_drain(mut self, deadline_ms: Int):
+        """Stop accepting and start closing. Safe from any thread.
+
+        `deadline_ms` is a monotonic timestamp rather than a duration, so every
+        reactor in a server shares one deadline instead of each starting its
+        own clock whenever its thread happens to notice.
+        """
+        self._flag(FLAG_DEADLINE).store(deadline_ms)
+        self._flag(FLAG_DRAINING).store(1)
+        self.wake()
+
+    def _close_listeners(mut self):
+        """Stop accepting, before anything else in the drain.
+
+        The listeners go first so the window where a client can connect and get
+        an immediate close is as short as it can be. A connection already in
+        the accept backlog is closed by the kernel with the listener, which
+        looks to that client like a connection refused and is the right answer
+        for a server that is on its way out."""
+        if self.listeners_closed:
+            return
+        self.listeners_closed = True
+        for i in range(len(self.listeners)):
+            self.poller.remove(self.listeners[i])
+            _ = close(self.listeners[i])
+        self.listeners.clear()
+
+    def _owes_nothing(self, slot: Int) -> Bool:
+        """Whether this connection can be closed without cutting anything off.
+
+        Three questions, and all three have to be no. Is there a response still
+        queued, is there a request half read, and is a stream still producing.
+        A keep alive connection between requests answers no to all three, which
+        is why an idle pool closes the instant a drain starts.
+        """
+        if self.conns[slot].pending() > 0:
+            return False
+        if self.conns[slot].input.length > 0:
+            return False
+        if self.conns[slot].producing:
+            return False
+        return True
+
+    def _drain_step(mut self) raises:
+        """One pass of the drain. Called after the poller, every pass."""
+        self._close_listeners()
+
+        var deadline = self._flag(FLAG_DEADLINE).load()
+        var expired = deadline > 0 and monotonic_ms() >= deadline
+
+        for i in range(len(self.conns)):
+            if not self.live[i]:
+                continue
+            if expired:
+                # Out of time. What is left is cut, and counted so the number
+                # ends up in the shutdown line rather than in nobody's log.
+                _ = self._flag(FLAG_DROPPED).add(1)
+                self._close_slot(i)
+                continue
+            # One more read before deciding this connection is finished. The
+            # poller is edge triggered, so a request that arrived between the
+            # last pass and this one has already spent its edge and there is no
+            # second one coming. Without this a connection that is about to ask
+            # for something looks exactly like one that is asleep, and the
+            # difference is a request the client sent and never got an answer
+            # to. It costs one recv per idle connection per drain pass.
+            self._service(i, True, False)
+            if not self.live[i]:
+                continue
+            if self._owes_nothing(i):
+                self._close_slot(i)
+
+        if self._flag(FLAG_OPEN).load() <= 0:
+            self._flag(FLAG_STOPPING).store(1)
 
     def connection_count(self) -> Int:
         var total = 0

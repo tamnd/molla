@@ -12,6 +12,7 @@ from molla.host import detect
 from molla.http.server import run_http
 from molla.json.bench import run_json_bench
 from molla.model.gguf import run_gguf
+from molla.net.drain import run_drain
 from molla.net.echo import run_echo
 from molla.net.soak import run_soak
 from molla.net.soak_net import run_net_soak
@@ -53,6 +54,10 @@ def print_usage():
     print("  echo [port]     run the M0 TCP echo spike on 127.0.0.1")
     print("  soak [n] [sec]  hold n echo connections for sec seconds")
     print("  netsoak [n] [s] hold n connections against the threaded reactor")
+    print(
+        "  drain [n] [ms]  load n connections, shut down on a signal, check the"
+        " drain"
+    )
     print("  jsonbench [kb] [n] parse an n round chat body and print the rate")
     print("  http [port]     run the M0 HTTP/1.1 spike on 127.0.0.1")
     print(
@@ -161,6 +166,27 @@ def main():
             exit(run_net_soak(net_connections, net_seconds))
         except e:
             print("molla netsoak:", e)
+            exit(1)
+    elif command == "drain":
+        # Small by default. The point is to run it a hundred times, not to run
+        # it once with a big number.
+        var drain_connections = 64
+        var drain_deadline = 5000
+        try:
+            if len(args) > 2:
+                drain_connections = Int(args[2])
+            if len(args) > 3:
+                drain_deadline = Int(args[3])
+        except:
+            print(
+                "molla: drain takes a connection count and a deadline in"
+                " milliseconds"
+            )
+            exit(2)
+        try:
+            exit(run_drain(drain_connections, drain_deadline))
+        except e:
+            print("molla drain:", e)
             exit(1)
     elif command == "jsonbench":
         # The two numbers issue #13 asks for, on whatever machine is running it.
