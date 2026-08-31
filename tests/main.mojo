@@ -12,6 +12,7 @@ import test_dns
 import test_gguf
 import test_host
 import test_http
+import test_io
 import test_net
 import test_registry
 import test_sha256
@@ -45,5 +46,9 @@ def main():
         test_sys.run(suite)
     except e:
         suite.fail("test_sys", String(e))
+    try:
+        test_io.run(suite)
+    except e:
+        suite.fail("test_io", String(e))
 
     finish(suite)
