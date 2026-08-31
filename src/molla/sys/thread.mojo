@@ -32,6 +32,7 @@ from std.sys.info import CompilationTarget
 
 from molla.sys.cstr import c_string
 from molla.sys.errno import ENOMEM, ENOTSUP
+from molla.sys.mem import allocate, release
 from molla.sys.result import SysResult, checked, ok
 
 comptime ThreadFunc = def(Int) thin abi("C") -> Int
@@ -63,19 +64,17 @@ def _pthread_result(rc: Int) -> SysResult:
 def _alloc_sync() -> Int:
     """A zeroed block for one pthreads object, at an address that will not move.
 
-    `calloc` rather than `malloc` because pthreads reads the whole object during
-    init on some platforms, and a block full of whatever was there before is a
-    bad thing to hand it. Returns 0 if the allocation failed, which every caller
-    turns into ENOMEM rather than dereferencing."""
-    return Int(
-        external_call["calloc", Int](c_size_t(1), c_size_t(SYNC_STORAGE))
-    )
+    `molla.sys.mem` allocates with `calloc`, which matters here: pthreads reads
+    the whole object during init on some platforms, and a block full of whatever
+    was there before is a bad thing to hand it. Returns 0 if the allocation
+    failed, which every caller turns into ENOMEM rather than dereferencing."""
+    return allocate(SYNC_STORAGE)
 
 
 def _free_sync(address: Int):
-    """Give the block back. Free of 0 is defined and does nothing, so the
-    failed-allocation path does not need its own branch."""
-    external_call["free", NoneType](address)
+    """Give the block back. Freeing 0 is defined and does nothing, so the failed
+    allocation path does not need its own branch."""
+    release(address)
 
 
 struct Thread(Movable):
