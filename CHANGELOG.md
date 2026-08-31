@@ -4,6 +4,20 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.1.5] - 2026-09-01
+
+The concurrency layer, and a shutdown that finishes what it started. Also the TLS policy work, which decides per host whether a certificate has to check out.
+
+One rule runs through all of it: anything two threads touch lives at an address rather than in a value. A Mojo value moves, so two threads reaching a counter through two copies of it are incrementing two counters, and that looks entirely correct in a single threaded test. Every shared thing here is allocated once, kept at a fixed address, and handed to a thread as the one integer a thread entry point gets.
+
+Three pieces are not built the way the design said they would be, and each of them is a Mojo 1.0 fact rather than a preference. `Once` cannot be `pthread_once`, whose callback takes no argument, because an initialiser would have nowhere to leave its result except a global and there are no globals. Signals cannot arrive on signalfd, which needs the signal blocked in every thread of the process, because the runtime starts threads before `main` and offers no way to reach their masks. And the signal has to be armed before the server starts, which the first version got wrong in a way that only shows up when something signals faster than a person can press Ctrl-C.
+
+Draining means closing the listeners and then closing each connection at the first moment it owes the client nothing, cutting and counting what is left at the deadline. Writing the test for it found a real bug: the poller is edge triggered, so a request that arrived between two drain passes has already spent its edge, and a connection about to ask for something looked exactly like one that was asleep. The difference is a request the client sent and never got an answer to.
+
+The acceptance test is a command rather than a unit test, because every time in a hundred runs is not something a unit test reaches. A hundred runs of thirty two connections are clean on all four machines in the fleet, and the only failing check anywhere is the WSL2 backpressure one that was already failing.
+
+There is still no routing and no config file. Both are M1 and neither is here.
+
 ### Added
 
 - `molla.sys.atomic`, with `AtomicRef` for one atomic integer reached by address and `AtomicBlock` for several of them each alone on a cache line. Everything two threads share in molla lives at an address rather than in a value, because a Mojo value moves and two threads reaching a counter through two copies are incrementing two counters, which looks correct in a single threaded test.
