@@ -10,7 +10,8 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 - Exact integers and correctly rounded doubles with no `strtod` and no locale, in `number.mojo` and `decimal.mojo`. Three paths: an integer that fits in 64 bits stays an integer, a double with 53 bits of digits and a small exponent goes through Clinger's fast path, and anything else goes through an exact decimal expansion. Printing goes back through the same struct and gives the shortest form that reads back as the same double, with the two cutoffs JavaScript uses.
 - `molla jsonbench [kb] [n]`, the acceptance test for #13 as a command. On the M4 a 100 kB chat body parses at 2283 MB/s with zero allocations, against a gate of 1 GB/s. DOM mode is 1920 MB/s and five allocations for a 1234 node document.
 - `tests/test_json.mojo`, 154 checks over the scanner, both number directions, the reader, the DOM and the writer, including the inputs that break converters and a round trip over four thousand doubles built from random bit patterns.
-- `docs/validation/json.md`, with the numbers, the three places the design departs from what issue #13 describes, and why.
+- `keep` in `molla.sys.mem`, which counts as a use of a value and does nothing else. Mojo destroys a local at its last use, so handing a buffer's address to a reader is the last thing the compiler sees using it and the buffer is freed while the parse is still reading it. It passed on the M4, where the freed block still held the bytes, and failed six checks on x86_64 Linux, where the allocator hands the block straight to someone else.
+- `docs/validation/json.md`, with the numbers, the three places the design departs from what issue #13 describes, and the lifetime bug the fleet run found.
 
 ## [0.1.3] - 2026-09-01
 

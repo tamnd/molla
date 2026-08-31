@@ -52,14 +52,26 @@ The zero is also asserted in the test suite rather than only in the benchmark, s
 
 ## Where it was run
 
-| Machine | Result |
-| --- | --- |
-| M4, macOS, arm64 | 809 passed, 0 failed |
-| server1, EPYC, x86_64 | 809 passed, 0 failed |
-| server2, EPYC, x86_64 | 809 passed, 0 failed |
-| gpc, i9-13900K on WSL2, x86_64 | 808 passed, 1 failed |
+| Machine | Suite | Streaming | DOM |
+| --- | --- | --- | --- |
+| M4, macOS, arm64 | 809 passed | 2283 MB/s | 1920 MB/s |
+| gpc, i9-13900K on WSL2, x86_64 | 809 passed, 1 failed | 2446 MB/s | 1920 MB/s |
+| server1, EPYC, 4 cores, x86_64 | 810 passed | 532 MB/s | 613 MB/s |
+| server2, EPYC, 6 cores, x86_64 | 810 passed | 198 MB/s | 135 MB/s |
 
-The one failure on gpc is issue #87, the reactor backpressure test under WSL2, and is unrelated to this work. It fails on main in the same way.
+The one failure on gpc is issue #87, the reactor backpressure test under WSL2, which fails on main in the same way and has nothing to do with this work. The Linux machines count one check more than the M4 because sharded accept and the poller struct layout are checked differently there, which predates this work.
+
+Both EPYC machines were carrying a load average above 13 on 4 and 6 cores throughout, from unrelated work belonging to whoever else is on them, so their numbers are a floor and not a measurement. They are here because they are the machines that found the bug below, not because they say anything about the code's speed.
+
+## The bug the fleet found
+
+The suite passed on the M4 and failed six checks on both EPYC machines, in two groups, with a syntax error at offset 1 of a document that is plainly well formed.
+
+The reader holds the document as an address, because that is how everything in this codebase passes a buffer around. Mojo destroys a local at its last use rather than at the end of the scope, and handing the buffer to `Reader.begin` is the last thing the compiler can see using it, so a buffer held in a local was freed before the first event came back and the parse then walked a block the allocator had already given to someone else. On the M4 the freed block still held the bytes and every check passed. On x86_64 Linux it did not.
+
+The fix is `keep` in `molla.sys.mem`, which counts as a use and does nothing else, and a note in the docstrings of `Reader.begin` and `dom.parse` saying when it is needed. It is needed for a buffer in a local and not for one that is a field of a connection, which is why the server was never going to hit this and a test hit it immediately.
+
+Worth saying plainly: nothing about this bug is x86 specific, and a run on one machine would have shipped it.
 
 ## What is still not covered
 
