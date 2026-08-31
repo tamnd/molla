@@ -101,3 +101,21 @@ The spec was written against release notes. Building against the real toolchain 
 **There is no `mojo format --check`.** Only `-q`. The CI equivalent is to format in place and assert the tree is still clean.
 
 **A plain function will not bind to a closure trait.** This is the one that cost real time. A top level `def` has a "thin" function type that is unique to that declaration, so you cannot collect functions into a table and call them generically, and `type_of` only gets you a type that matches exactly one function. That is why the test harness is assertion based instead of registering test functions. Worth remembering before designing anything else around a table of callbacks.
+
+**`def` does not raise unless it says so.** In older Mojo the difference between `fn` and `def` was that `def` could raise. With `fn` gone, `def` is the non raising default and `raises` is written explicitly, including on `main`.
+
+## FFI, found while writing the socket layer
+
+These came out of issue #2 and they apply to every module that touches libc, so they are here rather than only in `sockets.md`.
+
+**`read` and `write` are unreachable through `external_call`.** `std.ffi` already declares symbols with those names, and a second declaration with a different signature fails to lower, with the error pointing into the standard library rather than at your code. Sockets use `send` and `recv` instead. Anything else that needs those calls will need a different entry point too, so the GGUF reader should plan on `pread`.
+
+**Variadic libc functions need `num_fixed_args`.** `external_call` takes it as a keyword parameter and it matters most on arm64 macOS, where variadic arguments go on the stack while fixed arguments go in registers. Without it, `fcntl(fd, F_SETFL, flags)` puts the flags somewhere libc never looks, reads stack garbage instead, and returns success having done nothing. `open`, `ioctl`, and `syscall` are all variadic and all need the same treatment.
+
+**`stack_allocation` does not zero.** Any struct handed to a syscall has to be filled completely, including padding, or the call fails on whatever was left on the stack. This produced a `kevent` that worked in one function and returned EINVAL from another.
+
+**Pointers.** `UnsafePointer` is `Pointer[T, origin]`. `stack_allocation` returns `MutUntrackedOrigin` and `List.unsafe_ptr` returns an origin tied to the list, so functions that take either are generic over `MutOrigin`. Indexing, loads, stores, and offsets are all spelled `unsafe_`: `unsafe_offset=` in place of positional `[]`, `unsafe_load`, `unsafe_store`, `unsafe_bitcast`, and `unsafe_offset()` in place of pointer addition. A null pointer is `Pointer[T, MutAnyOrigin](unsafe_from_address=...)`.
+
+**Architecture predicates.** `CompilationTarget.is_x86()` exists. `is_aarch64`, `is_arm64`, and `is_x86_64` do not. This matters because the `epoll_event` layout depends on it.
+
+**You cannot move an element out of a `List` by index.** `list[i]^` is rejected because an index expression does not designate a value with an origin. Compacting a list of non copyable structs is done with `pop(i)` walking backwards.

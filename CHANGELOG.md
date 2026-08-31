@@ -11,6 +11,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 - A test runner, since Mojo 1.0 has no `mojo test`
 - CI builds and tests on all three platforms for real, and smoke tests the binary
 - `docs/validation/toolchain.md` recording the pin, the machines validated so far, and what Mojo 1.0 actually looks like against the release notes
+- `molla.sys`, the libc boundary: errno, descriptors, IPv4 TCP sockets, and one `Poller` over kqueue and epoll with read and write interest
+- `molla.net.echo`, a non blocking edge triggered TCP echo server, and `molla echo` to run it
+- `molla soak`, which holds a thousand connections for sixty seconds and checks for descriptor and memory leaks
+- `docs/validation/sockets.md` with the soak results on all three platforms and what the spike says about D1
 
 - Design document, roadmap, and milestone plan
 - CI with docs linting, workflow linting, CodeQL on workflow definitions, OpenSSF Scorecard, and dependency review
