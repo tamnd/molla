@@ -412,8 +412,8 @@ def run(mut suite: Suite) raises:
     two.close()
     _remove(v2_path)
 
-    # Cut in the middle of the key value block, so the header says there are
-    # fourteen keys and the file runs out somewhere around the fourth.
+    # Cut in the middle of the key value block, so the header promises sixteen
+    # keys and the file runs out somewhere around the fourth.
     var short_path = _temp_path("short")
     _write(short_path, _truncate(sample, 120))
     suite.check(_raises(short_path), "truncated inside the metadata")
