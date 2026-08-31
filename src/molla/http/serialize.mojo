@@ -120,6 +120,36 @@ def _decimal_width(value: Int) -> Int:
     return width
 
 
+def write_decimal(mut out: Buffer, value: Int) -> Bool:
+    """Decimal into a buffer, written in place rather than through a digit list.
+
+    The reverse-a-list version allocates, and a response with a Content-Length
+    allocating once per request is the thing #17 measures. A free function
+    because the streaming writers in `stream.mojo` need the same thing into
+    their own buffers, and one implementation is one place to get it wrong.
+    """
+    if value == 0:
+        return out.append_byte(UInt8(48))
+    var negative = value < 0
+    var n = -value if negative else value
+    var width = _decimal_width(n)
+    var total = width + 1 if negative else width
+    if not out.reserve(total):
+        return False
+    var at = out.length
+    var p = out.ptr()
+    if negative:
+        p.unsafe_store(at, UInt8(45))
+        at += 1
+    var i = at + width - 1
+    while n > 0:
+        p.unsafe_store(i, UInt8(48 + n % 10))
+        n //= 10
+        i -= 1
+    out.commit(total)
+    return True
+
+
 struct ResponseWriter(Movable):
     """A scratch buffer and the state needed to write one response into it."""
 
@@ -180,31 +210,7 @@ struct ResponseWriter(Movable):
         return self.out.append_str(CRLF)
 
     def write_int(mut self, value: Int) -> Bool:
-        """Decimal, written in place rather than through a digit list.
-
-        The reverse-a-list version allocates, and a response with a
-        Content-Length allocating once per request is the thing #17 measures.
-        """
-        if value == 0:
-            return self.out.append_byte(UInt8(48))
-        var negative = value < 0
-        var n = -value if negative else value
-        var width = _decimal_width(n)
-        var total = width + 1 if negative else width
-        if not self.out.reserve(total):
-            return False
-        var at = self.out.length
-        var p = self.out.ptr()
-        if negative:
-            p.unsafe_store(at, UInt8(45))
-            at += 1
-        var i = at + width - 1
-        while n > 0:
-            p.unsafe_store(i, UInt8(48 + n % 10))
-            n //= 10
-            i -= 1
-        self.out.commit(total)
-        return True
+        return write_decimal(self.out, value)
 
     def header(mut self, name: StringSpan, value: StringSpan) -> Bool:
         if not self.out.append_str(name):

@@ -84,6 +84,13 @@ struct Connection(Movable):
     Tracked so interest is only changed when the answer changes, since a
     register call per pass is a syscall per pass for nothing."""
 
+    var producing: Bool
+    """The protocol has more to write that no readiness event is going to ask
+    for. A streaming response is the case: the client sent one request and is
+    not going to send another, and once the ring drains into the socket there is
+    no edge left to come back on. Set it and the reactor calls `on_writable`
+    while there is room, whether or not the poller said anything."""
+
     var bytes_in: Int
     var bytes_out: Int
     var short_writes: Int
@@ -111,6 +118,7 @@ struct Connection(Movable):
         self.closing = False
         self.closed = False
         self.write_interest = False
+        self.producing = False
         self.bytes_in = 0
         self.bytes_out = 0
         self.short_writes = 0
@@ -174,6 +182,15 @@ struct Connection(Movable):
 
     def queue_str(mut self, text: StringSpan) -> Int:
         return self.output.push_str(text)
+
+    def produce(mut self, more: Bool):
+        """Say whether there is more to write on the protocol's own initiative.
+
+        Cheaper and narrower than a fifth call on the trait. The reactor needs
+        one bit to tell a connection that is finished from one that is waiting
+        on nothing but its own producer, and this is that bit.
+        """
+        self.producing = more
 
     def writable(self) -> Int:
         """Room left in the output ring. What a protocol checks before

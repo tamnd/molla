@@ -455,6 +455,7 @@ struct Reactor[P: Protocol](Movable):
             rounds += 1
             var input_before = self.conns[slot].input.length
             var output_before = self.conns[slot].pending()
+            var wrote_any = 0
 
             if input_before > 0 and self.conns[slot].writable() > 0:
                 keep = self.proto.on_readable(self.conns[slot])
@@ -463,9 +464,12 @@ struct Reactor[P: Protocol](Movable):
 
             # `on_writable` is for a protocol that produces without being asked,
             # which is what a streaming response is. It only makes sense when
-            # there is somewhere to put the output, and only in a pass where the
-            # socket said it had room.
-            if writable and self.conns[slot].writable() > 0:
+            # there is somewhere to put the output, so either the socket said it
+            # had room or the protocol said it has more, and in the second case
+            # there is no edge coming and waiting for one is the hang.
+            if (writable or self.conns[slot].producing) and self.conns[
+                slot
+            ].writable() > 0:
                 keep = self.proto.on_writable(self.conns[slot])
                 if not keep:
                     break
@@ -476,11 +480,18 @@ struct Reactor[P: Protocol](Movable):
                     self._close_slot(slot)
                     return
                 if wrote > 0:
+                    wrote_any = wrote
                     self.conns[slot].touch(now)
 
+            # Bytes leaving the ring count as progress. Without that, a producer
+            # that fills the ring and has it drained inside the same round looks
+            # identical to one that did nothing, since both start and end the
+            # round with an empty ring, and the loop stops with the stream half
+            # written and nothing scheduled to finish it.
             moving = (
                 self.conns[slot].input.length != input_before
                 or self.conns[slot].pending() != output_before
+                or wrote_any > 0
             )
 
         if keep and moving and rounds == SERVICE_ROUNDS:

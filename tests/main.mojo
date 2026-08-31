@@ -17,6 +17,7 @@ import test_net
 import test_reactor
 import test_registry
 import test_sha256
+import test_stream
 import test_sys
 
 
@@ -55,5 +56,6 @@ def main():
         test_reactor.run(suite)
     except e:
         suite.fail("test_reactor", String(e))
+    test_stream.run(suite)
 
     finish(suite)
