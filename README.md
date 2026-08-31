@@ -96,7 +96,7 @@ pixi run test
 ./build/molla version
 ```
 
-That builds and runs today on macOS arm64, Linux x86_64, and Linux arm64. It does not serve a model yet. `molla version` prints the toolchain and what it detected about your machine. `molla echo` runs the M0 socket spike, which is a TCP echo server, `molla http` runs the M0 throughput spike, which answers every request with the same fixed body, and `molla gguf <path>` prints the metadata and tensor directory of a model file. None of them is a molla feature. See [docs/validation/toolchain.md](docs/validation/toolchain.md) for the pinned version, the machines it has actually been run on, and the notes on what Mojo 1.0 turned out to look like in practice.
+That builds and runs today on macOS arm64, Linux x86_64, and Linux arm64. It does not serve a model yet. `molla version` prints the toolchain and what it detected about your machine. `molla echo` runs the M0 socket spike, which is a TCP echo server, `molla http` runs the M0 throughput spike, which answers every request with the same fixed body, `molla gguf <path>` prints the metadata and tensor directory of a model file, `molla tls <host>` connects over HTTPS and prints what was negotiated, and `molla pull <ref>` fetches a blob from ghcr.io and checks its digest. None of them is a molla feature. See [docs/validation/toolchain.md](docs/validation/toolchain.md) for the pinned version, the machines it has actually been run on, and the notes on what Mojo 1.0 turned out to look like in practice.
 
 ## Contributing
 

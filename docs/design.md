@@ -20,6 +20,8 @@ We rejected a Go control plane, and then a Rust one. Rust remains the documented
 
 **Reversal condition, decided at the M1 gate.** If sustained HTTP throughput on the M4 is under 5000 requests per second for a trivial handler, or the TLS FFI binding proves unstable across macOS and Linux, or memory safety diagnostics make a non blocking multi threaded socket server impractical in Mojo 1.0, then the network edge moves to Rust and Mojo keeps the engine and kernels. The module boundaries are drawn so that swap costs weeks rather than a rewrite.
 
+**TLS, answered at M0.** The binding holds. `molla pull` fetches and verifies a blob from ghcr.io through OpenSSL 3.x, OpenSSL 1.1.1 and Secure Transport, all dlopened, with no C in the build and no bundled CA list. One limit came out of it: Secure Transport has no TLS 1.3, and the Apple framework that does is built on Objective-C blocks, which Mojo cannot emit, so macOS caps at TLS 1.2 until someone solves that. Details in [validation/tls.md](validation/tls.md).
+
 ## D2: open APIs are the product surface
 
 molla speaks OpenAI HTTP, Anthropic Messages, and MCP revision 2026-07-28, as both an MCP server and an MCP client. These are the interfaces the ecosystem already targets. Implementing them means every SDK, IDE plugin, and agent runtime works without anyone adopting a molla specific client.

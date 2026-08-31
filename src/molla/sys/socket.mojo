@@ -268,3 +268,81 @@ def connect(fd: Int, addr_host_order: UInt32, port: UInt16) -> Int:
     return Int(
         external_call["connect", c_int](c_int(fd), sa, c_int(SOCKADDR_IN_SIZE))
     )
+
+
+def _so_rcvtimeo() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 0x1006
+    else:
+        return 20
+
+
+def _so_sndtimeo() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 0x1005
+    else:
+        return 21
+
+
+comptime SO_RCVTIMEO = _so_rcvtimeo()
+comptime SO_SNDTIMEO = _so_sndtimeo()
+
+comptime TIMEVAL_SIZE = 16
+"""struct timeval is 16 bytes on both platforms, though not for the same reason.
+Linux has two 8 byte fields. macOS has an 8 byte seconds field and a 4 byte
+microseconds field with 4 bytes of padding. Writing seconds into the first 8
+bytes and zeroing the rest is correct on both."""
+
+
+def set_timeout(fd: Int, option: Int, seconds: Int) raises:
+    """Put a wall clock limit on a blocking send or receive."""
+    var tv = stack_allocation[TIMEVAL_SIZE, UInt8]()
+    for i in range(TIMEVAL_SIZE):
+        tv.unsafe_store(i, UInt8(0))
+    tv.unsafe_bitcast[Int64]().unsafe_store(0, Int64(seconds))
+    var rc = Int(
+        external_call["setsockopt", c_int](
+            c_int(fd),
+            c_int(SOL_SOCKET),
+            c_int(option),
+            tv,
+            c_int(TIMEVAL_SIZE),
+        )
+    )
+    if rc < 0:
+        raise Error("setsockopt timeout failed: " + errno_name(get_errno()))
+
+
+def dial(
+    addr_host_order: UInt32, port: UInt16, timeout_seconds: Int
+) raises -> Int:
+    """Open a blocking connected TCP socket, with send and receive timeouts.
+
+    Blocking on purpose. The server side is non blocking because it holds
+    thousands of connections in one thread, and none of that applies to a client
+    that opens one connection, pulls a blob and closes it. A blocking socket also
+    makes the TLS layer above simple, since neither OpenSSL nor Secure Transport
+    then has to be driven through a retry loop for every partial record. The
+    timeouts are what stops a dead peer hanging the process forever.
+    """
+    var fd = Int(
+        external_call["socket", c_int](
+            c_int(AF_INET), c_int(SOCK_STREAM), c_int(0)
+        )
+    )
+    if fd < 0:
+        raise Error("socket failed: " + errno_name(get_errno()))
+
+    try:
+        set_timeout(fd, SO_RCVTIMEO, timeout_seconds)
+        set_timeout(fd, SO_SNDTIMEO, timeout_seconds)
+        set_nodelay(fd)
+    except e:
+        _ = close(fd)
+        raise e
+
+    if connect(fd, addr_host_order, port) < 0:
+        var code = get_errno()
+        _ = close(fd)
+        raise Error("connect failed: " + errno_name(code))
+    return fd
