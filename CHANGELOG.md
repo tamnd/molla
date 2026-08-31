@@ -4,13 +4,27 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.1.2] - 2026-09-01
+
+The event loop the request path will run on. One reactor per worker thread, each owning its poller, its connection table and its timers, with nothing shared on the request path.
+
+There is still no request. This is the layer HTTP gets written against, and the reason it is tagged on its own is that it is the last piece that can be validated purely against a kernel, before anything above it can hide a bug in it.
+
+Three things came out of building it. Servicing a connection cannot be a single pass over a readiness event, which is the shape every event loop tutorial has, because a connection that reads more than its output ring holds ends up with no read edge and no write edge coming and a response half written. It never happens under light load and happens every time under the load that makes it worst. The backpressure test that catches it was only honest on one platform until the socket buffers were pinned at both ends, since Linux starts them larger and grows them, so the amount of data needed to provoke a short write is different on every machine. And a test that waits for another thread has to wait in milliseconds rather than in loop iterations, because the two convert at a rate that depends on how loaded the machine is, and the budget runs out soonest on the machine that needed it to last longest.
+
+A thousand connections held for an hour on the M4 and on server1, no mismatched payloads across 657195369 and 59256042 round trips, no descriptor growth, and a p99 flat to the bucket across all ten segments of both runs.
+
 ### Added
 
 - `molla.net` gets a real reactor. One event loop per worker thread, each owning its poller, its connection table and its timers, with no shared state on the request path. `reactor.mojo` is the loop and the four call protocol trait everything above it will be written against. `conn.mojo` is one connection and the four states a non blocking socket can be in. `listener.mojo` decides how connections are spread, which is SO_REUSEPORT sharding on Linux and a round robin handoff on macOS because macOS gives the last binder every connection instead of balancing. `server.mojo` is N reactors on N threads behind one address, TCP or unix.
 - `molla.net.wheel`, a four level timing wheel at 100 ms resolution. An idle connection costs one entry in a slab and no timer descriptor, which is what makes a thousand idle keep alive connections free rather than a thousand syscalls per second.
 - `molla netsoak`, the acceptance test for issue #10. A thousand connections with mixed idle and active traffic, latency compared across ten segments of the run so drift shows up as a number, and descriptors and peak memory checked at the end.
 - `tests/test_reactor.mojo`, 61 checks on macOS and 62 on Linux over the wheel against an explicit clock, the reactor stepped by hand, backpressure, idle timeouts, unix sockets and the threaded server.
-- `set_keepalive` and `listen_tcp_shared` in `molla.sys.socket`, and `monotonic_ms` in `molla.sys.clock`.
+- `set_keepalive`, `listen_tcp_shared` and `set_buffer_size` in `molla.sys.socket`, and `monotonic_ms` in `molla.sys.clock`. `set_buffer_size` exists because an accepted socket inherits its send and receive buffers from the listener, which is the only way to make a backpressure test hit the same wall on both platforms.
+
+### Fixed
+
+- The threaded server tests waited for a worker thread by counting empty non blocking reads rather than by watching a clock, so on a loaded runner the whole budget could burn through before the thread that owed the answer was scheduled at all. Both waits now run against a monotonic deadline and sleep between attempts instead of spinning on the core the worker needs.
 
 ## [0.1.1] - 2026-08-31
 
