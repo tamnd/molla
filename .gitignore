@@ -1,11 +1,13 @@
 # Build output
+/build/
 /target/
 /dist/
 *.mojopkg
 *.o
 *.a
 
-# Pixi
+# Pixi. The lock file is committed on purpose, that is the whole point of
+# pinning the toolchain.
 /.pixi/
 pixi.lock.bak
 

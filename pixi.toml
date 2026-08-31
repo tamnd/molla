@@ -1,0 +1,30 @@
+[workspace]
+name = "molla"
+version = "0.0.1"
+description = "Local inference server in pure Mojo"
+authors = ["tamnd <1218621+tamnd@users.noreply.github.com>"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+# Pinned to an exact version on purpose. A toolchain change is a deliberate
+# commit with a green CI run behind it, not something that happens on a Tuesday
+# because someone ran an update. See docs/validation/toolchain.md.
+mojo = "==1.0.0"
+
+[tasks]
+mkbuild = { cmd = "mkdir -p build" }
+build = { cmd = "mojo build -I src src/molla/main.mojo -o build/molla", depends-on = [
+    "mkbuild",
+] }
+run = "mojo run -I src src/molla/main.mojo"
+# Mojo 1.0 has no test command, so the suite is a binary that exits nonzero on
+# failure. See tests/harness.mojo.
+test = "mojo run -I src -I tests tests/main.mojo"
+fmt = "mojo format -q src tests"
+# `mojo format` has no check mode, so formatting in place and asserting a clean
+# tree is the honest equivalent. CI runs this on a clean checkout.
+fmt-check = "mojo format -q src tests && git diff --exit-code -- src tests"
+# What we paste into docs/validation/toolchain.md when adding a machine.
+toolchain = "mojo --version"
+check = { depends-on = ["fmt-check", "build", "test"] }

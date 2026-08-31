@@ -79,17 +79,20 @@ See [docs/design.md](docs/design.md) for the reasoning and [docs/roadmap.md](doc
 
 Tier 1 means every kernel is tuned, numerics run in CI on real hardware, and performance regressions block merges. Tier 2 means correct and tested at milestone boundaries, but not performance gated. AMD is tier 2 because we do not have the hardware, which is a real gap and not a hedge. Apple GPU is tier 1 but carries the most risk, because the toolchain supports it while upstream nightly CI does not cover it.
 
-Windows is WSL only, matching the toolchain.
+Windows is WSL only, matching the toolchain. That is not a hypothetical: the only NVIDIA GPU we develop against is an RTX 4090 in a Windows machine, reached through WSL2. So every CUDA result molla publishes is a WSL2 result until someone puts a card in a Linux box, and we label them that way rather than rounding up to "Linux CUDA". The machines are listed in [docs/validation/toolchain.md](docs/validation/toolchain.md).
 
 ## Building
 
-There is nothing to build yet. Once M0 lands:
+You need [pixi](https://pixi.sh). It pulls the pinned Mojo toolchain, so there is nothing else to install.
 
-```
+```console
 pixi install
 pixi run build
 pixi run test
+./build/molla version
 ```
+
+That builds and runs today on macOS arm64, Linux x86_64, and Linux arm64. It does not serve anything yet. `molla version` prints the toolchain and what it detected about your machine, which is all M0 promises. See [docs/validation/toolchain.md](docs/validation/toolchain.md) for the pinned version, the machines it has actually been run on, and the notes on what Mojo 1.0 turned out to look like in practice.
 
 ## Contributing
 

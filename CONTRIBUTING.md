@@ -45,7 +45,7 @@ Comment the surprising parts. If you spent an hour working out why something has
 
 Once M0 lands:
 
-```
+```console
 pixi install
 pixi run build
 pixi run test

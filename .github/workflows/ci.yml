@@ -13,9 +13,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-env:
-  # Bump this to move the whole matrix onto a new toolchain in one commit.
-  MOJO_VERSION: "1.0"
+# The toolchain version lives in pixi.toml and nowhere else. Two places to bump
+# is one place to forget. See docs/validation/toolchain.md.
 
 jobs:
   docs:
@@ -78,9 +77,6 @@ jobs:
           if [ ${#files[@]} -eq 0 ]; then echo "no shell scripts yet"; exit 0; fi
           shellcheck "${files[@]}"
 
-  # Activates automatically once the first Mojo source lands in M0.
-  # Until then it reports skipped rather than red, because a build job
-  # with nothing to build is not a failure.
   build:
     name: Build and test (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -104,40 +100,43 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: Check for sources
-        id: sources
-        shell: bash
-        run: |
-          if [ -f pixi.toml ] && compgen -G "src/**/*.mojo" > /dev/null; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "No Mojo sources yet, skipping. This job activates with M0."
-          fi
       - uses: prefix-dev/setup-pixi@194d461b21b6c5717c722ffc597fa91ed2ff29fa # v0.9.1
-        if: steps.sources.outputs.present == 'true'
         with:
           cache: true
+          # Fail rather than silently resolving something new. The lock file is
+          # committed so every runner gets the same toolchain.
+          locked: true
+      - name: Toolchain
+        run: pixi run toolchain
+      # `mojo format` has no check mode, so we format and assert the tree is
+      # still clean. Only on Linux x86, since formatting is platform independent
+      # and running it three times just gives three chances to be flaky.
+      - name: Formatting
+        if: matrix.name == 'linux-x86_64'
+        run: pixi run fmt-check
       - name: Build
-        if: steps.sources.outputs.present == 'true'
         run: pixi run build
       - name: Test
-        if: steps.sources.outputs.present == 'true'
         run: pixi run test
-      - name: Upload test results
-        if: steps.sources.outputs.present == 'true' && always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: test-results-${{ matrix.name }}
-          path: target/test-results/
-          if-no-files-found: ignore
+      # The build is worthless if the binary does not start. Cheap to check.
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          ./build/molla version
+          ./build/molla help
+          if ./build/molla definitely-not-a-command 2>/dev/null; then
+            echo "an unknown command should exit nonzero"
+            exit 1
+          fi
 
   # Numerics and performance need real devices, so they run on the fleet
   # rather than on hosted runners. See D7 and D8 in docs/design.md.
   # Gated on the label so forks and doc changes do not queue on hardware.
   hardware:
     name: Hardware suite (${{ matrix.device }})
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'needs: hardware')
+    # Quoted because the label name contains a colon and space, which would
+    # otherwise end the YAML scalar right here.
+    if: "github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'needs: hardware')"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
@@ -154,27 +153,33 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: Check for sources
-        id: sources
+      # The numerics and bench tasks arrive with the kernel work in M0 and M2.
+      # Until they exist this job proves the fleet runner can build, which is
+      # the thing most likely to be quietly broken when we come to need it.
+      - name: Check for hardware tasks
+        id: tasks
         shell: bash
         run: |
-          if [ -f pixi.toml ] && compgen -G "src/**/*.mojo" > /dev/null; then
+          if pixi task list 2>/dev/null | grep -q 'test-numerics'; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No hardware tasks defined yet, building only."
           fi
+      - name: Build
+        run: pixi run build
       - name: Numerics
-        if: steps.sources.outputs.present == 'true'
+        if: steps.tasks.outputs.present == 'true'
         run: pixi run test-numerics
       - name: Benchmarks
-        if: steps.sources.outputs.present == 'true'
-        run: pixi run bench --json target/bench.json
+        if: steps.tasks.outputs.present == 'true'
+        run: pixi run bench --json build/bench.json
       - name: Upload benchmark results
-        if: steps.sources.outputs.present == 'true'
+        if: steps.tasks.outputs.present == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bench-${{ matrix.device }}
-          path: target/bench.json
+          path: build/bench.json
           if-no-files-found: ignore
 
   # Single required check, so branch protection needs one entry and the

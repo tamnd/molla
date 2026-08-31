@@ -66,7 +66,9 @@ A target that cannot pass numerics is listed as unsupported. It does not ship as
 
 ## D8: real hardware gates every milestone
 
-No milestone closes without passing on at least two device classes, one of which is a GPU. The fleet is an M4 MacBook Air, a box with an RTX 4090, and Linux servers. CI runs on the Linux servers, with M4 and 4090 runs required at milestone boundaries.
+No milestone closes without passing on at least two device classes, one of which is a GPU. The fleet is an M4 MacBook Air, three CPU only Linux servers, and an RTX 4090 reached through WSL2 on a Windows machine. CI runs on the Linux servers, with M4 and 4090 runs required at milestone boundaries. See [docs/validation/toolchain.md](validation/toolchain.md) for what each machine actually is.
+
+Two consequences of that fleet are worth stating plainly rather than discovering later. Every CUDA number we produce is a WSL2 number, because that is the only NVIDIA GPU we have, and WSL2 does not have the same transfer or pinned memory behaviour as a bare metal Linux host. We label those results as WSL2 results. And three of the five machines have no GPU at all, which keeps the CPU path honest but also means CPU is the path that gets the most incidental testing while the GPU paths get the least.
 
 This exists because Apple GPU support is documented but not covered by upstream nightly CI, and consumer NVIDIA is described upstream as known compatible for development rather than tested for serving. Those are exactly the conditions where paper support and real support drift apart.
 
@@ -78,7 +80,7 @@ No telemetry. No account. No outbound connection except pulls you asked for. Loo
 
 One process, one language, layered so each layer could be replaced. Arrows point downward only. The API layer never touches the engine directly, it goes through the scheduler, and the engine never parses HTTP or JSON. A build lint checks this, because layering that is not enforced does not exist.
 
-```
+```text
 edge        sys, tls, io, net, http, json, uri, time, log, metrics
 api         openai, anthropic, mcp, admin, compat.ollama
 semantics   jinja, chat, tokenizer, parse, grammar
@@ -106,5 +108,7 @@ A connection is a state machine struct rather than a suspended stack, since ther
 Stating this is part of the point, since a one sided comparison is the thing we are objecting to.
 
 The toolchain is single vendor. Mojo is Apache-2.0 but developed primarily by Modular, so a change of direction affects molla in a way it would not affect a Rust or C++ project. We mitigate with pinned toolchain versions, a vendored kernel snapshot, and keeping D1's reversal path alive, but the risk is real.
+
+Worse than that, and only found once we actually installed it: the Mojo compiler we build with is not the open source one. The language and standard library are Apache-2.0, but the prebuilt package on Modular's conda channel is distributed under `LicenseRef-Modular-Proprietary`, and that is what `pixi install` pulls. So molla's source and molla's dependencies are Apache-2.0 while its compiler is not, which makes the README's "Apache-2.0 all the way down" true of the artifact and not yet true of the build. Building the toolchain from the open source tree closes the gap. We have not done it. Until we do, this is the largest hole in the openness charter and it is tracked in `docs/validation/toolchain.md`.
 
 Apple GPU support depends on a path that upstream nightly CI does not cover. AMD is tier 2 for lack of hardware. And we do not host a registry, which avoids lock-in but does mean molla is less turnkey than a tool with a curated library. Refusing to default to any registry is a deliberate convenience cost.
