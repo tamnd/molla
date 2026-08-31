@@ -4,7 +4,11 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- `molla.sys.mmap`, a read only whole file memory map
+- `molla.model.gguf`, a GGUF v2 and v3 metadata reader that walks the header, the key value block and the tensor directory in place without copying the file, and `molla gguf <path>` to dump one
+- `docs/validation/gguf.md` with the comparison against `gguf-dump` on four models covering bert, llama, gemma3 and qwen2, and what the zero copy read is actually worth
 
 ## [0.0.1] - 2026-08-31
 

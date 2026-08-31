@@ -10,6 +10,7 @@ from std.sys import argv, exit
 from molla.build_info import MOJO_PIN, VERSION
 from molla.host import detect
 from molla.http.server import run_http
+from molla.model.gguf import run_gguf
 from molla.net.echo import run_echo
 from molla.net.soak import run_soak
 from molla.sys.poll import USES_KQUEUE
@@ -39,6 +40,9 @@ def print_usage():
     print("  echo [port]     run the M0 TCP echo spike on 127.0.0.1")
     print("  soak [n] [sec]  hold n echo connections for sec seconds")
     print("  http [port]     run the M0 HTTP/1.1 spike on 127.0.0.1")
+    print(
+        "  gguf <path>     print the metadata and tensor directory of a model"
+    )
     print("  help            print this message")
     print()
     print("Nothing serves yet. See the roadmap for what lands when:")
@@ -111,6 +115,15 @@ def main():
             run_http(http_port)
         except e:
             print("molla http:", e)
+            exit(1)
+    elif command == "gguf":
+        if len(args) < 3:
+            print("molla gguf: expected a path to a .gguf file")
+            exit(2)
+        try:
+            run_gguf(args[2])
+        except e:
+            print("molla gguf:", e)
             exit(1)
     else:
         print("molla: unknown command '", command, "'", sep="")
