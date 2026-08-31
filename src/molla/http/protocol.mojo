@@ -439,8 +439,9 @@ struct HttpProtocol(Movable, Protocol):
         """The stand in handler.
 
         Three routes and a 404, which is enough to exercise framing end to end
-        and is deliberately not a router. #13 replaces this with one, and the
-        seam is here so that when it does, nothing above or below has to move.
+        and is deliberately not a router. The API routes in M2 replace this
+        with one, and the seam is here so that when they do, nothing above or
+        below has to move.
         """
         if health:
             _ = self.states[slot].writer.respond_str(

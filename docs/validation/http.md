@@ -68,7 +68,7 @@ This matches what the socket soak in #2 already found, where server3 managed 718
 
 Note that `getpid` is useless as a syscall probe on macOS, where it is served from the commpage and times at 1.16ns. The numbers above use `close(-1)` for that reason.
 
-## What is not covered
+## What is not covered by the spike
 
 There is no request body handling beyond counting `Content-Length` and skipping the bytes, no chunked decoding, no compression, no routing and no TLS. Each is M1 work. The handler is a constant, so none of the numbers above include anything an application would do.
 
@@ -83,3 +83,102 @@ The p99 numbers on the M4 are not a property of the server and should not be quo
 The request path is not where the difficulty is. The parser is a few hundred lines, it is zero copy, it holds up under the smuggling cases, and it never appeared in a profile. Both of the things that actually cost throughput were memory and socket behaviour, and both were fixed by writing less code rather than more.
 
 The gate wanted 5000 requests per second. The worst measurement taken on a heavily loaded laptop was 43705 and the best was 249896. This is not close, and D1 should not be decided on throughput grounds.
+
+## M1: the parser that has to hold up
+
+Everything above is the spike. Issue #11 replaced the parser and built the four things that go around it, and the difference in intent is worth stating plainly. The spike parser had to be fast enough to measure the socket. This one has to be correct against a client that is trying to get something past it.
+
+### Where the message boundary is decided
+
+The single largest change is that `parse` now stops at the blank line and does not wait for the body. It records how the body is framed, in `body_kind` and `content_length`, and returns. `BodyReader` reads the body after that.
+
+This is not a tidying. A parser that consumes the whole message cannot handle a body larger than the buffer it is parsing out of, which means either a cap on upload size set by the read buffer or a read buffer the size of the largest upload. An inference server is sent images and audio, so both of those are wrong. Splitting the two makes the memory cost of a body a property of `BodyReader` rather than of the connection.
+
+### What the parser refuses now, and why each one
+
+Every rule below is something two implementations can disagree about. That disagreement is the whole of request smuggling: a front end reads a byte stream as one request, molla reads it as two, and the second one is attributable to whoever's connection it lands in.
+
+| Input | Answer | Why |
+| --- | --- | --- |
+| Bare LF anywhere, in the request line or a header | 400 | RFC 9112 says a recipient MAY treat it as a terminator. Both readings are legal, which is exactly what makes it useful to an attacker. molla takes neither. |
+| Bare CR inside a field | 400 | Same argument, and a lone CR is also how a value gets read as the start of a new header. |
+| `Content-Length` with `Transfer-Encoding` | 400 | The original smuggling pair. Preferring one is legal and is what the front end on the other side also did, differently. |
+| Duplicate `Content-Length` | 400 | Even with equal values, because agreeing to read the second one is a rule the other hop may not have. |
+| Duplicate `Transfer-Encoding` | 400 | Same. |
+| `Transfer-Encoding` that is not exactly `chunked` | 501 | `gzip, chunked` is legal and molla does not decode it. Reading a compressed stream as chunk headers is the failure mode being avoided. |
+| Space or tab before the colon | 400 | `Content-Length : 5` is a header to some parsers and not to others. |
+| Obsolete line folding, a field starting with SP or HTAB | 400 | Deprecated by RFC 9112 and a reliable way to hide a second header inside a first. |
+| HTTP/1.1 with zero or two `Host` headers | 400 | Zero is what a smuggled request looks like after a front end strips the outer one. Two is a request two hops route to different places. |
+| A control character or NUL anywhere in a field | 400 | Header injection, and the NUL case specifically splits a C string parser from a length based one. |
+| `Expect` that is not `100-continue` | 417 | The client is blocked waiting for an answer. Ignoring it hangs them until a timeout. |
+| More than 8 KiB of request line, 64 KiB of headers, or 128 headers | 431 | Bounds, so a client cannot dribble headers forever. |
+| A well formed version we do not speak | 505 | RFC 9110 section 15.6.6, carried over from the spike. |
+
+The hostile corpus in `tests/test_http.mojo` is one case per row, and it asserts the status as well as the refusal. A 400 where a 501 belongs is a smaller bug than accepting the input, but it is still a wrong answer and the test says so.
+
+### SIMD scanning
+
+`molla.http.scan` finds delimiters sixteen bytes at a time. A scalar loop over a header block is a dependent branch per byte, which is the pattern a branch predictor is worst at, and header parsing is nothing but that loop.
+
+Two Mojo details are worth recording because both cost time. `simd_width_of` lives in `std.sys.info` and not in `std.sys`. And `chunk == target` on two SIMD values returns a plain `Bool`, not a mask: the mask comes from `.eq()`, `.ne()`, `.lt()` and `.gt()`. Writing `chunk < space` fails at compile time with a message that says so, which is the good case. Writing `chunk == target` compiles and gives an answer about the whole vector, which is not.
+
+The tail is a plain byte loop rather than a masked load. A masked load needs the mask built per call and buys back at most fifteen bytes of a scan that is already bounded by the header block, and being able to read the tail handling is worth more here than the instructions are.
+
+### Bodies
+
+`BodyReader` handles the three framings behind one call: hand it what arrived, it says how much it took and whether the body is finished. Bytes past the end of the body are left alone, which is what makes a pipelined request behind a body work at all.
+
+Under a megabyte the body accumulates in memory. Over it, everything collected so far is written to a file and every byte after goes straight there, so peak memory for a body is bounded by the threshold and not by the body. The file is opened `O_EXCL` with mode 600 and retried on a collision, because a thousand connections on four threads can reach that line in the same millisecond with the same byte count behind them, and any name built from what the reader knows about itself is a name another reader can build too. The file is unlinked when the reader is destroyed. When the content addressed store lands in M3 the spill target becomes a store blob, which is the same write with a digest running over it, and nothing above `BodyReader` changes.
+
+Chunked framing is a small state machine and a large attack surface. The size line is hex and nothing else: no leading plus, no whitespace, no `0x`, and at most sixteen digits so the accumulator cannot wrap. Chunk extensions are skipped and never interpreted. The trailer section is read and discarded rather than merged into the header set, because a trailer that lands in the headers is how a header a front end already checked gets replaced after the check.
+
+### multipart
+
+`molla.http.multipart` is a streaming parser fed decoded body bytes. It holds back the last `len(boundary) + 6` bytes of every feed and prepends them to the next, so a boundary landing across two reads is still found. Each part spills on the same threshold a whole body does.
+
+It allocates, and that is deliberate. A part's headers become owned strings because a part header can be split across feeds and a span into a consumed buffer points at nothing. A request that reaches this code is already doing megabytes of I/O and a few short strings are not what makes it slow. The zero allocation claim is about the JSON request path, and this is not it.
+
+Nested multipart, `multipart/byteranges`, and the base64 and quoted-printable content transfer encodings are all refused rather than read wrongly. The last one matters: reading a part as raw bytes when the sender said it was base64 hands a handler the wrong content with no sign that it did.
+
+### The response path allocates nothing
+
+`ResponseWriter` assembles a response into a buffer that belongs to the connection and is reused for the life of it. After the first few requests the buffer has grown to whatever that client's responses need and stops growing.
+
+The test warms up eight responses and then measures two thousand more, and asserts the allocation counter is unchanged. Stating it that way rather than measuring from the first request is the honest version: the first few responses on a connection do allocate, once, and a number that hid that would depend on the initial capacity rather than on the code.
+
+Getting there needed one specific thing. Writing a decimal number by building a list of digits and reversing it allocates once per number, and a response carries at least a status and a Content-Length. `write_int` computes the width and writes the digits into place instead.
+
+`Date` is formatted at most once a second and held as bytes. HEAD is decided once, at `start`, and `body` then counts the bytes without writing them, so no call site has to remember. A HEAD that sends a body does not produce a wrong page, it desynchronises the connection, and the next request on it is read out of the middle of the body.
+
+### On the reactor
+
+`molla.http.protocol` implements the four calls in `Protocol` and gets the event loop, the sharded accept, the idle timer and the write ring from #9. Keep alive with a request cap, pipelining, `Expect: 100-continue` answered before the body is read, HEAD, and a framing error that closes the connection instead of reading what is behind it.
+
+One thing about the reactor boundary is worth writing down because the first version got it wrong and the tests caught it. A protocol that wants to close after answering must call `conn.finish()` and return True, not return False. Returning False tells the reactor to stop servicing the connection, and it stops before the flush, so the response saying the connection is closing never leaves the ring and the client waits for a reply that is sitting in a buffer. `finish` says the same thing without cutting the write short: the reactor drains what is queued and closes after. `EchoProtocol` never closes, so nothing had exercised this path before.
+
+The other is per connection state. The reactor holds one protocol object per worker thread, so anything that outlives a call is indexed by `conn.slot`, and `on_open` resets the entry rather than trusting what the last connection in that slot left behind.
+
+Header spans are offsets into the read buffer, so they are valid only until it is consumed. A request with no body, which is every GET and HEAD, consumes nothing before the response is written and copies nothing at all. A request with a body has to consume as the body arrives or the read buffer grows to the size of the upload, so the method and target are copied into a per connection buffer first. That buffer is reused like the writer is, so it is a memcpy of a few dozen bytes.
+
+### Where it was run
+
+`tests/test_http.mojo` grew from 472 lines to roughly 1370 and the suite from 474 checks to 595. The whole suite was run on the M4 and on three Linux machines.
+
+| Machine | Result |
+| --- | --- |
+| M4, macOS, kqueue | 595 passed, 0 failed |
+| server1, EPYC, epoll | 596 passed, 0 failed |
+| server2, EPYC, epoll | 596 passed, 0 failed |
+| gpc, i9-13900K on WSL2, epoll | 595 passed, 1 failed |
+
+Linux runs one more check than macOS because the reactor suite has a Linux only case for SO_REUSEPORT sharding. The gpc failure is `net.reactor backpressure, and the ring filled up behind it`, it is not in this issue's code, and it fails the same way on main at 474 passed and 1 failed. WSL2 does not honour the 8 kB SO_SNDBUF the test pins, so the kernel takes the whole write and the ring never fills. That is a test portability bug against WSL2 rather than a reactor bug, and it is filed as #87.
+
+### What is still not covered
+
+No routing, no compression, no TLS termination, no HTTP/2. Routing arrives with the API routes in M2, `molla.tls` is a client and has nothing to do with terminating TLS on the listener, and HTTP/2 is refused by the issue for reasons that have not changed: it buys nothing for a loopback inference server with one long stream per request and costs HPACK, flow control and a settings state machine.
+
+Streaming responses are #12. `ResponseWriter` can already write a chunked body, so SSE and NDJSON are framing on top of what is here rather than another pass over the response path.
+
+The connection cap is a count of requests and not a byte budget, so a client can hold a slot for a long time within it. The idle timeout is the reactor's and covers a silent connection, not a slow one.
+
+`molla.http.server`, the M0 spike, now answers 501 to a request with a body rather than half reading one, because the parser no longer consumes the body. It is kept as the evidence behind the throughput numbers above and should not be used for anything else.
