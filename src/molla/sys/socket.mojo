@@ -72,6 +72,13 @@ def _so_reuseport() -> Int:
         return 15
 
 
+def _so_keepalive() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 0x0008
+    else:
+        return 9
+
+
 comptime IPPROTO_TCP = 6
 comptime TCP_NODELAY = 1
 """Same numbers on macOS and Linux, unlike most of the socket option space."""
@@ -79,6 +86,9 @@ comptime TCP_NODELAY = 1
 comptime SOL_SOCKET = _sol_socket()
 comptime SO_REUSEADDR = _so_reuseaddr()
 comptime SO_REUSEPORT = _so_reuseport()
+comptime SO_KEEPALIVE = _so_keepalive()
+"""8 on macOS and 9 on Linux. The two platforms agree on TCP_NODELAY and on
+almost nothing else in this space."""
 
 comptime INADDR_LOOPBACK: UInt32 = 0x7F000001
 """127.0.0.1 in host order. molla binds loopback by default, see D9."""
@@ -183,6 +193,19 @@ def set_nodelay(fd: Int) raises:
         raise Error("setsockopt TCP_NODELAY failed: " + errno_name(get_errno()))
 
 
+def set_keepalive(fd: Int) raises:
+    """Ask the kernel to probe an idle connection.
+
+    This is not the idle timeout, which the reactor does itself with a timing
+    wheel and much shorter deadlines. Keepalive is for the case the reactor
+    cannot see: a peer whose machine went away without sending anything, where
+    the socket stays open and readable forever because nothing tells us
+    otherwise. The default interval is two hours on both platforms, so this is
+    a backstop against descriptor leaks over days and not a latency control.
+    """
+    set_reuse(fd, SO_KEEPALIVE)
+
+
 def listen_tcp(
     addr_host_order: UInt32, port: UInt16, backlog: Int
 ) raises -> Int:
@@ -192,14 +215,28 @@ def listen_tcp(
     That is what the tests do, so two test runs on the same machine cannot
     collide on a fixed port.
     """
+    return listen_tcp_shared(addr_host_order, port, backlog, False)
+
+
+def listen_tcp_shared(
+    addr_host_order: UInt32, port: UInt16, backlog: Int, reuse_port: Bool
+) raises -> Int:
+    """The same, with SO_REUSEPORT as a choice rather than a default.
+
+    REUSEPORT is how each I/O worker on Linux gets its own listening socket on
+    one port, with the kernel hashing new connections across them, which is
+    what removes the single accept queue as a contention point. It is off
+    unless asked for, because a stray REUSEPORT listener would let a second
+    molla silently take half the traffic from a running one, and that is a
+    confusing morning for whoever has to work out why half the requests are
+    answered by yesterday's build.
+    """
     var fd = socket_tcp()
 
-    # SO_REUSEADDR only, not SO_REUSEPORT. REUSEPORT would let a second molla
-    # silently steal half the traffic from a running one, which is a confusing
-    # failure mode to hand somebody. The listener sharing case can turn it on
-    # explicitly when we get there.
     try:
         set_reuse(fd, SO_REUSEADDR)
+        if reuse_port:
+            set_reuse(fd, SO_REUSEPORT)
     except e:
         _ = close(fd)
         raise e

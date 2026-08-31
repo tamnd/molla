@@ -14,6 +14,7 @@ import test_host
 import test_http
 import test_io
 import test_net
+import test_reactor
 import test_registry
 import test_sha256
 import test_sys
@@ -50,5 +51,9 @@ def main():
         test_io.run(suite)
     except e:
         suite.fail("test_io", String(e))
+    try:
+        test_reactor.run(suite)
+    except e:
+        suite.fail("test_reactor", String(e))
 
     finish(suite)
