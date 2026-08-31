@@ -4,6 +4,16 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.1.4] - 2026-09-01
+
+JSON, in both directions, at a bit over 2 GB/s on the M4. Two modes over one SIMD scanner: a pull loop for request bodies, which is nearly all of the traffic, and a small tree for config and manifests. Object keys keep the order they arrived in, which matters because a tool call's arguments came from a model and the order is part of what it said.
+
+Numbers are the half of a JSON library that is either right or nearly right, and nearly right shows up months later as one customer whose floats come back different. There is no `strtod` here, so no locale and no copy to get a NUL terminated string, and the conversion is exact for every input including the ones written specifically to break converters.
+
+Running the suite on four machines was worth more than the parser was. It passed on the M4 and failed six checks on both EPYC boxes, because Mojo destroys a local at its last use and the reader holds its document as an address, so the buffer was freed while the parse was still reading it. The M4 passed because the freed block still held the bytes. That is a bug nothing about x86 caused and one machine would have shipped.
+
+There is still no routing. That is M2.
+
 ### Added
 
 - `molla.json`, a JSON parser and serializer with two modes over one SIMD scanner. `scan.mojo` classifies bytes a vector at a time and finds the quote, the backslash and any raw control byte with one mask, so validating a string costs nothing extra. `reader.mojo` is streaming mode, `dom.mojo` is DOM mode, `serialize.mojo` writes into a buffer with no intermediate allocation and keeps object keys in the order they arrived.
