@@ -9,7 +9,16 @@
 # Pixi. The lock file is committed on purpose, that is the whole point of
 # pinning the toolchain.
 /.pixi/
+spikes/*/.pixi/
 pixi.lock.bak
+
+# Spike binaries. These have no extension, so they need naming one by one.
+/spikes/qmatmul/qmatmul_cpu
+/spikes/qmatmul/qmatmul_gpu
+/spikes/qmatmul/qmatmul_nv
+/spikes/qmatmul/appleprobe
+/spikes/qmatmul/shape.txt
+/spikes/qmatmul/shape_q40.txt
 
 # Local state. Never commit a model store.
 /.molla/

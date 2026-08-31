@@ -20,17 +20,20 @@ An optional Ollama compatibility adapter exists behind `--compat ollama`. It is 
 
 ## Why bother
 
-There are good local runners already. The gap this fills is a runner with no proprietary dependency anywhere in the stack, that runs the same source on CPU, NVIDIA, AMD, and Apple GPUs, and that never asks you to sign in.
+There are good local runners already. The gap this fills is a runner that runs the same source on CPU, NVIDIA, AMD, and Apple GPUs, that stores nothing you cannot read with other tools, and that never asks you to sign in.
 
-Mojo's compiler and standard library are Apache-2.0, and so is `max/kernels`, which is where the hard math lives (attention, paged KV cache, quantized matmul, MoE, collectives). The MAX runtime sits under a separate license, so molla does not use it. We write the engine and take the kernels. That one split is the reason a permissively licensed inference server in this stack is possible.
+This section used to claim there was no proprietary dependency anywhere in the stack, on the grounds that Mojo and `max/kernels` are Apache-2.0 and only the MAX runtime is not. The M0 kernel spike went looking for the seam and there isn't one. The Mojo standard library is Apache-2.0 and so is the `max/kernels` source, but the compiler is proprietary and links a proprietary support library into every binary it produces, and `max/kernels` does not build or run without a proprietary runtime package, including its CPU only kernels. The measurements and the exact packages are in [docs/validation/kernels.md](docs/validation/kernels.md), and what molla does about it is being decided in issue #7.
 
-Five things we commit to, and test in CI:
+What is left of the original argument is the part about the engine. Weight loading, scheduling, the KV cache and sampling are ours either way, and that is the part that decides how molla behaves.
+
+Four things we commit to, and test in CI:
 
 1. Nothing molla produces is only readable by molla.
 2. Nothing molla consumes requires molla.
 3. No account, no telemetry, no network traffic you did not ask for.
-4. No required proprietary dependency.
-5. The exit is one command and it is tested.
+4. The exit is one command and it is tested.
+
+Every proprietary dependency gets named here with what it is needed for, rather than being left out of the pitch. Today that is `mojo-compiler`, which is the toolchain and the runtime support library in every binary.
 
 ## What it costs
 
@@ -46,6 +49,7 @@ Being honest about this up front. Mojo 1.0 has no async, no sockets, no HTTP, no
 | GGUF and safetensors readers | GGUF metadata and tensor directory done, no tensor reads, no safetensors, see [docs/validation/gguf.md](docs/validation/gguf.md) |
 | An OCI client, which needs TLS through FFI | no HTTP client |
 | A paged KV cache batching executor | `max/kernels` gives kernels, not an engine |
+| Quantized matmul on an Apple GPU | `max/kernels` has none that runs below an M5, see [docs/validation/kernels.md](docs/validation/kernels.md) |
 
 That is a foundation project, not a wrapper project. M0 exists to find out in three weeks whether it is a reasonable one, and there is a written condition under which we move the network edge to Rust and keep Mojo for the engine and kernels.
 
@@ -60,7 +64,7 @@ Each of these has a full writeup with the alternatives we rejected and the evide
 | D3 | Ollama compatibility is an optional adapter, off by default. |
 | D4 | Model semantics come from the model's own artifacts, not from per family code we maintain. |
 | D5 | Distribution is OCI. No molla registry, ever. |
-| D6 | The engine is ours, built on `max/kernels`. MAX runtime interop is optional. |
+| D6 | The engine is ours, built on `max/kernels`. MAX runtime interop is optional. Under review, see [docs/validation/kernels.md](docs/validation/kernels.md). |
 | D7 | One kernel source per op, four targets, numerics asserted on each. |
 | D8 | Every milestone is validated on at least two device classes, one of them a GPU. |
 | D9 | Local, offline, and accountless by default. |

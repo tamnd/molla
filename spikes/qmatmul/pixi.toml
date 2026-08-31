@@ -1,0 +1,18 @@
+[workspace]
+name = "molla-qmatmul-spike"
+version = "0.0.0"
+channels = ["conda-forge", "https://conda.modular.com/max"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+# max-core is LicenseRef-Modular-Proprietary. It is here because max/kernels
+# does not build or run without it, which is the thing this spike set out to
+# find out. It is deliberately not in the root pixi.toml, so nothing in this
+# directory affects `pixi run build` or `pixi run test` at the repo root.
+[dependencies]
+max-core = "==26.5.0"
+
+[tasks]
+cpu = "mojo build qmatmul_cpu.mojo -o qmatmul_cpu && ./qmatmul_cpu"
+gpu = "mojo build qmatmul_gpu.mojo -o qmatmul_gpu && ./qmatmul_gpu"
+nv = "mojo build qmatmul_nv.mojo -o qmatmul_nv && ./qmatmul_nv"
+apple = "mojo build appleprobe.mojo -o appleprobe && ./appleprobe"
