@@ -13,7 +13,9 @@ from molla.http.server import run_http
 from molla.model.gguf import run_gguf
 from molla.net.echo import run_echo
 from molla.net.soak import run_soak
+from molla.registry.pull import run_pull
 from molla.sys.poll import USES_KQUEUE
+from molla.tls.client import run_tls
 
 
 def print_version():
@@ -43,6 +45,8 @@ def print_usage():
     print(
         "  gguf <path>     print the metadata and tensor directory of a model"
     )
+    print("  tls <host>      connect over TLS and print what was negotiated")
+    print("  pull <ref>      pull a blob from ghcr.io and check its digest")
     print("  help            print this message")
     print()
     print("Nothing serves yet. See the roadmap for what lands when:")
@@ -124,6 +128,37 @@ def main():
             run_gguf(args[2])
         except e:
             print("molla gguf:", e)
+            exit(1)
+    elif command == "tls":
+        if len(args) < 3:
+            print("molla tls: expected a hostname")
+            exit(2)
+        var tls_port: UInt16 = 443
+        if len(args) > 3:
+            try:
+                tls_port = UInt16(Int(String(args[3])))
+            except:
+                print(
+                    "molla: '",
+                    String(args[3]),
+                    "' is not a port number",
+                    sep="",
+                )
+                exit(2)
+        try:
+            run_tls(String(args[2]), tls_port)
+        except e:
+            print("molla tls:", e)
+            exit(1)
+    elif command == "pull":
+        if len(args) < 3:
+            print("molla pull: expected an image reference")
+            print("  for example: molla pull linuxcontainers/alpine:latest")
+            exit(2)
+        try:
+            run_pull(String(args[2]))
+        except e:
+            print("molla pull:", e)
             exit(1)
     else:
         print("molla: unknown command '", command, "'", sep="")
