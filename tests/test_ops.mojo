@@ -14,6 +14,12 @@ The admin routes are checked against a real threaded server rather than by
 calling the handler, because the interesting failure is a route that works on
 one thread and returns somebody else's counters on four, and calling the
 handler directly cannot see it.
+
+Every test that makes a `LogSink` ends with `keep(sink)`. A `Logger` is a set of
+addresses into the sink's block, Mojo drops a value at its last use rather than
+at the end of the scope, and handing out an address is not a use it can see. A
+test that forgets it reads a freed ring, which passes most of the time and fails
+on a machine with a different allocator, which is how two of these were found.
 """
 
 from std.ffi import c_int, external_call
@@ -451,6 +457,7 @@ def _check_log_off_allocates_nothing(mut suite: Suite):
 
     _ = sink.drain(out)
     keep(out)
+    keep(sink)
     counter.close()
 
 
@@ -479,6 +486,7 @@ def _check_log_full_ring(mut suite: Suite):
         "and the ring takes records again once it has been drained",
     )
     keep(out)
+    keep(sink)
 
 
 def _check_log_pump(mut suite: Suite) raises:
