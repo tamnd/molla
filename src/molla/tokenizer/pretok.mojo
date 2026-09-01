@@ -464,20 +464,28 @@ struct PreTokenizer(Movable):
         return pieces^
 
     def _prefix(self, var pieces: Pieces, cp: Int) -> Pieces:
-        """Put one code point in front of the first piece unless it is already
-        there."""
+        """Put one code point in front of every piece that does not start with
+        it already.
+
+        Every piece and not just the first. When byte level is the only step
+        there is only one piece and the difference does not show, but after a
+        Bert pre-tokenizer there is a piece per word and each of them is given
+        its space, which is how `a  b` keeps the space in front of `b` that the
+        splitting threw away.
+
+        No pieces means an earlier step threw everything away, which is what a
+        Bert pre-tokenizer does to a string of nothing but spaces. There is
+        nothing to put anything in front of, and inventing a piece turns a
+        string that should produce no tokens at all into a single space token.
+        """
         if len(pieces.start) == 0:
-            var only = List[Int]()
-            only.append(cp)
-            return Pieces(only^)
-        if pieces.points[pieces.start[0]] == cp:
             return pieces^
         var points = List[Int]()
         var start = List[Int]()
         var end = List[Int]()
         for p in range(len(pieces.start)):
             start.append(len(points))
-            if p == 0:
+            if pieces.points[pieces.start[p]] != cp:
                 points.append(cp)
             for i in range(pieces.start[p], pieces.end[p]):
                 points.append(pieces.points[i])

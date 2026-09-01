@@ -89,17 +89,25 @@ struct PostProcessor(Movable):
         # sequence already opens with the id this template is about to write,
         # the template's copy is dropped. Only the caller can know that, which
         # is why it is a flag rather than something decided here.
+        #
+        # The id in question is the last one written before the sequence, and
+        # finding it means looking for the sequence rather than assuming the
+        # template opens with one run of specials. Whisper writes three items
+        # in front of the text, a start marker then a language then a
+        # timestamp setting, each its own item, and the one that would double
+        # up is the third.
+        var drop_item = -1
         var drop = -1
-        if (
-            reconcile
-            and len(template) > 1
-            and template[0].kind == I_SPECIAL
-            and template[1].kind == I_SEQUENCE_A
-            and len(template[0].ids) > 0
-            and len(first) > 0
-            and template[0].ids[len(template[0].ids) - 1] == first[0]
-        ):
-            drop = len(template[0].ids) - 1
+        if reconcile and len(first) > 0:
+            for i in range(len(template)):
+                if template[i].kind != I_SEQUENCE_A:
+                    continue
+                if i > 0 and template[i - 1].kind == I_SPECIAL:
+                    ref ids = template[i - 1].ids
+                    if len(ids) > 0 and ids[len(ids) - 1] == first[0]:
+                        drop_item = i - 1
+                        drop = len(ids) - 1
+                break
 
         for i in range(len(template)):
             var kind = template[i].kind
@@ -114,7 +122,7 @@ struct PostProcessor(Movable):
                     types.append(type_id)
             else:
                 for j in range(len(template[i].ids)):
-                    if i == 0 and j == drop:
+                    if i == drop_item and j == drop:
                         continue
                     out.append(template[i].ids[j])
                     types.append(type_id)

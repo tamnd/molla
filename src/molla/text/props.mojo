@@ -481,13 +481,17 @@ struct Unicode(Movable):
         return c >= CAT_CC and c <= CAT_CN
 
     def is_word(self, cp: Int) -> Bool:
-        """What a regex `\\w` means: a letter, a mark, a digit, or a joiner.
+        """What a regex `\\w` means: alphabetic, a mark, a digit, a connector
+        or a joiner.
 
         Written the way the Rust regex crate writes it, since that is the
-        engine the tokenizer files were tested against. Alphabetic there is
-        wider than the letter categories by a few hundred combining vowel
-        signs, and those are marks, so taking every mark covers them and takes
-        a handful of enclosing marks with it.
+        engine the tokenizer files were tested against. Alphabetic is not the
+        letter categories. It is wider by the letter numbers, which is where
+        the ideographic zero and the Roman numerals live, and by the circled
+        and squared Latin letters, which are symbols. It is also narrower by
+        about a thousand marks, but `\\w` takes every mark anyway so that end
+        does not matter. The two extra pieces do, because a pre-tokenizer that
+        calls the ideographic zero a symbol cuts a Chinese word in half.
         """
         if cp == 0x200C or cp == 0x200D:
             return True
@@ -496,7 +500,16 @@ struct Unicode(Movable):
             return True
         if c >= CAT_MN and c <= CAT_ME:
             return True
-        return c == CAT_ND or c == CAT_PC
+        if c == CAT_ND or c == CAT_PC or c == CAT_NL:
+            return True
+        if c != CAT_SO:
+            return False
+        return (
+            (cp >= 0x24B6 and cp <= 0x24E9)
+            or (cp >= 0x1F130 and cp <= 0x1F149)
+            or (cp >= 0x1F150 and cp <= 0x1F169)
+            or (cp >= 0x1F170 and cp <= 0x1F189)
+        )
 
     def decomposition(self, cp: Int, compatibility: Bool) -> Int:
         """The index of the decomposition of `cp`, or minus one.

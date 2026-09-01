@@ -273,6 +273,21 @@ def _props(mut suite: Suite, tables: Unicode):
     suite.check(tables.is_number(0x31), "1 is a number")
     suite.check(not tables.is_letter(0x31), "1 is not a letter")
     suite.check(tables.is_word(0x5F), "underscore is a word character")
+
+    # What `\w` means is Alphabetic and not the letter categories, and the two
+    # differ in both directions. These are the code points where it shows, and
+    # every answer is what the Rust regex crate gives, because that is the
+    # engine the tokenizer files were tested against. The ideographic zero is
+    # the one that costs real ids: a pre-tokenizer that calls it a symbol cuts
+    # a Chinese word in half.
+    suite.check(tables.is_word(0x3007), "the ideographic zero is a word")
+    suite.check(tables.is_word(0x2160), "and so is a roman numeral")
+    suite.check(tables.is_word(0x24B6), "and so is a circled letter")
+    suite.check(tables.is_word(0x1F130), "and so is a squared one")
+    suite.check(tables.is_word(0x200D), "and so is the joiner")
+    suite.check(tables.is_word(0x0663), "and so is an arabic digit")
+    suite.check(not tables.is_word(0x2603), "a snowman is not a word")
+    suite.check(not tables.is_word(0xA9), "and neither is a copyright sign")
     suite.check(tables.is_punctuation(0x21), "bang is punctuation")
 
     suite.check(is_whitespace(0x20), "space is whitespace")
@@ -470,6 +485,24 @@ def _regex(mut suite: Suite, tables: Unicode) raises:
 
     suite.check(_matches("^abc$", "abc", tables), "is_match says yes")
     suite.check(not _matches("^abc$", "abcd", tables), "is_match says no")
+
+    # The class `\w` compiles here and the same question gets answered again by
+    # `Unicode.is_word` when a boundary is being decided, so the two have to
+    # agree. These are the code points where Alphabetic and the letter
+    # categories part company, and the splits came from Python's `regex`
+    # module.
+    suite.check(
+        _split(r"\w+", "龥鿿〇々 ☃", tables) == "龥鿿〇々",
+        r"\w takes the letter numbers, so a word keeps its zero",
+    )
+    suite.check(
+        _split(r"\w+", "ⒶⒷ©", tables) == "ⒶⒷ",
+        r"and the circled letters, and stops at a symbol that is not one",
+    )
+    suite.check(
+        _split(r"\w+", "🄰🄱☃", tables) == "🄰🄱",
+        r"and the squared letters above the basic plane",
+    )
 
     # The real thing. This is the GPT-2 pre-tokenizer pattern, and the expected
     # split came from Python's `regex` module, not from us.

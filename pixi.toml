@@ -28,3 +28,9 @@ fmt-check = "mojo format -q src tests scripts && git diff --exit-code -- src tes
 # What we paste into docs/validation/toolchain.md when adding a machine.
 toolchain = "mojo --version"
 check = { depends-on = ["fmt-check", "build", "test"] }
+# The tokenizer conformance corpus. The files it reads are not in the
+# repository, so `scripts/fetch-tokenizers.py` has to have put them in
+# `corpus/tokenizers` first. The quick tier is what CI runs on every commit and
+# the full one is a few hundred more files. See docs/validation/tokenizer.md.
+conformance-tokenizer = "mojo run -I src scripts/tokenizer_oracle.mojo scripts/tokenizer_cases.txt scripts/tokenizers.tsv corpus/tokenizers quick"
+conformance-tokenizer-full = "mojo run -I src scripts/tokenizer_oracle.mojo scripts/tokenizer_cases.txt scripts/tokenizers.tsv corpus/tokenizers full"

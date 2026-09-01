@@ -20,6 +20,7 @@ from .vocab import NO_ID, Merges, Vocab, _hash
 comptime M_BPE = 0
 comptime M_WORDPIECE = 1
 comptime M_UNIGRAM = 2
+comptime M_WORDLEVEL = 3
 
 comptime UNK_PENALTY = 10.0
 """How much worse than the worst real token an unknown character is.
@@ -239,9 +240,24 @@ struct Model(Movable):
             self._bpe(text, out, work)
         elif self.kind == M_WORDPIECE:
             self._wordpiece(text, out)
+        elif self.kind == M_WORDLEVEL:
+            self._wordlevel(text, out)
         else:
             self._unigram(text, out, work)
         work.remember(text, out, from_at)
+
+    def _wordlevel(self, text: Span[UInt8, _], mut out: List[Int]):
+        """The whole piece, or the unknown token, and nothing in between.
+
+        There is no sub-word step here at all. The pre-tokenizer decided what a
+        word is and either the vocabulary has it or it does not, which is what
+        makes this the one model where an unseen word costs exactly one id.
+        """
+        var whole = self.vocab.id_of(text)
+        if whole != NO_ID:
+            out.append(whole)
+        elif self.unk_id != NO_ID:
+            out.append(self.unk_id)
 
     def _fallback(self, text: Span[UInt8, _], mut out: List[Int]) -> Bool:
         """These bytes as byte fallback tokens, or nothing if any is missing.
