@@ -693,6 +693,13 @@ struct HttpProtocol(Movable, Protocol):
         remaining bytes cannot be trusted to be a request rather than the tail
         of the one that went wrong, and reading them is exactly how a smuggled
         request gets a second chance.
+
+        The accounting at the end is the same call `_write_default` makes, and
+        it was missing until the HTTP soak in issue #18 sent a million oversized
+        bodies and the server reported zero 4xx responses. A 413, a 414 and a
+        431 are answers, they are the answers an operator most wants a graph
+        of, and they never go through the handler path that was doing the
+        counting.
         """
         self.errors += 1
         self.states[slot].keep_alive = False
@@ -702,6 +709,7 @@ struct HttpProtocol(Movable, Protocol):
         )
         self.states[slot].out_at = 0
         conn.input.clear()
+        self._account(slot)
 
     def _respond(mut self, slot: Int, mut conn: Connection):
         """Answer a request whose spans are still valid in the read buffer."""

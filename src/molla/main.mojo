@@ -16,6 +16,7 @@ from molla.net.allocs import run_allocs
 from molla.net.drain import run_drain
 from molla.net.echo import run_echo
 from molla.net.soak import run_soak
+from molla.net.soak_http import run_http_soak
 from molla.net.soak_net import run_net_soak
 from molla.ops.config import describe_setting, load_config
 from molla.registry.pull import run_pull
@@ -56,6 +57,10 @@ def print_usage():
     print("  echo [port]     run the M0 TCP echo spike on 127.0.0.1")
     print("  soak [n] [sec]  hold n echo connections for sec seconds")
     print("  netsoak [n] [s] hold n connections against the threaded reactor")
+    print(
+        "  httpsoak [n] [s] hold n connections of mixed HTTP traffic against"
+        " the server"
+    )
     print(
         "  drain [n] [ms]  load n connections, shut down on a signal, check the"
         " drain"
@@ -219,6 +224,28 @@ def main():
             exit(run_net_soak(net_connections, net_seconds))
         except e:
             print("molla netsoak:", e)
+            exit(1)
+    elif command == "httpsoak":
+        # Defaults are the numbers issue #18 asks for: a thousand connections
+        # of mixed traffic for an hour. The nightly workflow runs exactly this
+        # with no arguments.
+        var http_connections = 1000
+        var http_seconds = 3600
+        try:
+            if len(args) > 2:
+                http_connections = Int(args[2])
+            if len(args) > 3:
+                http_seconds = Int(args[3])
+        except:
+            print(
+                "molla: httpsoak takes a connection count and a duration in"
+                " seconds"
+            )
+            exit(2)
+        try:
+            exit(run_http_soak(http_connections, http_seconds))
+        except e:
+            print("molla httpsoak:", e)
             exit(1)
     elif command == "drain":
         # Small by default. The point is to run it a hundred times, not to run
