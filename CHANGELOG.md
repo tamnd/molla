@@ -4,6 +4,20 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.2.2] - 2026-09-01
+
+Text goes in and ids come out, and there is an oracle saying they are the right ids.
+
+This is the tokenizer, and underneath it the whole character layer Mojo does not ship: UTF-8 that rejects what it should reject, Unicode categories and combining classes and decompositions and case mappings generated from the current database, the four normal forms, and a backtracking regular expression engine. On top of that the five stage pipeline a `tokenizer.json` describes, with BPE, WordPiece, Unigram and word level models, twelve normalizers, ten pre-tokenizers, eight decoders and four post processors.
+
+None of that is worth anything without an independent implementation to check it against, because a tokenizer that is wrong produces output that still looks sensible. So most of the work here is the checking. 4560 differential cases across four real models, eight million bytes through each of them, and then the conformance corpus: 338 real `tokenizer.json` files from the hub and 355 pieces of text, every id and every decode round trip compared against Hugging Face `tokenizers` 0.23.1. It runs on every commit and a mismatch blocks the merge.
+
+The corpus earned its keep immediately. It found six defects in code that had already passed 1430 unit checks and four models, and the beginning of text property found a seventh. Two of them were GPT-2 refusing to load at all, one was a Chinese word being cut in half at the ideographic zero, and one was Whisper getting two beginning of text tokens where it should get one. All seven are fixed and all seven have a fixture in the suite now.
+
+It is also fast, between five and eight times the reference on six of the eight throughput rows, and seven of the eight clear the 20 MB/s the milestone asked for. The eighth is gemma on unwrapped documentation, which is a property of that file rather than of the code, and the reference is slower on it too.
+
+What is still refused is a `Precompiled` normalizer, the SentencePiece charsmap, which is 60 of the 338 corpus files and covers the T5, XLM-R and NLLB families. The corpus asserts a clean refusal rather than a quiet wrong answer, and the reference digests are already recorded for the day it lands.
+
 ### Added
 
 - `molla.text`, everything a tokenizer needs to know about characters before it can start: UTF-8 encoding and decoding that rejects overlong forms and surrogates and reports an incomplete sequence as one, Unicode categories, combining classes, decompositions and full lowercase mappings generated from the database by `scripts/gen-unicode.py`, the four normal forms, and a backtracking regular expression engine with Unicode categories, lookahead and possessive quantifiers. Checked against Python over 294552 normalization cases and 6732 regular expression cases, all identical. See [docs/validation/text.md](docs/validation/text.md). The regex engine now works out which characters a match starting at each instruction could begin with, which is what makes the seven way alternation at the front of every GPT-2 style pattern cheap, and normalization skips runs of characters below the floor where every form is the identity.
