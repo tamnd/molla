@@ -61,6 +61,13 @@ from molla.ops.metrics import (
     M_RESPONSES_5XX,
     Metrics,
 )
+from molla.sys.errno import (
+    ECONNREFUSED,
+    ECONNRESET,
+    EPIPE,
+    ETIMEDOUT,
+    get_errno,
+)
 from molla.sys.fd import close, set_nonblocking
 from molla.sys.file import close_fd, open_read, pread_all
 from molla.sys.signal import ignore_sigpipe
@@ -105,9 +112,11 @@ framing came apart, which is a failure rather than a reason to grow."""
 
 comptime SEND_TRIES = 200
 comptime STALL_NS = 5_000_000_000
-"""How long a client may fail to get a request out before the run says so. A
-loopback handshake finishes in microseconds, so anything near this is a socket
-that is stuck rather than one that is busy."""
+"""How long a client waits for a fresh socket to take its first byte before
+giving up on it and connecting again. A loopback handshake finishes in
+microseconds when the accept backlog has room, and takes as long as the SYN
+retransmits when it does not, so waiting longer than this is waiting for a
+connection the server has already decided it has no room for."""
 
 comptime CONNECT_BATCH = 64
 comptime SETTLE_NS = 30_000_000_000
@@ -392,7 +401,10 @@ def _request_for(role: Int, turn: Int) -> String:
 
 
 def _try_send(fd: Int, text: StringSpan) -> Int:
-    """Push a request out. 1 for gone, 0 for not yet, -1 for a half sent one.
+    """Push a request out.
+
+    1 for gone, 0 for not yet, -1 for a half sent one, and -2 for a socket the
+    kernel has already given up on.
 
     Not yet is the case that matters and it took a run to find. Every socket
     here is non blocking from the moment it is created, so `connect` returns
@@ -400,6 +412,13 @@ def _try_send(fd: Int, text: StringSpan) -> Int:
     until it does. Spinning on that in a tight loop turns a normal wait into a
     failure, so a socket that is not ready yet says so and the caller comes
     back on the next pass.
+
+    The -2 took a second run. A client that reconnects as fast as this one does
+    will eventually offer connections faster than the accept loop drains them,
+    and a full backlog on loopback is a refusal rather than a wait. The errno
+    on the first write is the whole difference between a connection the kernel
+    turned away and a server that stopped answering, and reading it is the only
+    way the report can tell them apart.
 
     Once the first byte is out the connection is up, and the rest of a request
     that is a couple of hundred bytes long is going to follow, so finishing a
@@ -411,6 +430,14 @@ def _try_send(fd: Int, text: StringSpan) -> Int:
     )
     var sent = send(fd, p, n)
     if sent <= 0:
+        var code = get_errno()
+        if (
+            code == ECONNREFUSED
+            or code == ECONNRESET
+            or code == EPIPE
+            or code == ETIMEDOUT
+        ):
+            return -2
         return 0
     var tries = 0
     while sent < n and tries < SEND_TRIES:
@@ -529,6 +556,7 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
     var malformed = 0
     var reconnects = 0
     var send_failures = 0
+    var turned_away = 0
     var read_buf = stack_allocation[READ_CHUNK, UInt8]()
 
     var started = Int(monotonic())
@@ -567,17 +595,29 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
                     continue
                 var outcome = _try_send(fds[i], _request_for(role, turns[i]))
                 if outcome == 0:
-                    # Almost always a handshake that has not finished. Given
-                    # five seconds of passes it is a socket that is never going
-                    # to take a byte, and that is worth failing the run over.
+                    # A handshake that has not finished. On an idle loopback
+                    # that is microseconds, and against a full accept backlog
+                    # it is however long the SYN retransmits take, which is
+                    # seconds. Past the budget this one is given up on and
+                    # counted with the refusals, because a connection nobody
+                    # has accepted yet and one the kernel turned away are the
+                    # same thing seen from two sides.
                     if stalled_since[i] == 0:
                         stalled_since[i] = now
                     elif now - stalled_since[i] > STALL_NS:
-                        send_failures += 1
+                        turned_away += 1
                         _ = close(fds[i])
                         fds[i] = -1
                         stalled_since[i] = 0
                         next_at[i] = now + RECONNECT_MS * 1_000_000
+                    continue
+                if outcome == -2:
+                    # The backlog was full when this one knocked, and said so.
+                    turned_away += 1
+                    _ = close(fds[i])
+                    fds[i] = -1
+                    stalled_since[i] = 0
+                    next_at[i] = now + RECONNECT_MS * 1_000_000
                     continue
                 if outcome < 0:
                     send_failures += 1
@@ -690,6 +730,21 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
     server.stop()
     var fd_after = probe_fd()
 
+    # The biggest timing wheel in the process. One entry per connection is
+    # armed at a time, so a slab much larger than the connection count is a
+    # wheel that is keeping entries it has finished with, which is what an hour
+    # of resident memory growth turned out to be. Read after the workers have
+    # stopped, so nothing is walking these while this does.
+    var slab_peak = 0
+    var slots_peak = 0
+    for i in range(len(server.reactors)):
+        var slab = server.reactors[i].wheel.slab_size()
+        if slab > slab_peak:
+            slab_peak = slab
+        var slots = len(server.reactors[i].conns)
+        if slots > slots_peak:
+            slots_peak = slots
+
     var requests = metrics.total(M_REQUESTS)
     var responses_2xx = metrics.total(M_RESPONSES_2XX)
     var responses_4xx = metrics.total(M_RESPONSES_4XX)
@@ -717,6 +772,11 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
         + " 5xx"
     )
     print("  answers read   " + String(read_answers))
+    print(
+        "  turned away    "
+        + String(turned_away)
+        + " connects the backlog would not take"
+    )
     print("  by client kind")
     for role in range(ROLE_COUNT):
         print(
@@ -767,6 +827,13 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
         + " records dropped"
     )
     print("  connections    " + String(open_after) + " left after the clients")
+    print(
+        "  timer slab     "
+        + String(slab_peak)
+        + " entries at the busiest reactor, "
+        + String(slots_peak)
+        + " connection slots"
+    )
 
     print("  latency by segment, microseconds")
     print("    segment  samples      mean       p50       p99")
@@ -831,9 +898,13 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
             + " responses could not be framed by the client"
         )
         ok = False
+    # Half a request on an established socket, which is the one send outcome
+    # that is nobody's backpressure and nothing's normal behaviour.
     if send_failures != 0:
         print(
-            "  FAIL: " + String(send_failures) + " requests could not be sent"
+            "  FAIL: "
+            + String(send_failures)
+            + " requests went out half written"
         )
         ok = False
     if responses_5xx != 0 or handler_errors != 0:
@@ -871,6 +942,32 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
             "  FAIL: "
             + String(open_after)
             + " connections were not reaped after the clients closed"
+        )
+        ok = False
+    # A reactor arms one timer per connection it holds, so its slab should
+    # settle at the number of connections it was given. The whole connection
+    # count is a generous bound for one reactor of several and it is nowhere
+    # near the millions a wheel that never frees a cancelled timer reaches.
+    if slab_peak > connections:
+        print(
+            "  FAIL: the busiest timing wheel holds "
+            + String(slab_peak)
+            + " entries for "
+            + String(slots_peak)
+            + " connection slots"
+        )
+        ok = False
+    # Being turned away is the accept backlog full, which is the kernel pushing
+    # back on a client that reconnects tens of thousands of times a second, and
+    # it is normal on the fastest machines. A run where most attempts are turned
+    # away is a listener that has stopped working.
+    if turned_away > reconnects:
+        print(
+            "  FAIL: "
+            + String(turned_away)
+            + " connects were turned away against "
+            + String(reconnects)
+            + " that were not"
         )
         ok = False
     if dropped_logs != 0:

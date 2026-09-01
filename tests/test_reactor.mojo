@@ -155,6 +155,40 @@ def _check_wheel(mut suite: Suite) raises:
     suite.check(total == SLOTS * 4, "and every one of them fires exactly once")
     suite.check(many.pending == 0, "leaving nothing behind")
 
+    # Cancelling has to give the slab entry back on the spot. It used to leave
+    # it to be freed when the slot was next walked, which for a minute long
+    # idle timeout is a minute of closed connections held in dead entries, and
+    # for the hour long soak was every connection the run ever made. The
+    # deadline here is far enough out that a lazy free would not happen inside
+    # the loop, which is exactly the case that went wrong.
+    var churn = Wheel(0)
+    for i in range(10000):
+        var timer = churn.add(i, 3_600_000)
+        churn.cancel(timer)
+    suite.check(churn.pending == 0, "ten thousand armed and cancelled")
+    suite.check(
+        churn.slab_size() == 1,
+        "and the slab still holds one entry, because each cancel gave it back",
+    )
+
+    # Unlinking from the middle of a slot list, which is the case a singly
+    # linked list could not do. All three land in the same slot.
+    var chain = Wheel(0)
+    _ = chain.add(1, 500)
+    var middle = chain.add(2, 500)
+    _ = chain.add(3, 500)
+    suite.check(chain.slab_size() == 3, "three timers in one slot")
+    chain.cancel(middle)
+    suite.check(chain.advance(500, fired) == 2, "the other two still fire")
+    suite.check(
+        (fired[0] == 1 or fired[0] == 3) and (fired[1] == 1 or fired[1] == 3),
+        "and they are the two that were not cancelled",
+    )
+    suite.check(
+        chain.pending == 0 and chain.slab_size() == 3,
+        "with nothing armed and nothing added to the slab",
+    )
+
     var idle = Wheel(0)
     suite.check(
         idle.next_timeout_ms() == -1, "an empty wheel does not need waking"
