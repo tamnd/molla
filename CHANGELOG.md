@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla.jinja`, a bounded Jinja2 subset for chat templates. Ten modules: a lexer with `trim_blocks` and `lstrip_blocks` and the explicit whitespace markers, a parser onto a flat node list, and an evaluator with 70 filters, 30 tests and the five globals `range`, `dict`, `namespace`, `strftime_now` and `raise_exception`. Statements are `if`, `for` with the loop object and `break` and `continue`, `set` in both forms, `macro`, `call` and `filter` blocks. Checked against Python `jinja2` in the environment `transformers.apply_chat_template` builds, over 38 real chat templates and nine conversation shapes each: 342 renders, 342 identical. See [docs/validation/jinja.md](docs/validation/jinja.md).
+- Seven constructs are excluded on purpose and each is a named error at compile time, which is model load time rather than request time: `include`, `extends`, `import`, `from`, `do`, `autoescape` and the async forms. There is no template loader, because a chat template is one self contained string. A refusal carries the construct, the line, the column and a snippet with a caret under it.
+- Four execution limits, because a template is untrusted input from a repository anybody can publish: a step budget, an output cap, a recursion depth and a wall clock deadline. The clock is read every 1024 steps rather than every step, which kept it out of the profile.
+- `Template` and `Cache` in `molla.jinja.template`. Compiling and rendering are separate because a template is compiled when a model loads and rendered on every request, and the cache keys compiled trees by the SHA-256 of the source rather than by the model, since most forks of a model ship the same template bytes. Values go in as JSON, which is the shape a request body and a tokenizer config already have.
+- `molla template <template> <vars> [rounds]`, which renders a template and times it. A 20 turn conversation is 59.9 us on the Llama 3.1 template against the 200 us the milestone asks for, with Qwen3 at 79.8, Mistral Small at 85.4 and Granite at 43.4, all on the M4 and all including the cost of parsing the variables JSON on every round.
+
 ## [0.2.2] - 2026-09-01
 
 Text goes in and ids come out, and there is an oracle saying they are the right ids.

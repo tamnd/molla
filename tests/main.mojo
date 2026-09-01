@@ -15,6 +15,7 @@ import test_gguf
 import test_host
 import test_http
 import test_io
+import test_jinja
 import test_json
 import test_net
 import test_ops
@@ -98,6 +99,10 @@ def main():
         test_tokenizer.run(suite)
     except e:
         suite.fail("test_tokenizer", String(e))
+    try:
+        test_jinja.run(suite)
+    except e:
+        suite.fail("test_jinja", String(e))
     test_stream.run(suite)
     test_json.run(suite)
     test_tls.run(suite)
