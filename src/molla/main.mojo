@@ -12,7 +12,8 @@ from molla.host import detect
 from molla.http.server import run_http
 from molla.json.bench import run_json_bench
 from molla.model.gguf import run_gguf
-from molla.model.spec import run_spec
+from molla.model.repo import run_model_spec
+from molla.model.safetensors import run_safetensors
 from molla.net.allocs import run_allocs
 from molla.net.drain import run_drain
 from molla.net.echo import run_echo
@@ -21,6 +22,7 @@ from molla.net.soak_http import run_http_soak
 from molla.net.soak_net import run_net_soak
 from molla.ops.config import describe_setting, load_config
 from molla.registry.pull import run_pull
+from molla.sys.mem import AllocCounter
 from molla.sys.poll import USES_KQUEUE
 from molla.tls.client import probe, run_tls
 
@@ -74,6 +76,10 @@ def print_usage():
     print("  http [port]     run the M0 HTTP/1.1 spike on 127.0.0.1")
     print(
         "  gguf <path>     print the metadata and tensor directory of a model"
+    )
+    print(
+        "  safetensors <p> print the header and tensor directory of a"
+        " safetensors model"
     )
     print(
         "  spec <path>     print what a model is and what this build can do"
@@ -313,12 +319,24 @@ def main():
         except e:
             print("molla gguf:", e)
             exit(1)
+    elif command == "safetensors":
+        if len(args) < 3:
+            print("molla safetensors: expected a path to a file or a directory")
+            exit(2)
+        var st_counter = AllocCounter()
+        try:
+            run_safetensors(args[2], st_counter.raw())
+        except e:
+            print("molla safetensors:", e)
+            st_counter.close()
+            exit(1)
+        st_counter.close()
     elif command == "spec":
         if len(args) < 3:
-            print("molla spec: expected a path to a .gguf file")
+            print("molla spec: expected a model file or a model directory")
             exit(2)
         try:
-            run_spec(args[2])
+            run_model_spec(args[2])
         except e:
             print("molla spec:", e)
             exit(1)

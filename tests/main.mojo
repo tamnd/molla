@@ -20,6 +20,7 @@ import test_net
 import test_ops
 import test_reactor
 import test_registry
+import test_safetensors
 import test_sha256
 import test_soak_http
 import test_spec
@@ -43,6 +44,10 @@ def main():
         test_spec.run(suite)
     except e:
         suite.fail("test_spec", String(e))
+    try:
+        test_safetensors.run(suite)
+    except e:
+        suite.fail("test_safetensors", String(e))
     try:
         test_dns.run(suite)
     except e:

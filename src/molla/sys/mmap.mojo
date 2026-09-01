@@ -56,6 +56,20 @@ struct Mapping(Movable):
     var fd: Int
     var mapped: Bool
 
+    def __init__(out self):
+        """A mapping of nothing.
+
+        There is no file behind this and there never was. It exists so a struct
+        that holds a mapping can be built before it knows whether the file it
+        wants is there, which is the common case for the optional JSON files in
+        a model directory. `close()` on one is a no op, and `base()` is not to
+        be called on one: length is zero, so every loop over it does nothing.
+        """
+        self.address = 0
+        self.length = 0
+        self.fd = -1
+        self.mapped = False
+
     def __init__(out self, path: StringSpan) raises:
         var opened = open_read(path)
         if opened.is_err():
