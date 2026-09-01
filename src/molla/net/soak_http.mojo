@@ -139,13 +139,21 @@ pausing for a hundred milliseconds is never mistaken for an idle connection."""
 def _slack(kilobytes: Int) -> Int:
     """How much a memory figure may move in the second half of a run.
 
-    A tenth, or four megabytes, whichever is larger. The tenth is for machines
-    where the steady size is large enough that a page here or there is noise,
-    and the four megabytes is for the ones where it is small enough that a
-    tenth would be a handful of pages and every run would be a coin toss.
+    A quarter, or four megabytes, whichever is larger. The four megabytes is
+    for machines whose steady size is small enough that a proportion would be a
+    handful of pages and every run would be a coin toss.
+
+    The quarter is where two populations of real measurement sit. A reactor's
+    slot table never shrinks, so an hour of reconnecting keeps finding higher
+    bursts than it had seen before, and each new slot costs a read buffer and a
+    write ring. That is step shaped and it was eleven percent across the second
+    half of the noisiest machine in the fleet. The leak this soak found was
+    thirty one percent on the same measure on the quietest, and sixty five on
+    the busiest. A run that lands in between is a thing to go and find, not a
+    reason to widen this.
     """
-    var tenth = kilobytes // 10
-    return tenth if tenth > 4096 else 4096
+    var quarter = kilobytes // 4
+    return quarter if quarter > 4096 else 4096
 
 
 def current_rss_kb() -> Int:
@@ -758,20 +766,24 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
     server.stop()
     var fd_after = probe_fd()
 
-    # The biggest timing wheel in the process. One entry per connection is
-    # armed at a time, so a slab much larger than the connection count is a
-    # wheel that is keeping entries it has finished with, which is what an hour
-    # of resident memory growth turned out to be. Read after the workers have
-    # stopped, so nothing is walking these while this does.
+    # The biggest timing wheel in the process, next to the connection table of
+    # the same reactor. A connection has one timer armed at a time and a slot
+    # table never shrinks, so the slab can never honestly hold more entries
+    # than that reactor has slots. It held three and a half million against a
+    # hundred slots before the wheel gave a cancelled timer its entry back.
+    # Read after the workers have stopped, so nothing is walking these while
+    # this does.
     var slab_peak = 0
     var slots_peak = 0
+    var slab_excess = 0
     for i in range(len(server.reactors)):
         var slab = server.reactors[i].wheel.slab_size()
+        var slots = len(server.reactors[i].conns)
         if slab > slab_peak:
             slab_peak = slab
-        var slots = len(server.reactors[i].conns)
-        if slots > slots_peak:
             slots_peak = slots
+        if slab - slots > slab_excess:
+            slab_excess = slab - slots
 
     var requests = metrics.total(M_REQUESTS)
     var responses_2xx = metrics.total(M_RESPONSES_2XX)
@@ -862,7 +874,7 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
     print(
         "  timer slab     "
         + String(slab_peak)
-        + " entries at the busiest reactor, "
+        + " entries at the busiest reactor, which has "
         + String(slots_peak)
         + " connection slots"
     )
@@ -976,17 +988,14 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
             + " connections were not reaped after the clients closed"
         )
         ok = False
-    # A reactor arms one timer per connection it holds, so its slab should
-    # settle at the number of connections it was given. The whole connection
-    # count is a generous bound for one reactor of several and it is nowhere
-    # near the millions a wheel that never frees a cancelled timer reaches.
-    if slab_peak > connections:
+    # No arbitrary number here: a reactor arms one timer per connection and its
+    # slot table never shrinks, so a slab with more entries than that reactor
+    # has slots is holding timers nothing asked for.
+    if slab_excess > 0:
         print(
-            "  FAIL: the busiest timing wheel holds "
-            + String(slab_peak)
-            + " entries for "
-            + String(slots_peak)
-            + " connection slots"
+            "  FAIL: a timing wheel holds "
+            + String(slab_excess)
+            + " more entries than its reactor has connection slots"
         )
         ok = False
     # Being turned away is the accept backlog full, which is the kernel pushing
