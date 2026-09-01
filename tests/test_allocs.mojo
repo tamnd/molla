@@ -7,12 +7,14 @@ that you have just put a malloc on the hot path. So the claim gets an assertion,
 and the assertion runs here rather than only in a benchmark somebody remembers
 to look at.
 
-The shape is a warm up pass and a steady pass. Everything molla allocates for a
+The shape is a warm up and a steady pass. Everything molla allocates for a
 connection is allocated the first time it needs it: the read buffer, the write
-ring, the reactor's slot table, the responses the writer builds. The counter is
-read after the warm up, the identical load runs again, and the second reading
-has to be the first reading exactly. There is no tolerance, because a tolerance
-is a budget and a budget gets spent.
+ring, the reactor's slot table, the responses the writer builds. The load runs
+until one pass of it costs nothing, the identical load runs once more, and that
+last reading has to be zero. There is no tolerance, because a tolerance is a
+budget and a budget gets spent. A load that never stops costing runs out of
+warm up passes and fails saying that, which is what a real regression looks
+like against this.
 
 `molla allocs` is the same measurement with more connections and more rounds,
 wired into CI as its own step. What is here is the version that fits in a test
