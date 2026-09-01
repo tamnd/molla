@@ -278,7 +278,14 @@ struct Normalizer(Movable):
 
     def _nmt(self, points: List[Int]) -> List[Int]:
         """The sentencepiece NMT cleanup: some controls vanish and some odd
-        spaces become ordinary ones."""
+        spaces become ordinary ones.
+
+        The two lists are not the same list and neither is the set of
+        characters anything else calls whitespace. A tab and a newline become
+        spaces here while a vertical tab is deleted, and the four space
+        characters just below the zero width space are left exactly as they
+        are. Both lists are copied from sentencepiece rather than derived.
+        """
         var out = List[Int]()
         for i in range(len(points)):
             var cp = points[i]
@@ -292,8 +299,12 @@ struct Normalizer(Movable):
             ):
                 continue
             if (
-                cp == 0x1680
-                or (cp >= 0x2000 and cp <= 0x200F)
+                cp == 0x0009
+                or cp == 0x000A
+                or cp == 0x000C
+                or cp == 0x000D
+                or cp == 0x1680
+                or (cp >= 0x200B and cp <= 0x200F)
                 or cp == 0x2028
                 or cp == 0x2029
                 or cp == 0x2581

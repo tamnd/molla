@@ -863,6 +863,435 @@ def _flags(mut suite: Suite, dir: String) raises:
     _ = unlink(path)
 
 
+def _untyped_bpe_json() -> String:
+    """A BPE model with no `type` and the vocabulary written first.
+
+    Shaped after `openai-community/gpt2`, which really is written this way. The
+    member order matters because a vocabulary cannot be read before the type
+    says whether it is an object or an array, and the missing type matters
+    because the reference implementation works it out from the other members
+    rather than refusing the file.
+    """
+    return String(
+        '{"version":"1.0","truncation":null,"padding":null,'
+        + '"added_tokens":[],"normalizer":null,'
+        + '"pre_tokenizer":{"type":"Whitespace"},'
+        + '"post_processor":null,"decoder":null,"model":{"vocab":'
+        + '{"h":0,"e":1,"l":2,"o":3,"w":4,"r":5,"d":6,"he":7,"ll":8,'
+        + '"hell":9,"hello":10,"wo":11,"wor":12,"worl":13,"world":14},'
+        + '"merges":["h e","l l","he ll","hell o","w o","wo r","wor l",'
+        + '"worl d"],"dropout":null,"unk_token":null,'
+        + '"continuing_subword_prefix":"","end_of_word_suffix":"",'
+        + '"fuse_unk":false}}'
+    )
+
+
+def _untyped_unigram_json() -> String:
+    """No type either, and the vocabulary is an array rather than an object,
+    which is the one character that says Unigram."""
+    return String(
+        '{"version":"1.0","truncation":null,"padding":null,'
+        + '"added_tokens":[],"normalizer":null,'
+        + '"pre_tokenizer":{"type":"Whitespace"},'
+        + '"post_processor":null,"decoder":null,"model":{"unk_id":0,'
+        + '"vocab":[["<unk>",0.0],["a",-1.0],["b",-1.5],["ab",-1.2],'
+        + '["c",-3.0]],"byte_fallback":false}}'
+    )
+
+
+def _untyped_wordpiece_json() -> String:
+    """No type, no merges, and a word length limit, which is what tells
+    WordPiece apart from a plain word level vocabulary."""
+    return String(
+        '{"version":"1.0","truncation":null,"padding":null,'
+        + '"added_tokens":[],"normalizer":null,'
+        + '"pre_tokenizer":{"type":"Whitespace"},'
+        + '"post_processor":null,"decoder":null,"model":{"vocab":'
+        + '{"[UNK]":0,"play":1,"##ing":2,"##ed":3},"unk_token":"[UNK]",'
+        + '"continuing_subword_prefix":"##","max_input_chars_per_word":100}}'
+    )
+
+
+def _word_level_json(typed: Bool) -> String:
+    """A word level vocabulary, once with its type and once without.
+
+    The two files have to give the same ids, because the untyped one is what
+    is left when a vocabulary has no merges and no word length limit.
+    """
+    var kind = String('"type":"WordLevel",') if typed else String("")
+    return (
+        '{"version":"1.0","truncation":null,"padding":null,'
+        + '"added_tokens":[],"normalizer":null,'
+        + '"pre_tokenizer":{"type":"Whitespace"},'
+        + '"post_processor":null,"decoder":null,"model":{'
+        + kind
+        + '"vocab":{"[UNK]":0,"hello":1,"world":2,"cat":3},'
+        + '"unk_token":"[UNK]"}}'
+    )
+
+
+def _nmt_json() -> String:
+    """Three whole strings in a vocabulary, so the cleanup shows up as an id.
+
+    There is no pre-tokenizer, so the whole string is one word and the id says
+    exactly what the normalizer left behind: `a b` when the character in the
+    middle became a space, `ab` when it was deleted, and the unknown token when
+    it was left alone.
+    """
+    return String(
+        '{"version":"1.0","truncation":null,"padding":null,'
+        + '"added_tokens":[],"normalizer":{"type":"Nmt"},'
+        + '"pre_tokenizer":null,"post_processor":null,"decoder":null,'
+        + '"model":{"type":"WordLevel","vocab":{"[UNK]":0,"a b":1,"ab":2},'
+        + '"unk_token":"[UNK]"}}'
+    )
+
+
+def _prefix_json() -> String:
+    """A byte level prefix space behind a whitespace split.
+
+    This is the shape a few dozen of the real files have, and it is the one
+    that says whether the prefix space goes on the first piece or on all of
+    them. The vocabulary is the byte alphabet and nothing else, so every id is
+    the byte it stands for and the answer reads as the string it came from.
+    """
+    return String(
+        '{"version":"1.0","truncation":null,"padding":null,'
+        + '"added_tokens":[],"normalizer":null,'
+        + '"pre_tokenizer":{"type":"Sequence","pretokenizers":['
+        + '{"type":"Whitespace"},{"type":"ByteLevel",'
+        + '"add_prefix_space":true,"trim_offsets":true,"use_regex":false}]},'
+        + '"post_processor":null,"decoder":{"type":"ByteLevel",'
+        + '"add_prefix_space":true,"trim_offsets":true,"use_regex":false},'
+        + '"model":{"type":"BPE","vocab":{'
+        + _byte_level_vocab()
+        + '},"merges":[],"dropout":null,"unk_token":null,'
+        + '"continuing_subword_prefix":"","end_of_word_suffix":"",'
+        + '"fuse_unk":false}}'
+    )
+
+
+def _template_json() -> String:
+    """Three separate specials in front of the text, the way Whisper writes it.
+
+    Whisper opens with a start marker, then a language, then a timestamp
+    setting, and each one is its own item rather than one run of three. The id
+    the reconciliation rule is about is the third, because that is the one
+    sitting next to the text, and a rule that only looked at the first item
+    would never fire here.
+    """
+    return String(
+        '{"version":"1.0","truncation":null,"padding":null,"added_tokens":['
+        + _added(10, "<|s|>", False, False, False)
+        + ","
+        + _added(11, "<|n|>", False, False, False)
+        + ","
+        + _added(12, "<|e|>", False, False, False)
+        + '],"normalizer":null,"pre_tokenizer":null,"decoder":null,'
+        + '"post_processor":{"type":"TemplateProcessing","single":['
+        + '{"SpecialToken":{"id":"<|s|>","type_id":0}},'
+        + '{"SpecialToken":{"id":"<|n|>","type_id":0}},'
+        + '{"Sequence":{"id":"A","type_id":0}},'
+        + '{"SpecialToken":{"id":"<|e|>","type_id":0}}],'
+        + '"pair":[{"Sequence":{"id":"A","type_id":0}},'
+        + '{"Sequence":{"id":"B","type_id":1}}],"special_tokens":{'
+        + '"<|s|>":{"id":"<|s|>","ids":[10],"tokens":["<|s|>"]},'
+        + '"<|n|>":{"id":"<|n|>","ids":[11],"tokens":["<|n|>"]},'
+        + '"<|e|>":{"id":"<|e|>","ids":[12],"tokens":["<|e|>"]}}},'
+        + '"model":{"type":"WordLevel","vocab":{"hello":4,"[UNK]":5,'
+        + '"<|s|>":10,"<|n|>":11,"<|e|>":12},"unk_token":"[UNK]"}}'
+    )
+
+
+def _shapes(mut suite: Suite, dir: String) raises:
+    """Files that say what model they are in a roundabout way.
+
+    Every id in here came out of the reference implementation reading the same
+    bytes. A file with no `type` is not a broken file, it is what the oldest
+    and most downloaded tokenizers on the hub look like, and refusing one means
+    refusing GPT-2.
+    """
+    suite.group("model shapes")
+    var path = dir + "/sh.json"
+    var counter = AllocCounter()
+
+    _write(path, _untyped_bpe_json())
+    var bpe = Tokenizer(path, counter.raw())
+    var session = Session()
+    _encodes(
+        suite,
+        bpe,
+        session,
+        "hello world",
+        False,
+        [10, 14],
+        "a bpe model with no type and its vocabulary written first",
+    )
+    _encodes(suite, bpe, session, "hell", False, [9], "and it merges")
+    _encodes(
+        suite,
+        bpe,
+        session,
+        "ohh",
+        False,
+        [3, 0, 0],
+        "and leaves alone what it cannot merge",
+    )
+    _ = bpe^
+
+    _write(path, _untyped_unigram_json())
+    var unigram = Tokenizer(path, counter.raw())
+    var us = Session()
+    _encodes(
+        suite,
+        unigram,
+        us,
+        "ab",
+        False,
+        [3],
+        "an array vocabulary with no type is unigram",
+    )
+    _encodes(suite, unigram, us, "abc", False, [3, 4], "and scores its path")
+    _encodes(suite, unigram, us, "zz", False, [0], "and falls back to unknown")
+    _ = unigram^
+
+    _write(path, _untyped_wordpiece_json())
+    var wordpiece = Tokenizer(path, counter.raw())
+    var ws = Session()
+    _encodes(
+        suite,
+        wordpiece,
+        ws,
+        "playing",
+        False,
+        [1, 2],
+        "a word length limit with no type is wordpiece",
+    )
+    _encodes(suite, wordpiece, ws, "played", False, [1, 3], "and it continues")
+    _encodes(suite, wordpiece, ws, "zzz", False, [0], "and gives up as a whole")
+    _ = wordpiece^
+
+    # The same file twice, once saying what it is and once not, because the
+    # untyped one is only right if it lands on the same model.
+    for typed in [True, False]:
+        _write(path, _word_level_json(typed))
+        var level = Tokenizer(path, counter.raw())
+        var ls = Session()
+        var said = String(" with a type") if typed else String(" without one")
+        _encodes(
+            suite,
+            level,
+            ls,
+            "hello world",
+            False,
+            [1, 2],
+            "a word level vocabulary" + said,
+        )
+        _encodes(
+            suite,
+            level,
+            ls,
+            "hello dog",
+            False,
+            [1, 0],
+            "and an unseen word costs one id" + said,
+        )
+        _encodes(suite, level, ls, "cat", False, [3], "and a seen one" + said)
+        _ = level^
+    _ = unlink(path)
+
+
+def _nmt(mut suite: Suite, dir: String) raises:
+    """The sentencepiece cleanup, one character at a time.
+
+    Two lists that are nearly the same and are not: some characters become a
+    space and some are deleted, and neither list is what anything else calls
+    whitespace. Every answer here came out of the reference implementation.
+    """
+    suite.group("nmt normalizer")
+    var path = dir + "/nmt.json"
+    _write(path, _nmt_json())
+    var counter = AllocCounter()
+    var tokenizer = Tokenizer(path, counter.raw())
+    var session = Session()
+
+    _encodes(suite, tokenizer, session, "a\tb", False, [1], "a tab is a space")
+    _encodes(
+        suite, tokenizer, session, "a\nb", False, [1], "and so is a newline"
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "a\x0Cb",
+        False,
+        [1],
+        "and so is a form feed",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "a\rb",
+        False,
+        [1],
+        "and so is a carriage return",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "a\x0Bb",
+        False,
+        [2],
+        "a vertical tab is deleted rather than spaced",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "a​b",
+        False,
+        [1],
+        "a zero width space is a space",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "a b",
+        False,
+        [0],
+        "and an en quad just above it is left alone",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "a b",
+        False,
+        [0],
+        "and so is a no break space",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "a▁b",
+        False,
+        [1],
+        "the metaspace character becomes a space",
+    )
+    _ = unlink(path)
+
+
+def _prefix(mut suite: Suite, dir: String) raises:
+    """The byte level prefix space, once there is more than one piece."""
+    suite.group("byte level prefix space")
+    var path = dir + "/px.json"
+    _write(path, _prefix_json())
+    var counter = AllocCounter()
+    var tokenizer = Tokenizer(path, counter.raw())
+    var session = Session()
+
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "a b",
+        False,
+        [32, 97, 32, 98],
+        "every piece gets the space and not just the first",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "a  b",
+        False,
+        [32, 97, 32, 98],
+        "which is what makes two spaces read as one",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        " a",
+        False,
+        [32, 97],
+        "a piece that has the space already does not get another",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "   ",
+        False,
+        [],
+        "nothing but spaces produces no tokens at all",
+    )
+    _encodes(
+        suite, tokenizer, session, "", False, [], "and neither does nothing"
+    )
+    _ = unlink(path)
+
+
+def _template(mut suite: Suite, dir: String) raises:
+    """A template with three specials in front of the text, and the rule about
+    the last of them."""
+    suite.group("template with several leading specials")
+    var path = dir + "/tp.json"
+    _write(path, _template_json())
+    var counter = AllocCounter()
+    var tokenizer = Tokenizer(path, counter.raw())
+    var session = Session()
+
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "hello",
+        True,
+        [10, 11, 4, 12],
+        "the template writes all three specials",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "<|n|>hello",
+        True,
+        [10, 11, 11, 4, 12],
+        "and writes the third one twice when the text has it already",
+    )
+    var once = List[Int]()
+    tokenizer.encode_rendered("<|n|>hello", session, once)
+    suite.check(
+        _same(once, [10, 11, 4, 12]),
+        "encoding rendered text drops the template's copy of it",
+    )
+
+    # The first special doubles up here rather than the third. Nothing is
+    # dropped, because the rule is about the id next to the text and this one
+    # is two places away from it.
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        "<|s|>hello",
+        True,
+        [10, 11, 10, 4, 12],
+        "a different special in the text doubles up on its own",
+    )
+    var kept = List[Int]()
+    tokenizer.encode_rendered("<|s|>hello", session, kept)
+    suite.check(
+        _same(kept, [10, 11, 10, 4, 12]),
+        "and rendered text leaves that one alone",
+    )
+    _ = unlink(path)
+
+
 def _refuses(mut suite: Suite, dir: String) raises:
     suite.group("tokenizer files that are refused")
     var path = dir + "/bad.json"
@@ -905,6 +1334,10 @@ def run(mut suite: Suite) raises:
         _unigram(suite, dir)
         _fallback(suite, dir)
         _flags(suite, dir)
+        _shapes(suite, dir)
+        _nmt(suite, dir)
+        _prefix(suite, dir)
+        _template(suite, dir)
         _refuses(suite, dir)
     except e:
         _ = rmdir(dir)

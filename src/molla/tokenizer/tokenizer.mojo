@@ -49,6 +49,11 @@ struct Session(Movable):
     Held by the caller rather than by the tokenizer so that the tokenizer can
     be shared and read only, which is what lets one loaded file serve every
     request without a lock.
+
+    It belongs to one tokenizer. The word cache inside it maps bytes to ids and
+    those ids only mean anything in the vocabulary they came from, so a session
+    handed to a second tokenizer will answer with the first one's ids and will
+    not say so. One session per thread per loaded file.
     """
 
     var scratch: Scratch

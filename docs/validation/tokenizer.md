@@ -69,14 +69,89 @@ The word cache in front of the model is what carries the rest. Real text repeats
 
 **Double BOS is opt in to avoid, not on by default.** A chat template writes the beginning of text token into the text it renders, the added token matcher turns it back into an id, and then the post processor writes another one in front of it. Two of them is not what the model was trained on and it does not fail, it just makes the answers worse in a way nobody traces back to here. The reference does exactly this and can be watched doing it: on the byte fallback fixture in `tests/test_tokenizer.mojo`, `encode("<s>hello", add_special_tokens=True)` returns `[1, 1, 5, 114, 111, 118, 118, 7]`. `Tokenizer.encode` reproduces that, because its job is to be the reference. `Tokenizer.encode_rendered` is the one to call for text a template produced, and it returns `[1, 5, 114, 111, 118, 118, 7]`. Only the caller knows where the text came from, so it is a second entry point rather than a guess made inside the post processor.
 
+## The conformance corpus
+
+Issue #22. Four models are four models, and four is not enough to find the things that are wrong in one file out of fifty. So the corpus is 338 real `tokenizer.json` files and 355 pieces of text, and it runs on every commit.
+
+`scripts/tokenizers.tsv` is the manifest. One row per file: the repository, the commit it was read at, the tier, the size, the sha256 of the file, whether molla is expected to load it, the sha256 of the answer, and the cases excluded for that file. The files themselves are not in the repository, because they come to 1284 MB. `scripts/fetch-tokenizers.py` downloads them and checks every digest, and `.gitignore` keeps `corpus/` out.
+
+The 338 were picked from 2740 popular repositories on the hub. 1734 of them carry a `tokenizer.json` and 722 of those files are distinct, and the corpus is a greedy set cover over all 42 pipeline component types, one representative per coarse pipeline signature, and sixteen flagship models forced in by name. It is split into two tiers because 1284 MB is too much to fetch on every commit: a quick tier of 59 files and 172 MB that CI runs, and the full 338 for the ones that need running by hand.
+
+`scripts/tokenizer_cases.txt` is the text, one case per line written as hex. Hex because the corpus is full of things an editor would quietly fix: lone control characters, a byte order mark, trailing spaces, and the empty string, which is case zero and therefore an empty line. The 355 cases are whitespace on its own in every combination, plain English, every C0 control, the invisible marks, combining sequences composed and decomposed, Hangul in both spellings, CJK in four scripts, ten right to left cases with the bidirectional overrides, emoji with skin tones and joiner families and flags, twenty other scripts, strings that look like special tokens but are not, normalization targets, realistic prompts, every Latin-1 byte as a character, and one eight character sample from each of 48 Unicode blocks.
+
+The answer for one file is one line per case: the case number, the ids with special tokens, the ids without them, and the bytes the ids decode back to, in hex. The sha256 of the whole run of them is what the manifest records. A digest rather than the answers because the answers are forty megabytes, and because a digest that matches is the only thing anybody reads.
+
+Both halves are in the repository. `scripts/check-tokenizer.py` is the reference: it runs Hugging Face `tokenizers` 0.23.1 and writes the digests. `scripts/tokenizer_oracle.mojo` is molla: it produces the same answer in the same spelling and compares. Python is a test time oracle and nothing else, and the everyday check does not run it at all, which is the point of storing digests rather than a script that regenerates them.
+
+Where it stands:
+
+| Outcome | Files |
+| --- | --- |
+| Identical ids and identical decode round trip | 272 |
+| Identical apart from an excluded case | 6 |
+| Refused at load, as the manifest says they should be | 60 |
+| Mismatched | 0 |
+
+The six with an excluded case are all the same thing in three places. Case 279 is U+32FF, the square era name Reiwa, whose NFKC decomposition was added in Unicode 12.1. Cases 319 and 320 contain U+0C04 and U+0D04, Telugu and Malayalam signs assigned in Unicode 11. The reference reads its character properties from a crate whose tables are frozen at roughly Unicode 9 and molla's are generated from the current database, so on those three characters the reference is reading an older Unicode than we are. Following it would mean shipping a deliberately stale copy of the database, so the case is excluded for those files with the reason written here, and it still runs against the other 332.
+
+The 60 refusals are all the same thing too: a `Precompiled` normalizer, which is a SentencePiece charsmap compiled into a blob of trie data. That is 18 per cent of the popular corpus, and it is the T5, mT5, XLM-R, ALBERT, DeBERTa-v3 and NLLB families. Recording them as refused is not sweeping them under the rug: the corpus asserts that molla refuses each one cleanly rather than loading it and producing ids that are quietly wrong, and the answer digest for each is already in the manifest, so the day `Precompiled` is implemented the change is one word per row. Issue #109 is the follow up.
+
+One thing in the corpus has no reference to compare against. `encode_rendered` drops the beginning of text token the post processor would otherwise write in front of one the chat template already wrote, and the reference has no such rule, so there is nothing to diff. It is checked as a property instead: the opening special is read off the file by encoding nothing and encoding one letter and taking the ids they agree on, then the same text is encoded both ways, and the rendered call has to come back with exactly one of the doubled ids gone and nothing else changed. When the id does not double there is nothing to drop and the two calls have to agree exactly, which is the half that catches dropping too eagerly. 210 of the 278 files have an opening special and all 210 hold.
+
+## What the corpus found
+
+Six defects, all of them in code that 1430 unit checks and 4560 differential cases across four models had passed.
+
+**A model object whose members are in the wrong order.** The loader read `vocab` when it reached it, which needs the type, because the type says whether a vocabulary is an object or an array. 13 files write `unk_token` or `dropout` ahead of the type and one of them is GPT-2. The spans of `vocab` and `merges` are noted and skipped on the way past now, and read once the object has closed.
+
+**A model object with no type at all.** GPT-2 again: its model object has seven members and `type` is not one of them. The reference answers this by trying each model in turn until one accepts the other members. What the members say is unambiguous, so it is read off them directly. An array vocabulary is Unigram, a `merges` list is BPE, a word length limit is WordPiece, and what is left is a plain word level vocabulary, which is a fourth model kind that molla did not have and now does.
+
+**Two wrong character lists in the Nmt normalizer.** It used U+2000 through U+200F where SentencePiece uses U+200B through U+200F, so four space characters were being turned into ordinary spaces that should have been left alone, and it never mapped tab, newline, form feed or carriage return to a space at all.
+
+**A gap in what `\w` means.** The regex crate the model files were tested against reads `\w` as Alphabetic, and Alphabetic is not the letter categories. It is wider by the letter numbers, which is where the ideographic zero and the Roman numerals live, and by the circled and squared Latin letters, which the database files as symbols. A pre-tokenizer that calls the ideographic zero a symbol cuts a Chinese word in half.
+
+**A space invented out of nothing.** A byte level pre-tokenizer with `add_prefix_space` behind a Bert pre-tokenizer, given a string of nothing but spaces, produced one token containing a space, because the prefix step made a piece to put the space in front of when the earlier step had correctly thrown everything away.
+
+**A prefix space on the first piece only.** The same step, given several pieces, prefixed the first. The reference runs the prepend over every one of them, which is how `a  b` keeps the space in front of `b` that the splitting threw away.
+
+The seventh was found by the beginning of text property rather than by the reference. The rule only fired when the template was one run of specials followed by the sequence, and Whisper writes three separate specials in front of the text, so the id that would double up is the third and the rule never looked at it. It looks for the sequence now and takes the special before it, wherever that is.
+
 ## What is in CI
 
-`tests/test_tokenizer.mojo` builds five small `tokenizer.json` files in a temporary directory and checks fifty two things against them. Every expected id and every expected string in that file came out of `tokenizers` 0.23.1 running on the same bytes, because a tokenizer that is wrong produces output that still looks sensible and the only question worth asking is whether it matches.
+`tests/test_tokenizer.mojo` builds thirteen small `tokenizer.json` files in a temporary directory and checks eighty six things against them. Every expected id and every expected string in that file came out of `tokenizers` 0.23.1 running on the same bytes, because a tokenizer that is wrong produces output that still looks sensible and the only question worth asking is whether it matches.
 
-The five files are a byte level BPE shaped like GPT-2, a WordPiece shaped like BERT with the template processor and both sequence types, a Unigram with a metaspace pre-tokenizer and scores chosen so the greedy answer and the Viterbi answer differ, a BPE with byte fallback and a fused decoder shaped like Llama and Gemma, and one file whose added tokens carry the `lstrip`, `rstrip` and `single_word` flags one each. Between them they exercise every stage the loader can build. The streaming decoder gets its own check: six ids that spell two three byte characters, fed one at a time, must say nothing four times and then produce the two characters.
+Five of them cover the stages: a byte level BPE shaped like GPT-2, a WordPiece shaped like BERT with the template processor and both sequence types, a Unigram with a metaspace pre-tokenizer and scores chosen so the greedy answer and the Viterbi answer differ, a BPE with byte fallback and a fused decoder shaped like Llama and Gemma, and one file whose added tokens carry the `lstrip`, `rstrip` and `single_word` flags one each. Between them they exercise every stage the loader can build. The streaming decoder gets its own check: six ids that spell two three byte characters, fed one at a time, must say nothing four times and then produce the two characters.
 
-The four real models are not in CI because their tokenizer files run to 33 MB and CI cannot download them on every push. That is what this document is for.
+The other eight are the corpus findings brought back as small files, so that the next person to break one of them sees it in a second rather than in a corpus run. Four files with no `type` at all, one per model kind, the BPE one also writing its vocabulary ahead of everything else the way GPT-2 does. A word level vocabulary with its type, to check that it lands in the same place the untyped one does. An Nmt normalizer read one character at a time. A byte level prefix space behind a whitespace split. And a Whisper shaped template with three specials in front of the text. Every id in all of them came out of the reference reading the same bytes.
+
+The conformance corpus runs in CI too, as the `Tokenizer conformance` job, on the quick tier. It fetches the 59 files, checks their digests, and runs `pixi run conformance-tokenizer`, and it is one of the jobs the required `CI OK` check waits for, so a mismatch blocks the merge. The corpus directory is cached on the manifest hash, so an ordinary commit restores it rather than downloading it.
+
+The full tier is `pixi run conformance-tokenizer-full` after `python3 scripts/fetch-tokenizers.py --tier full --into corpus/tokenizers`. The fetch is 1284 MB and the run is about twenty seconds. Run it when the loader or any stage changes.
+
+The four real models in `~/models/st` are not in CI because their tokenizer files run to 33 MB and they are what the throughput numbers above were measured on. That part is still by hand and this document is the record of it.
 
 ## Running it again
 
-The oracle scripts and the benchmark programs are not in the repository, since they need `~/models/st` and a Python environment with `tokenizers` in it. Rebuilding them is half an hour: generate cases with `tokenizers`, write out the input as hex with the ids beside it, and read that file from a Mojo program that runs the same input through `molla.tokenizer` and compares. The one thing worth copying is the hex encoding of the input text, which is what makes a case containing a bare newline or an unpaired combining mark survive being written to a file and read back.
+The corpus is in the repository and runs with two commands:
+
+```console
+$ python3 scripts/fetch-tokenizers.py --tier quick --into corpus/tokenizers
+tier quick rows 59 have 0 fetched 59 failed 0 bytes 172.4 MB
+$ pixi run conformance-tokenizer
+checked 46 refused 13 failed 0 cases 355 bos 29
+```
+
+A mismatch prints the repository and the two digests. To find out which case, print both sides and diff them:
+
+```console
+$ pixi run mojo run -I src scripts/tokenizer_oracle.mojo scripts/tokenizer_cases.txt \
+    scripts/tokenizers.tsv corpus/tokenizers full --print openai-community/gpt2 > mine.txt
+$ python3 scripts/check-tokenizer.py --dir corpus/tokenizers --explain openai-community/gpt2 > theirs.txt
+$ diff theirs.txt mine.txt
+```
+
+The first field of a differing line is the case number, and `python3 -c "print(bytes.fromhex(open('scripts/tokenizer_cases.txt').read().split(chr(10))[N]))"` says what the text was.
+
+Regenerating the manifest digests needs a Python environment with `tokenizers` in it and the full tier on disk. `python3 scripts/check-tokenizer.py --dir corpus/tokenizers --refresh` rewrites the answer column and leaves the `status` and `skip` columns alone, because those are statements about molla rather than about the reference and nothing on the Python side can work them out.
+
+The throughput numbers are a separate thing and their benchmark programs are not in the repository, since they need `~/models/st`.

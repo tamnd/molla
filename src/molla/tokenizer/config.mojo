@@ -29,6 +29,7 @@ from molla.json.reader import (
     EV_STRING,
     Reader,
 )
+from molla.sys.mem import as_ptr
 from molla.sys.mmap import Mapping
 from molla.text.props import Unicode
 from molla.text.regex import Regex
@@ -47,7 +48,7 @@ from .decoder import (
     DecodeStep,
     Decoder,
 )
-from .model import M_BPE, M_UNIGRAM, M_WORDPIECE, Model
+from .model import M_BPE, M_UNIGRAM, M_WORDLEVEL, M_WORDPIECE, Model
 from .normalizer import (
     N_BERT,
     N_LOWERCASE,
@@ -966,14 +967,89 @@ def _read_merges(mut reader: Reader, mut model: Model) raises:
         rank += 1
 
 
+def _over(base: Int, start: Int, end: Int) -> Reader:
+    """A second reader over one member of the object the first one is in.
+
+    The bytes are the same bytes, not a copy, so this costs a scratch buffer
+    and nothing else.
+    """
+    var out = Reader(0, 1024)
+    out.begin(
+        Span[UInt8, MutAnyOrigin](
+            unsafe_ptr=as_ptr(base + start), length=end - start
+        )
+    )
+    return out^
+
+
+def _guess_kind(
+    base: Int, vocab_at: Int, vocab_end: Int, has_merges: Bool, capped: Bool
+) raises -> Int:
+    """Which model a `model` object with no `type` in it is.
+
+    A Unigram vocabulary is an array and the other three are objects, so one
+    character settles that. After it, `merges` means BPE, a word length limit
+    means WordPiece, and what is left is a plain word level vocabulary.
+    """
+    if vocab_end > vocab_at:
+        var p = as_ptr(base)
+        for i in range(vocab_at, vocab_end):
+            var b = p.unsafe_load(i)
+            if (
+                b == UInt8(32)
+                or b == UInt8(9)
+                or b == UInt8(10)
+                or b == UInt8(13)
+            ):
+                continue
+            if b == UInt8(ord("[")):
+                return M_UNIGRAM
+            break
+    if has_merges:
+        return M_BPE
+    if capped:
+        return M_WORDPIECE
+    if vocab_end > vocab_at:
+        return M_WORDLEVEL
+    raise Error("the model has no type")
+
+
 def read_model(mut reader: Reader) raises -> Model:
-    """The `model` object, into a `Model` that is ready to tokenize."""
+    """The `model` object, into a `Model` that is ready to tokenize.
+
+    The two big members are read last whatever order the file writes them in.
+    A vocabulary cannot be read before the type, because the type says whether
+    it is an object or an array, and a merge cannot be resolved before the
+    vocabulary, because a merge is a pair of ids. Files disagree about the
+    order: most write the type first, and enough of them write `unk_token` or
+    `dropout` or the vocabulary itself ahead of it that reading in file order
+    means refusing files the reference implementation loads. So the spans of
+    `vocab` and `merges` are noted and skipped on the way past, and read once
+    the object has closed and the type is known.
+
+    The type can also be missing, which the reference implementation answers by
+    trying each model in turn until one of them accepts the other members. What
+    the members actually say is unambiguous, so it is read off them directly:
+    an array of pairs is a Unigram vocabulary, a `merges` list means BPE, and a
+    word length limit means WordPiece.
+    """
     if reader.next() != EV_OBJECT_BEGIN:
         raise Error("the model is not an object")
-    var model = Model(M_BPE, 4096)
-    var started = False
+    var kind = -1
+    var continuing_prefix = List[UInt8]()
+    var end_suffix = List[UInt8]()
+    var fuse_unk = False
+    var byte_fallback = False
+    var ignore_merges = False
+    var max_input_chars = 100
+    var saw_max_input_chars = False
     var unk_text = List[UInt8]()
     var unk_id = NO_ID
+    var base = reader.base
+    var vocab_at = 0
+    var vocab_end = 0
+    var merges_at = 0
+    var merges_end = 0
     while True:
         var member = reader.next()
         if member == EV_OBJECT_END or member == EV_END:
@@ -985,44 +1061,68 @@ def read_model(mut reader: Reader) raises -> Model:
         if reader.key_is("type"):
             var text = _text_of(_read_string(reader))
             if text == "BPE":
-                model = Model(M_BPE, 65536)
+                kind = M_BPE
             elif text == "WordPiece":
-                model = Model(M_WORDPIECE, 32768)
+                kind = M_WORDPIECE
             elif text == "Unigram":
-                model = Model(M_UNIGRAM, 32768)
+                kind = M_UNIGRAM
+            elif text == "WordLevel":
+                kind = M_WORDLEVEL
             else:
                 raise Error("unsupported tokenizer model " + text)
-            started = True
         elif reader.key_is("vocab"):
-            if not started:
-                raise Error("the model has a vocabulary before its type")
-            if model.kind == M_UNIGRAM:
-                _read_vocab_array(reader, model)
-            else:
-                _read_vocab_object(reader, model)
+            vocab_at = reader.at
+            _ = reader.skip_next_value()
+            vocab_end = reader.at
         elif reader.key_is("merges"):
-            _read_merges(reader, model)
+            merges_at = reader.at
+            _ = reader.skip_next_value()
+            merges_end = reader.at
         elif reader.key_is("unk_token"):
             unk_text = _read_string(reader)
         elif reader.key_is("unk_id"):
             unk_id = _read_int(reader, NO_ID)
         elif reader.key_is("continuing_subword_prefix"):
-            model.continuing_prefix = _read_string(reader)
+            continuing_prefix = _read_string(reader)
         elif reader.key_is("end_of_word_suffix"):
-            model.end_suffix = _read_string(reader)
+            end_suffix = _read_string(reader)
         elif reader.key_is("fuse_unk"):
-            model.fuse_unk = _read_bool(reader, False)
+            fuse_unk = _read_bool(reader, False)
         elif reader.key_is("byte_fallback"):
-            model.byte_fallback = _read_bool(reader, False)
+            byte_fallback = _read_bool(reader, False)
         elif reader.key_is("ignore_merges"):
-            model.ignore_merges = _read_bool(reader, False)
+            ignore_merges = _read_bool(reader, False)
         elif reader.key_is("max_input_chars_per_word"):
-            model.max_input_chars = _read_int(reader, 100)
+            max_input_chars = _read_int(reader, 100)
+            saw_max_input_chars = True
         else:
             _ = reader.skip_next_value()
 
-    if not started:
-        raise Error("the model has no type")
+    if kind < 0:
+        kind = _guess_kind(
+            base,
+            vocab_at,
+            vocab_end,
+            merges_end > merges_at,
+            saw_max_input_chars,
+        )
+    var expected = 65536 if kind == M_BPE else 32768
+    var model = Model(kind, expected)
+    model.continuing_prefix = continuing_prefix^
+    model.end_suffix = end_suffix^
+    model.fuse_unk = fuse_unk
+    model.byte_fallback = byte_fallback
+    model.ignore_merges = ignore_merges
+    model.max_input_chars = max_input_chars
+    if vocab_end > vocab_at:
+        var sub = _over(base, vocab_at, vocab_end)
+        if model.kind == M_UNIGRAM:
+            _read_vocab_array(sub, model)
+        else:
+            _read_vocab_object(sub, model)
+    if merges_end > merges_at:
+        var sub = _over(base, merges_at, merges_end)
+        _read_merges(sub, model)
     if len(unk_text) > 0:
         model.unk_id = model.vocab.id_of(unk_text)
     elif unk_id != NO_ID:

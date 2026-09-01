@@ -20,11 +20,18 @@ pixi.lock.bak
 /spikes/qmatmul/shape.txt
 /spikes/qmatmul/shape_q40.txt
 
+# The tokenizer conformance corpus. A gigabyte of real `tokenizer.json` files
+# that `scripts/fetch-tokenizers.py` downloads and checks the digests of.
+/corpus/
+
 # Local state. Never commit a model store.
 /.molla/
 *.gguf
 *.safetensors
 *.bin
+
+# The oracle scripts are Python, and importing one leaves this behind.
+__pycache__/
 
 # Editors and OS
 .DS_Store

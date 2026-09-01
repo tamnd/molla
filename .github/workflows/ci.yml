@@ -144,6 +144,40 @@ jobs:
       - name: Allocation assertion
         run: ./build/molla allocs 16 4
 
+  # Every id molla produces for a real tokenizer file, checked against the
+  # digest the Hugging Face library gave for the same file and the same text.
+  # The files are not in the repository, so they are fetched and cached. See
+  # docs/validation/tokenizer.md and issue #22.
+  tokenizer:
+    name: Tokenizer conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@194d461b21b6c5717c722ffc597fa91ed2ff29fa # v0.9.1
+        with:
+          cache: true
+          locked: true
+      # Keyed on the manifest, so a corpus change fetches and everything else
+      # restores. The prefix key means a change to one row does not re-download
+      # the other fifty eight.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: corpus/tokenizers
+          key: tokenizers-quick-${{ hashFiles('scripts/tokenizers.tsv') }}
+          restore-keys: tokenizers-quick-
+      - name: Fetch the corpus
+        run: python3 scripts/fetch-tokenizers.py --tier quick --into corpus/tokenizers
+      - name: Run the corpus
+        run: pixi run conformance-tokenizer
+
   # Numerics and performance need real devices, so they run on the fleet
   # rather than on hosted runners. See D7 and D8 in docs/design.md.
   # Gated on the label so forks and doc changes do not queue on hardware.
@@ -202,7 +236,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [docs, workflows, shell, build]
+    needs: [docs, workflows, shell, build, tokenizer]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

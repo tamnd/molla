@@ -31,6 +31,7 @@ from molla.text.props import (
     CAT_ME,
     CAT_MN,
     CAT_ND,
+    CAT_NL,
     CAT_NO,
     CAT_PC,
     Unicode,
@@ -235,11 +236,15 @@ def whitespace_class() -> CharClass:
 
 
 def word_class(tables: Unicode) -> CharClass:
-    """What `\\w` means: letters, marks, digits, connectors and the joiners.
+    """What `\\w` means: alphabetic, marks, digits, connectors and the joiners.
 
     Written the way the Rust regex crate writes it, because that is the engine
     the model files were tested against, and it is wider than the ASCII `\\w`
-    most people picture.
+    most people picture. Alphabetic is wider than the letter categories too:
+    it takes the letter numbers, which is where the ideographic zero and the
+    Roman numerals are, and the circled and squared Latin letters, which the
+    database files as symbols. See `Unicode.is_word`, which has to agree with
+    this because a word boundary is decided there and a class match here.
     """
     var out = CharClass()
     for i in range(len(tables.cat_start)):
@@ -247,9 +252,14 @@ def word_class(tables: Unicode) -> CharClass:
         var wanted = value >= CAT_LU and value <= CAT_LO
         wanted = wanted or (value >= CAT_MN and value <= CAT_ME)
         wanted = wanted or value == CAT_ND or value == CAT_PC
+        wanted = wanted or value == CAT_NL
         if wanted:
             out.add(tables.cat_start[i], tables.cat_end[i])
     out.add(0x200C, 0x200D)
+    out.add(0x24B6, 0x24E9)
+    out.add(0x1F130, 0x1F149)
+    out.add(0x1F150, 0x1F169)
+    out.add(0x1F170, 0x1F189)
     out.sort()
     return out^
 
