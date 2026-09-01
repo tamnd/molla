@@ -2,6 +2,18 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- The `Precompiled` normalizer, which is the SentencePiece charsmap. It was 60 of the 338 files in the tokenizer conformance corpus, 18 per cent of them, and all of the T5, mT5, XLM-R, ALBERT, DeBERTa-v3 and NLLB families. Those 60 load now and the full corpus reports no refusals and no mismatches. See [docs/validation/tokenizer.md](docs/validation/tokenizer.md).
+- `molla.text.graphemes`, UAX #29 extended grapheme clusters, with all of the rules including the emoji rule GB11 and the Indic conjunct rule GB9c. The charsmap needs it because SentencePiece looks text up one cluster at a time. The grapheme break property is a fifth generated table in `src/molla/text/tables.mojo`.
+- `strip_combining` in `molla.text.normalize`, which drops spacing and enclosing marks as well as non spacing ones.
+
+### Fixed
+
+- A `StripAccents` normalizer written on its own dropped only non spacing marks. Hugging Face drops all three mark categories there and drops only the non spacing ones for the `strip_accents` flag inside a `BertNormalizer`, and molla was using one function for both. It lost the enclosing keycap off a digit and the vowel sign off a Devanagari syllable, and it was two files in the corpus.
+
 ## [0.2.4] - 2026-09-01
 
 The template engine now answers to an oracle on every commit.

@@ -8,9 +8,23 @@ Issue #21. The done criterion was 20 MB/s single threaded on the M4 with the con
 
 All three model kinds are here. BPE with a ranked merge heap, byte fallback, fused unknowns and the `ignore_merges` flag. WordPiece with the longest match walk and the continuing subword prefix. Unigram with a Viterbi pass over the lattice.
 
-Around them: NFC, NFD, NFKC, NFKD, Lowercase, StripAccents, Nmt, Strip, Prepend, Replace with either a string or a regular expression, BertNormalizer and any Sequence of those. ByteLevel, Whitespace, WhitespaceSplit, BertPreTokenizer, Punctuation, Digits, CharDelimiterSplit, Metaspace and Split with all five split behaviours. ByteLevel, ByteFallback, Fuse, Metaspace, WordPiece, BPEDecoder, Replace and Strip decoders. TemplateProcessing, BertProcessing, RobertaProcessing and ByteLevel post processors, all four compiled into one template so there is one thing to get right rather than four.
+Around them: NFC, NFD, NFKC, NFKD, Lowercase, StripAccents, Nmt, Strip, Prepend, Replace with either a string or a regular expression, Precompiled, BertNormalizer and any Sequence of those. ByteLevel, Whitespace, WhitespaceSplit, BertPreTokenizer, Punctuation, Digits, CharDelimiterSplit, Metaspace and Split with all five split behaviours. ByteLevel, ByteFallback, Fuse, Metaspace, WordPiece, BPEDecoder, Replace and Strip decoders. TemplateProcessing, BertProcessing, RobertaProcessing and ByteLevel post processors, all four compiled into one template so there is one thing to get right rather than four.
 
-A file naming something not on those lists is refused at load rather than loaded with the part it did not understand quietly missing. A `Precompiled` normalizer is the case that matters: it is a SentencePiece charsmap, skipping it changes the ids, and a tokenizer that is silently wrong is worse than one that will not open.
+A file naming something not on those lists is refused at load rather than loaded with the part it did not understand quietly missing. Skipping a stage changes the ids, and a tokenizer that is silently wrong is worse than one that will not open.
+
+## The SentencePiece charsmap
+
+`Precompiled` is the odd one on that list and it has its own section because it was the last thing missing and because two of its rules are surprising. It is issue #109, and it was 60 of the 338 files in the conformance corpus, which is 18 per cent of the popular tokenizers on the hub: T5, mT5, XLM-R, ALBERT, DeBERTa-v3 and NLLB, most of the multilingual encoders anybody runs.
+
+What the file carries is a quarter of a megabyte of base64 that SentencePiece produced when the model was trained. Inside it is a little endian length, then a double array trie whose keys are UTF-8 byte sequences, then every replacement string laid end to end and separated by NUL bytes. A rule is a key in the trie whose value is an offset into that table. The rules are a compiled NFKC variant plus whatever else the training script asked for, so the result is close to NFKC and not equal to it, and approximating it with NFKC gives ids that are wrong in a way nothing reports.
+
+The first surprise is that lookup happens per grapheme cluster rather than per character or over the whole string, and only when the cluster is under six bytes. That is what turns a letter and a combining acute into one precomposed letter, and it is why a rule keyed on a flag or a family emoji can never fire. Six is the reference implementation's number and there is no principle behind it. Getting there needed a UAX #29 grapheme cluster walker, which is now `molla.text.graphemes` and which implements all of the rules including the emoji rule GB11 and the Indic conjunct rule GB9c, even though the six byte cutoff means the charsmap can never reach either.
+
+The second is that the trie search returns the shortest key that is a prefix of what it was given rather than the longest. SentencePiece itself takes the longest. The Rust port that Hugging Face `tokenizers` uses takes the first result the search produced, which is the shortest, and since the corpus is checked against that port, so does molla. It is visible from outside: a subscript i followed by a combining breve comes back as a plain i, because the rule for the subscript matched first and the breve went with it.
+
+Both were settled before any Mojo was written, by reimplementing the algorithm in Python and running it against `tokenizers.normalizers.Precompiled` directly, over each of the three distinct charsmaps the corpus contains and 42288 inputs each. Zero mismatches on all three.
+
+Implementing this also found a defect that had nothing to do with charsmaps. Hugging Face has two ways to spell stripping accents and they are not the same function: a `StripAccents` normalizer written on its own drops Mn, Mc and Me, while the `strip_accents` flag inside a `BertNormalizer` drops only Mn. molla used one function for both, which lost the enclosing keycap off a digit and the vowel sign off a Devanagari syllable. There are two functions now, `strip_marks` and `strip_combining`, and the difference is checked in `tests/test_text.mojo`.
 
 ## Against the reference
 
@@ -87,16 +101,16 @@ Where it stands:
 
 | Outcome | Files |
 | --- | --- |
-| Identical ids and identical decode round trip | 272 |
+| Identical ids and identical decode round trip | 332 |
 | Identical apart from an excluded case | 6 |
-| Refused at load, as the manifest says they should be | 60 |
+| Refused at load, as the manifest says they should be | 0 |
 | Mismatched | 0 |
 
 The six with an excluded case are all the same thing in three places. Case 279 is U+32FF, the square era name Reiwa, whose NFKC decomposition was added in Unicode 12.1. Cases 319 and 320 contain U+0C04 and U+0D04, Telugu and Malayalam signs assigned in Unicode 11. The reference reads its character properties from a crate whose tables are frozen at roughly Unicode 9 and molla's are generated from the current database, so on those three characters the reference is reading an older Unicode than we are. Following it would mean shipping a deliberately stale copy of the database, so the case is excluded for those files with the reason written here, and it still runs against the other 332.
 
-The 60 refusals are all the same thing too: a `Precompiled` normalizer, which is a SentencePiece charsmap compiled into a blob of trie data. That is 18 per cent of the popular corpus, and it is the T5, mT5, XLM-R, ALBERT, DeBERTa-v3 and NLLB families. Recording them as refused is not sweeping them under the rug: the corpus asserts that molla refuses each one cleanly rather than loading it and producing ids that are quietly wrong, and the answer digest for each is already in the manifest, so the day `Precompiled` is implemented the change is one word per row. Issue #109 is the follow up.
+There are no refusals left. There were 60 of them until issue #109, all the same thing, all a `Precompiled` normalizer, and the corpus asserted that molla refused each one cleanly rather than loading it and producing ids that are quietly wrong. The answer digests were already in the manifest the whole time, recorded from the reference, so implementing the charsmap turned out to be one word per row in `scripts/tokenizers.tsv` and no regeneration of anything.
 
-One thing in the corpus has no reference to compare against. `encode_rendered` drops the beginning of text token the post processor would otherwise write in front of one the chat template already wrote, and the reference has no such rule, so there is nothing to diff. It is checked as a property instead: the opening special is read off the file by encoding nothing and encoding one letter and taking the ids they agree on, then the same text is encoded both ways, and the rendered call has to come back with exactly one of the doubled ids gone and nothing else changed. When the id does not double there is nothing to drop and the two calls have to agree exactly, which is the half that catches dropping too eagerly. 210 of the 278 files have an opening special and all 210 hold.
+One thing in the corpus has no reference to compare against. `encode_rendered` drops the beginning of text token the post processor would otherwise write in front of one the chat template already wrote, and the reference has no such rule, so there is nothing to diff. It is checked as a property instead: the opening special is read off the file by encoding nothing and encoding one letter and taking the ids they agree on, then the same text is encoded both ways, and the rendered call has to come back with exactly one of the doubled ids gone and nothing else changed. When the id does not double there is nothing to drop and the two calls have to agree exactly, which is the half that catches dropping too eagerly. 243 of the 338 files have an opening special and all 243 hold.
 
 ## What the corpus found
 
@@ -118,9 +132,11 @@ The seventh was found by the beginning of text property rather than by the refer
 
 ## What is in CI
 
-`tests/test_tokenizer.mojo` builds thirteen small `tokenizer.json` files in a temporary directory and checks eighty six things against them. Every expected id and every expected string in that file came out of `tokenizers` 0.23.1 running on the same bytes, because a tokenizer that is wrong produces output that still looks sensible and the only question worth asking is whether it matches.
+`tests/test_tokenizer.mojo` builds fourteen small `tokenizer.json` files in a temporary directory and checks ninety five things against them. Every expected id and every expected string in that file came out of `tokenizers` 0.23.1 running on the same bytes, because a tokenizer that is wrong produces output that still looks sensible and the only question worth asking is whether it matches.
 
 Five of them cover the stages: a byte level BPE shaped like GPT-2, a WordPiece shaped like BERT with the template processor and both sequence types, a Unigram with a metaspace pre-tokenizer and scores chosen so the greedy answer and the Viterbi answer differ, a BPE with byte fallback and a fused decoder shaped like Llama and Gemma, and one file whose added tokens carry the `lstrip`, `rstrip` and `single_word` flags one each. Between them they exercise every stage the loader can build. The streaming decoder gets its own check: six ids that spell two three byte characters, fed one at a time, must say nothing four times and then produce the two characters.
+
+The fourteenth is a `Precompiled` normalizer, on a charsmap with six rules in it built by hand, because the real ones are a quarter of a megabyte and there is no way to read one. Two of the six can never fire and that is the point of them: one is shadowed by a shorter rule and one is a seven byte key, so between them they pin the shortest match rule and the six byte cutoff, and a rewrite that fixed either would break sixty files in the corpus.
 
 The other eight are the corpus findings brought back as small files, so that the next person to break one of them sees it in a second rather than in a corpus run. Four files with no `type` at all, one per model kind, the BPE one also writing its vocabulary ahead of everything else the way GPT-2 does. A word level vocabulary with its type, to check that it lands in the same place the untyped one does. An Nmt normalizer read one character at a time. A byte level prefix space behind a whitespace split. And a Whisper shaped template with three specials in front of the text. Every id in all of them came out of the reference reading the same bytes.
 
@@ -138,7 +154,7 @@ The corpus is in the repository and runs with two commands:
 $ python3 scripts/fetch-tokenizers.py --tier quick --into corpus/tokenizers
 tier quick rows 59 have 0 fetched 59 failed 0 bytes 172.4 MB
 $ pixi run conformance-tokenizer
-checked 46 refused 13 failed 0 cases 355 bos 29
+checked 59 refused 0 failed 0 cases 355 bos 35
 ```
 
 A mismatch prints the repository and the two digests. To find out which case, print both sides and diff them:
