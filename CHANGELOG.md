@@ -4,6 +4,16 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.2.3] - 2026-09-01
+
+A chat template renders to the same bytes Python produces, and anything it cannot render refuses to load.
+
+This is the Jinja2 subset. It is bounded on purpose: seven constructs are excluded and each of them raises when the template is compiled, which is when a model loads, rather than at render time on somebody's request. A template that would misrender does not get to serve traffic. Four execution limits are on by default, because a chat template is code out of a repository anybody can publish.
+
+The checking is the part that matters. 38 real chat templates from the hub, nine conversation shapes each, compared for exact string equality against Python `jinja2` in the environment `transformers.apply_chat_template` builds. 342 renders, 342 identical. It found four defects in code that had already passed its unit tests, three of which produced plausible looking output rather than an error, and the worst of them made every binary operator past a certain depth in a template silently evaluate to its left operand.
+
+A 20 turn conversation renders in 59.9 microseconds on the Llama 3.1 template, against the 200 the milestone asks for, with the cost of parsing the request JSON inside that number rather than beside it.
+
 ### Added
 
 - `molla.jinja`, a bounded Jinja2 subset for chat templates. Ten modules: a lexer with `trim_blocks` and `lstrip_blocks` and the explicit whitespace markers, a parser onto a flat node list, and an evaluator with 70 filters, 30 tests and the five globals `range`, `dict`, `namespace`, `strftime_now` and `raise_exception`. Statements are `if`, `for` with the loop object and `break` and `continue`, `set` in both forms, `macro`, `call` and `filter` blocks. Checked against Python `jinja2` in the environment `transformers.apply_chat_template` builds, over 38 real chat templates and nine conversation shapes each: 342 renders, 342 identical. See [docs/validation/jinja.md](docs/validation/jinja.md).
