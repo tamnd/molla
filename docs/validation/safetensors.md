@@ -66,7 +66,7 @@ One more difference matters for M2 and does not show up in the spec at all. GGUF
 
 Phi-3-mini-4k-instruct is 7.3 GB in two shards with a `model.safetensors.index.json` naming which shard holds each of its 195 tensors. It lives on server1, since the laptop does not have the disk for it.
 
-```
+```text
 weights
   files         2 shards, written by pt, 1 dtype
   model-00001-of-00002.safetensors  128 tensors, header 14952 bytes
