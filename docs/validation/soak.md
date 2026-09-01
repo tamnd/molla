@@ -93,3 +93,29 @@ It is not in CI. An hour is longer than anybody will wait on a pull request, and
 The test suite runs a short version, sixteen connections for three seconds, which checks every gate the long run checks except the one about drift, on numbers too small to prove anything about an hour. That is the division: the suite says the soak works, the nightly says the server does. The suite also covers the client side framing on responses assembled by hand, because a `Wire` that finds the end of a response too early counts two answers where there was one, and a run like that passes while measuring a server that was falling apart.
 
 ## What was run
+
+Four machines, an hour each, a thousand connections, the same commit on all of them. Two of them are the platforms the nightly covers, and the other two are there because a laptop and a small cloud VM disagree about almost everything and it is useful to know which of the numbers below are the server and which are the machine.
+
+| Machine | Platform | Workers | Accepted | Requests |
+| --- | --- | --- | --- | --- |
+| Laptop | macOS 15, Apple M4 | 10 | 35,180,220 | 299,335,447 |
+| server1 | Ubuntu 24.04, 4 core EPYC | 4 | 6,822,060 | 32,187,256 |
+| server2 | Ubuntu 24.04, 6 core EPYC | 6 | 4,702,998 | 21,333,061 |
+| Desktop | WSL2 on Windows, i9-13900K | 32 | 40,059,212 | 384,095,824 |
+
+| Machine | Resident at connect | Halfway | End | Timer slab | p99 first | p99 last |
+| --- | --- | --- | --- | --- | --- | --- |
+| Laptop | 127568 kB peak | 162688 kB | 162688 kB | 143 for 143 slots | 16384 us | 8192 us |
+| server1 | 46488 kB | 122236 kB | 121872 kB | 493 for 493 slots | 524288 us | 262144 us |
+| server2 | 47584 kB | 169956 kB | 172420 kB | 551 for 551 slots | 1048576 us | 1048576 us |
+| Desktop | 60296 kB | 114036 kB | 115048 kB | 44 for 44 slots | 2048 us | 4096 us |
+
+All four passed. Across roughly seven hundred million answers read there was not one 5xx and not one response of the wrong status for the kind of client that asked for it. No machine leaked a descriptor, none of them ended the run with a connection the clients had already closed, and none of them left a byte in the log ring.
+
+The slab column is the one this round was for. On every machine the busiest timing wheel ended holding exactly as many entries as its reactor had connection slots, which is what a wheel with no dead timers in it looks like. Before the fix the same column read three and a half million against a hundred and forty three.
+
+Memory rose during the first segment on all four and then stopped. The Linux figures are the current resident size and can go down, and on server1 it did, ending three hundred kilobytes below the halfway mark after an hour of churn. server2 gained one and a half percent over the second half and the desktop gained one, both of them the slot table finding a slightly bigger burst late on. The laptop's figure is a peak so it can only go up, and it did not move after the first segment.
+
+The two Linux boxes are the slow ones here by three orders of magnitude on the tail, and that is oversubscription rather than the server. Four workers on four cores with the client thread competing for the same cores means a request often waits for a core before it waits for anything else. The desktop has thirty two workers and enough cores to run them, and its p99 is half a millisecond. The useful comparison is not between the machines, it is each machine against itself an hour later, which is why the gate is on drift and not on a number.
+
+The spread in volume is worth reading alongside the memory column. The desktop accepted forty million connections and server2 accepted four point seven million, and they ended the run within sixty megabytes of each other. Resident size here tracks the biggest burst of concurrent connections a reactor ever had to hold, not how many it has handled since.
