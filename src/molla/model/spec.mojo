@@ -399,7 +399,14 @@ struct TokenizerSpec(Copyable, ImplicitlyCopyable, Movable):
     """
 
     var model: String
-    """`tokenizer.ggml.model`: spm, bpe, wpm, or none."""
+    """The algorithm: spm, bpe, wpm, or none."""
+
+    var model_source: String
+    """What the file called it. GGUF names the tokenizer after the model it
+    first shipped on, so byte level BPE is `gpt2` and SentencePiece is `llama`,
+    while `tokenizer.json` names the algorithm as `BPE` and `Unigram`. Both are
+    kept because `model` is the one to branch on and this is the one to quote
+    when a file turns out to be lying about which it is."""
 
     var pre: String
     """`tokenizer.ggml.pre`, the pre-tokenizer regex family. Absent on older
@@ -418,10 +425,36 @@ struct TokenizerSpec(Copyable, ImplicitlyCopyable, Movable):
     var add_eos: Bool
     var has_chat_template: Bool
 
+    var embedding_rows: Int
+    """How many rows the embedding matrix has, when the model says. It is not
+    always the number of tokens: a vocabulary is commonly padded up to a round
+    number so the matrix divides evenly across devices, and the rows past the
+    last real token are never selected. Zero when nothing states it."""
+
+
+def tokenizer_algorithm(name: String) -> String:
+    """The algorithm behind a tokenizer name, in one spelling.
+
+    GGUF and `tokenizer.json` describe the same three algorithms in different
+    words, and a caller that has to know which one it is should not have to know
+    both vocabularies. `gpt2` and `BPE` are byte level BPE. `llama`, `t5` and
+    `Unigram` are SentencePiece. `bert` and `WordPiece` are WordPiece. Anything
+    else comes back unchanged, which reports as itself rather than as a guess.
+    """
+    if name == "gpt2" or name == "BPE":
+        return String("bpe")
+    if name == "llama" or name == "t5" or name == "Unigram":
+        return String("spm")
+    if name == "bert" or name == "WordPiece":
+        return String("wpm")
+    return name
+
 
 def read_tokenizer(g: Gguf) -> TokenizerSpec:
+    var model = g.string_or("tokenizer.ggml.model", "none")
     return TokenizerSpec(
-        model=g.string_or("tokenizer.ggml.model", "none"),
+        model=tokenizer_algorithm(model),
+        model_source=model,
         pre=g.string_or("tokenizer.ggml.pre", "none"),
         vocab_size=g.array_count("tokenizer.ggml.tokens"),
         merge_count=g.array_count("tokenizer.ggml.merges"),
@@ -434,6 +467,7 @@ def read_tokenizer(g: Gguf) -> TokenizerSpec:
         add_bos=g.bool_or("tokenizer.ggml.add_bos_token", False),
         add_eos=g.bool_or("tokenizer.ggml.add_eos_token", False),
         has_chat_template=g.has("tokenizer.chat_template"),
+        embedding_rows=g.uint_or(g.architecture() + ".vocab_size", 0),
     )
 
 
@@ -506,6 +540,11 @@ struct ModelSpec(Movable):
     """Everything molla needs to know about a model before it loads one."""
 
     var name: String
+    var source: String
+    """Which reader produced this, gguf or safetensors. A report says so because
+    the two formats state different things about the same model, and knowing
+    which one was read is the first question about any number below."""
+
     var architecture: String
     var arch_id: Int
     var file_type: String
@@ -539,6 +578,7 @@ def from_gguf(g: Gguf) raises -> ModelSpec:
 
     return ModelSpec(
         name=g.string_or("general.name", "unnamed"),
+        source=String("gguf"),
         architecture=arch,
         arch_id=id,
         file_type=file_type,
@@ -556,14 +596,19 @@ def _mib(bytes: Int) -> String:
     return String(bytes // (1024 * 1024)) + " MiB"
 
 
-def run_spec(path: StringSpan) raises:
-    """Entry point for `molla spec`. Says what a file is and what we can do."""
-    var g = Gguf(path)
-    var spec = from_gguf(g)
+def report(spec: ModelSpec, path: StringSpan):
+    """Print a spec.
+
+    One printer for both readers. `molla spec` on a GGUF file and on a Hugging
+    Face directory answer the same questions in the same order, and where the
+    two formats state different things the difference shows up as a different
+    number under the same heading rather than as a differently shaped report.
+    """
     var geo = spec.geometry
     var tok = spec.tokenizer
 
-    print("file:           " + String(path))
+    print("path:           " + String(path))
+    print("read as:        " + spec.source)
     print("name:           " + spec.name)
     print(
         "architecture:   "
@@ -615,7 +660,10 @@ def run_spec(path: StringSpan) raises:
     print("  epsilon       " + String(geo.epsilon))
     print("")
     print("tokenizer")
-    print("  model         " + tok.model + ", pre " + tok.pre)
+    var spelling = String("")
+    if tok.model_source != tok.model:
+        spelling = ", spelled " + tok.model_source
+    print("  model         " + tok.model + spelling + ", pre " + tok.pre)
     print(
         "  vocabulary    "
         + String(tok.vocab_size)
@@ -623,6 +671,25 @@ def run_spec(path: StringSpan) raises:
         + String(tok.merge_count)
         + " merges"
     )
+    if tok.embedding_rows > tok.vocab_size and tok.vocab_size > 0:
+        print(
+            "  embedding     "
+            + String(tok.embedding_rows)
+            + " rows, "
+            + String(tok.embedding_rows - tok.vocab_size)
+            + " of them past the last token"
+        )
+    elif tok.embedding_rows > 0 and tok.embedding_rows < tok.vocab_size:
+        # Not padding, the other way round: a token that can be produced and has
+        # no row to look up. Gemma 3 does this in its text only checkpoints,
+        # which keep the image token id from the multimodal ones.
+        print(
+            "  embedding     "
+            + String(tok.embedding_rows)
+            + " rows, token ids run "
+            + String(tok.vocab_size - tok.embedding_rows)
+            + " past the last row"
+        )
     print(
         "  specials      bos "
         + String(tok.bos)
@@ -655,13 +722,16 @@ def run_spec(path: StringSpan) raises:
         + _mib(spec.layout.bytes)
         + ")"
     )
-    print(
-        "  quantized     "
-        + String(spec.layout.quantized_bytes)
-        + " bytes of that, "
-        + String(spec.layout.bytes - spec.layout.quantized_bytes)
-        + " stored at full width"
-    )
+    if spec.layout.quantized_bytes > 0:
+        print(
+            "  quantized     "
+            + String(spec.layout.quantized_bytes)
+            + " bytes of that, "
+            + String(spec.layout.bytes - spec.layout.quantized_bytes)
+            + " stored at full width"
+        )
+    else:
+        print("  quantized     none, every tensor is stored at its own width")
     if spec.layout.unknown_types > 0:
         print("  directory     stops at a tensor type this build cannot size")
     elif not spec.layout.packed:
@@ -687,4 +757,11 @@ def run_spec(path: StringSpan) raises:
             + capability_names(spec.withheld())
             + ", because no kernel in this build produces a token yet"
         )
+
+
+def run_spec(path: StringSpan) raises:
+    """Entry point for `molla spec` on a GGUF file."""
+    var g = Gguf(path)
+    var spec = from_gguf(g)
+    report(spec, path)
     g.close()

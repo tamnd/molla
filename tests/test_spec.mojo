@@ -437,7 +437,13 @@ def _check_tokenizer(mut suite: Suite) raises:
     var spec = from_gguf(g)
     var tok = spec.tokenizer
 
-    suite.check(tok.model == "gpt2", "the tokenizer family is read")
+    # The file says gpt2, which is the model byte level BPE first shipped on.
+    # The spec says bpe, because that is the question the layers above ask, and
+    # it keeps what the file said so a report can quote it.
+    suite.check(tok.model == "bpe", "the tokenizer family is read")
+    suite.check(
+        tok.model_source == "gpt2", "and what the file called it is kept"
+    )
     suite.check(
         tok.vocab_size == 3,
         "the vocabulary is counted without any of it being decoded",
