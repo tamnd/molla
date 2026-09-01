@@ -4,6 +4,16 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.2.0] - 2026-09-01
+
+M1 is done. Everything Mojo 1.0 does not ship and a server cannot do without: syscall wrappers, buffers and arenas, a reactor, HTTP/1.1, SSE and NDJSON, a JSON scanner, client TLS, threads and queues and a shutdown that finishes what it started, config and logging and metrics, and two commands that assert the properties the rest of it claims.
+
+The milestone was to write eight layers a normal server project gets for free, and the point of ending it here is that there is now something to build on that has been measured rather than asserted. The server answers HTTP on Linux, macOS and Windows under WSL2, it holds a thousand connections through an hour without leaking, and it allocates nothing on the request path. Those are three claims and each of them has a command that fails if it stops being true.
+
+This release adds the last of those, the hour long soak, and fixes the leak it found. The timing wheel cancelled lazily on a written assumption that nothing would ever create enough dead timers to matter, and every connection that closes cancels its idle timer, so the assumption was never true for any server anybody would run. It took an hour of real churn to become visible: on the laptop the run went from 127 MB to 2.3 GB. The sign off round was four machines, an hour each, a thousand connections, seven hundred million answers, no 5xx and no wrong statuses, and on every one of them the busiest timing wheel ended holding exactly as many entries as its reactor had connection slots.
+
+There is still no model, no routing beyond the handful of built in routes, and no server side TLS. Those are M2 and later. What is here is the floor.
+
 ### Added
 
 - `molla httpsoak`, an hour long soak on the systems layer. Five kinds of client at once against a real server: keep alive, streaming, slow readers that fill the write ring and hold it full, abrupt disconnects that never read the answer, and oversized bodies that get a 413 and a close. It watches resident memory, descriptors, the log ring and the connection table, the size of the busiest timing wheel, and latency drift across ten segments of the run. Runs nightly on Linux and macOS through `.github/workflows/soak.yml`, and a short version runs in the test suite. See [docs/validation/soak.md](docs/validation/soak.md).
