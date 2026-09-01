@@ -125,6 +125,18 @@ comptime IDLE_MARGIN_MS = 60000
 pausing for a hundred milliseconds is never mistaken for an idle connection."""
 
 
+def _slack(kilobytes: Int) -> Int:
+    """How much a memory figure may move in the second half of a run.
+
+    A tenth, or four megabytes, whichever is larger. The tenth is for machines
+    where the steady size is large enough that a page here or there is noise,
+    and the four megabytes is for the ones where it is small enough that a
+    tenth would be a handful of pages and every run would be a coin toss.
+    """
+    var tenth = kilobytes // 10
+    return tenth if tenth > 4096 else 4096
+
+
 def current_rss_kb() -> Int:
     """Resident set size right now, in kilobytes, or -1 where it cannot be
     read.
@@ -548,6 +560,10 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
     var rss_start = max_rss_kb()
     var live_rss_start = current_rss_kb()
     var rss_by_segment = List[Int](length=SEGMENTS, fill=-1)
+    # The same two figures the report ends with, taken at the top of every
+    # segment. The series is what says whether a run that grew was warming up
+    # or leaking, and the halfway entry is what the end is judged against.
+    var peak_by_segment = List[Int](length=SEGMENTS, fill=-1)
 
     var latency = LatencyLog(SEGMENTS)
     var answers = List[Int](length=ROLE_COUNT, fill=0)
@@ -576,6 +592,7 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
             # /proc is a syscall and this loop is the client.
             segment_seen = segment
             rss_by_segment[segment] = current_rss_kb()
+            peak_by_segment[segment] = max_rss_kb()
 
         for i in range(len(fds)):
             var role = roles[i]
@@ -798,6 +815,10 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
         + String(rss_end)
         + " kB at the end"
     )
+    var peak_line = String("  peak by segment, kB ")
+    for s in range(SEGMENTS):
+        peak_line += " " + String(peak_by_segment[s])
+    print(peak_line)
     if live_rss_start >= 0:
         print(
             "  live rss       "
@@ -988,26 +1009,34 @@ def run_http_soak(connections: Int, seconds: Int) raises -> Int:
             + String(fd_after)
         )
         ok = False
-    if rss_end > rss_start * 2 and rss_end - rss_start > 16384:
-        print("  FAIL: peak memory more than doubled during the run")
+    # Memory is judged on the second half of the run rather than against where
+    # it started, and that is not the gate being made easy. A server that has
+    # just accepted a thousand connections has not yet grown the buffers those
+    # connections need, so the first segments climb on every machine and always
+    # will. The claim is that it stops, so the number to compare the end
+    # against is the middle. A leak does not level off: the wheel bug this soak
+    # found put a third more memory on in the second half of every run it was
+    # in, on all four machines.
+    var mid_peak = peak_by_segment[SEGMENTS // 2]
+    if mid_peak > 0 and rss_end - mid_peak > _slack(mid_peak):
+        print(
+            "  FAIL: peak memory went from "
+            + String(mid_peak)
+            + " kB at the halfway mark to "
+            + String(rss_end)
+            + " kB"
+        )
         ok = False
-    # A quarter more than it was once the connections were up, or four
-    # megabytes, whichever is larger. The allowance is there because this
-    # process is both ends of every connection and the client side is still
-    # growing its buffers into their steady size when the clock starts.
-    if live_rss_start > 0 and live_rss_end > 0:
-        var allowed = live_rss_start // 4
-        if allowed < 4096:
-            allowed = 4096
-        if live_rss_end - live_rss_start > allowed:
-            print(
-                "  FAIL: resident memory went from "
-                + String(live_rss_start)
-                + " kB to "
-                + String(live_rss_end)
-                + " kB"
-            )
-            ok = False
+    var mid_live = rss_by_segment[SEGMENTS // 2]
+    if mid_live > 0 and live_rss_end - mid_live > _slack(mid_live):
+        print(
+            "  FAIL: resident memory went from "
+            + String(mid_live)
+            + " kB at the halfway mark to "
+            + String(live_rss_end)
+            + " kB"
+        )
+        ok = False
     # Four times is a wide gate on purpose. The histogram is powers of two, so
     # two neighbouring buckets are already a factor of two apart and a run that
     # crosses one boundary is noise rather than drift.
