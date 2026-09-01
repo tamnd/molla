@@ -4,6 +4,15 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla httpsoak`, an hour long soak on the systems layer. Five kinds of client at once against a real server: keep alive, streaming, slow readers that fill the write ring and hold it full, abrupt disconnects that never read the answer, and oversized bodies that get a 413 and a close. It watches resident memory, descriptors, the log ring and the connection table, and latency drift across ten segments of the run. Runs nightly on Linux and macOS through `.github/workflows/soak.yml`, and a short version runs in the test suite. See [docs/validation/soak.md](docs/validation/soak.md).
+- `molla.net.latency`, the segmented latency histogram both soaks now share, so the drift gate means the same thing in each.
+
+### Fixed
+
+- `HttpProtocol._error` answered a 413, a 414 or a 431 without going through the handler path, which is where the status accounting lived, so those responses were never counted. A server that refused a hundred thousand oversized bodies reported `molla_http_responses_4xx_total 0`. Found by the soak on its first complete run.
+
 ## [0.1.7] - 2026-09-01
 
 A per request allocation on a server whose whole pitch is not having one, found by the assertion added to stop exactly this.

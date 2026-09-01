@@ -14,7 +14,9 @@ The M0 spike in `molla.net.echo` is still in the tree and is a different thing. 
 | `reactor` | The loop. Accept, drain, service, flush, expire, and the `Protocol` trait everything above will be written against. |
 | `protocol` | Echo, as a reference implementation of that trait and as what the tests drive. |
 | `server` | N reactors on N threads behind one address, TCP or unix. |
+| `latency` | The segmented latency histogram both soaks record into, and the drift gate they both read out of it. |
 | `soak_net` | `molla netsoak`, the acceptance test. |
+| `soak_http` | `molla httpsoak`, the hour long soak on the whole stack. See [soak.md](soak.md). |
 
 ## The two deliberate deviations from issue #10
 
