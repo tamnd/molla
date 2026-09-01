@@ -4,6 +4,18 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.2.1] - 2026-09-01
+
+The model plane starts. Two readers, one model spec, and nothing that touches a weight yet.
+
+molla now reads a GGUF file and a Hugging Face directory and answers the same questions about either: what architecture it is, what shape it is, which tokenizer it wants, what the tensors add up to, and what this build could actually do with it. `molla spec <path>` prints that for both, and dispatches on what is at the path rather than on the extension.
+
+The point of doing both formats before doing anything with the weights is that everything above this has to be written once. The tokenizer in #21, the weight loading in #25 and the architecture blocks in #26 all read a `ModelSpec` and none of them will care which file it came out of. The one place the formats genuinely disagree is shape order, GGUF writing the fastest varying dimension first and safetensors writing row major, and that is written down where the code that has to reconcile it will find it.
+
+Both readers check rather than trust, since both formats hand you byte offsets out of a downloaded file. The GGUF tensor directory is recomputed from the block geometry of every type and required to match every offset in the file. Every safetensors range is checked against the mapping and then against the dtype and the shape. Neither reader allocates per tensor and neither reads past the header, so a 7.3 GB two shard repository costs twenty milliseconds and twelve megabytes of resident set.
+
+The check that mattered most was reading the same four models both ways. bge-small, SmolLM2-135M, gemma-3-270m and Qwen2.5-0.5B agree on the architecture, every geometry field, the tokenizer algorithm and every special token id, and the four places the numbers differ are each a real difference between the two files rather than a bug in one of the readers.
+
 ### Added
 
 - `molla.model.spec`, the mapping from a GGUF file to a `ModelSpec`: architecture id, geometry, tokenizer shape, the block geometry of every ggml tensor type, and the capabilities the file declares intersected with what this build can do with them. Nothing in it reads a weight. Checked field by field against what llama.cpp loads from the same four models, and the tensor directory is recomputed from the block sizes and required to match every offset in the file. See [docs/validation/spec.md](docs/validation/spec.md).
