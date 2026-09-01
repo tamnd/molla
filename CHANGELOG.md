@@ -4,6 +4,12 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla.model.spec`, the mapping from a GGUF file to a `ModelSpec`: architecture id, geometry, tokenizer shape, the block geometry of every ggml tensor type, and the capabilities the file declares intersected with what this build can do with them. Nothing in it reads a weight. Checked field by field against what llama.cpp loads from the same four models, and the tensor directory is recomputed from the block sizes and required to match every offset in the file. See [docs/validation/spec.md](docs/validation/spec.md).
+- `molla spec <path>`, which prints all of that for a model file. Seven milliseconds and fourteen megabytes of resident set against a 468 MB model.
+- `Gguf.flt`, `float_or`, `bool_or`, `has`, `array_count`, `tensor_index` and `tensor_prefixed`, so the layer above can ask about floats, flags and tensor names without decoding anything it did not ask for.
+
 ## [0.2.0] - 2026-09-01
 
 M1 is done. Everything Mojo 1.0 does not ship and a server cannot do without: syscall wrappers, buffers and arenas, a reactor, HTTP/1.1, SSE and NDJSON, a JSON scanner, client TLS, threads and queues and a shutdown that finishes what it started, config and logging and metrics, and two commands that assert the properties the rest of it claims.

@@ -20,9 +20,14 @@ would work today. It would also be an unaligned load of a 64 bit value at
 whatever offset a variable length key happened to end on, which is a different
 gamble, and assembling bytes is correct on any host.
 
-Only what the M0 spike needs is decoded: the architecture, the context length,
-the file type, and the tensor directory. Arrays are located and measured but
-their elements are skipped, because nothing yet needs a vocabulary.
+Arrays are located and measured but their elements are skipped, because nothing
+that asks about a model needs to decode a thirty thousand entry vocabulary to
+answer. Counting one is a field on the key rather than a walk.
+
+What the values mean is not decided here. This module answers what a key holds
+and `molla.model.spec` decides what that says about the model, because the
+mapping from `<arch>.attention.head_count_kv` to a head count belongs in one
+place and not in every caller.
 """
 
 from std.memory import bitcast
@@ -470,6 +475,19 @@ struct Gguf(Movable):
             return String(cur.u64().cast[DType.int64]())
         return String(self.uint(i))
 
+    def flt(self, i: Int) raises -> Float64:
+        """Read a float value at whatever width it was stored at."""
+        var kv = self.kvs[i]
+        var cur = Cursor(self.mapping.address, self.mapping.length)
+        cur.at = kv.at
+        if kv.kind == GGUF_FLOAT32:
+            return bitcast[DType.float32, 1](UInt32(cur.u32())).cast[
+                DType.float64
+            ]()
+        if kv.kind == GGUF_FLOAT64:
+            return bitcast[DType.float64, 1](cur.u64())
+        raise Error("gguf key is not a float")
+
     def string_or(self, key: StringSpan, fallback: StringSpan) -> String:
         var i = self.find(key)
         if i < 0:
@@ -487,6 +505,74 @@ struct Gguf(Movable):
             return Int(self.uint(i))
         except:
             return fallback
+
+    def float_or(self, key: StringSpan, fallback: Float64) -> Float64:
+        """A float value, or the fallback.
+
+        An integer stored where a float was expected is accepted, because
+        writers do emit `rope.freq_base` as 10000 rather than 10000.0 and
+        refusing that would report a model with no rope base at all.
+        """
+        var i = self.find(key)
+        if i < 0:
+            return fallback
+        try:
+            return self.flt(i)
+        except:
+            pass
+        try:
+            return Float64(self.uint(i))
+        except:
+            return fallback
+
+    def bool_or(self, key: StringSpan, fallback: Bool) -> Bool:
+        var i = self.find(key)
+        if i < 0:
+            return fallback
+        try:
+            return self.uint(i) != 0
+        except:
+            return fallback
+
+    def has(self, key: StringSpan) -> Bool:
+        return self.find(key) >= 0
+
+    def array_count(self, key: StringSpan) -> Int:
+        """How many elements an array key holds, without decoding any of them.
+
+        This is how the vocabulary gets counted. The elements are still where
+        the file put them and none of them are read.
+        """
+        var i = self.find(key)
+        if i < 0 or self.kvs[i].kind != GGUF_ARRAY:
+            return 0
+        return self.kvs[i].count
+
+    def tensor_index(self, name: StringSpan) -> Int:
+        """Index of a tensor by name, or -1."""
+        for i in range(len(self.tensors)):
+            if self._region_eq(self.tensors[i].name, name):
+                return i
+        return -1
+
+    def tensor_prefixed(self, prefix: StringSpan) -> Bool:
+        """Whether any tensor name starts with this prefix."""
+        var p = prefix.unsafe_ptr()
+        var n = prefix.byte_length()
+        for i in range(len(self.tensors)):
+            var region = self.tensors[i].name
+            if region.length < n:
+                continue
+            var same = True
+            for j in range(n):
+                if self.mapping.base().unsafe_load(
+                    region.start + j
+                ) != p.unsafe_load(j):
+                    same = False
+                    break
+            if same:
+                return True
+        return False
 
     def architecture(self) -> String:
         return self.string_or("general.architecture", "unknown")
