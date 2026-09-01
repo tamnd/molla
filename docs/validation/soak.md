@@ -26,9 +26,13 @@ The operations surface is on, with the log ring at warn and metrics enabled, bec
 
 ## What it watches
 
-Four things, and they are the four ways a server dies slowly rather than loudly.
+Five things, and they are the ways a server dies slowly rather than loudly.
 
 Resident memory. Sampled per segment on Linux, which publishes the current figure in `/proc/self/statm`, and as a peak from `getrusage` on both platforms. macOS has no equivalent file and the mach call that answers the same question is a different kind of dependency, so on macOS the current figure is reported as not readable rather than invented, and the gate there is the peak. Saying which platform gets the stronger check is better than pretending both do.
+
+The claim is not that memory never grows. A server that has just accepted a thousand connections has not yet grown the buffers those connections need, and the first segments climb on every machine in the fleet, by a factor of three on the smaller ones. The claim is that it stops, so the end of the run is judged against the halfway mark rather than against where it started, with a tenth or four megabytes of slack. A leak does not level off: the one this soak found put a third more memory on in the second half of every run it was in.
+
+The size of the busiest timing wheel. One timer is armed per connection, so the slab should settle at the number of connections a reactor is holding, and a slab in the millions is a wheel that is keeping timers it has finished with. This gate exists because that is what the first four runs turned out to be measuring.
 
 Descriptors. A socket is opened after teardown and the number the kernel hands back is compared with the same probe taken before the run. Descriptors are allocated lowest free first on both platforms, so a leak comes back high. This soak reconnects constantly, tens of thousands of times over an hour, so a leak of one descriptor per connection would be obvious and a leak of one in a thousand would still show.
 
@@ -44,13 +48,27 @@ There is a correctness gate underneath all four. Every answer is checked against
 
 ## What it found
 
-A metrics bug, on the first run that got far enough to print a report.
+A memory leak in the timing wheel, which is the one that needed the hour.
+
+Every one of the first four runs, on all four machines, grew resident memory in every segment and never stopped. On the laptop it went from 127 MB to 2.3 GB, on the Linux boxes from 46 MB to about 350 MB, on the Windows machine from 60 MB to 1.4 GB. The shape was the same everywhere: a straight line, and the slope in proportion to how many connections the machine had managed to churn through.
+
+The wheel cancelled lazily. A cancelled timer was marked dead and left in its slot, to be freed when that slot was next walked, and the module said in as many words why that was fine: nothing here creates enough dead timers for the cost of a doubly linked list to be worth paying. Every connection that closes cancels its idle timer, so there was never a version of this server for which that was true. A slot is not walked until time gets close to the deadline it holds, and this soak sets the idle timeout past the end of the run so that a slow reader pausing is never mistaken for an idle connection, which meant no slot was ever walked and the wheel ended the run holding one dead entry for every connection the run had ever made. Three and a half million per reactor on the laptop.
+
+Slot lists are doubly linked now and cancel unlinks and releases in constant time. At a thousand connections for five minutes the busiest slab went from 257,388 entries to 115, which is the number of connections that reactor was holding. The soak gained a gate on it, so a future edit that goes back to lazy cancelling fails the run with the reason rather than with a memory number somebody has to bisect.
+
+The reason this took an hour to find and not a minute is worth being clear about. The leak is one 32 byte slab entry per connection, which is invisible at any scale a test suite would run at, and it is bounded in principle: with the default minute long idle timeout a server holds a minute of closed connections rather than all of them. It is still a server that gets steadily larger the busier it is, and nothing short of a long run with real churn was ever going to show it.
+
+Then a metrics bug, on the first run that got far enough to print a report.
 
 `HttpProtocol._error` answers a 413, a 414 or a 431 from the parse path without going through `_write_default`, which is where the status accounting lived. So a run that sent a hundred thousand oversized bodies and got a hundred thousand 413s reported `molla_http_responses_4xx_total 0`. Those are the answers an operator most wants a graph of, and they were the ones that were never counted. The soak caught it because it checks the server's own count of 4xx answers against what the clients read back, which is the kind of cross check a unit test of the error path would not have.
 
 The fix is one line, `_error` now calls `_account` the same way `_write_default` does.
 
-It also found something about the client rather than the server, which is worth recording because it looked like a server failure for an hour. Every socket in molla is non blocking from the moment it is created, so `connect` returns before the handshake finishes and the first write on a fresh socket fails until it does. The client's first version treated that as a send failure after two hundred tight retries, and reported a couple of hundred failures per run against a server that was fine. A socket that is not ready now says so and the caller comes back on the next pass, with a five second budget before it counts as stuck. A loopback handshake finishes in microseconds, so anything near five seconds is a socket that will never take a byte.
+It also found two things about the client rather than the server, both of which looked like server failures for a while.
+
+Every socket in molla is non blocking from the moment it is created, so `connect` returns before the handshake finishes and the first write on a fresh socket fails until it does. The client's first version treated that as a send failure after two hundred tight retries, and reported a couple of hundred failures per run against a server that was fine. A socket that is not ready now says so and the caller comes back on the next pass.
+
+The second is what happens when it still is not ready five seconds later, which on the fastest machine in the fleet happened to about one connection in two thousand. That is not a stuck socket, it is the accept backlog full: this client reconnects roughly ten thousand times a second and the kernel drops the SYN when the queue is behind, so the handshake waits out a retransmit or two. A connection nobody has accepted yet and one the kernel turned away with a refusal are the same thing seen from two sides, so they are counted together and reported as connects the backlog would not take. The run fails only if more attempts were turned away than got through, which is a listener that has stopped working rather than one that is busy. What still fails the run outright is a request that went out half written on an established socket, because that is nobody's backpressure.
 
 ## What it cannot see
 
@@ -58,7 +76,7 @@ It runs one process, so it says nothing about a server under a real client that 
 
 It does not measure throughput and the numbers it prints should not be quoted as though it did. The client is one thread pacing itself with think times, so the request rate is what the client chose and not what the server could do.
 
-The memory gate on macOS is a peak rather than a level, which is weaker than it sounds. What it can prove is the useful direction: if the peak at the end of an hour is the peak from the moment the connections came up, nothing grew while the loop ran.
+The memory gate on macOS is a peak rather than a level, which is weaker than it sounds. A peak only ever goes up, so it can say that nothing grew after the halfway mark and it cannot say that anything was given back. Linux gets the stronger check and the two platforms agreed on the leak, which is the most a peak can be asked for.
 
 Allocation counting is deliberately not in here. `AllocCounter` is explicitly not atomic and the soak runs several workers, so a count taken across them would be a number that looks precise and is not. The zero allocation claim has its own assertion in `molla allocs`, on one worker, where the count means something. See `docs/validation/allocations.md`.
 

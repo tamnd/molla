@@ -6,11 +6,12 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ### Added
 
-- `molla httpsoak`, an hour long soak on the systems layer. Five kinds of client at once against a real server: keep alive, streaming, slow readers that fill the write ring and hold it full, abrupt disconnects that never read the answer, and oversized bodies that get a 413 and a close. It watches resident memory, descriptors, the log ring and the connection table, and latency drift across ten segments of the run. Runs nightly on Linux and macOS through `.github/workflows/soak.yml`, and a short version runs in the test suite. See [docs/validation/soak.md](docs/validation/soak.md).
+- `molla httpsoak`, an hour long soak on the systems layer. Five kinds of client at once against a real server: keep alive, streaming, slow readers that fill the write ring and hold it full, abrupt disconnects that never read the answer, and oversized bodies that get a 413 and a close. It watches resident memory, descriptors, the log ring and the connection table, the size of the busiest timing wheel, and latency drift across ten segments of the run. Runs nightly on Linux and macOS through `.github/workflows/soak.yml`, and a short version runs in the test suite. See [docs/validation/soak.md](docs/validation/soak.md).
 - `molla.net.latency`, the segmented latency histogram both soaks now share, so the drift gate means the same thing in each.
 
 ### Fixed
 
+- The timing wheel cancelled lazily, marking a timer dead and leaving it in its slot to be freed when that slot was next walked. Every connection that closes cancels its idle timer, and a slot is not walked until time gets close to the deadline it holds, so a busy server accumulated a dead slab entry per connection for the length of its idle timeout and never gave the memory back. The hour long soak grew from 127 MB to 2.3 GB on macOS and from 60 MB to 1.4 GB on Windows before this. Slot lists are doubly linked now and cancel unlinks and releases in constant time.
 - `HttpProtocol._error` answered a 413, a 414 or a 431 without going through the handler path, which is where the status accounting lived, so those responses were never counted. A server that refused a hundred thousand oversized bodies reported `molla_http_responses_4xx_total 0`. Found by the soak on its first complete run.
 
 ## [0.1.7] - 2026-09-01

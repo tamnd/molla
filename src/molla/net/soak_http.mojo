@@ -17,12 +17,18 @@ without reading a byte of the answer, which is the write to a dead socket that
 a server has to survive. Oversized clients announce a body far larger than the
 limit and are told 413, which is the error path with a close on the end of it.
 
-Four things are watched, and they are the four ways a server dies slowly rather
-than loudly.
+What is watched are the ways a server dies slowly rather than loudly.
 
 Resident memory, sampled per segment on Linux where the current figure can be
-read, and as a peak on both platforms. Flat resident memory across ten segments
-of an hour is the claim.
+read, and as a peak on both platforms. The claim is not that it never grows,
+because a thousand connections that have just been accepted have not yet grown
+the buffers they need, so the first segments climb everywhere. The claim is
+that it stops, and the end of the run is judged against the halfway mark.
+
+The size of the busiest timing wheel, which is here because a wheel that keeps
+cancelled timers is what the growth turned out to be the first time this ran.
+One timer is armed per connection, so a slab far larger than the connection
+count is a leak with a name.
 
 Descriptors, by opening a socket after teardown and reading the number the
 kernel hands back. This soak reconnects constantly, tens of thousands of times
