@@ -42,6 +42,8 @@ Latency drift. The run is cut into ten segments, every round trip lands in the s
 
 The slow readers are deliberately left out of the latency numbers. Their round trip time is their own doing and including it would drown the signal in a delay the test itself is causing.
 
+Drift is only judged on a run of at least a minute. Ten segments of three seconds each, which is what the version in the test suite is, are three hundred milliseconds apiece, and one scheduling hiccup on a shared CI runner moves the tail three buckets. That is what the gate said the first time it ran on a macOS runner, and a gate that fails on jitter gets an exception written into it and then it is not a gate. The short run proves the soak works and checks everything that does not need the hour.
+
 The gate on drift is four times, which is wide on purpose. The histogram is powers of two microseconds, so two neighbouring buckets are already a factor of two apart and a run that crosses one boundary is noise rather than drift. The histogram lives in `molla.net.latency` and is shared with the reactor soak, so the gate means the same thing in both. It used to be two copies of the same code, which is two chances for the one number this rests on to mean something slightly different in each.
 
 There is a correctness gate underneath all four. Every answer is checked against the status that kind of client should be getting, per kind rather than as a range, because a run where the oversized clients started getting 200 and the keep alive clients started getting 413 would have exactly the same totals as a clean one.
@@ -86,6 +88,6 @@ Allocation counting is deliberately not in here. `AllocCounter` is explicitly no
 
 It is not in CI. An hour is longer than anybody will wait on a pull request, and the thing it is looking for needs the hour to show up at all.
 
-The test suite runs a short version, sixteen connections for three seconds, which checks every gate the long run checks on numbers too small to prove anything about an hour. That is the division: the suite says the soak works, the nightly says the server does. The suite also covers the client side framing on responses assembled by hand, because a `Wire` that finds the end of a response too early counts two answers where there was one, and a run like that passes while measuring a server that was falling apart.
+The test suite runs a short version, sixteen connections for three seconds, which checks every gate the long run checks except the one about drift, on numbers too small to prove anything about an hour. That is the division: the suite says the soak works, the nightly says the server does. The suite also covers the client side framing on responses assembled by hand, because a `Wire` that finds the end of a response too early counts two answers where there was one, and a run like that passes while measuring a server that was falling apart.
 
 ## What was run

@@ -16,9 +16,10 @@ The second is that the whole thing runs at all. A short soak here catches the
 kind of breakage that stops the run before it starts, which is worth finding in
 a pull request rather than at two in the morning when the nightly fires. It is
 a few seconds of five kinds of client against a real server, and every gate the
-long run checks is checked here too, on numbers too small to prove anything
-about an hour. That is the division: this says the soak works, the nightly says
-the server does.
+long run checks is checked here too, except the one about latency drift, which
+needs segments long enough to be a sample of the machine rather than of what
+else the machine was doing. That is the division: this says the soak works, the
+nightly says the server does.
 """
 
 from std.sys.info import CompilationTarget
