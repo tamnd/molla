@@ -123,6 +123,37 @@ struct Connection(Movable):
         self.bytes_out = 0
         self.short_writes = 0
 
+    def reuse(mut self, fd: Int, generation: Int, now_ms: Int):
+        """Take over a new socket without giving the buffers back.
+
+        A reactor slot is reused as soon as the connection in it closes, and
+        building a fresh `Connection` for it meant a free and a calloc for the
+        read buffer and the write ring every time, plus growing the read buffer
+        again the first time a request did not fit in the starting size. That is
+        a per connection allocation on a server that claims not to have one, and
+        on a client that opens a connection per request it is a per request
+        allocation.
+
+        So the buffers stay and everything else is set back to what a new
+        connection would have. The buffers keep whatever size the last
+        connection grew them to, which is the point: after a warm up the traffic
+        has already paid for the size it needs.
+        """
+        self.fd = fd
+        self.generation = generation
+        self.input.clear()
+        self.output.clear()
+        self.timer = -1
+        self.last_active_ms = now_ms
+        self.peer_done = False
+        self.closing = False
+        self.closed = False
+        self.write_interest = False
+        self.producing = False
+        self.bytes_in = 0
+        self.bytes_out = 0
+        self.short_writes = 0
+
     def is_valid(self) -> Bool:
         """Both blocks were allocated. A connection that fails this is closed
         immediately rather than served with a null buffer."""

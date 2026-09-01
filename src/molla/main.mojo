@@ -12,6 +12,7 @@ from molla.host import detect
 from molla.http.server import run_http
 from molla.json.bench import run_json_bench
 from molla.model.gguf import run_gguf
+from molla.net.allocs import run_allocs
 from molla.net.drain import run_drain
 from molla.net.echo import run_echo
 from molla.net.soak import run_soak
@@ -58,6 +59,10 @@ def print_usage():
     print(
         "  drain [n] [ms]  load n connections, shut down on a signal, check the"
         " drain"
+    )
+    print(
+        "  allocs [n] [r]  run a mixed load twice and check the second pass"
+        " allocated nothing"
     )
     print("  jsonbench [kb] [n] parse an n round chat body and print the rate")
     print("  http [port]     run the M0 HTTP/1.1 spike on 127.0.0.1")
@@ -306,6 +311,24 @@ def main():
             run_pull(args[2], insecure)
         except e:
             print("molla pull:", e)
+            exit(1)
+    elif command == "allocs":
+        # Small by default. The check is whether the number is zero, not how
+        # long it took to get there.
+        var alloc_connections = 4
+        var alloc_rounds = 4
+        try:
+            if len(args) > 2:
+                alloc_connections = Int(args[2])
+            if len(args) > 3:
+                alloc_rounds = Int(args[3])
+        except:
+            print("molla allocs: expected two numbers")
+            exit(2)
+        try:
+            exit(run_allocs(alloc_connections, alloc_rounds))
+        except e:
+            print("molla allocs:", e)
             exit(1)
     elif command == "config":
         run_config(args)
