@@ -142,11 +142,52 @@ def normalize(
     `compatibility` picks the K forms and `composed` picks C over D, so NFC is
     false and true, NFKD is true and false, and there is no fifth combination
     to get wrong.
+
+    Most characters do not need any of this. Every character under the floor is
+    already in every normal form and cannot join with anything around it, so a
+    run of them is copied across and only the runs in between are taken apart
+    and put back together. English text never leaves the first branch, and a
+    page of prose with one accent in it does the real work on one word.
+
+    A run of real work starts one character early, because the first character
+    of it may be a mark that composes with the ordinary letter in front of it,
+    and that letter has to be there for it to compose with. One character back
+    is far enough: everything under the floor is a starter, so the segment
+    cannot have begun any earlier than that.
     """
-    var taken_apart = decompose(tables, points, compatibility)
-    if not composed:
-        return taken_apart^
-    return compose(tables, taken_apart)
+    var floor = (
+        tables.compatibility_floor if compatibility else tables.canonical_floor
+    )
+    var out = List[Int]()
+    out.reserve(len(points))
+    var run = List[Int]()
+    var i = 0
+
+    while i < len(points):
+        if points[i] < floor:
+            out.append(points[i])
+            i += 1
+            continue
+
+        var start = i
+        if len(out) > 0:
+            start -= 1
+            _ = out.pop()
+        var end = i
+        while end < len(points) and points[end] >= floor:
+            end += 1
+
+        run.clear()
+        for j in range(start, end):
+            run.append(points[j])
+        var done = decompose(tables, run, compatibility)
+        if composed:
+            done = compose(tables, done)
+        for j in range(len(done)):
+            out.append(done[j])
+        i = end
+
+    return out^
 
 
 def strip_marks(tables: Unicode, points: List[Int]) -> List[Int]:
