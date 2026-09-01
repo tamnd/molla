@@ -8,9 +8,13 @@ The criterion was that the assertion runs on every commit. It does, twice: a sma
 
 `molla allocs` runs a mixed load against a real server on a real socket until one run of it costs nothing, then runs it once more and requires that last one to cost nothing too. Not nearly nothing. There is no tolerance, because a tolerance is a budget and a budget gets spent.
 
-The warm up is where every buffer grows to the size the traffic needs, every connection slot in the reactor gets built, and every response the writer will ever produce is produced once. It takes one or two passes in practice. It is a loop rather than a single pass because the number of reactor slots is the high water mark of connections open at once, and that mark is not the connection count: a round of the load closes its connections and the next round opens its own before the reactor has necessarily reaped the last ones, so whether the tenth round overlaps the ninth by one connection is a scheduling question. A warm up that peaked one slot short leaves that slot for the steady pass to build, and the run then fails for a reason that has nothing to do with the request path. This is not hypothetical, it is what CI caught on the macOS runner while this was being written.
+The warm up is where every buffer grows to the size the traffic needs, every connection slot in the reactor gets built, and every response the writer will ever produce is produced once.
 
-Looping is not a loosening of the check. A real per request allocation never stops costing, so it runs out of warm up passes and fails, and it fails saying it ran out rather than saying a number was off by three.
+The number of reactor slots is the awkward part, and it took two goes to make it deterministic. A slot is built the first time the reactor needs one and reused afterwards, so the slot count is the high water mark of connections open at once, and that mark is not the connection count: a round of the load closes its connections and the next round opens its own before the reactor has necessarily reaped the last ones, so whether one round overlaps the one before it by a connection is a scheduling question. A warm up that peaked one slot short leaves that slot for the steady pass to build, and the run fails for a reason that has nothing to do with the request path. That is not hypothetical, it is what the macOS CI runner caught twice while this was being written, both times at exactly three allocations, which is one slot.
+
+So a primer pass opens twice the connection count at once before anything is measured. A pass never has more than the connection count open, plus at most the previous round's, so twice it is a ceiling the load cannot reach. After that the slot table is a property of the load rather than of the scheduler. The warm up then runs the real load until a pass of it costs nothing, up to eight passes, which covers everything else that is paid for once.
+
+Neither of those is a loosening of the check. A real per request allocation never stops costing, so it runs out of warm up passes and fails, and it fails saying it ran out rather than quoting a number that looks like a rounding error.
 
 The load is mixed on purpose, because the interesting allocation is the one on a path a simpler test does not take. One connection sends this batch, pipelined, in a single write:
 
@@ -49,7 +53,7 @@ The fix is `Connection.reuse`, which sets everything back to what a new connecti
 Before, at sixty four connections:
 
 ```text
-  warm up        6144 allocations over 8 passes
+  warm up        6528 allocations in 8 passes
   steady state   768 allocations, 152576 bytes read
   heap grew by   29360128 bytes
   the load never stopped allocating, which is the thing this looks for
@@ -62,13 +66,13 @@ After:
 $ molla allocs 64 4
 allocs 64 connections, 4 rounds
   workers        1
-  warm up        192 allocations over 2 passes
+  warm up        384 allocations in 1 pass
   steady state   0 allocations, 152576 bytes read
   heap grew by   0 bytes
   result         pass
 ```
 
-Three allocations per connection, two hundred and fifty six connections, and twenty eight megabytes of churn to serve a hundred and fifty kilobytes of answers. Afterwards the warm up number is the one that should be there, which is three allocations for each of sixty four slots, paid once.
+Three allocations per connection, two hundred and fifty six connections, and twenty eight megabytes of churn to serve a hundred and fifty kilobytes of answers. Afterwards the warm up number is the one that should be there, which is three allocations for each of a hundred and twenty eight slots, paid once.
 
 ## What it cannot see
 

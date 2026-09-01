@@ -4,11 +4,11 @@ Issue #17. The design claims the request path allocates nothing in steady
 state, and a claim like that stops being true within a month unless something
 checks it. This is the something.
 
-What it does is run a mixed load twice. The first pass is a warm up: every
-buffer grows to the size the traffic needs, every connection slot in the
-reactor gets made, every response the writer will ever build is built once. The
-counter is read after that, the identical load runs again, and the counter has
-to read exactly the same number. Not nearly the same. The same.
+What it does is run a mixed load until one run of it costs nothing, and then
+run it once more and require that one to cost nothing too. The warm up is where
+every buffer grows to the size the traffic needs, every connection slot in the
+reactor gets made, and every response the writer will ever build is built once.
+After that the counter has to stand still. Not nearly still. Still.
 
 The load is mixed on purpose, because the interesting allocation is the one on
 a path a simpler test does not take. So it covers a plain GET, a HEAD, a 404, a
@@ -222,14 +222,18 @@ def measure_allocs(connections: Int, rounds: Int) raises -> AllocReport:
     afterwards, so the number of slots is the high water mark of connections
     open at once. That mark is not the connection count, because a round of the
     load closes its connections and the next round opens its own before the
-    reactor has necessarily reaped the last ones. Whether the tenth round
-    overlaps the ninth by one connection is a scheduling question, so a warm up
-    that peaked at three slots leaves a fourth for the steady pass to build,
-    and the run fails for a reason that has nothing to do with the request
-    path.
+    reactor has necessarily reaped the last ones. Whether one round overlaps the
+    one before it by a connection is a scheduling question, so a warm up that
+    peaked one slot short leaves that slot for the steady pass to build, and the
+    run fails for a reason that has nothing to do with the request path.
 
-    So the warm up runs until a pass costs nothing, up to `MAX_WARM_PASSES`.
-    That is not a loosening of the check. A real per request allocation never
+    Two things deal with that. A primer pass opens twice the connection count at
+    once, which is a ceiling the load cannot pass, so the slot table is a
+    property of the load rather than of the scheduler. Then the warm up runs
+    until a pass costs nothing, up to `MAX_WARM_PASSES`, which covers everything
+    else that is paid for once.
+
+    Neither is a loosening of the check. A real per request allocation never
     stops costing, so it runs out of passes and fails, and it fails saying it
     ran out rather than saying a number was wrong.
     """
@@ -250,6 +254,15 @@ def measure_allocs(connections: Int, rounds: Int) raises -> AllocReport:
     var port = server.port
     report.workers = server.workers
     server.start()
+
+    # Build the slot table to a size the load cannot exceed, before anything is
+    # measured. A pass never has more than `connections` sockets open, plus at
+    # most the previous round's `connections` waiting to be reaped, so twice the
+    # connection count is a ceiling. Reaching it deliberately with one primer
+    # pass is the difference between a slot count that is a property of the
+    # load and a slot count that is a property of the scheduler.
+    var primer = String("GET / HTTP/1.1\r\nHost: molla\r\n\r\n")
+    _ = _pass(port, connections * 2, 1, primer)
 
     var batch = _load()
     while report.warm_passes < MAX_WARM_PASSES:
@@ -283,9 +296,9 @@ def run_allocs(connections: Int, rounds: Int) raises -> Int:
     print(
         "  warm up       ",
         report.warm_allocations,
-        "allocations over",
+        "allocations in",
         report.warm_passes,
-        "passes",
+        "pass" if report.warm_passes == 1 else "passes",
     )
     print(
         "  steady state  ",
