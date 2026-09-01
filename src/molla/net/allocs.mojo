@@ -40,6 +40,11 @@ from molla.sys.thread import sleep_ms
 
 comptime WAIT_MS = 10000
 comptime CHUNK = 8192
+comptime MAX_WARM_PASSES = 8
+"""How many times the load may run before one of them has to cost nothing. A
+real per request allocation never stops costing, so this is the number of tries
+it gets before the command says so."""
+
 comptime STREAM_EVENTS = 4
 """Few, because the point is that a stream allocates nothing per event and not
 how fast it goes. Four is enough for the pending and wire buffers to reach
@@ -166,6 +171,10 @@ struct AllocReport(Copyable, ImplicitlyCopyable, Movable):
 
     var warm_allocations: Int
     var warm_bytes_read: Int
+    var warm_passes: Int
+    """How many passes it took before one of them allocated nothing. One is the
+    usual answer and more than one is not a problem, see `measure_allocs`."""
+
     var steady_allocations: Int
     """The number the whole exercise is about. Anything but zero is a
     regression."""
@@ -178,6 +187,7 @@ struct AllocReport(Copyable, ImplicitlyCopyable, Movable):
     def __init__(out self):
         self.warm_allocations = 0
         self.warm_bytes_read = 0
+        self.warm_passes = 0
         self.steady_allocations = -1
         self.steady_bytes_grown = 0
         self.steady_bytes_read = 0
@@ -204,7 +214,25 @@ struct AllocReport(Copyable, ImplicitlyCopyable, Movable):
 
 
 def measure_allocs(connections: Int, rounds: Int) raises -> AllocReport:
-    """Run the mixed load twice against a real server and count both passes."""
+    """Warm the server until a pass allocates nothing, then require the next
+    one to allocate nothing either.
+
+    A single warm up pass is not enough, and the reason is worth knowing. A
+    reactor slot is built the first time the reactor needs one and reused
+    afterwards, so the number of slots is the high water mark of connections
+    open at once. That mark is not the connection count, because a round of the
+    load closes its connections and the next round opens its own before the
+    reactor has necessarily reaped the last ones. Whether the tenth round
+    overlaps the ninth by one connection is a scheduling question, so a warm up
+    that peaked at three slots leaves a fourth for the steady pass to build,
+    and the run fails for a reason that has nothing to do with the request
+    path.
+
+    So the warm up runs until a pass costs nothing, up to `MAX_WARM_PASSES`.
+    That is not a loosening of the check. A real per request allocation never
+    stops costing, so it runs out of passes and fails, and it fails saying it
+    ran out rather than saying a number was wrong.
+    """
     _ = ignore_sigpipe()
     var report = AllocReport()
 
@@ -224,7 +252,12 @@ def measure_allocs(connections: Int, rounds: Int) raises -> AllocReport:
     server.start()
 
     var batch = _load()
-    report.warm_bytes_read = _pass(port, connections, rounds, batch)
+    while report.warm_passes < MAX_WARM_PASSES:
+        var before = counter.total()
+        report.warm_bytes_read = _pass(port, connections, rounds, batch)
+        report.warm_passes += 1
+        if counter.total() == before:
+            break
     var after_warm = counter.total()
     var bytes_after_warm = counter.bytes()
     report.warm_allocations = after_warm
@@ -250,9 +283,9 @@ def run_allocs(connections: Int, rounds: Int) raises -> Int:
     print(
         "  warm up       ",
         report.warm_allocations,
-        "allocations,",
-        report.warm_bytes_read,
-        "bytes read",
+        "allocations over",
+        report.warm_passes,
+        "passes",
     )
     print(
         "  steady state  ",
@@ -262,6 +295,11 @@ def run_allocs(connections: Int, rounds: Int) raises -> Int:
         "bytes read",
     )
     print("  heap grew by  ", report.steady_bytes_grown, "bytes")
+    if report.warm_passes == MAX_WARM_PASSES and report.steady_allocations != 0:
+        print(
+            "  the load never stopped allocating, which is the thing this"
+            " looks for"
+        )
     if not report.served_the_same():
         print("  the two passes did not read the same answers back")
     if not report.drained:

@@ -6,9 +6,11 @@ The criterion was that the assertion runs on every commit. It does, twice: a sma
 
 ## What it measures
 
-`molla allocs` runs a mixed load twice against a real server on a real socket.
+`molla allocs` runs a mixed load against a real server on a real socket until one run of it costs nothing, then runs it once more and requires that last one to cost nothing too. Not nearly nothing. There is no tolerance, because a tolerance is a budget and a budget gets spent.
 
-The first pass is a warm up. Every buffer grows to the size the traffic needs, every connection slot in the reactor gets built, every response the writer will ever produce is produced once. The allocation counter is read after that, the identical load runs again, and the second reading has to equal the first exactly. Not nearly. There is no tolerance because a tolerance is a budget and a budget gets spent.
+The warm up is where every buffer grows to the size the traffic needs, every connection slot in the reactor gets built, and every response the writer will ever produce is produced once. It takes one or two passes in practice. It is a loop rather than a single pass because the number of reactor slots is the high water mark of connections open at once, and that mark is not the connection count: a round of the load closes its connections and the next round opens its own before the reactor has necessarily reaped the last ones, so whether the tenth round overlaps the ninth by one connection is a scheduling question. A warm up that peaked one slot short leaves that slot for the steady pass to build, and the run then fails for a reason that has nothing to do with the request path. This is not hypothetical, it is what CI caught on the macOS runner while this was being written.
+
+Looping is not a loosening of the check. A real per request allocation never stops costing, so it runs out of warm up passes and fails, and it fails saying it ran out rather than saying a number was off by three.
 
 The load is mixed on purpose, because the interesting allocation is the one on a path a simpler test does not take. One connection sends this batch, pipelined, in a single write:
 
@@ -28,7 +30,7 @@ Anything that allocates on the fifth kind of request is invisible to a test that
 
 The client ordering matters more than the load does, and it took three tries to get right.
 
-Every connection in a round is opened before any of them is written to, all of them are written to before any of them is read, and every one of them has been answered before any of them is asked to close. The first version opened and finished one connection at a time, which let the server accept, answer and free the same slot every time, so it proved that one slot gets reused and nothing about the other sixty three. It reported three allocations of warm up at sixty four connections, which should have been the giveaway.
+Every connection in a round is opened before any of them is written to, all of them are written to before any of them is read, and every one of them has been answered before any of them is asked to close. The first version of the client opened and finished one connection at a time, which let the server accept, answer and free the same slot every time, so it proved that one slot gets reused and nothing about the other sixty three. It reported three allocations of warm up at sixty four connections, which should have been the giveaway.
 
 Opening all of them first fixed that and left a flake behind. The batch ended with `Connection: close`, so the server was closing the early connections while the late ones were still in the accept queue, and the reactor served the whole load out of fifty five or sixty or sixty four slots depending on how the scheduler felt. A slot costs three allocations the first time and nothing afterwards, so a warm up that happened to build fifty five of them left nine for the steady pass to build, and the run failed about half the time. The closing request is now sent separately, after every connection has been answered once, and the slot count is the connection count on every run.
 
@@ -47,9 +49,10 @@ The fix is `Connection.reuse`, which sets everything back to what a new connecti
 Before, at sixty four connections:
 
 ```text
-  warm up        768 allocations, 152576 bytes read
+  warm up        6144 allocations over 8 passes
   steady state   768 allocations, 152576 bytes read
   heap grew by   29360128 bytes
+  the load never stopped allocating, which is the thing this looks for
   result         fail
 ```
 
@@ -59,7 +62,7 @@ After:
 $ molla allocs 64 4
 allocs 64 connections, 4 rounds
   workers        1
-  warm up        192 allocations, 152576 bytes read
+  warm up        192 allocations over 2 passes
   steady state   0 allocations, 152576 bytes read
   heap grew by   0 bytes
   result         pass
