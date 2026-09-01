@@ -4,6 +4,11 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- `molla.text`, everything a tokenizer needs to know about characters before it can start: UTF-8 encoding and decoding that rejects overlong forms and surrogates and reports an incomplete sequence as one, Unicode categories, combining classes, decompositions and full lowercase mappings generated from the database by `scripts/gen-unicode.py`, the four normal forms, and a backtracking regular expression engine with Unicode categories, lookahead and possessive quantifiers. Checked against Python over 294552 normalization cases and 6732 regular expression cases, all identical. See [docs/validation/text.md](docs/validation/text.md).
+- `scripts/check-text.py` and `scripts/text_oracle.mojo`, the differential run behind that, which also reports the pre-tokenizer split throughput against a file it generates. The GPT-2 pattern over 4 MB of mixed text is 174ms on the M4, which is 23 MB/s.
+
 ## [0.2.1] - 2026-09-01
 
 The model plane starts. Two readers, one model spec, and nothing that touches a weight yet.

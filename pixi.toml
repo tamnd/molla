@@ -21,10 +21,10 @@ run = "mojo run -I src src/molla/main.mojo"
 # Mojo 1.0 has no test command, so the suite is a binary that exits nonzero on
 # failure. See tests/harness.mojo.
 test = "mojo run -I src -I tests tests/main.mojo"
-fmt = "mojo format -q src tests"
+fmt = "mojo format -q src tests scripts"
 # `mojo format` has no check mode, so formatting in place and asserting a clean
 # tree is the honest equivalent. CI runs this on a clean checkout.
-fmt-check = "mojo format -q src tests && git diff --exit-code -- src tests"
+fmt-check = "mojo format -q src tests scripts && git diff --exit-code -- src tests scripts"
 # What we paste into docs/validation/toolchain.md when adding a machine.
 toolchain = "mojo --version"
 check = { depends-on = ["fmt-check", "build", "test"] }
