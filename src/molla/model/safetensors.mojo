@@ -290,8 +290,10 @@ struct SafeTensors(Movable):
             mapping.close()
             raise Error(INDEX_NAME + " has no weight_map")
 
-        # The shards, in the order the map first mentions them, so a report
-        # lists them the way the file does.
+        # The shards, sorted by name rather than left in the order the map
+        # happens to mention them. A weight map starting at lm_head names the
+        # last shard first, and a report that lists two of five shards in file
+        # order reads like a bug in the reader.
         var names = List[String]()
         var child = doc.first_child(weights)
         while child != NO_NODE:
@@ -305,6 +307,17 @@ struct SafeTensors(Movable):
             if not known:
                 names.append(shard)
             child = doc.next_sibling(child)
+
+        # Insertion sort. A model with more shards than a person can count on
+        # both hands does not exist, and the names are zero padded, so ordering
+        # them as text orders them as numbers.
+        for i in range(1, len(names)):
+            var name = names[i]
+            var j = i
+            while j > 0 and names[j - 1] > name:
+                names[j] = names[j - 1]
+                j -= 1
+            names[j] = name
 
         for i in range(len(names)):
             self._read_shard(names[i], counter)

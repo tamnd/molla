@@ -307,12 +307,14 @@ def run(mut suite: Suite) raises:
     )
     _write_st(shard_dir + "/model-00001-of-00002.safetensors", first, 16)
     _write_st(shard_dir + "/model-00002-of-00002.safetensors", second, 16)
+    # The map names the second shard first, which is what a real index does
+    # when it starts at lm_head. The shards are still opened in name order.
     _write_text(
         shard_dir + "/model.safetensors.index.json",
         (
             '{"metadata":{"total_size":32},"weight_map":'
-            '{"a.weight":"model-00001-of-00002.safetensors",'
-            '"b.weight":"model-00002-of-00002.safetensors"}}'
+            '{"b.weight":"model-00002-of-00002.safetensors",'
+            '"a.weight":"model-00001-of-00002.safetensors"}}'
         ),
     )
 
@@ -334,8 +336,12 @@ def run(mut suite: Suite) raises:
         "the second tensor is in the second shard",
     )
     suite.check(
-        sharded.shards[1].name == "model-00002-of-00002.safetensors",
-        "shards are named after the files",
+        sharded.shards[0].name == "model-00001-of-00002.safetensors"
+        and sharded.shards[1].name == "model-00002-of-00002.safetensors",
+        (
+            "shards are opened in name order, not in the order the index names"
+            " them"
+        ),
     )
     # Offsets are per shard, not global, which is the one thing about a sharded
     # repository that is easy to get wrong.
