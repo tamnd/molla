@@ -99,6 +99,14 @@ struct Env(Movable):
     var steps: Int
     var depth: Int
     var started_ms: Int
+    var now: Int
+    """The wall clock `strftime_now` reads, or 0 for the real one.
+
+    A template that stamps the date into the system prompt renders a different
+    string tomorrow, which is correct in production and useless in a corpus.
+    Pinning this is how the conformance run compares two implementations rather
+    than two days.
+    """
     var uni: List[Unicode]
     """The Unicode tables, built on first use and not before.
 
@@ -118,6 +126,7 @@ struct Env(Movable):
         self.steps = 0
         self.depth = 0
         self.started_ms = monotonic_ns() // 1000000
+        self.now = 0
         self.uni = List[Unicode]()
 
     def unicode(mut self) raises -> Pointer[Unicode, origin_of(self.uni[0])]:

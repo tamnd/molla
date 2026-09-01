@@ -82,8 +82,11 @@ struct Template(Movable):
         self.tree = parse_template(source)
         self.source = source
 
-    def render(self, bindings: List[Binding], limits: Limits) raises -> String:
+    def render(
+        self, bindings: List[Binding], limits: Limits, now: Int = 0
+    ) raises -> String:
         var env = Env(self.source, limits, 0)
+        env.now = now
         var frame = env.push(builtin_frame(env))
         _install(env, frame, bindings)
         render_tree(env, self.tree, frame)
@@ -92,15 +95,22 @@ struct Template(Movable):
     def render(self, bindings: List[Binding]) raises -> String:
         return self.render(bindings, Limits())
 
-    def render_object(self, vars: String, limits: Limits) raises -> String:
+    def render_object(
+        self, vars: String, limits: Limits, now: Int = 0
+    ) raises -> String:
         """Render with one JSON object, each member of it bound by its name.
 
         This is the shape the server has anyway. A chat request carries the
         messages and the tools, the tokenizer config carries the special tokens,
         and the two go into one object rather than being taken apart into
         bindings and put back together.
+
+        `now` is what `strftime_now` reads, in seconds since the epoch, and
+        zero is the real clock. It exists because the conformance corpus has to
+        get the same answer twice.
         """
         var env = Env(self.source, limits, 0)
+        env.now = now
         var frame = env.push(builtin_frame(env))
         var doc = Document(0)
         var reader = Reader(0, 4096)

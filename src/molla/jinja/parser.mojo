@@ -271,6 +271,8 @@ struct Parser(Movable):
             return self._with(at)
         if name == "block":
             return self._named_block(at)
+        if name == "generation":
+            return self._generation(at)
         if name == "break" or name == "continue":
             self._end_tag()
             var node = self.tree.add(N_LOOP_CONTROL, at)
@@ -562,6 +564,24 @@ struct Parser(Movable):
         self.pos += 2
         if self._kind() == T_NAME:
             self.pos += 1
+        self._end_tag()
+        return body
+
+    def _generation(mut self, at: Int) raises -> Int:
+        """`{% generation %}`, which is a `transformers` extension, not Jinja.
+
+        It marks the span of the output a model is supposed to have produced,
+        so that a training script can build a loss mask over the tokens. The
+        tag contributes nothing to the string, which is the only thing we are
+        rendering, so the body renders and the marks are dropped.
+        """
+        self._end_tag()
+        var stops = List[String]()
+        stops.append(String("endgeneration"))
+        var body = self._block(stops)
+        if self._kind() == T_EOF:
+            self._fail(at, "`generation` was never closed with `endgeneration`")
+        self.pos += 2
         self._end_tag()
         return body
 

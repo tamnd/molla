@@ -25,6 +25,8 @@ every value they have been checked against, including the ones where the
 exponent form kicks in, and the tests hold that agreement in place.
 """
 
+from molla.text.utf8 import decode
+
 comptime V_UNDEFINED = 0
 comptime V_NONE = 1
 comptime V_BOOL = 2
@@ -463,21 +465,36 @@ def quote(s: String) -> String:
     return String(StringSpan(unsafe_from_utf8=Span(raw)))
 
 
-def json_string(s: String) -> String:
-    """A JSON string with `ensure_ascii` off, which is what transformers uses.
+def _u_escape(cp: Int, mut raw: List[UInt8]):
+    """One `\\uXXXX`, which is the only spelling JSON has for a code point."""
+    var hex = _HEX.as_bytes()
+    raw.append(0x5C)
+    raw.append(0x75)
+    raw.append(hex[(cp >> 12) & 0x0F])
+    raw.append(hex[(cp >> 8) & 0x0F])
+    raw.append(hex[(cp >> 4) & 0x0F])
+    raw.append(hex[cp & 0x0F])
+
+
+def json_string(s: String, ensure_ascii: Bool = False) -> String:
+    """A JSON string, with `ensure_ascii` off by default as transformers has it.
 
     `json.dumps` escapes the same seven characters and writes everything below
-    a space as `\\u00xx`. Everything above ASCII goes through as itself, which
-    is the difference between the filter transformers installs and Jinja's own,
-    and it is the difference a template printing a Chinese tool description
-    notices.
+    a space as `\\u00xx`. With `ensure_ascii` off everything above ASCII goes
+    through as itself, which is the difference between the filter transformers
+    installs and Jinja's own, and it is the difference a template printing a
+    Chinese tool description notices. With it on the same character comes out as
+    `\\uXXXX`, and anything past the basic plane comes out as the surrogate pair
+    Python writes, which is the one place JSON still has UTF-16 in it.
     """
     var data = s.as_bytes()
     var raw = List[UInt8]()
     var hex = _HEX.as_bytes()
     raw.append(0x22)
-    for i in range(len(data)):
+    var i = 0
+    while i < len(data):
         var c = data[i]
+        i += 1
         if c == 0x22 or c == 0x5C:
             raw.append(0x5C)
             raw.append(c)
@@ -503,8 +520,20 @@ def json_string(s: String) -> String:
             raw.append(0x30)
             raw.append(hex[Int(c >> 4)])
             raw.append(hex[Int(c & 0x0F)])
-        else:
+        elif c < 0x80 or not ensure_ascii:
             raw.append(c)
+        else:
+            var step = decode(data, i - 1)
+            if step.code < 0:
+                raw.append(c)
+                continue
+            i = i - 1 + step.width
+            if step.code < 0x10000:
+                _u_escape(step.code, raw)
+            else:
+                var rest = step.code - 0x10000
+                _u_escape(0xD800 + (rest >> 10), raw)
+                _u_escape(0xDC00 + (rest & 0x3FF), raw)
     raw.append(0x22)
     return String(StringSpan(unsafe_from_utf8=Span(raw)))
 
@@ -531,17 +560,34 @@ def _sorted_keys(heap: Heap, d: Int) -> List[Int]:
     return order^
 
 
-def to_json(
-    heap: Heap, v: Int, indent: Int, sort_keys: Bool, level: Int
-) raises -> String:
-    """`json.dumps` with the defaults transformers passes.
+struct JsonStyle(Copyable, ImplicitlyCopyable, Movable):
+    """The keyword arguments `tojson` takes, worked out once.
 
     The separators matter and are easy to get wrong. With no indent the item
     separator is a comma and a space and the key separator is a colon and a
     space, which is `json.dumps` default and not what most hand written JSON
     writers produce. With an indent the item separator loses its space, because
-    the newline is already there.
+    the newline is already there. A template that passes `separators` says both
+    itself and neither default applies, which four of the templates in the
+    corpus do to get the compact spelling.
     """
+
+    var indent: Int
+    var sort_keys: Bool
+    var ensure_ascii: Bool
+    var item_sep: String
+    var key_sep: String
+
+    def __init__(out self, indent: Int = 0):
+        self.indent = indent
+        self.sort_keys = False
+        self.ensure_ascii = False
+        self.item_sep = String(",") if indent > 0 else String(", ")
+        self.key_sep = String(": ")
+
+
+def to_json(heap: Heap, v: Int, style: JsonStyle, level: Int) raises -> String:
+    """`json.dumps` with the defaults transformers passes."""
     var k = heap.kind(v)
     if k == V_NONE or k == V_UNDEFINED:
         return String("null")
@@ -552,18 +598,17 @@ def to_json(
     if k == V_FLOAT:
         return String(heap.cells[v].f)
     if k == V_STRING:
-        return json_string(heap.cells[v].s)
+        return json_string(heap.cells[v].s, style.ensure_ascii)
 
     var newline = String("")
     var pad = String("")
     var closing = String("")
-    if indent > 0:
+    if style.indent > 0:
         newline = "\n"
-        for _ in range((level + 1) * indent):
+        for _ in range((level + 1) * style.indent):
             pad += " "
-        for _ in range(level * indent):
+        for _ in range(level * style.indent):
             closing += " "
-    var comma = String(",") if indent > 0 else String(", ")
 
     if k == V_LIST:
         if len(heap.cells[v].items) == 0:
@@ -571,12 +616,10 @@ def to_json(
         var out = String("[")
         for i in range(len(heap.cells[v].items)):
             if i > 0:
-                out += comma
+                out += style.item_sep
             out += newline
             out += pad
-            out += to_json(
-                heap, heap.cells[v].items[i], indent, sort_keys, level + 1
-            )
+            out += to_json(heap, heap.cells[v].items[i], style, level + 1)
         out += newline
         out += closing
         return out + "]"
@@ -585,7 +628,7 @@ def to_json(
         if len(heap.cells[v].keys) == 0:
             return String("{}")
         var order = List[Int]()
-        if sort_keys:
+        if style.sort_keys:
             order = _sorted_keys(heap, v)
         else:
             for i in range(len(heap.cells[v].keys)):
@@ -593,17 +636,13 @@ def to_json(
         var out = String("{")
         for n in range(len(order)):
             if n > 0:
-                out += comma
+                out += style.item_sep
             out += newline
             out += pad
-            out += json_string(heap.cells[v].keys[order[n]])
-            out += ": "
+            out += json_string(heap.cells[v].keys[order[n]], style.ensure_ascii)
+            out += style.key_sep
             out += to_json(
-                heap,
-                heap.cells[v].items[order[n]],
-                indent,
-                sort_keys,
-                level + 1,
+                heap, heap.cells[v].items[order[n]], style, level + 1
             )
         out += newline
         out += closing

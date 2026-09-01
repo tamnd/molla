@@ -178,6 +178,40 @@ jobs:
       - name: Run the corpus
         run: pixi run conformance-tokenizer
 
+  # Every chat template molla renders, checked against the string transformers
+  # rendered from the same template and the same conversation. The templates are
+  # not in the repository, so they are fetched and cached. See
+  # docs/validation/jinja.md and issue #24.
+  template:
+    name: Template conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@194d461b21b6c5717c722ffc597fa91ed2ff29fa # v0.9.1
+        with:
+          cache: true
+          locked: true
+      # Keyed on the manifest, so a corpus change fetches and everything else
+      # restores. The whole corpus is four megabytes, which is why the full tier
+      # is what runs here rather than the quick one.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: corpus/templates
+          key: templates-full-${{ hashFiles('scripts/templates.tsv') }}
+          restore-keys: templates-full-
+      - name: Fetch the corpus
+        run: python3 scripts/fetch-templates.py --tier full --into corpus/templates
+      - name: Run the corpus
+        run: pixi run conformance-template-full
+
   # Numerics and performance need real devices, so they run on the fleet
   # rather than on hosted runners. See D7 and D8 in docs/design.md.
   # Gated on the label so forks and doc changes do not queue on hardware.
@@ -236,7 +270,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [docs, workflows, shell, build, tokenizer]
+    needs: [docs, workflows, shell, build, tokenizer, template]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -277,6 +277,47 @@ def _filters(mut suite: Suite):
     )
     _ok(suite, '{{ "a\\"b" | tojson }}', '"a\\"b"', "tojson escapes a quote")
 
+    # The rest of the `tojson` signature, which four templates in the corpus
+    # reach for and which the corpus caught us not having.
+    _ok(
+        suite,
+        "{{ {'a': [1, 2]} | tojson(separators=(',', ':')) }}",
+        '{"a":[1,2]}',
+        "tojson with separators writes the compact spelling",
+    )
+    _ok(
+        suite,
+        "{{ {'k': 'caf\\u00e9'} | tojson(ensure_ascii=True) }}",
+        '{"k": "caf\\u00e9"}',
+        "tojson with ensure_ascii escapes above ascii",
+    )
+    _ok(
+        suite,
+        "{{ '\\U0001f600' | tojson(ensure_ascii=True) }}",
+        '"\\ud83d\\ude00"',
+        "tojson with ensure_ascii writes a surrogate pair",
+    )
+    _ok(
+        suite,
+        "{{ {'b': 1, 'a': 2} | tojson(sort_keys=True) }}",
+        '{"a": 2, "b": 1}',
+        "tojson with sort_keys",
+    )
+    # The first positional argument is `ensure_ascii` and not `indent`, because
+    # that is the order transformers gives the filter.
+    _ok(
+        suite,
+        "{{ {'k': 'caf\\u00e9'} | tojson(True) }}",
+        '{"k": "caf\\u00e9"}',
+        "the first positional argument to tojson is ensure_ascii",
+    )
+    _render_fails(
+        suite,
+        "{{ {'a': 1} | tojson(separators=',') }}",
+        "wants a pair",
+        "tojson refuses a separator that is not a pair",
+    )
+
     _ok(suite, "{{ 1 is odd }}", "True", "the odd test")
     _ok(suite, "{{ missing is defined }}", "False", "the defined test")
     _ok(suite, "{{ 'a' is string }}", "True", "the string test")

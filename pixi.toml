@@ -34,3 +34,12 @@ check = { depends-on = ["fmt-check", "build", "test"] }
 # the full one is a few hundred more files. See docs/validation/tokenizer.md.
 conformance-tokenizer = "mojo run -I src scripts/tokenizer_oracle.mojo scripts/tokenizer_cases.txt scripts/tokenizers.tsv corpus/tokenizers quick"
 conformance-tokenizer-full = "mojo run -I src scripts/tokenizer_oracle.mojo scripts/tokenizer_cases.txt scripts/tokenizers.tsv corpus/tokenizers full"
+# The chat template conformance corpus, which works the same way and wants
+# `scripts/fetch-templates.py` to have run first. The zone is pinned because a
+# Llama template writes today's date into the system prompt, and both halves of
+# the corpus have to read the same clock in the same zone. The full tier is
+# every repository and takes half a second, so it is what CI runs; the quick
+# tier is one repository per distinct template and is for iterating locally.
+# See docs/validation/jinja.md.
+conformance-template = { cmd = "mojo run -I src scripts/template_oracle.mojo scripts/template_cases.txt scripts/templates.tsv corpus/templates quick", env = { TZ = "UTC" } }
+conformance-template-full = { cmd = "mojo run -I src scripts/template_oracle.mojo scripts/template_cases.txt scripts/templates.tsv corpus/templates full", env = { TZ = "UTC" } }

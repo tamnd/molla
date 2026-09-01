@@ -20,8 +20,9 @@ pixi.lock.bak
 /spikes/qmatmul/shape.txt
 /spikes/qmatmul/shape_q40.txt
 
-# The tokenizer conformance corpus. A gigabyte of real `tokenizer.json` files
-# that `scripts/fetch-tokenizers.py` downloads and checks the digests of.
+# The conformance corpora. A gigabyte of real `tokenizer.json` files and a few
+# megabytes of real chat templates, which `scripts/fetch-tokenizers.py` and
+# `scripts/fetch-templates.py` download and check the digests of.
 /corpus/
 
 # Local state. Never commit a model store.
