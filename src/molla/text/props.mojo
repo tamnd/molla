@@ -1,0 +1,509 @@
+"""Unicode character properties, decoded from the generated tables.
+
+A `Unicode` is the tables in memory. Building one decodes about eleven thousand
+varints and costs well under a millisecond, and everything that needs a
+property holds a reference to one rather than reaching for a global, because
+Mojo 1.0 has no global to reach for. A server builds one when it loads a
+tokenizer and keeps it.
+
+The properties here are the ones a tokenizer actually asks for: the general
+category, the canonical combining class, the decompositions, the compositions
+that are allowed to run backwards, and the lowercase mapping. Whitespace and
+the regex shorthand classes are written out below rather than generated,
+because they are short and a list you can read is a list you can check.
+"""
+
+from molla.text.tables import (
+    CATEGORY_COUNT,
+    CATEGORY_DATA,
+    COMBINING_COUNT,
+    COMBINING_DATA,
+    DECOMPOSITION_COUNT,
+    DECOMPOSITION_DATA,
+    LOWERCASE_COUNT,
+    LOWERCASE_DATA,
+)
+
+comptime CAT_LU = 0
+comptime CAT_LL = 1
+comptime CAT_LT = 2
+comptime CAT_LM = 3
+comptime CAT_LO = 4
+comptime CAT_MN = 5
+comptime CAT_MC = 6
+comptime CAT_ME = 7
+comptime CAT_ND = 8
+comptime CAT_NL = 9
+comptime CAT_NO = 10
+comptime CAT_PC = 11
+comptime CAT_PD = 12
+comptime CAT_PS = 13
+comptime CAT_PE = 14
+comptime CAT_PI = 15
+comptime CAT_PF = 16
+comptime CAT_PO = 17
+comptime CAT_SM = 18
+comptime CAT_SC = 19
+comptime CAT_SK = 20
+comptime CAT_SO = 21
+comptime CAT_ZS = 22
+comptime CAT_ZL = 23
+comptime CAT_ZP = 24
+comptime CAT_CC = 25
+comptime CAT_CF = 26
+comptime CAT_CS = 27
+comptime CAT_CO = 28
+comptime CAT_CN = 29
+"""Unassigned. Anything not in the table is this."""
+
+comptime CATEGORY_NAMES = (
+    "LuLlLtLmLoMnMcMeNdNlNoPcPdPsPePiPfPoSmScSkSoZsZlZpCcCfCsCoCn"
+)
+"""The two letter names in table order, so a category index can be printed."""
+
+comptime HANGUL_S_BASE = 0xAC00
+comptime HANGUL_L_BASE = 0x1100
+comptime HANGUL_V_BASE = 0x1161
+comptime HANGUL_T_BASE = 0x11A7
+comptime HANGUL_L_COUNT = 19
+comptime HANGUL_V_COUNT = 21
+comptime HANGUL_T_COUNT = 28
+comptime HANGUL_N_COUNT = 588
+comptime HANGUL_S_COUNT = 11172
+
+
+def category_name(index: Int) -> String:
+    """The two letter name of a category index, for a message or a report."""
+    if index < 0 or index > CAT_CN:
+        return String("??")
+    var bytes = CATEGORY_NAMES.as_bytes()
+    var out = List[UInt8]()
+    out.append(bytes[index * 2])
+    out.append(bytes[index * 2 + 1])
+    return String(StringSpan(unsafe_from_utf8=out))
+
+
+def category_index(name: StringSpan) -> Int:
+    """The index of a two letter category name, or minus one.
+
+    A one letter name is not accepted here. The regex layer wants `\\p{L}` to
+    mean five categories rather than one, so it expands the major categories
+    itself and this stays a straight lookup.
+    """
+    if name.byte_length() != 2:
+        return -1
+    var bytes = CATEGORY_NAMES.as_bytes()
+    var p = name.unsafe_ptr()
+    for i in range(CAT_CN + 1):
+        if bytes[i * 2] == p.unsafe_load(0) and bytes[
+            i * 2 + 1
+        ] == p.unsafe_load(1):
+            return i
+    return -1
+
+
+def is_whitespace(cp: Int) -> Bool:
+    """The White_Space property, which is what a regex `\\s` means.
+
+    Written out rather than generated. There are twenty five of them, the list
+    has not changed since Unicode 4, and a reader can check this against the
+    standard in about a minute. Note what is not here: the four ASCII
+    separators at 0x1C to 0x1F, which Python calls space and Unicode does not.
+    """
+    if cp < 0x2000:
+        if cp >= 0x09 and cp <= 0x0D:
+            return True
+        return cp == 0x20 or cp == 0x85 or cp == 0xA0 or cp == 0x1680
+    if cp <= 0x200A:
+        return True
+    return (
+        cp == 0x2028
+        or cp == 0x2029
+        or cp == 0x202F
+        or cp == 0x205F
+        or cp == 0x3000
+    )
+
+
+def is_ascii_whitespace(cp: Int) -> Bool:
+    """Space, tab, newline, carriage return, form feed, vertical tab."""
+    return cp == 0x20 or (cp >= 0x09 and cp <= 0x0D)
+
+
+def _digit(b: UInt8) -> Int:
+    """The value of one base 64 digit, in the standard alphabet."""
+    if b >= 65 and b <= 90:
+        return Int(b) - 65
+    if b >= 97 and b <= 122:
+        return Int(b) - 97 + 26
+    if b >= 48 and b <= 57:
+        return Int(b) - 48 + 52
+    if b == 43:
+        return 62
+    return 63
+
+
+def _varint(data: Span[UInt8, _], mut at: Int) -> Int:
+    """Read one varint: five payload bits per digit, 0x20 says another follows.
+    """
+    var value = 0
+    var shift = 0
+    while at < len(data):
+        var d = _digit(data[at])
+        at += 1
+        value |= (d & 0x1F) << shift
+        if (d & 0x20) == 0:
+            return value
+        shift += 5
+    return value
+
+
+struct Unicode(Movable):
+    """The Unicode tables, decoded once.
+
+    The three range tables are parallel lists searched by bisection. The two
+    mapping tables are a sorted list of code points and an arena of the code
+    points they map to. The composition map is built here rather than
+    generated, by running the canonical decompositions backwards and dropping
+    the ones the exclusion bit says do not compose.
+    """
+
+    var cat_start: List[Int]
+    var cat_end: List[Int]
+    var cat_value: List[UInt8]
+
+    var ccc_start: List[Int]
+    var ccc_end: List[Int]
+    var ccc_value: List[UInt8]
+
+    var decomp_cp: List[Int]
+    var decomp_header: List[Int]
+    var decomp_at: List[Int]
+    var decomp_points: List[Int]
+
+    var lower_cp: List[Int]
+    var lower_at: List[Int]
+    var lower_points: List[Int]
+
+    var comp_key: List[Int]
+    var comp_value: List[Int]
+    var comp_mask: Int
+
+    def __init__(out self):
+        self.cat_start = List[Int]()
+        self.cat_end = List[Int]()
+        self.cat_value = List[UInt8]()
+        self.ccc_start = List[Int]()
+        self.ccc_end = List[Int]()
+        self.ccc_value = List[UInt8]()
+        self.decomp_cp = List[Int]()
+        self.decomp_header = List[Int]()
+        self.decomp_at = List[Int]()
+        self.decomp_points = List[Int]()
+        self.lower_cp = List[Int]()
+        self.lower_at = List[Int]()
+        self.lower_points = List[Int]()
+        self.comp_key = List[Int]()
+        self.comp_value = List[Int]()
+        self.comp_mask = 0
+
+        self._read_ranges(
+            CATEGORY_DATA.as_bytes(),
+            CATEGORY_COUNT,
+            self.cat_start,
+            self.cat_end,
+            self.cat_value,
+        )
+        self._read_ranges(
+            COMBINING_DATA.as_bytes(),
+            COMBINING_COUNT,
+            self.ccc_start,
+            self.ccc_end,
+            self.ccc_value,
+        )
+        self._read_decompositions()
+        self._read_lowercase()
+        self._build_compositions()
+
+    @staticmethod
+    def _read_ranges(
+        data: Span[UInt8, _],
+        count: Int,
+        mut starts: List[Int],
+        mut ends: List[Int],
+        mut values: List[UInt8],
+    ):
+        starts.reserve(count)
+        ends.reserve(count)
+        values.reserve(count)
+        var at = 0
+        var previous = -1
+        for _ in range(count):
+            var start = previous + 1 + _varint(data, at)
+            var end = start + _varint(data, at)
+            var value = _varint(data, at)
+            starts.append(start)
+            ends.append(end)
+            values.append(UInt8(value))
+            previous = end
+
+    def _read_decompositions(mut self):
+        var data = DECOMPOSITION_DATA.as_bytes()
+        self.decomp_cp.reserve(DECOMPOSITION_COUNT)
+        self.decomp_header.reserve(DECOMPOSITION_COUNT)
+        self.decomp_at.reserve(DECOMPOSITION_COUNT + 1)
+        var at = 0
+        var previous = -1
+        for _ in range(DECOMPOSITION_COUNT):
+            var cp = previous + 1 + _varint(data, at)
+            var header = _varint(data, at)
+            self.decomp_cp.append(cp)
+            self.decomp_header.append(header)
+            self.decomp_at.append(len(self.decomp_points))
+            for _ in range(header >> 2):
+                self.decomp_points.append(_varint(data, at))
+            previous = cp
+        self.decomp_at.append(len(self.decomp_points))
+
+    def _read_lowercase(mut self):
+        var data = LOWERCASE_DATA.as_bytes()
+        self.lower_cp.reserve(LOWERCASE_COUNT)
+        self.lower_at.reserve(LOWERCASE_COUNT + 1)
+        var at = 0
+        var previous = -1
+        for _ in range(LOWERCASE_COUNT):
+            var cp = previous + 1 + _varint(data, at)
+            var count = _varint(data, at)
+            self.lower_cp.append(cp)
+            self.lower_at.append(len(self.lower_points))
+            for _ in range(count):
+                self.lower_points.append(_varint(data, at))
+            previous = cp
+        self.lower_at.append(len(self.lower_points))
+
+    def _build_compositions(mut self):
+        """Every canonical two character decomposition that composes back.
+
+        Open addressed, power of two, kept under half full. The key packs the
+        two code points into one integer, which fits because a code point is
+        twenty one bits and there are sixty four to put them in.
+        """
+        var size = 64
+        while size < DECOMPOSITION_COUNT * 2:
+            size *= 2
+        self.comp_mask = size - 1
+        for _ in range(size):
+            self.comp_key.append(-1)
+            self.comp_value.append(0)
+
+        for i in range(len(self.decomp_cp)):
+            var header = self.decomp_header[i]
+            if (header & 1) != 0 or (header & 2) != 0:
+                continue
+            if (header >> 2) != 2:
+                continue
+            var at = self.decomp_at[i]
+            var key = (self.decomp_points[at] << 21) | self.decomp_points[
+                at + 1
+            ]
+            var slot = self._slot(key)
+            self.comp_key[slot] = key
+            self.comp_value[slot] = self.decomp_cp[i]
+
+    def _slot(self, key: Int) -> Int:
+        """Where a key lives, or the first free slot after where it would."""
+        # Knuth's multiplicative hash on the packed pair. The keys are dense in
+        # the low bits and clustered by script, so the low bits on their own
+        # collide badly.
+        var h = (key * 0x9E3779B1) & 0x7FFFFFFFFFFFFFFF
+        var slot = (h >> 13) & self.comp_mask
+        while self.comp_key[slot] != -1 and self.comp_key[slot] != key:
+            slot = (slot + 1) & self.comp_mask
+        return slot
+
+    @staticmethod
+    def _find(starts: List[Int], ends: List[Int], cp: Int) -> Int:
+        """The range containing `cp`, or minus one."""
+        var low = 0
+        var high = len(starts) - 1
+        while low <= high:
+            var mid = (low + high) >> 1
+            if cp < starts[mid]:
+                high = mid - 1
+            elif cp > ends[mid]:
+                low = mid + 1
+            else:
+                return mid
+        return -1
+
+    def category(self, cp: Int) -> Int:
+        """The general category of `cp`, `CAT_CN` if it is not assigned."""
+        var at = self._find(self.cat_start, self.cat_end, cp)
+        if at < 0:
+            return CAT_CN
+        return Int(self.cat_value[at])
+
+    def combining(self, cp: Int) -> Int:
+        """The canonical combining class of `cp`, zero for a starter."""
+        var at = self._find(self.ccc_start, self.ccc_end, cp)
+        if at < 0:
+            return 0
+        return Int(self.ccc_value[at])
+
+    def is_letter(self, cp: Int) -> Bool:
+        var c = self.category(cp)
+        return c >= CAT_LU and c <= CAT_LO
+
+    def is_mark(self, cp: Int) -> Bool:
+        var c = self.category(cp)
+        return c >= CAT_MN and c <= CAT_ME
+
+    def is_number(self, cp: Int) -> Bool:
+        var c = self.category(cp)
+        return c >= CAT_ND and c <= CAT_NO
+
+    def is_punctuation(self, cp: Int) -> Bool:
+        var c = self.category(cp)
+        return c >= CAT_PC and c <= CAT_PO
+
+    def is_symbol(self, cp: Int) -> Bool:
+        var c = self.category(cp)
+        return c >= CAT_SM and c <= CAT_SO
+
+    def is_separator(self, cp: Int) -> Bool:
+        var c = self.category(cp)
+        return c >= CAT_ZS and c <= CAT_ZP
+
+    def is_other(self, cp: Int) -> Bool:
+        var c = self.category(cp)
+        return c >= CAT_CC and c <= CAT_CN
+
+    def is_word(self, cp: Int) -> Bool:
+        """What a regex `\\w` means: a letter, a mark, a digit, or a joiner.
+
+        Written the way the Rust regex crate writes it, since that is the
+        engine the tokenizer files were tested against. Alphabetic there is
+        wider than the letter categories by a few hundred combining vowel
+        signs, and those are marks, so taking every mark covers them and takes
+        a handful of enclosing marks with it.
+        """
+        if cp == 0x200C or cp == 0x200D:
+            return True
+        var c = self.category(cp)
+        if c >= CAT_LU and c <= CAT_LO:
+            return True
+        if c >= CAT_MN and c <= CAT_ME:
+            return True
+        return c == CAT_ND or c == CAT_PC
+
+    def decomposition(self, cp: Int, compatibility: Bool) -> Int:
+        """The index of the decomposition of `cp`, or minus one.
+
+        Compatibility decompositions are only used when asked for.
+        Canonical ones are used either way, because NFKD is NFD plus more.
+        Hangul is not in the table and callers handle it themselves.
+        """
+        var low = 0
+        var high = len(self.decomp_cp) - 1
+        while low <= high:
+            var mid = (low + high) >> 1
+            if cp < self.decomp_cp[mid]:
+                high = mid - 1
+            elif cp > self.decomp_cp[mid]:
+                low = mid + 1
+            else:
+                if not compatibility and (self.decomp_header[mid] & 1) != 0:
+                    return -1
+                return mid
+        return -1
+
+    def decomposition_length(self, index: Int) -> Int:
+        return self.decomp_header[index] >> 2
+
+    def decomposition_at(self, index: Int, offset: Int) -> Int:
+        return self.decomp_points[self.decomp_at[index] + offset]
+
+    def compose(self, first: Int, second: Int) -> Int:
+        """The single character `first` and `second` compose to, or zero.
+
+        Hangul composes by arithmetic. Everything else is the table, which
+        already had the exclusions taken out of it when it was built.
+        """
+        var l_index = first - HANGUL_L_BASE
+        if l_index >= 0 and l_index < HANGUL_L_COUNT:
+            var v_index = second - HANGUL_V_BASE
+            if v_index >= 0 and v_index < HANGUL_V_COUNT:
+                return (
+                    HANGUL_S_BASE
+                    + (l_index * HANGUL_V_COUNT + v_index) * HANGUL_T_COUNT
+                )
+        var s_index = first - HANGUL_S_BASE
+        if s_index >= 0 and s_index < HANGUL_S_COUNT:
+            if s_index % HANGUL_T_COUNT == 0:
+                var t_index = second - HANGUL_T_BASE
+                if t_index > 0 and t_index < HANGUL_T_COUNT:
+                    return first + t_index
+            return 0
+
+        var slot = self._slot((first << 21) | second)
+        if self.comp_key[slot] == -1:
+            return 0
+        return self.comp_value[slot]
+
+    def lowercase(self, cp: Int, mut out: List[Int]):
+        """Append the lowercase of `cp`, which is sometimes two characters.
+
+        Capital I with a dot above lowercases to i and a combining dot, and a
+        normalizer that returned one character would be deleting the dot rather
+        than lowercasing the letter.
+        """
+        var low = 0
+        var high = len(self.lower_cp) - 1
+        while low <= high:
+            var mid = (low + high) >> 1
+            if cp < self.lower_cp[mid]:
+                high = mid - 1
+            elif cp > self.lower_cp[mid]:
+                low = mid + 1
+            else:
+                for i in range(self.lower_at[mid], self.lower_at[mid + 1]):
+                    out.append(self.lower_points[i])
+                return
+        out.append(cp)
+
+    def lowercase_one(self, cp: Int) -> Int:
+        """The lowercase of `cp` when it is a single character, else `cp`.
+
+        The regex layer uses this. A case insensitive literal is one character
+        against one character, so the two character mappings cannot take part
+        and leaving them alone is the honest answer.
+        """
+        var low = 0
+        var high = len(self.lower_cp) - 1
+        while low <= high:
+            var mid = (low + high) >> 1
+            if cp < self.lower_cp[mid]:
+                high = mid - 1
+            elif cp > self.lower_cp[mid]:
+                low = mid + 1
+            else:
+                if self.lower_at[mid + 1] - self.lower_at[mid] != 1:
+                    return cp
+                return self.lower_points[self.lower_at[mid]]
+        return cp
+
+    def uppercase_one(self, cp: Int) -> Int:
+        """The character whose lowercase is `cp`, or `cp` when there is none.
+
+        There is no uppercase table. Case insensitive matching needs to get
+        from a lowercase letter back to its uppercase, and building that from
+        the lowercase table costs one pass at startup, so this walks instead
+        and the regex compiler calls it once per literal rather than once per
+        byte of input.
+        """
+        for i in range(len(self.lower_cp)):
+            if self.lower_at[i + 1] - self.lower_at[i] != 1:
+                continue
+            if self.lower_points[self.lower_at[i]] == cp:
+                return self.lower_cp[i]
+        return cp

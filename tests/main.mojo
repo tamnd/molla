@@ -26,6 +26,7 @@ import test_soak_http
 import test_spec
 import test_stream
 import test_sys
+import test_text
 import test_tls
 
 
@@ -88,6 +89,10 @@ def main():
         test_soak_http.run(suite)
     except e:
         suite.fail("test_soak_http", String(e))
+    try:
+        test_text.run(suite)
+    except e:
+        suite.fail("test_text", String(e))
     test_stream.run(suite)
     test_json.run(suite)
     test_tls.run(suite)

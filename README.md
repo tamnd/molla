@@ -59,7 +59,7 @@ Being honest about this up front. Mojo 1.0 has no async, no sockets, no HTTP, no
 | HTTP/1.1 with chunked, SSE, and NDJSON framing | no HTTP stack, parser, bodies, multipart, SSE and NDJSON done, no routing yet, see [docs/validation/http.md](docs/validation/http.md) |
 | A SIMD JSON parser and serializer | no `std.json`, done, streaming and DOM modes, exact numbers, see [docs/validation/json.md](docs/validation/json.md) |
 | A Jinja2 subset for chat templates | no template engine |
-| BPE, Unigram, and WordPiece tokenizers | no tokenizer |
+| BPE, Unigram, and WordPiece tokenizers | no tokenizer, the Unicode tables, normal forms and regular expression engine underneath one are done, see [docs/validation/text.md](docs/validation/text.md) |
 | GGUF and safetensors readers | both done as far as the metadata goes, one model spec out of either, sharded repositories resolved through the index, no tensor reads yet, see [docs/validation/gguf.md](docs/validation/gguf.md), [docs/validation/spec.md](docs/validation/spec.md) and [docs/validation/safetensors.md](docs/validation/safetensors.md) |
 | An OCI client, which needs TLS through FFI | no HTTP client, client TLS and a verified ghcr.io pull done, see [docs/validation/tls.md](docs/validation/tls.md) |
 | A paged KV cache batching executor | `max/kernels` gives kernels, not an engine |
