@@ -87,12 +87,18 @@ There is no allocation number here, and that is deliberate. The engine allocates
 
 ## Where it was run
 
-| Machine | Suite | Corpus | Llama 3.1 per render |
-| --- | --- | --- | --- |
-| M4, macOS, arm64 | 1587 passed | 342/342 | 59.9 us |
-| server1, EPYC, 4 cores, x86_64 | to fill in | to fill in | to fill in |
-| server2, EPYC, 6 cores, x86_64 | to fill in | to fill in | to fill in |
-| gpc, i9-13900K on WSL2, x86_64 | to fill in | to fill in | to fill in |
+| Machine | Suite | Corpus | Llama 3.1 | Qwen3 | Mistral Small | Granite |
+| --- | --- | --- | --- | --- | --- | --- |
+| M4, macOS, arm64 | 1587 passed | 342/342 | 59.9 us | 79.8 us | 85.4 us | 43.4 us |
+| gpc, i9-13900K on WSL2, x86_64 | 1588 passed, 1 failed | 342/342 | 41.5 us | 61.5 us | 63.4 us | 27.6 us |
+| server1, EPYC, 4 cores, x86_64 | 1589 passed | 342/342 | 130.1 us | 188.0 us | 199.9 us | 101.0 us |
+| server2, EPYC, 6 cores, x86_64 | 1589 passed | 342/342 | 193.9 us | 511.6 us | 689.3 us | 177.7 us |
+
+The one failure on gpc is issue #87, the reactor backpressure test under WSL2, which fails on main in the same way and has nothing to do with this work. The Linux machines count two checks more than the M4 for reasons that predate this work.
+
+The corpus column on the three Linux machines is a replay rather than a fresh differential run. The reference output was recorded on the M4, where it is byte identical to Python, and each machine renders the same 342 cases and compares against that recording. It is the same assertion with the Python half cached, and what it is really checking is that nothing in the engine depends on the platform.
+
+Both EPYC machines were carrying a load average above 9 on 6 cores and above 38 on 4 cores throughout, from unrelated work belonging to whoever else is on them, so their render numbers are a ceiling on the time and not a measurement. Qwen3 and Mistral Small on server2 are past the gate on those readings, at 512 and 689 microseconds, and I am not going to claim they would pass on an idle machine without having seen an idle machine. What the two rows do establish is that the answers are the same everywhere, which is what they were run for.
 
 ## What is still not covered
 
