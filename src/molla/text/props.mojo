@@ -8,9 +8,10 @@ tokenizer and keeps it.
 
 The properties here are the ones a tokenizer actually asks for: the general
 category, the canonical combining class, the decompositions, the compositions
-that are allowed to run backwards, and the lowercase mapping. Whitespace and
-the regex shorthand classes are written out below rather than generated,
-because they are short and a list you can read is a list you can check.
+that are allowed to run backwards, the lowercase mapping, and the grapheme
+cluster break property that `graphemes.mojo` walks. Whitespace and the regex
+shorthand classes are written out below rather than generated, because they are
+short and a list you can read is a list you can check.
 """
 
 from molla.text.tables import (
@@ -20,6 +21,8 @@ from molla.text.tables import (
     COMBINING_DATA,
     DECOMPOSITION_COUNT,
     DECOMPOSITION_DATA,
+    GRAPHEME_COUNT,
+    GRAPHEME_DATA,
     LOWERCASE_COUNT,
     LOWERCASE_DATA,
 )
@@ -60,6 +63,33 @@ comptime CATEGORY_NAMES = (
     "LuLlLtLmLoMnMcMeNdNlNoPcPdPsPePiPfPoSmScSkSoZsZlZpCcCfCsCoCn"
 )
 """The two letter names in table order, so a category index can be printed."""
+
+comptime GB_OTHER = 0
+comptime GB_CR = 1
+comptime GB_LF = 2
+comptime GB_CONTROL = 3
+comptime GB_EXTEND = 4
+comptime GB_ZWJ = 5
+comptime GB_REGIONAL = 6
+comptime GB_PREPEND = 7
+comptime GB_SPACING_MARK = 8
+comptime GB_L = 9
+comptime GB_V = 10
+comptime GB_T = 11
+comptime GB_LV = 12
+comptime GB_LVT = 13
+
+comptime GB_CLASS_MASK = 0x0F
+comptime GB_PICTOGRAPHIC = 0x10
+"""Set on a code point with the Extended_Pictographic property."""
+
+comptime GB_INCB_SHIFT = 5
+"""Where the two Indic conjunct bits sit in a packed break property."""
+
+comptime INCB_NONE = 0
+comptime INCB_CONSONANT = 1
+comptime INCB_EXTEND = 2
+comptime INCB_LINKER = 3
 
 comptime HANGUL_S_BASE = 0xAC00
 comptime HANGUL_L_BASE = 0x1100
@@ -187,6 +217,16 @@ struct Unicode(Movable):
     var ccc_end: List[Int]
     var ccc_value: List[UInt8]
 
+    var gcb_start: List[Int]
+    var gcb_end: List[Int]
+    var gcb_value: List[UInt8]
+    """The packed grapheme break property, bisected rather than flattened.
+
+    It gets no flat table. Only the tokenizers with a SentencePiece charsmap
+    ask for it, which is about a fifth of them, and a megabyte of table that
+    four fifths of models never read is not a trade worth making.
+    """
+
     var cat_direct: List[UInt8]
     """Category per code point, the whole range, `CAT_CN` where unassigned."""
 
@@ -231,6 +271,9 @@ struct Unicode(Movable):
         self.ccc_start = List[Int]()
         self.ccc_end = List[Int]()
         self.ccc_value = List[UInt8]()
+        self.gcb_start = List[Int]()
+        self.gcb_end = List[Int]()
+        self.gcb_value = List[UInt8]()
         self.cat_direct = List[UInt8]()
         self.ccc_direct = List[UInt8]()
         self.lower_index = List[Int]()
@@ -261,6 +304,13 @@ struct Unicode(Movable):
             self.ccc_start,
             self.ccc_end,
             self.ccc_value,
+        )
+        self._read_ranges(
+            GRAPHEME_DATA.as_bytes(),
+            GRAPHEME_COUNT,
+            self.gcb_start,
+            self.gcb_end,
+            self.gcb_value,
         )
         self._read_decompositions()
         self._read_lowercase()
@@ -451,6 +501,20 @@ struct Unicode(Movable):
         if cp < 0 or cp >= UNICODE_MAX:
             return 0
         return Int(self.ccc_direct[cp])
+
+    def grapheme_break(self, cp: Int) -> Int:
+        """The packed grapheme break property of `cp`, zero for plain text.
+
+        Zero means break class Other, not pictographic and no Indic conjunct
+        role, which is what almost every character is, so the table only holds
+        the ranges that are something else.
+        """
+        if cp < 0 or cp >= UNICODE_MAX:
+            return GB_OTHER
+        var found = self._find(self.gcb_start, self.gcb_end, cp)
+        if found < 0:
+            return GB_OTHER
+        return Int(self.gcb_value[found])
 
     def is_letter(self, cp: Int) -> Bool:
         var c = self.category(cp)

@@ -24,7 +24,13 @@ an empty match, and what happens when a pattern goes exponential.
 
 from harness import Suite
 
-from molla.text.normalize import canonical_order, normalize, strip_marks
+from molla.text.graphemes import cluster_ends
+from molla.text.normalize import (
+    canonical_order,
+    normalize,
+    strip_combining,
+    strip_marks,
+)
 from molla.text.props import (
     CAT_CC,
     CAT_CN,
@@ -403,6 +409,134 @@ def _normalize(mut suite: Suite, tables: Unicode):
         _hex(strip_marks(tables, accented)) == "43 61 66 65",
         "strip_marks drops what a decomposition separated",
     )
+    suite.check(
+        _hex(strip_combining(tables, accented)) == "43 61 66 65",
+        "strip_combining drops the same non spacing marks",
+    )
+
+    # The two are different for the other two mark categories, and the
+    # difference is the whole reason both exist. A spacing mark and an
+    # enclosing mark survive the BERT flag and do not survive a StripAccents
+    # step written on its own.
+    var visarga: List[Int] = [0x61, 0x903]
+    suite.check(
+        _hex(strip_marks(tables, visarga)) == "61 903",
+        "strip_marks keeps a spacing mark",
+    )
+    suite.check(
+        _hex(strip_combining(tables, visarga)) == "61",
+        "strip_combining drops a spacing mark",
+    )
+    var keycap: List[Int] = [0x31, 0x20E3]
+    suite.check(
+        _hex(strip_marks(tables, keycap)) == "31 20E3",
+        "strip_marks keeps an enclosing mark",
+    )
+    suite.check(
+        _hex(strip_combining(tables, keycap)) == "31",
+        "strip_combining drops an enclosing mark",
+    )
+
+
+def _clusters(tables: Unicode, points: List[Int]) -> String:
+    """Cluster lengths in code points, joined by a slash.
+
+    Lengths rather than the text itself, because every string worth testing
+    here is a base and something invisible hanging off it and printing them
+    back would show one character either way.
+    """
+    var ends = cluster_ends(tables, points)
+    var out = String("")
+    var start = 0
+    for i in range(len(ends)):
+        if i > 0:
+            out += "/"
+        out += String(ends[i] - start)
+        start = ends[i]
+    return out^
+
+
+def _graphemes(mut suite: Suite, tables: Unicode) raises:
+    """Extended grapheme cluster boundaries, UAX #29.
+
+    Every answer here came from the `regex` module's `\\X`, which is the same
+    thing the Rust crate behind the reference tokenizer implements. The cases
+    are one per rule that can be got wrong on its own rather than a sweep,
+    because a sweep over the whole of Unicode lives outside the suite.
+    """
+    suite.group("text/graphemes")
+
+    suite.check(_clusters(tables, _points("")) == "", "nothing has no cluster")
+    suite.check(
+        _clusters(tables, _points("abc")) == "1/1/1", "ASCII is one each"
+    )
+
+    var e_acute: List[Int] = [0x65, 0x301]
+    suite.check(
+        _clusters(tables, e_acute) == "2", "a mark joins the letter before it"
+    )
+
+    var crlf: List[Int] = [0x0D, 0x0A]
+    suite.check(_clusters(tables, crlf) == "2", "CR and LF are one cluster")
+    var lfcr: List[Int] = [0x0A, 0x0D]
+    suite.check(_clusters(tables, lfcr) == "1/1", "and LF and CR are two")
+    var line: List[Int] = [0x61, 0x0D, 0x0A, 0x62]
+    suite.check(
+        _clusters(tables, line) == "1/2/1", "a line break breaks either side"
+    )
+    var tabbed: List[Int] = [0x61, 0x09]
+    suite.check(
+        _clusters(tables, tabbed) == "1/1", "a control character stands alone"
+    )
+
+    var hangul: List[Int] = [0x1100, 0x1161, 0x11A8]
+    suite.check(
+        _clusters(tables, hangul) == "3", "a Hangul syllable spelled in jamo"
+    )
+
+    # GB12 and GB13. Regional indicators pair up from the left, so an odd one
+    # at the end is a cluster on its own rather than joining the pair.
+    var flag: List[Int] = [0x1F1E6, 0x1F1E7]
+    suite.check(_clusters(tables, flag) == "2", "two regional indicators pair")
+    var flags: List[Int] = [0x1F1E6, 0x1F1E7, 0x1F1E8]
+    suite.check(
+        _clusters(tables, flags) == "2/1", "and a third starts a new cluster"
+    )
+
+    # GB11, the emoji rule. The join only holds because the run before the
+    # zero width joiner started with a pictograph.
+    var joined: List[Int] = [0x1F468, 0x200D, 0x1F469]
+    suite.check(
+        _clusters(tables, joined) == "3", "a zero width joiner joins emoji"
+    )
+    var not_joined: List[Int] = [0x61, 0x200D, 0x1F469]
+    suite.check(
+        _clusters(tables, not_joined) == "2/1",
+        "and does not join a letter to one",
+    )
+    var toned: List[Int] = [0x1F469, 0x1F3FD]
+    suite.check(_clusters(tables, toned) == "2", "a skin tone is an extender")
+
+    # GB9c, the Indic conjunct rule. Consonant, linker, consonant is one
+    # cluster, and the linker is what makes it one.
+    var conjunct: List[Int] = [0x915, 0x94D, 0x915]
+    suite.check(
+        _clusters(tables, conjunct) == "3", "a virama joins two consonants"
+    )
+    var separate: List[Int] = [0x915, 0x915]
+    suite.check(
+        _clusters(tables, separate) == "1/1",
+        "and two consonants without one are two clusters",
+    )
+    var spacing: List[Int] = [0x915, 0x93E]
+    suite.check(
+        _clusters(tables, spacing) == "2", "a spacing mark joins as well"
+    )
+    var prepended: List[Int] = [0x600, 0x627]
+    suite.check(
+        _clusters(tables, prepended) == "2",
+        "and a prepending character joins forwards",
+    )
 
 
 def _regex(mut suite: Suite, tables: Unicode) raises:
@@ -588,4 +722,5 @@ def run(mut suite: Suite) raises:
     _utf8(suite)
     _props(suite, tables)
     _normalize(suite, tables)
+    _graphemes(suite, tables)
     _regex(suite, tables)

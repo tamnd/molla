@@ -57,6 +57,7 @@ from .normalizer import (
     N_NFKC,
     N_NFKD,
     N_NMT,
+    N_PRECOMPILED,
     N_PREPEND,
     N_REPLACE_REGEX,
     N_REPLACE_STRING,
@@ -66,6 +67,7 @@ from .normalizer import (
     Normalizer,
 )
 from .post import I_SEQUENCE_A, I_SEQUENCE_B, I_SPECIAL, PostItem, PostProcessor
+from .precompiled import Precompiled
 from .pretok import (
     B_CONTIGUOUS,
     B_ISOLATED,
@@ -132,6 +134,9 @@ struct Spec(Copyable, Movable):
     var replacement: List[UInt8]
     var behavior: List[UInt8]
     var prepend_scheme: List[UInt8]
+    var charsmap: List[UInt8]
+    """The `precompiled_charsmap` member, still base64."""
+
     var sep_token: List[UInt8]
     var cls_token: List[UInt8]
     var sep_id: Int
@@ -180,6 +185,7 @@ struct Spec(Copyable, Movable):
         self.replacement = List[UInt8]()
         self.behavior = List[UInt8]()
         self.prepend_scheme = List[UInt8]()
+        self.charsmap = List[UInt8]()
         self.sep_token = List[UInt8]()
         self.cls_token = List[UInt8]()
         self.sep_id = NO_ID
@@ -470,6 +476,8 @@ def _read_node(mut reader: Reader, mut specs: Specs) raises -> Spec:
             spec.behavior = _read_string(reader)
         elif reader.key_is("prepend_scheme"):
             spec.prepend_scheme = _read_string(reader)
+        elif reader.key_is("precompiled_charsmap"):
+            spec.charsmap = _read_string(reader)
         elif reader.key_is("sep"):
             _read_pair(reader, spec, True)
         elif reader.key_is("cls"):
@@ -598,6 +606,11 @@ def build_normalizer(
         into.steps.append(NormStep(N_STRIP_ACCENTS))
     elif spec.is_a("Nmt"):
         into.steps.append(NormStep(N_NMT))
+    elif spec.is_a("Precompiled"):
+        var step = NormStep(N_PRECOMPILED)
+        step.charsmap = len(into.charsmaps)
+        into.charsmaps.append(Precompiled(Span(spec.charsmap)))
+        into.steps.append(step^)
     elif spec.is_a("Strip"):
         var step = NormStep(N_STRIP)
         step.strip_left = spec.strip_left

@@ -25,8 +25,10 @@ from harness import Suite
 
 from molla.sys.file import MODE_755, mkdir, rmdir, unlink
 from molla.sys.mem import AllocCounter
+from molla.text.props import Unicode
 from molla.text.utf8 import encode
 from molla.tokenizer.bytelevel import byte_to_point
+from molla.tokenizer.precompiled import Precompiled
 from molla.tokenizer.tokenizer import DecodeStream, Session, Tokenizer
 
 
@@ -947,6 +949,63 @@ def _nmt_json() -> String:
     )
 
 
+def _charsmap() -> String:
+    """A sentencepiece charsmap with six rules in it, built by hand.
+
+    The real ones are a quarter of a megabyte and there is no way to read one,
+    so this is the same format with a trie small enough to reason about. The
+    rules are `A` to `a`, a no break space to nothing, `a` and a combining
+    acute to a precomposed one, `e` to a capital `E`, `e` and a combining
+    acute to a precomposed one, and `o` with three combining marks after it to
+    a `Z`.
+
+    The last two rules are there because they can never fire. The `e` rule is
+    a prefix of the `e` acute rule and the search takes the shorter one, and
+    the `o` rule is a seven byte key which is past the point where a cluster
+    stops being looked up whole. Both are the reference implementation's
+    behaviour rather than anything intended, and a rewrite that fixed either
+    of them would break real files.
+    """
+    return String(
+        "QAMAAAAEAAAAAAAAAAAAgAAAAAAAAAAAAwAAgAYAAIAAAAAACAAAgAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAsAAIAAAAAAAgAAgAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBCQEAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGGMAQAAAAAAAAAAAAAAAABl"
+        + "iQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAb5wBAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACBAQIA"
+        + "gTkCAAAAAAAAAAAAAAAAAAAAAACBAAIAAAAAAIMJAgCCDAIAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAoIUCAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        + "AAAAAAAAAAAAAADMPAMAAAAAAMJMAwAAAAAAzDwDAAAAAADMLAMAAAAAAAAA"
+        + "AADMNAMAAAAAAAAAAAAAAAAAAAAAAMwsAwBhAADDoQBFAMOpAFoA"
+    )
+
+
+def _precompiled_json() -> String:
+    """The charsmap in front of a word level vocabulary, the way T5 is shaped.
+
+    No pre-tokenizer, so the whole string is one word and the id is a straight
+    reading of what the normalizer left behind.
+    """
+    return String(
+        '{"version":"1.0","truncation":null,"padding":null,'
+        + '"added_tokens":[],"normalizer":{"type":"Precompiled",'
+        + '"precompiled_charsmap":"'
+        + _charsmap()
+        + '"},"pre_tokenizer":null,"post_processor":null,"decoder":null,'
+        + '"model":{"type":"WordLevel","vocab":{"[UNK]":0,"a":1,'
+        + '"\\u00e1":2,"E":3,"ab":4},"unk_token":"[UNK]"}}'
+    )
+
+
 def _prefix_json() -> String:
     """A byte level prefix space behind a whitespace split.
 
@@ -1185,6 +1244,99 @@ def _nmt(mut suite: Suite, dir: String) raises:
     _ = unlink(path)
 
 
+def _points_hex(points: List[Int]) -> String:
+    """Code points as space separated hex, the way a mismatch reads."""
+    var digits = String("0123456789ABCDEF")
+    var out = String("")
+    for i in range(len(points)):
+        if i > 0:
+            out += " "
+        var cp = points[i]
+        var one = String("")
+        while cp > 0:
+            var nibble = cp & 0xF
+            one = digits[byte = nibble : nibble + 1] + one
+            cp >>= 4
+        if one.byte_length() == 0:
+            one = "0"
+        out += one
+    return out^
+
+
+def _precompiled(mut suite: Suite, dir: String) raises:
+    """The sentencepiece charsmap, on a map small enough to read.
+
+    Two of the checks here are about behaviour that looks like a bug and is
+    not. The reference takes the shortest rule that matches rather than the
+    longest, and it only looks a cluster up whole when the cluster is under
+    six bytes. Both are pinned, because sixty files in the corpus tokenize
+    differently if either changes.
+    """
+    suite.group("precompiled normalizer")
+    var path = dir + "/pc.json"
+    _write(path, _precompiled_json())
+    var counter = AllocCounter()
+    var tokenizer = Tokenizer(path, counter.raw())
+    var session = Session()
+
+    # Everything with a combining mark in it is built out of chr, because a
+    # mark in a source file is invisible and a precomposed letter that
+    # looked the same would take a different path through the map.
+    _encodes(suite, tokenizer, session, "A", False, [1], "a rule rewrites")
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        String("a") + chr(0x301),
+        False,
+        [2],
+        "a letter and a combining mark are looked up as one cluster",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        String("a") + chr(0xA0) + "b",
+        False,
+        [4],
+        "a rule with an empty replacement deletes what it matched",
+    )
+    _encodes(
+        suite,
+        tokenizer,
+        session,
+        String("e") + chr(0x301),
+        False,
+        [3],
+        "the shortest rule wins and takes the whole cluster with it",
+    )
+    _ = tokenizer^
+    _ = unlink(path)
+
+    # The six byte limit, which needs a cluster nothing shorter matches and so
+    # cannot be said in a vocabulary. The rule for o with three marks is in
+    # the map and the cluster is seven bytes, so the lookup never happens and
+    # all four code points come through untouched.
+    var tables = Unicode()
+    var encoded = _charsmap()
+    var map = Precompiled(encoded.as_bytes())
+    var stacked: List[Int] = [0x6F, 0x301, 0x302, 0x303]
+    suite.check(
+        _points_hex(map.apply(tables, stacked)) == "6F 301 302 303",
+        "a cluster of six bytes or more is not looked up whole",
+    )
+    var plain: List[Int] = [0x62, 0x63]
+    suite.check(
+        _points_hex(map.apply(tables, plain)) == "62 63",
+        "and a character no rule mentions is copied across",
+    )
+    var empty = List[Int]()
+    suite.check(
+        _points_hex(map.apply(tables, empty)) == "",
+        "and an empty string stays empty",
+    )
+
+
 def _prefix(mut suite: Suite, dir: String) raises:
     """The byte level prefix space, once there is more than one piece."""
     suite.group("byte level prefix space")
@@ -1302,18 +1454,32 @@ def _refuses(mut suite: Suite, dir: String) raises:
     _write(path, String('{"model":{"type":"Nonsense","vocab":{}}}'))
     suite.check(not _opens(path), "a model kind nobody has heard of is refused")
 
-    _write(
-        path,
-        String(
-            '{"model":{"type":"BPE","vocab":{"a":0},"merges":[]},'
-            + '"normalizer":{"type":"Precompiled","precompiled_charsmap":"x"}}'
-        ),
+    # A charsmap is a quarter of a megabyte of base64 in the middle of a file
+    # and there is nothing in the format that would catch a truncated one, so
+    # the loader checks the three things it can check and refuses rather than
+    # walking a trie off the end of itself.
+    _write(path, _bad_charsmap("x"))
+    suite.check(
+        not _opens(path), "a charsmap too short to hold a trie is refused"
     )
+    _write(path, _bad_charsmap("!!!!"))
+    suite.check(not _opens(path), "a charsmap that is not base64 is refused")
+    _write(path, _bad_charsmap("6AMAAEFBQUE="))
     suite.check(
         not _opens(path),
-        "a normalizer that would silently do nothing is refused",
+        "and one whose trie runs past the end of the blob is refused",
     )
     _ = unlink(path)
+
+
+def _bad_charsmap(encoded: StringSpan) -> String:
+    """A tokenizer that is fine apart from the charsmap it carries."""
+    return String(
+        '{"model":{"type":"BPE","vocab":{"a":0},"merges":[]},'
+        + '"normalizer":{"type":"Precompiled","precompiled_charsmap":"'
+        + String(encoded)
+        + '"}}'
+    )
 
 
 def _opens(path: String) -> Bool:
@@ -1336,6 +1502,7 @@ def run(mut suite: Suite) raises:
         _flags(suite, dir)
         _shapes(suite, dir)
         _nmt(suite, dir)
+        _precompiled(suite, dir)
         _prefix(suite, dir)
         _template(suite, dir)
         _refuses(suite, dir)

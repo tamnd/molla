@@ -12,15 +12,16 @@ Everything here works on code points rather than bytes, because every operation
 in the list is defined on characters, and it returns a new list rather than
 editing in place, because most of the steps change the length.
 
-`Precompiled` is not here. It is a sentencepiece character map compiled into a
-blob of trie data, it appears in the Llama 1 and T5 tokenizers, and it needs
-its own reader. A `tokenizer.json` that asks for one is refused at load time
-rather than silently normalized some other way.
+`Precompiled` is a step like the others here and its work is in
+`precompiled.mojo`, because a sentencepiece character map is a trie in a blob
+of base64 and reading one has nothing in common with lowercasing.
 """
 
-from molla.text.normalize import normalize, strip_marks
+from molla.text.normalize import normalize, strip_combining, strip_marks
 from molla.text.props import CAT_CC, CAT_CO, Unicode, is_whitespace
 from molla.text.regex import Regex, Scratch
+
+from .precompiled import Precompiled
 
 comptime N_NFC = 0
 comptime N_NFD = 1
@@ -34,6 +35,7 @@ comptime N_REPLACE_REGEX = 8
 comptime N_PREPEND = 9
 comptime N_BERT = 10
 comptime N_NMT = 11
+comptime N_PRECOMPILED = 12
 
 
 def _is_control(tables: Unicode, cp: Int) -> Bool:
@@ -93,6 +95,9 @@ struct NormStep(Copyable, Movable):
     var expression: Int
     """Index into the normalizer's compiled patterns, or -1."""
 
+    var charsmap: Int
+    """Index into the normalizer's character maps, or -1."""
+
     var lowercase: Bool
     var clean_text: Bool
     var handle_chinese: Bool
@@ -105,6 +110,7 @@ struct NormStep(Copyable, Movable):
         self.pattern = List[Int]()
         self.content = List[Int]()
         self.expression = -1
+        self.charsmap = -1
         self.lowercase = False
         self.clean_text = False
         self.handle_chinese = False
@@ -114,14 +120,16 @@ struct NormStep(Copyable, Movable):
 
 
 struct Normalizer(Movable):
-    """The steps, in order, and the patterns they compiled to."""
+    """The steps, in order, and the patterns and maps they compiled to."""
 
     var steps: List[NormStep]
     var expressions: List[Regex]
+    var charsmaps: List[Precompiled]
 
     def __init__(out self):
         self.steps = List[NormStep]()
         self.expressions = List[Regex]()
+        self.charsmaps = List[Precompiled]()
 
     def is_empty(self) -> Bool:
         return len(self.steps) == 0
@@ -149,7 +157,7 @@ struct Normalizer(Movable):
         if kind == N_STRIP:
             return self._strip(points, step.strip_left, step.strip_right)
         if kind == N_STRIP_ACCENTS:
-            return strip_marks(tables, points)
+            return strip_combining(tables, points)
         if kind == N_REPLACE_STRING:
             return self._replace_string(points, step.pattern, step.content)
         if kind == N_REPLACE_REGEX:
@@ -163,6 +171,8 @@ struct Normalizer(Movable):
             return self._bert(tables, step, points)
         if kind == N_NMT:
             return self._nmt(points)
+        if kind == N_PRECOMPILED:
+            return self.charsmaps[step.charsmap].apply(tables, points)
         return points.copy()
 
     def _lowercase(self, tables: Unicode, points: List[Int]) -> List[Int]:

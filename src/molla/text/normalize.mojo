@@ -15,6 +15,7 @@ gives you different tokens for the same sentence.
 """
 
 from molla.text.props import (
+    CAT_ME,
     CAT_MN,
     HANGUL_L_BASE,
     HANGUL_N_COUNT,
@@ -203,5 +204,25 @@ def strip_marks(tables: Unicode, points: List[Int]) -> List[Int]:
     out.reserve(len(points))
     for i in range(len(points)):
         if tables.category(points[i]) != CAT_MN:
+            out.append(points[i])
+    return out^
+
+
+def strip_combining(tables: Unicode, points: List[Int]) -> List[Int]:
+    """Drop every mark, spacing and enclosing ones included.
+
+    Wider than `strip_marks` by the two categories a BERT normalizer keeps.
+    The two are not interchangeable and the difference is not academic: a
+    `StripAccents` step written on its own drops all three categories, while
+    the `strip_accents` flag inside a `BertNormalizer` drops only the non
+    spacing ones. Both spellings are in the corpus, the reference has one
+    function for each, and running one where the other belongs loses the
+    enclosing keycap off a digit or the vowel sign off a Devanagari syllable.
+    """
+    var out = List[Int]()
+    out.reserve(len(points))
+    for i in range(len(points)):
+        var category = tables.category(points[i])
+        if category < CAT_MN or category > CAT_ME:
             out.append(points[i])
     return out^
