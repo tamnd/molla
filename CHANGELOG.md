@@ -4,9 +4,17 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+## [0.1.7] - 2026-09-01
+
+A per request allocation on a server whose whole pitch is not having one, found by the assertion added to stop exactly this.
+
+The design has always said the request path allocates nothing in steady state. Nothing checked it, and it had already stopped being true: the reactor rebuilt a `Connection` when it reused a slot, so every accept freed and re-allocated the read buffer and the write ring, and the read buffer then grew again on the first request that did not fit. Three allocations per connection, which against a client that opens a connection per request is a per request allocation.
+
+`molla allocs` is the check that will not let that happen again. It runs a mixed load until one pass of it costs nothing and then requires the next pass to cost nothing too, with no tolerance, because a tolerance is a budget and a budget gets spent. It runs in CI on every commit on all three platforms and a smaller version runs in the test suite.
+
 ### Added
 
-- `molla allocs`, which runs a mixed load twice against a real server and fails if the second pass allocated anything. The load is a pipelined batch of a GET, a HEAD, a 404, a Content-Length body, a chunked body, eight pipelined GETs and both streaming routes, so an allocation on the fifth kind of request is not invisible. Runs in CI on every commit on all three platforms, and a smaller version runs in the test suite. See [docs/validation/allocations.md](docs/validation/allocations.md).
+- `molla allocs`, which runs a mixed load against a real server until a pass of it costs nothing and fails if the pass after that allocates anything. The load is a pipelined batch of a GET, a HEAD, a 404, a Content-Length body, a chunked body, eight pipelined GETs and both streaming routes, so an allocation on the fifth kind of request is not invisible. Runs in CI on every commit on all three platforms, and a smaller version runs in the test suite. See [docs/validation/allocations.md](docs/validation/allocations.md).
 
 ### Fixed
 
