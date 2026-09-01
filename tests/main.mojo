@@ -21,6 +21,7 @@ import test_ops
 import test_reactor
 import test_registry
 import test_sha256
+import test_soak_http
 import test_stream
 import test_sys
 import test_tls
@@ -73,6 +74,10 @@ def main():
         test_allocs.run(suite)
     except e:
         suite.fail("test_allocs", String(e))
+    try:
+        test_soak_http.run(suite)
+    except e:
+        suite.fail("test_soak_http", String(e))
     test_stream.run(suite)
     test_json.run(suite)
     test_tls.run(suite)

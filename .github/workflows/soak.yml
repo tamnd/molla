@@ -1,0 +1,69 @@
+name: Soak
+
+# The hour long run from issue #18. It does not belong in CI, because an hour
+# is longer than anybody will wait on a pull request and because the thing it
+# is looking for is drift, which needs the hour to show up at all. So it runs
+# once a night on both platforms and on demand when somebody wants it.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      connections:
+        description: "Concurrent connections"
+        required: false
+        default: "1000"
+      seconds:
+        description: "How long to run for"
+        required: false
+        default: "3600"
+
+permissions: {}
+
+# Not cancel-in-progress. A soak that is forty minutes in is worth more than
+# the one that would replace it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  soak:
+    name: HTTP soak (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: macos-aarch64
+            runner: macos-15
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@194d461b21b6c5717c722ffc597fa91ed2ff29fa # v0.9.1
+        with:
+          cache: true
+          locked: true
+      - name: Toolchain
+        run: pixi run toolchain
+      - name: Build
+        run: pixi run build
+      # One process is both ends of every connection, so a thousand connections
+      # is two thousand descriptors plus the listener and whatever the runtime
+      # is holding. The macOS default is 256 and would fail on the first batch.
+      - name: Raise the descriptor limit and soak
+        shell: bash
+        env:
+          CONNECTIONS: ${{ inputs.connections || '1000' }}
+          SECONDS_TO_RUN: ${{ inputs.seconds || '3600' }}
+        run: |
+          ulimit -n 8192 || ulimit -n unlimited || true
+          echo "descriptor limit is now $(ulimit -n)"
+          ./build/molla httpsoak "$CONNECTIONS" "$SECONDS_TO_RUN"

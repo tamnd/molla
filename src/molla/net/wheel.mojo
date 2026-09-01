@@ -27,13 +27,28 @@ and a finer tick would mean the reactor waking more often to do nothing, which
 is the thing that shows up on a laptop's battery and in a container's CPU
 share.
 
-Cancelling is lazy and the reason is worth a sentence. A cancelled timer is
-marked dead and left where it is, freed when its slot is next walked, because
-unlinking from a singly linked slot list would mean either a doubly linked list
-or a scan. Nothing here creates enough dead timers for that to matter: the one
-operation that would, refreshing an idle deadline on every read, is not done by
-cancelling and rearming. The reactor lets the timer fire, checks how long the
-connection has actually been idle, and rearms only if it has more to wait.
+Cancelling frees the slab entry there and then, which is why the slot lists are
+doubly linked. That is one extra field per timer and it buys the thing the
+first version of this file got wrong.
+
+That version cancelled lazily. A cancelled timer was marked dead and left where
+it was, to be freed when its slot was next walked, on the argument that nothing
+here creates enough dead timers for it to matter. It does. Every connection
+that closes cancels its idle timer, and a connection that closes is not the
+exception, it is the whole traffic pattern of a server. A dead timer in a slot
+is not walked until time gets close to the deadline it was set for, so with a
+minute long idle timeout a server accumulates a minute of closed connections in
+dead slab entries, and the slab never shrinks. The hour long soak in issue #18
+sets the idle timeout past the end of the run, so nothing was ever walked and
+the slab ended up holding one entry for every connection the run ever made:
+three and a half million per reactor, two gigabytes across the process. The
+lazy version was not wrong about the cost of a doubly linked list. It was wrong
+about how many dead timers there would be.
+
+Refreshing an idle deadline is still not done by cancelling and rearming. The
+reactor lets the timer fire, checks how long the connection has actually been
+idle, and rearms only if it has more to wait, which keeps the common case at
+one store.
 """
 
 comptime TICK_MS = 100
@@ -65,8 +80,16 @@ struct Timer(Copyable, ImplicitlyCopyable, Movable):
     """Absolute tick, counted from when the wheel was made."""
 
     var next: Int
-    """The next timer in the same slot, or -1. Slots are singly linked through
-    the slab so a timer costs no allocation of its own."""
+    var prev: Int
+    """Neighbours in the same slot, or -1. Slots are linked through the slab so
+    a timer costs no allocation of its own, and linked both ways so cancelling
+    one costs no scan."""
+
+    var slot: Int
+    """Which slot this timer is currently in, or -1 when it is not in one. Not
+    derivable from the deadline: a timer moves down a level as time catches up
+    with it, and unlinking has to know where it actually is rather than where it
+    would go if it were being armed now."""
 
     var live: Bool
 
@@ -74,6 +97,8 @@ struct Timer(Copyable, ImplicitlyCopyable, Movable):
         self.token = 0
         self.deadline = 0
         self.next = NO_TIMER
+        self.prev = NO_TIMER
+        self.slot = NO_TIMER
         self.live = False
 
 
@@ -115,6 +140,8 @@ struct Wheel(Movable):
 
     def _release(mut self, id: Int):
         self.timers[id].live = False
+        self.timers[id].prev = NO_TIMER
+        self.timers[id].slot = NO_TIMER
         self.timers[id].next = self.free_head
         self.free_head = id
 
@@ -141,8 +168,30 @@ struct Wheel(Movable):
 
     def _link(mut self, id: Int):
         var slot = self._slot_for(self.timers[id].deadline)
-        self.timers[id].next = self.slots[slot]
+        var head = self.slots[slot]
+        self.timers[id].slot = slot
+        self.timers[id].prev = NO_TIMER
+        self.timers[id].next = head
+        if head != NO_TIMER:
+            self.timers[head].prev = id
         self.slots[slot] = id
+
+    def _unlink(mut self, id: Int):
+        """Take one timer out of the slot it is in, in constant time."""
+        var slot = self.timers[id].slot
+        if slot == NO_TIMER:
+            return
+        var prev = self.timers[id].prev
+        var next = self.timers[id].next
+        if prev == NO_TIMER:
+            self.slots[slot] = next
+        else:
+            self.timers[prev].next = next
+        if next != NO_TIMER:
+            self.timers[next].prev = prev
+        self.timers[id].prev = NO_TIMER
+        self.timers[id].next = NO_TIMER
+        self.timers[id].slot = NO_TIMER
 
     def add(mut self, token: Int, delay_ms: Int) -> Int:
         """Arm a timer. Returns its id, which is what `cancel` takes.
@@ -162,7 +211,7 @@ struct Wheel(Movable):
         return id
 
     def cancel(mut self, id: Int):
-        """Mark a timer dead. It is freed when its slot is next walked.
+        """Unlink a timer and give its slab entry back.
 
         Safe to call on a timer that already fired, because firing frees the
         slab entry and a freed entry is not live, so this is a no op rather
@@ -173,8 +222,9 @@ struct Wheel(Movable):
             return
         if not self.timers[id].live:
             return
-        self.timers[id].live = False
         self.pending -= 1
+        self._unlink(id)
+        self._release(id)
 
     def deadline_of(self, id: Int) -> Int:
         """The absolute tick a timer is set for. For tests."""
@@ -263,3 +313,12 @@ struct Wheel(Movable):
 
     def now_tick(self) -> Int:
         return self.current
+
+    def slab_size(self) -> Int:
+        """Entries in the slab, live and free together.
+
+        This is the number the soak in issue #18 watched climb for an hour. It
+        should settle at the most timers that were ever armed at once, and a
+        wheel that keeps growing while `pending` stays flat is holding on to
+        cancelled timers."""
+        return len(self.timers)

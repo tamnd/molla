@@ -21,7 +21,9 @@ getting slower as the idle ones pile up rather than anything failing outright.
 Drift is measured by cutting the run into ten segments and comparing the last
 one against the first. Latency that is flat across ten segments of an hour is
 the claim being made. Latency that climbs means something is accumulating, and
-the number says how fast.
+the number says how fast. The histogram that does the cutting lives in
+`molla.net.latency`, shared with the HTTP soak, so the drift gate means the
+same thing in both.
 
 Descriptors are checked by opening a socket after teardown and reading the
 number the kernel hands back, which is the lowest free one on both platforms. A
@@ -32,6 +34,7 @@ from std.memory import stack_allocation
 from std.time import monotonic
 
 from molla.net.context import ServerContext
+from molla.net.latency import LatencyLog
 from molla.net.listener import ListenAddress
 from molla.net.protocol import EchoProtocol
 from molla.net.server import Server
@@ -43,11 +46,6 @@ comptime SEGMENTS = 10
 """Slices of the run compared against each other. Ten is enough to see a trend
 and few enough that each one holds a meaningful number of samples."""
 
-comptime BUCKETS = 28
-"""Latency histogram buckets, one per power of two microseconds. Bucket 0 is
-under a microsecond and bucket 27 is over two minutes, which covers everything
-between a loopback round trip and a hang."""
-
 comptime PAYLOAD = 32
 comptime ACTIVE_IN = 8
 """One connection in eight sends. The rest connect and stay silent, which is
@@ -57,41 +55,6 @@ comptime CONNECT_BATCH = 128
 comptime IDLE_MARGIN_MS = 60000
 """Added to the run length to get the server's idle timeout, so a connection
 that is idle on purpose is not closed for being idle."""
-
-
-def _bucket(ns: Int) -> Int:
-    """Which power of two microseconds a duration lands in."""
-    var us = ns // 1000
-    if us <= 0:
-        return 0
-    var index = 0
-    var edge = 1
-    while edge < us and index < BUCKETS - 1:
-        edge = edge << 1
-        index += 1
-    return index
-
-
-def _quantile(
-    counts: List[Int], base: Int, total: Int, fraction_num: Int
-) -> Int:
-    """Upper edge in microseconds of the bucket holding a quantile.
-
-    Reported as the bucket edge rather than an interpolated value, because a
-    histogram this coarse cannot honestly claim more precision than the bucket
-    it landed in.
-    """
-    if total == 0:
-        return 0
-    var want = (total * fraction_num) // 100
-    if want < 1:
-        want = 1
-    var seen = 0
-    for i in range(BUCKETS):
-        seen += counts[base + i]
-        if seen >= want:
-            return 1 << i
-    return 1 << (BUCKETS - 1)
 
 
 def run_net_soak(connections: Int, seconds: Int) raises -> Int:
@@ -159,9 +122,7 @@ def run_net_soak(connections: Int, seconds: Int) raises -> Int:
     var rss_at_start = max_rss_kb()
     var open_at_start = server.open_connections()
 
-    var counts = List[Int](length=SEGMENTS * BUCKETS, fill=0)
-    var totals = List[Int](length=SEGMENTS, fill=0)
-    var sums = List[Int](length=SEGMENTS, fill=0)
+    var latency = LatencyLog(SEGMENTS)
     var round_trips = 0
     var mismatches = 0
 
@@ -203,9 +164,7 @@ def run_net_soak(connections: Int, seconds: Int) raises -> Int:
             for j in range(got):
                 if in_buf.unsafe_load(j) != mark:
                     mismatches += 1
-            counts[segment * BUCKETS + _bucket(elapsed)] += 1
-            totals[segment] += 1
-            sums[segment] += elapsed
+            latency.record(segment, elapsed)
 
     var elapsed_ns = Int(monotonic()) - started
     var rss_at_end = max_rss_kb()
@@ -252,24 +211,21 @@ def run_net_soak(connections: Int, seconds: Int) raises -> Int:
     print("  latency by segment, microseconds")
     print("    segment  samples      mean       p50       p99")
     for s in range(SEGMENTS):
-        var mean = (sums[s] // totals[s] // 1000) if totals[s] > 0 else 0
         print(
             "    "
             + String(s)
             + "        "
-            + String(totals[s])
+            + String(latency.count(s))
             + "  "
-            + String(mean)
+            + String(latency.mean_us(s))
             + "  "
-            + String(_quantile(counts, s * BUCKETS, totals[s], 50))
+            + String(latency.quantile_us(s, 50))
             + "  "
-            + String(_quantile(counts, s * BUCKETS, totals[s], 99))
+            + String(latency.quantile_us(s, 99))
         )
 
-    var first_p99 = _quantile(counts, 0, totals[0], 99)
-    var last_p99 = _quantile(
-        counts, (SEGMENTS - 1) * BUCKETS, totals[SEGMENTS - 1], 99
-    )
+    var first_p99 = latency.quantile_us(0, 99)
+    var last_p99 = latency.quantile_us(SEGMENTS - 1, 99)
 
     var ok = True
     if len(clients) != connections:
