@@ -10,6 +10,7 @@ from std.sys import argv, exit
 from molla.build_info import MOJO_PIN, VERSION
 from molla.host import detect
 from molla.http.server import run_http
+from molla.jinja.bench import run_template
 from molla.json.bench import run_json_bench
 from molla.model.gguf import run_gguf
 from molla.model.repo import run_model_spec
@@ -73,6 +74,10 @@ def print_usage():
         " allocated nothing"
     )
     print("  jsonbench [kb] [n] parse an n round chat body and print the rate")
+    print(
+        "  template <t> <v> [n] render a chat template with a json variables"
+        " file, and time n renders"
+    )
     print("  http [port]     run the M0 HTTP/1.1 spike on 127.0.0.1")
     print(
         "  gguf <path>     print the metadata and tensor directory of a model"
@@ -292,6 +297,21 @@ def main():
             print("molla: jsonbench takes a body size in kB and a round count")
             exit(2)
         exit(run_json_bench(json_kb * 1024, json_rounds))
+    elif command == "template":
+        if len(args) < 4:
+            print(
+                "molla: template takes a template file and a json file of the"
+                " variables"
+            )
+            exit(2)
+        var template_rounds = 0
+        try:
+            if len(args) > 4:
+                template_rounds = Int(args[4])
+        except:
+            print("molla: template takes a round count as its third argument")
+            exit(2)
+        exit(run_template(String(args[2]), String(args[3]), template_rounds))
     elif command == "http":
         var http_port: UInt16 = 0
         if len(args) > 2:
