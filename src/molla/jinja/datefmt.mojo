@@ -337,6 +337,11 @@ def strftime(format: String, when: Civil) raises -> String:
     return out
 
 
-def strftime_now(format: String) raises -> String:
-    """What the global of the same name does, which is local time, now."""
-    return strftime(format, local_from_unix(unix_time()))
+def strftime_now(format: String, now: Int) raises -> String:
+    """What the global of the same name does, which is local time, now.
+
+    A `now` of zero means the real clock. Anything else is a pinned time in
+    seconds since the epoch, which is what the conformance run passes so that
+    a template stamping today's date into the prompt still has one answer.
+    """
+    return strftime(format, local_from_unix(unix_time() if now == 0 else now))

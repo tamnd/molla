@@ -1,6 +1,6 @@
 # Chat templates, byte identical to Python, in 60 microseconds
 
-Issue #23 asks for a bounded Jinja2 subset rather than a general implementation, with every exclusion raising at model load time instead of at render time, execution limits because a template is untrusted input from the internet, and a gate: templates compile once and cache by content digest, and a 20 turn conversation renders in under 200 microseconds. This records what was built, what it was checked against, the four defects the corpus found that the unit tests did not, and the numbers.
+Issue #23 asks for a bounded Jinja2 subset rather than a general implementation, with every exclusion raising at model load time instead of at render time, execution limits because a template is untrusted input from the internet, and a gate: templates compile once and cache by content digest, and a 20 turn conversation renders in under 200 microseconds. Issue #24 asks for the corpus that proves it, over hundreds of real repositories, gating every commit. This records what was built, what it was checked against, the five defects the corpus found that the unit tests did not, and the numbers.
 
 ## Why a template engine at all
 
@@ -30,27 +30,47 @@ Four of its behaviours are worth writing down because none of them is the defaul
 
 ## The corpus
 
-38 chat templates downloaded from the hub, nine conversation shapes each: plain, with a system message, multi turn, a long conversation, without a generation prompt, with tools, with a tool call and its result, with thinking on and with thinking off. Every render is compared for exact string equality against the reference environment, and a template that raises has to raise on both sides with the same message.
+Issue #24 asks for chat templates from at least 300 real repositories, a conversation matrix covering system prompts, tools, tool results, multi turn, images, thinking and the generation prompt both ways, exact string equality against Python, a record of every template we refuse and what construct it was, and a gate on every commit. This is that.
+
+494 chat templates, one from each of 494 model repositories pinned by commit hash, rendered against 20 conversation shapes. The shapes are plain, without a generation prompt, with a system message, both of those without one, multi turn, a long conversation, an awkward one that starts with an assistant turn, with tools, with tools and no system message, with a tool call, with a tool call whose arguments are a JSON string rather than an object, with a tool result and no tool definitions, with an image, with several images across turns, with thinking on, with thinking off, with a thinking turn already in the history, with documents, with a date the template stamps into the prompt, and one that has all of it at once.
 
 | | |
 | --- | --- |
-| Templates | 38 |
-| Renders | 342 |
-| Identical | 342 |
-| Agreed refusals | 23 |
-| Templates refused at compile time | 0 |
+| Repositories | 494 |
+| Distinct templates | 154 |
+| Renders compared | 9500 |
+| Identical | 9500 |
+| Of which both sides refused | 750 |
+| Templates refused at load time | 0 |
+| Templates that differ on purpose | 19 |
 
-The 23 agreed refusals are the template's own `raise_exception` or a shared type error, mostly a template that will not accept tools or will not accept a conversation that starts with an assistant turn. Both sides refuse, so they count as agreement rather than as coverage.
+The reference is `transformers.utils.chat_template_utils.render_jinja_template`, which is the function `apply_chat_template` calls to turn a conversation into a string. It is not a reimplementation of what `transformers` does, it is the thing itself, one call below the tokenizer so that no weights have to be downloaded to run it.
 
-The families are Qwen 2, 2.5, 3, QwQ and Coder, Llama 3.1 and 3.2, Mistral 7B and Nemo and Small, Mixtral, Gemma 2 and 3, Phi 3 and 3.5 and 4 and 4-mini, SmolLM2, OpenHermes, DeepSeek R1-Distill and V3, TinyLlama, Yi, InternLM, Granite, OLMo2, Zephyr, OpenChat, Dolphin, SOLAR, Starling, StarCoder2, GLM-4, Falcon and StableLM.
+The 750 agreed refusals are the template's own `raise_exception` or a shared type error, mostly a template that will not accept tools, or will not accept an image, or will not accept a conversation that starts with an assistant turn. Both sides refuse the same case of the same template, so they count as agreement rather than as coverage. That is also why the numbers for the image cases are the highest: most models are text only and say so.
 
-Alongside it there is a snippet suite of 149 cases, each one expression or statement, run through both implementations the same way. 148 are identical. The one that is not is `r.append(1)`, where both refuse and only the wording differs, since ours names the line and column and theirs names the attribute.
+154 of the 494 templates are distinct by content digest, which is what the repository count hides. Most forks ship their parent's bytes, and a fork that changed one line is a different template with the same family name, which is exactly the case worth having. One repository per distinct template is the quick tier, for iterating locally; the full tier is all 494 and takes half a second, so that is what runs in CI.
 
-Both harnesses are the work of issue #24, which turns this into 300 repositories and puts it in CI. Until that lands these are run by hand and the numbers above are from the run on the merge commit.
+Two things had to be pinned or the same input gives two answers. The clock, because a Llama template writes today's date into the system prompt, so both halves are handed 2025-01-01 00:00:00 and both run under `TZ=UTC`. And the shape of the variables, because `render_jinja_template` always binds `messages`, `tools`, `documents` and `add_generation_prompt` whether the caller passed them or not, so every case spells all four out with a null where it does not use one. A template asking `tools is defined` gets the same answer from both sides that way.
 
-## The four defects the corpus found
+## The two we do not match
 
-Every one of these was in code that passed its unit tests, and three of the four produced plausible looking output rather than an error.
+Nothing in 494 templates uses a construct the engine excludes, so the refusal list the issue asks for is empty and the `status` column says `ok` for everything except the two below. An empty refusal list is a fact about what model authors write rather than about the engine, and the column stays because the interesting direction is a construct appearing later.
+
+There are two templates the reference and molla both render and do not agree on, and in both the reference is doing something that is Python rather than Jinja. They are marked `disputed` in the manifest, they are still compiled and still rendered so that a crash in one is still a failure, and the run prints them every time.
+
+`ai-sage/GigaChat3.1-Audio-10B-A1.8B` calls `dict.from_keys(pairs)`, which is a typo for `dict.fromkeys`. Jinja's attribute lookup falls back to item lookup when the attribute is missing, so it evaluates `dict['from_keys']`, and in Python 3.9 and later subscripting a type gives a generic alias, which is callable and calls the type. The typo works by accident, and it builds the dict the author wanted. We answer that `dict` has no such member.
+
+`zecanard/gemma-4-...` and its 17 quantisation siblings call `strftime_now('%Y-%m-%d %G:%i:%s')`. `%i` is not a `strftime` directive, Python hands the whole format to the platform, and what the platform writes for `%i` is a lone `i` on macOS and a literal `%i` on glibc. There is no single right answer to check against, so this one is excluded rather than picked. We raise on a directive we do not implement, which is the documented behaviour and the one that does not silently put a percent sign in a prompt.
+
+## In CI
+
+`Template conformance` runs on every commit, on the full tier, and is one of the jobs the required `CI OK` check waits for, so a mismatch blocks the merge. It fetches the 494 templates, checks every digest against the manifest, and runs `pixi run conformance-template-full`. The corpus directory is cached on the manifest hash, so an ordinary commit restores four megabytes rather than downloading it.
+
+There is no Python in that job. The manifest carries the sha256 of the reference answer for every repository, which is what the Mojo side compares against, so the everyday check is one binary reading a directory of text files. `scripts/check-template.py` is the half that needs `transformers`, and it is run when the reference version moves, with `--refresh` to write the digests back.
+
+## The five defects the corpus found
+
+Every one of these was in code that passed its unit tests, and four of the five produced plausible looking output rather than an error.
 
 A call was not a postfix. `content.split('</think>')[0]` stopped parsing at the closing bracket of the call, so Qwen3 and DeepSeek R1 refused to compile with a syntax error pointing at a `[` that is perfectly legal. This one at least failed loudly.
 
@@ -59,6 +79,8 @@ The evaluator lost the right operand of a binary node. `self.tree.nodes[node].b 
 `lstrip_blocks` stripped whitespace that was not indentation. The lexer only looked at the text since the last tag, so in `{{ x }} {% if %}` it saw a run consisting of one space, decided that was the indentation of a line, and ate it. It consults the source now to find out whether the line really started there.
 
 `'citations' in controls` raised where the reference answers False. Granite asks that about a name that is only bound when the caller passes it, which is most of the time not.
+
+`tojson` ignored every argument except `indent`. Kimi K2 and three others write `tojson(separators=(',', ':'))` to get the compact spelling, and got the spaced one, so their tool definitions went into the prompt with a space after every comma. The filter takes the signature transformers gives it now, which is `ensure_ascii`, `indent`, `separators` and `sort_keys` in that order, and the first positional argument is `ensure_ascii` rather than `indent`, which is worth knowing because it is not the order anybody guesses.
 
 ## The limits
 
@@ -102,7 +124,9 @@ Both EPYC machines were carrying a load average above 9 on 6 cores and above 38 
 
 ## What is still not covered
 
-The corpus is 38 templates and issue #24 raises it to 300, which is where the refusal list starts being a backlog rather than an empty column. Nothing in these 38 uses a construct we refuse, which is a fact about the sample as much as about the engine.
+The corpus is 494 templates that were on the hub in September 2026, weighted towards what people actually download, and it is a sample rather than the population. A construct nobody writes today is a construct the corpus cannot tell us about.
+
+The conversation matrix is 20 shapes and it is hand written. It covers what the issue asks for and what the templates in front of us branch on, but a template that branches on something none of the 20 shapes carry gets its other branch rendered by nobody.
 
 `\N{...}` in a string literal is refused rather than decoded, since it needs the Unicode name table and no template in the corpus writes one. A non ASCII identifier is a syntax error, which Jinja allows and no chat template uses.
 

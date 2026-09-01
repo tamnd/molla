@@ -42,6 +42,7 @@ from molla.jinja.strop import (
     upper_full,
 )
 from molla.jinja.value import (
+    JsonStyle,
     TUPLE_FLAG,
     UNDEFINED,
     V_BOOL,
@@ -301,6 +302,37 @@ def _flag(
 
 def _text(mut env: Env, v: Int) raises -> String:
     return to_string(env.heap, v)
+
+
+def _json_style(
+    mut env: Env, args: List[Int], names: List[String], at: Int
+) raises -> JsonStyle:
+    """What `tojson` was asked for.
+
+    The signature is the one transformers gives the filter, which is
+    `ensure_ascii`, `indent`, `separators` and `sort_keys` in that order. The
+    order is worth spelling out because the first positional argument is
+    `ensure_ascii` and not `indent`, so `tojson(2)` is not an indent of two, and
+    every template in the corpus that wants an indent names it.
+    """
+    var width = 0
+    var indent = _arg(args, names, 1, String("indent"))
+    if indent >= 0 and env.heap.kind(indent) != V_NONE:
+        width = as_int(env.heap, indent)
+    var style = JsonStyle(width)
+    style.ensure_ascii = _flag(env, args, names, 0, String("ensure_ascii"))
+    style.sort_keys = _flag(env, args, names, 3, String("sort_keys"))
+
+    var seps = _arg(args, names, 2, String("separators"))
+    if seps < 0 or env.heap.kind(seps) == V_NONE:
+        return style^
+    if env.heap.kind(seps) != V_LIST or len(env.heap.cells[seps].items) != 2:
+        env.fail(at, "`separators` wants a pair, as in `(',', ':')`")
+    var item = env.heap.cells[seps].items[0]
+    var key = env.heap.cells[seps].items[1]
+    style.item_sep = _text(env, item)
+    style.key_sep = _text(env, key)
+    return style^
 
 
 def _fold(mut env: Env, s: String, up: Bool) raises -> String:
@@ -631,11 +663,9 @@ def apply_filter(
         return _do_round(env, value, args, names, at)
 
     if id == F_TOJSON:
-        var indent = _arg(args, names, 0, String("indent"))
-        var width = 0
-        if indent >= 0 and env.heap.kind(indent) != V_NONE:
-            width = as_int(env.heap, indent)
-        return env.heap.str(to_json(env.heap, value, width, False, 0))
+        return env.heap.str(
+            to_json(env.heap, value, _json_style(env, args, names, at), 0)
+        )
 
     if id == F_ITEMS or id == F_DICTSORT:
         return _pairs(env, id, value, args, names, at)

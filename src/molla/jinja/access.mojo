@@ -469,7 +469,8 @@ def call_builtin(
     if id == B_STRFTIME_NOW:
         _no_keywords(env, names, what, at)
         _want_count(env, args, 1, 1, what, at)
-        return env.heap.str(_strftime_now(_want_string(env, args[0], what, at)))
+        var pattern = _want_string(env, args[0], what, at)
+        return env.heap.str(_strftime_now(pattern, env.now))
     if id == B_RAISE_EXCEPTION:
         _no_keywords(env, names, what, at)
         _want_count(env, args, 1, 1, what, at)

@@ -4,6 +4,19 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## Unreleased
 
+### Added
+
+- The chat template conformance corpus. 494 real chat templates from the hub, pinned by commit hash, rendered against 20 conversation shapes and compared for exact string equality against `transformers.utils.chat_template_utils.render_jinja_template`, which is the function `apply_chat_template` calls. 9500 renders compared and 9500 identical, of which 750 are cases both sides refuse. It runs on every commit as the `Template conformance` job and a mismatch blocks the merge. See [docs/validation/jinja.md](docs/validation/jinja.md).
+- `scripts/templates.tsv`, `scripts/fetch-templates.py`, `scripts/check-template.py` and `scripts/template_oracle.mojo`, laid out the same way the tokenizer corpus is. The manifest carries the sha256 of the reference answer per repository, so the everyday check needs no Python at all, and the Python half runs when the reference version moves.
+- `strftime_now` reads a clock that can be pinned, so a template that stamps today's date into the system prompt has one answer rather than one a day. `Template.render` and `Template.render_object` take the second to read, and zero is the real clock.
+- `{% generation %}` and `{% endgeneration %}` render their body. They are a `transformers` extension that marks the span a model was supposed to have produced, so a training script can build a loss mask, and they contribute nothing to the string. Seven templates in the corpus use them.
+
+### Fixed
+
+- `tojson` ignored every argument except `indent`. Four templates in the corpus write `tojson(separators=(',', ':'))` to get the compact spelling and were getting the spaced one, which put a space after every comma in their tool definitions. The filter now takes the signature transformers gives it, which is `ensure_ascii`, `indent`, `separators` and `sort_keys` in that order, so the first positional argument is `ensure_ascii` and not `indent`.
+- `{'a': 1}.items()` printed its pairs as lists rather than as tuples, so a template writing a pair straight out got square brackets where Python writes round ones.
+- `2 ** 3 ** 2` was 64 rather than 512. Exponentiation is the one operator in the language that associates to the right.
+
 ## [0.2.3] - 2026-09-01
 
 A chat template renders to the same bytes Python produces, and anything it cannot render refuses to load.
