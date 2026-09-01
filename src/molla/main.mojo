@@ -12,6 +12,7 @@ from molla.host import detect
 from molla.http.server import run_http
 from molla.json.bench import run_json_bench
 from molla.model.gguf import run_gguf
+from molla.model.spec import run_spec
 from molla.net.allocs import run_allocs
 from molla.net.drain import run_drain
 from molla.net.echo import run_echo
@@ -73,6 +74,10 @@ def print_usage():
     print("  http [port]     run the M0 HTTP/1.1 spike on 127.0.0.1")
     print(
         "  gguf <path>     print the metadata and tensor directory of a model"
+    )
+    print(
+        "  spec <path>     print what a model is and what this build can do"
+        " with it"
     )
     print("  config get [key] print a setting and where its value came from")
     print("  tls <host>      connect over TLS and print what was negotiated")
@@ -307,6 +312,15 @@ def main():
             run_gguf(args[2])
         except e:
             print("molla gguf:", e)
+            exit(1)
+    elif command == "spec":
+        if len(args) < 3:
+            print("molla spec: expected a path to a .gguf file")
+            exit(2)
+        try:
+            run_spec(args[2])
+        except e:
+            print("molla spec:", e)
             exit(1)
     elif command == "tls":
         if len(args) < 3:

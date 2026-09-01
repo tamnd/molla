@@ -22,6 +22,7 @@ import test_reactor
 import test_registry
 import test_sha256
 import test_soak_http
+import test_spec
 import test_stream
 import test_sys
 import test_tls
@@ -38,6 +39,10 @@ def main():
         test_gguf.run(suite)
     except e:
         suite.fail("test_gguf", String(e))
+    try:
+        test_spec.run(suite)
+    except e:
+        suite.fail("test_spec", String(e))
     try:
         test_dns.run(suite)
     except e:
