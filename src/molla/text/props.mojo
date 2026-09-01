@@ -158,6 +158,10 @@ def _varint(data: Span[UInt8, _], mut at: Int) -> Int:
     return value
 
 
+comptime UNICODE_MAX = 0x110000
+comptime BMP_MAX = 0x10000
+
+
 struct Unicode(Movable):
     """The Unicode tables, decoded once.
 
@@ -166,6 +170,13 @@ struct Unicode(Movable):
     points they map to. The composition map is built here rather than
     generated, by running the canonical decompositions backwards and dropping
     the ones the exclusion bit says do not compose.
+
+    On top of the ranges there are four flat tables, built at startup, that
+    turn the four hot lookups into one load each. Bisection over four thousand
+    category ranges is twelve unpredictable branches, and a tokenizer asks for
+    the category of every character it reads, several times over, so those
+    twelve branches were most of the cost of encoding a string. The flat
+    tables cost about three megabytes and they are worth it here.
     """
 
     var cat_start: List[Int]
@@ -175,6 +186,18 @@ struct Unicode(Movable):
     var ccc_start: List[Int]
     var ccc_end: List[Int]
     var ccc_value: List[UInt8]
+
+    var cat_direct: List[UInt8]
+    """Category per code point, the whole range, `CAT_CN` where unassigned."""
+
+    var ccc_direct: List[UInt8]
+    """Combining class per code point, the whole range, zero for a starter."""
+
+    var lower_index: List[Int]
+    """Index into `lower_cp` plus one, or zero, for the basic plane only."""
+
+    var decomp_index: List[Int]
+    """Index into `decomp_cp` plus one, or zero, for the basic plane only."""
 
     var decomp_cp: List[Int]
     var decomp_header: List[Int]
@@ -189,6 +212,18 @@ struct Unicode(Movable):
     var comp_value: List[Int]
     var comp_mask: Int
 
+    var canonical_floor: Int
+    """The lowest code point canonical normalization can do anything to.
+
+    Below it every character decomposes to itself, has a combining class of
+    zero, and is not a Hangul syllable, so a run of characters under this
+    value is already in NFC and NFD both. Worked out from the tables rather
+    than written down, so it stays right when the tables are regenerated.
+    """
+
+    var compatibility_floor: Int
+    """The same for the K forms, which take a wider set of characters apart."""
+
     def __init__(out self):
         self.cat_start = List[Int]()
         self.cat_end = List[Int]()
@@ -196,6 +231,10 @@ struct Unicode(Movable):
         self.ccc_start = List[Int]()
         self.ccc_end = List[Int]()
         self.ccc_value = List[UInt8]()
+        self.cat_direct = List[UInt8]()
+        self.ccc_direct = List[UInt8]()
+        self.lower_index = List[Int]()
+        self.decomp_index = List[Int]()
         self.decomp_cp = List[Int]()
         self.decomp_header = List[Int]()
         self.decomp_at = List[Int]()
@@ -206,6 +245,8 @@ struct Unicode(Movable):
         self.comp_key = List[Int]()
         self.comp_value = List[Int]()
         self.comp_mask = 0
+        self.canonical_floor = 0
+        self.compatibility_floor = 0
 
         self._read_ranges(
             CATEGORY_DATA.as_bytes(),
@@ -224,6 +265,69 @@ struct Unicode(Movable):
         self._read_decompositions()
         self._read_lowercase()
         self._build_compositions()
+        self._build_direct()
+
+    def _build_direct(mut self):
+        """Flatten the ranges and the two mapping tables into direct lookups."""
+        self.cat_direct = List[UInt8](length=UNICODE_MAX, fill=UInt8(CAT_CN))
+        for i in range(len(self.cat_start)):
+            var end = self.cat_end[i]
+            if end >= UNICODE_MAX:
+                end = UNICODE_MAX - 1
+            for cp in range(self.cat_start[i], end + 1):
+                self.cat_direct[cp] = self.cat_value[i]
+
+        self.ccc_direct = List[UInt8](length=UNICODE_MAX, fill=UInt8(0))
+        for i in range(len(self.ccc_start)):
+            var end = self.ccc_end[i]
+            if end >= UNICODE_MAX:
+                end = UNICODE_MAX - 1
+            for cp in range(self.ccc_start[i], end + 1):
+                self.ccc_direct[cp] = self.ccc_value[i]
+
+        # The two mapping tables only get a flat index for the basic plane.
+        # Everything they hold above it is a handful of recent scripts and some
+        # mathematical alphabets, and bisection is fine for those.
+        self.lower_index = List[Int](length=BMP_MAX, fill=0)
+        for i in range(len(self.lower_cp)):
+            if self.lower_cp[i] < BMP_MAX:
+                self.lower_index[self.lower_cp[i]] = i + 1
+
+        self.decomp_index = List[Int](length=BMP_MAX, fill=0)
+        for i in range(len(self.decomp_cp)):
+            if self.decomp_cp[i] < BMP_MAX:
+                self.decomp_index[self.decomp_cp[i]] = i + 1
+
+        self.canonical_floor = BMP_MAX
+        self.compatibility_floor = BMP_MAX
+        for cp in range(BMP_MAX):
+            var found = self._decomposition_of(cp)
+            if found < 0 and self.ccc_direct[cp] == 0:
+                continue
+            if self.compatibility_floor == BMP_MAX:
+                self.compatibility_floor = cp
+            if found < 0 or (self.decomp_header[found] & 1) == 0:
+                self.canonical_floor = cp
+                break
+        if self.canonical_floor > HANGUL_S_BASE:
+            self.canonical_floor = HANGUL_S_BASE
+        if self.compatibility_floor > HANGUL_S_BASE:
+            self.compatibility_floor = HANGUL_S_BASE
+
+        # A character below the floor could also turn up as the second half of
+        # a composition, and then the character in front of it is not safe to
+        # hand back untouched either. No pair in the current tables does that,
+        # and if one ever appears the floor drops to meet it rather than the
+        # fast path going quietly wrong.
+        for i in range(len(self.decomp_cp)):
+            var header = self.decomp_header[i]
+            if (header & 3) != 0 or (header >> 2) != 2:
+                continue
+            var second = self.decomp_points[self.decomp_at[i] + 1]
+            if second < self.canonical_floor:
+                self.canonical_floor = second
+            if second < self.compatibility_floor:
+                self.compatibility_floor = second
 
     @staticmethod
     def _read_ranges(
@@ -338,17 +442,15 @@ struct Unicode(Movable):
 
     def category(self, cp: Int) -> Int:
         """The general category of `cp`, `CAT_CN` if it is not assigned."""
-        var at = self._find(self.cat_start, self.cat_end, cp)
-        if at < 0:
+        if cp < 0 or cp >= UNICODE_MAX:
             return CAT_CN
-        return Int(self.cat_value[at])
+        return Int(self.cat_direct[cp])
 
     def combining(self, cp: Int) -> Int:
         """The canonical combining class of `cp`, zero for a starter."""
-        var at = self._find(self.ccc_start, self.ccc_end, cp)
-        if at < 0:
+        if cp < 0 or cp >= UNICODE_MAX:
             return 0
-        return Int(self.ccc_value[at])
+        return Int(self.ccc_direct[cp])
 
     def is_letter(self, cp: Int) -> Bool:
         var c = self.category(cp)
@@ -403,6 +505,16 @@ struct Unicode(Movable):
         Canonical ones are used either way, because NFKD is NFD plus more.
         Hangul is not in the table and callers handle it themselves.
         """
+        var found = self._decomposition_of(cp)
+        if found < 0:
+            return -1
+        if not compatibility and (self.decomp_header[found] & 1) != 0:
+            return -1
+        return found
+
+    def _decomposition_of(self, cp: Int) -> Int:
+        if cp >= 0 and cp < BMP_MAX:
+            return self.decomp_index[cp] - 1
         var low = 0
         var high = len(self.decomp_cp) - 1
         while low <= high:
@@ -412,8 +524,21 @@ struct Unicode(Movable):
             elif cp > self.decomp_cp[mid]:
                 low = mid + 1
             else:
-                if not compatibility and (self.decomp_header[mid] & 1) != 0:
-                    return -1
+                return mid
+        return -1
+
+    def _lowercase_of(self, cp: Int) -> Int:
+        if cp >= 0 and cp < BMP_MAX:
+            return self.lower_index[cp] - 1
+        var low = 0
+        var high = len(self.lower_cp) - 1
+        while low <= high:
+            var mid = (low + high) >> 1
+            if cp < self.lower_cp[mid]:
+                high = mid - 1
+            elif cp > self.lower_cp[mid]:
+                low = mid + 1
+            else:
                 return mid
         return -1
 
@@ -457,19 +582,12 @@ struct Unicode(Movable):
         normalizer that returned one character would be deleting the dot rather
         than lowercasing the letter.
         """
-        var low = 0
-        var high = len(self.lower_cp) - 1
-        while low <= high:
-            var mid = (low + high) >> 1
-            if cp < self.lower_cp[mid]:
-                high = mid - 1
-            elif cp > self.lower_cp[mid]:
-                low = mid + 1
-            else:
-                for i in range(self.lower_at[mid], self.lower_at[mid + 1]):
-                    out.append(self.lower_points[i])
-                return
-        out.append(cp)
+        var at = self._lowercase_of(cp)
+        if at < 0:
+            out.append(cp)
+            return
+        for i in range(self.lower_at[at], self.lower_at[at + 1]):
+            out.append(self.lower_points[i])
 
     def lowercase_one(self, cp: Int) -> Int:
         """The lowercase of `cp` when it is a single character, else `cp`.
@@ -478,19 +596,12 @@ struct Unicode(Movable):
         against one character, so the two character mappings cannot take part
         and leaving them alone is the honest answer.
         """
-        var low = 0
-        var high = len(self.lower_cp) - 1
-        while low <= high:
-            var mid = (low + high) >> 1
-            if cp < self.lower_cp[mid]:
-                high = mid - 1
-            elif cp > self.lower_cp[mid]:
-                low = mid + 1
-            else:
-                if self.lower_at[mid + 1] - self.lower_at[mid] != 1:
-                    return cp
-                return self.lower_points[self.lower_at[mid]]
-        return cp
+        var at = self._lowercase_of(cp)
+        if at < 0:
+            return cp
+        if self.lower_at[at + 1] - self.lower_at[at] != 1:
+            return cp
+        return self.lower_points[self.lower_at[at]]
 
     def uppercase_one(self, cp: Int) -> Int:
         """The character whose lowercase is `cp`, or `cp` when there is none.

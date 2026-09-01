@@ -28,6 +28,7 @@ import test_stream
 import test_sys
 import test_text
 import test_tls
+import test_tokenizer
 
 
 def main():
@@ -93,6 +94,10 @@ def main():
         test_text.run(suite)
     except e:
         suite.fail("test_text", String(e))
+    try:
+        test_tokenizer.run(suite)
+    except e:
+        suite.fail("test_tokenizer", String(e))
     test_stream.run(suite)
     test_json.run(suite)
     test_tls.run(suite)

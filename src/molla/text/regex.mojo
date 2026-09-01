@@ -867,6 +867,15 @@ struct Regex(Movable):
     list inside one of them is three loads where this is one.
     """
 
+    var first_ascii: List[Bool]
+    """128 answers per instruction: can a match starting here begin with this
+    ASCII character. Laid out end to end for the same reason `class_ascii` is.
+    """
+
+    var first_empty: List[Bool]
+    """One answer per instruction: can a match starting here consume nothing.
+    """
+
     var word: CharClass
     var source: String
 
@@ -879,6 +888,8 @@ struct Regex(Movable):
         self.class_hi = List[Int]()
         self.class_negated = List[Bool]()
         self.class_ascii = List[Bool]()
+        self.first_ascii = List[Bool]()
+        self.first_empty = List[Bool]()
         self.word = word_class(tables)
         self.source = String(pattern)
 
@@ -895,6 +906,75 @@ struct Regex(Movable):
         self.class_at.append(len(self.class_lo))
         self._compile(parser.nodes, parser.children, root)
         _ = self._emit(OP_MATCH, 0, 0)
+        self._analyze()
+
+    def _analyze(mut self):
+        """Work out, for every instruction, which characters a match starting
+        there could begin with.
+
+        This is what makes an alternation cheap. Seven apostrophe alternatives
+        compile to seven nested splits, so the second half of a split is
+        usually another split rather than the class that would have rejected
+        the character, and looking only one instruction ahead sees nothing it
+        can decide. Following the chain at match time would cost as much as
+        just trying the branches. Doing it once here turns the whole question
+        into one array read.
+
+        The answer is a fixed point because a repeat jumps backwards, so the
+        set at an instruction can depend on itself. Each round can only turn
+        answers on, never off, and there are a fixed number of answers, so the
+        rounds stop. Anything not proven is left as no, which reads as no
+        pruning, so a wrong table would be slow rather than incorrect.
+
+        Only ASCII is tabulated. A non ASCII character is rare in the patterns
+        that matter and skips the check entirely.
+        """
+        var count = len(self.op)
+        self.first_ascii = List[Bool](length=count * 128, fill=False)
+        self.first_empty = List[Bool](length=count, fill=False)
+
+        for pc in range(count):
+            if self.op[pc] == OP_CLASS:
+                var index = self.a[pc] << 7
+                for c in range(128):
+                    self.first_ascii[(pc << 7) + c] = self.class_ascii[
+                        index + c
+                    ]
+            elif self.op[pc] == OP_MATCH:
+                self.first_empty[pc] = True
+
+        var changed = True
+        while changed:
+            changed = False
+            for pc in range(count - 1, -1, -1):
+                var op = self.op[pc]
+                if op == OP_CLASS or op == OP_MATCH:
+                    continue
+                if op == OP_SPLIT:
+                    if self._merge(pc, self.a[pc]):
+                        changed = True
+                    if self._merge(pc, self.b[pc]):
+                        changed = True
+                elif op == OP_JUMP:
+                    if self._merge(pc, self.a[pc]):
+                        changed = True
+                elif self._merge(pc, pc + 1):
+                    changed = True
+
+    def _merge(mut self, into: Int, source: Int) -> Bool:
+        """Fold the answers at `source` into the ones at `into`. True when that
+        added anything."""
+        var changed = False
+        if self.first_empty[source] and not self.first_empty[into]:
+            self.first_empty[into] = True
+            changed = True
+        var to = into << 7
+        var frm = source << 7
+        for c in range(128):
+            if self.first_ascii[frm + c] and not self.first_ascii[to + c]:
+                self.first_ascii[to + c] = True
+                changed = True
+        return changed
 
     def _emit(mut self, op: Int, a: Int, b: Int) -> Int:
         self.op.append(op)
@@ -1043,6 +1123,23 @@ struct Regex(Movable):
                 return not self.class_negated[index]
         return self.class_negated[index]
 
+    def _dead(self, pc: Int, points: List[Int], sp: Int) -> Bool:
+        """True when a match starting at `pc` cannot begin at `sp`.
+
+        Three reads and no backtracking. A branch that has to consume
+        something is dead at the end of the input, and one whose first
+        characters are known is dead when the character in hand is not one of
+        them.
+        """
+        if self.first_empty[pc]:
+            return False
+        if sp >= len(points):
+            return True
+        var cp = points[sp]
+        if cp >= 128:
+            return False
+        return not self.first_ascii[(pc << 7) + cp]
+
     def _is_word(self, points: List[Int], at: Int) -> Bool:
         if at < 0 or at >= len(points):
             return False
@@ -1060,7 +1157,22 @@ struct Regex(Movable):
         One explicit stack rather than recursion, because a greedy quantifier
         over a long line would otherwise put one stack frame per character on
         the machine stack and fall over on input the server did not choose.
+
+        The instruction stream and the input are read on every step, and
+        reaching them through the struct and then through a list header each
+        time was a large part of what a step cost. Neither moves while this
+        runs, so the addresses are taken once at the top. The same goes for the
+        two lookup tables the inner tests use.
         """
+        var ops = self.op.unsafe_ptr()
+        var arg_a = self.a.unsafe_ptr()
+        var arg_b = self.b.unsafe_ptr()
+        var text = points.unsafe_ptr()
+        var length = len(points)
+        var ascii_class = self.class_ascii.unsafe_ptr()
+        var starts = self.first_ascii.unsafe_ptr()
+        var empties = self.first_empty.unsafe_ptr()
+
         var pc = from_pc
         var sp = start
         var floor = len(scratch.pc)
@@ -1078,21 +1190,57 @@ struct Regex(Movable):
                 )
 
             var failed = False
-            var op = self.op[pc]
+            var op = ops.unsafe_load(pc)
+            var here = text.unsafe_load(sp) if sp < length else -1
 
             if op == OP_CLASS:
-                if sp < len(points) and self._in_class(self.a[pc], points[sp]):
+                var index = arg_a.unsafe_load(pc)
+                var hit = False
+                if here >= 0:
+                    if here < 128:
+                        hit = ascii_class[unsafe_offset=(index << 7) + here]
+                    else:
+                        hit = self._in_class(index, here)
+                if hit:
                     pc += 1
                     sp += 1
                 else:
                     failed = True
             elif op == OP_SPLIT:
-                scratch.pc.append(self.b[pc])
-                scratch.sp.append(sp)
-                scratch.mark.append(len(scratch.marks))
-                pc = self.a[pc]
+                # A branch that cannot begin with the character in hand is not
+                # worth walking into and not worth remembering, because either
+                # way it ends at the same failure. Skipping it costs one array
+                # read. The tokenizer patterns open with seven apostrophe
+                # alternatives, so an ordinary letter used to try all seven,
+                # pushing and popping the stack each time, before reaching the
+                # branch that matches it. Now it steps past all seven.
+                var taken = arg_a.unsafe_load(pc)
+                var other = arg_b.unsafe_load(pc)
+                var live_taken = True
+                var live_other = True
+                if here < 0:
+                    live_taken = empties[unsafe_offset=taken]
+                    live_other = empties[unsafe_offset=other]
+                elif here < 128:
+                    live_taken = (
+                        empties[unsafe_offset=taken]
+                        or starts[unsafe_offset=(taken << 7) + here]
+                    )
+                    live_other = (
+                        empties[unsafe_offset=other]
+                        or starts[unsafe_offset=(other << 7) + here]
+                    )
+                if not live_taken:
+                    pc = other
+                elif not live_other:
+                    pc = taken
+                else:
+                    scratch.pc.append(other)
+                    scratch.sp.append(sp)
+                    scratch.mark.append(len(scratch.marks))
+                    pc = taken
             elif op == OP_JUMP:
-                pc = self.a[pc]
+                pc = arg_a.unsafe_load(pc)
             elif op == OP_MATCH:
                 self._unwind(scratch, floor, mark_floor)
                 return sp
@@ -1102,32 +1250,32 @@ struct Regex(Movable):
                 else:
                     failed = True
             elif op == OP_TEXT_END:
-                if sp == len(points):
+                if sp == length:
                     pc += 1
                 else:
                     failed = True
             elif op == OP_LINE_START:
-                if sp == 0 or points[sp - 1] == 0x0A:
+                if sp == 0 or text.unsafe_load(sp - 1) == 0x0A:
                     pc += 1
                 else:
                     failed = True
             elif op == OP_LINE_END:
-                if sp == len(points) or points[sp] == 0x0A:
+                if here < 0 or here == 0x0A:
                     pc += 1
                 else:
                     failed = True
             elif op == OP_BOUNDARY:
-                var here = self._is_word(points, sp)
-                var before = self._is_word(points, sp - 1)
-                var boundary = here != before
-                if boundary == (self.a[pc] == 0):
+                var word_here = self._is_word(points, sp)
+                var word_before = self._is_word(points, sp - 1)
+                var boundary = word_here != word_before
+                if boundary == (arg_a.unsafe_load(pc) == 0):
                     pc += 1
                 else:
                     failed = True
             elif op == OP_LOOK:
-                var got = self._run(points, sp, self.a[pc], scratch)
+                var got = self._run(points, sp, arg_a.unsafe_load(pc), scratch)
                 var matched = got >= 0
-                if matched == (self.b[pc] == 0):
+                if matched == (arg_b.unsafe_load(pc) == 0):
                     pc += 1
                 else:
                     failed = True
@@ -1178,6 +1326,8 @@ struct Regex(Movable):
         no search for a longer match at a later position.
         """
         for start in range(from_index, len(points) + 1):
+            if self._dead(0, points, start):
+                continue
             var end = self._run(points, start, 0, scratch)
             if end >= 0:
                 return Match(start, end)
