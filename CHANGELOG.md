@@ -2,7 +2,11 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.2.5] - 2026-09-02
+
+The tokenizer corpus has nothing left in it that molla refuses.
+
+60 of the 338 files carried a `Precompiled` normalizer, which is a SentencePiece charsmap, and molla refused every one of them rather than loading it with the normalizer missing and producing ids that are quietly wrong. That is 18 per cent of the popular tokenizers on the hub and it is all of T5, mT5, XLM-R, ALBERT, DeBERTa-v3 and NLLB. They load now and the full tier reports no refusals and no mismatches.
 
 ### Added
 
