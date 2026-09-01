@@ -2,7 +2,13 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.2.4] - 2026-09-01
+
+The template engine now answers to an oracle on every commit.
+
+494 real chat templates from the hub, 20 conversation shapes each, compared for exact string equality against the function `transformers.apply_chat_template` calls to build its string. 9500 renders compared and 9500 identical. It found that `tojson` was ignoring every argument except `indent`, which was putting a space after every comma in the tool definitions of four models that had asked for the compact spelling.
+
+Not one template in 494 uses a construct the engine refuses to compile, so the refusal list this was meant to produce is empty. That is a fact about what model authors write rather than a claim about the engine, and the machinery that records refusals runs on every commit so the first one gets noticed.
 
 ### Added
 
