@@ -96,14 +96,14 @@ There is no filesystem access and no network access, because nothing in the engi
 
 | M4, 20 turn conversation, 2000 rounds | Template | Prompt | Compile | Per render |
 | --- | --- | --- | --- | --- |
-| Llama 3.1 | 4614 bytes | 2649 bytes | 319 us | 59.9 us |
-| Qwen3 | 4168 bytes | 2059 bytes | 253 us | 79.8 us |
-| Mistral Small | 3959 bytes | 1617 bytes | 251 us | 85.4 us |
-| Granite | 3543 bytes | 2563 bytes | 200 us | 43.4 us |
+| Llama 3.1 | 4614 bytes | 2649 bytes | 258 us | 59.8 us |
+| Qwen3 | 4168 bytes | 2059 bytes | 277 us | 81.5 us |
+| Mistral Small | 3959 bytes | 1617 bytes | 265 us | 92.4 us |
+| Granite | 3543 bytes | 2563 bytes | 209 us | 40.8 us |
 
-The gate is 200 microseconds and the slowest of the four is 85. The measurement is conservative in one way that matters: it parses the variables JSON on every round, because that is what a server does with a request body, so the JSON layer's time is inside the render number rather than beside it.
+The gate is 200 microseconds and the slowest of the four is 92. The measurement is conservative in one way that matters: it parses the variables JSON on every round, because that is what a server does with a request body, so the JSON layer's time is inside the render number rather than beside it.
 
-Compiling is 250 to 320 microseconds, which is why it happens once. `Cache` keys compiled trees by the SHA-256 of the source rather than by the model, since most Qwen forks ship the same bytes and a digest is cheaper than a parse.
+Compiling is 210 to 280 microseconds, which is why it happens once. `Cache` keys compiled trees by the SHA-256 of the source rather than by the model, since most Qwen forks ship the same bytes and a digest is cheaper than a parse.
 
 There is no allocation number here, and that is deliberate. The engine allocates per render, into a heap that is thrown away at the end, and `AllocCounter` cannot see it because those allocations go through counter 0. Publishing a zero would read as a claim that is not true.
 
@@ -111,16 +111,18 @@ There is no allocation number here, and that is deliberate. The engine allocates
 
 | Machine | Suite | Corpus | Llama 3.1 | Qwen3 | Mistral Small | Granite |
 | --- | --- | --- | --- | --- | --- | --- |
-| M4, macOS, arm64 | 1587 passed | 342/342 | 59.9 us | 79.8 us | 85.4 us | 43.4 us |
-| gpc, i9-13900K on WSL2, x86_64 | 1588 passed, 1 failed | 342/342 | 41.5 us | 61.5 us | 63.4 us | 27.6 us |
-| server1, EPYC, 4 cores, x86_64 | 1589 passed | 342/342 | 130.1 us | 188.0 us | 199.9 us | 101.0 us |
-| server2, EPYC, 6 cores, x86_64 | 1589 passed | 342/342 | 193.9 us | 511.6 us | 689.3 us | 177.7 us |
+| M4, macOS, arm64 | 1593 passed | 9500/9500 | 59.8 us | 81.5 us | 92.4 us | 40.8 us |
+| gpc, i9-13900K on WSL2, x86_64 | 1594 passed, 1 failed | 9500/9500 | 41.5 us | 61.5 us | 63.4 us | 27.6 us |
+| server1, EPYC, 4 cores, x86_64 | 1595 passed | 9500/9500 | 130.1 us | 188.0 us | 199.9 us | 101.0 us |
+| server2, EPYC, 6 cores, x86_64 | 1595 passed | 9500/9500 | 193.9 us | 511.6 us | 689.3 us | 177.7 us |
+
+The GitHub hosted ubuntu-24.04 runner is the fifth machine and it gets the same 9500 out of 9500, in 42 seconds, on every push. It is not in the table because nobody should read a timing number off a shared runner.
 
 The one failure on gpc is issue #87, the reactor backpressure test under WSL2, which fails on main in the same way and has nothing to do with this work. The Linux machines count two checks more than the M4 for reasons that predate this work.
 
-The corpus column on the three Linux machines is a replay rather than a fresh differential run. The reference output was recorded on the M4, where it is byte identical to Python, and each machine renders the same 342 cases and compares against that recording. It is the same assertion with the Python half cached, and what it is really checking is that nothing in the engine depends on the platform.
+Every corpus column is a fresh run of the whole thing against the recorded reference answers, which is what the digests in the manifest are for. The earlier version of this table carried a replay of 342 goldens recorded on the M4, and that is gone.
 
-Both EPYC machines were carrying a load average above 9 on 6 cores and above 38 on 4 cores throughout, from unrelated work belonging to whoever else is on them, so their render numbers are a ceiling on the time and not a measurement. Qwen3 and Mistral Small on server2 are past the gate on those readings, at 512 and 689 microseconds, and I am not going to claim they would pass on an idle machine without having seen an idle machine. What the two rows do establish is that the answers are the same everywhere, which is what they were run for.
+The render numbers on the three fleet machines are carried over from the issue #23 run and were not measured again, because nothing here touches the render path except one filter. The M4 row was measured again on this commit. Both EPYC machines were carrying a load average above 9 on 6 cores and above 38 on 4 cores throughout, from unrelated work belonging to whoever else is on them, so their render numbers are a ceiling on the time and not a measurement. Qwen3 and Mistral Small on server2 are past the gate on those readings, at 512 and 689 microseconds, and I am not going to claim they would pass on an idle machine without having seen an idle machine. What the two rows do establish is that the answers are the same everywhere, which is what they were run for.
 
 ## What is still not covered
 
