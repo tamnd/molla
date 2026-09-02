@@ -56,6 +56,6 @@ The table's alternation at the boundaries, the two Gemma 3 rope bases, and every
 
 ## What this is not
 
-No model has been run. This produces logits from weights, and every weight it has been given was built by a test. Reading a real GGUF into a `ModelWeights` and a `List[LayerWeights]` needs the cache and the loop around it, which is #27, and comparing the logits against llama.cpp is #30. Until #30 passes, `supported` in the table means the row was written carefully, not that the numbers were checked.
+No model has been run. This produces logits from weights, and every weight it has been given was built by a test. Reading a real GGUF into a `ModelWeights` and a `List[LayerWeights]` needs the cache and the loop around it, which is #27, and comparing the logits against llama.cpp is #30, which has since landed in [logits.md](logits.md). Llama, Qwen 2 and SmolLM2 have had their numbers checked against llama.cpp end to end. For the rows of the table with no case in that corpus, `supported` still means the row was written carefully rather than that the numbers were checked.
 
 It is also still scalar and single threaded, like everything else in `molla.nn`. #120 is the repacking work.

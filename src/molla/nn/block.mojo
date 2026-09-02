@@ -268,6 +268,19 @@ struct Scratch(Movable):
     var up: Buffer
     var scores: List[Float32]
 
+    var tracing: Bool
+    """Whether `forward` records the residual stream as it goes. Off."""
+
+    var trace: List[Float32]
+    """Every snapshot `forward` took, one after another, `width` apart.
+
+    The trace lives here rather than in an argument of its own because
+    `Scratch` is the only mutable thing already threaded through every layer,
+    and a `mut` parameter in Mojo cannot carry a default. A separate trace
+    argument would be a thirteenth argument at six call sites, five of which
+    are tests that do not want one. Off it costs a bool test per layer.
+    """
+
     def __init__(out self, spec: BlockSpec, context: Int) raises:
         if context <= 0:
             raise Error("a layer needs room for at least one position")
@@ -280,6 +293,27 @@ struct Scratch(Movable):
         self.scores = List[Float32]()
         for _ in range(context):
             self.scores.append(0.0)
+        self.tracing = False
+        self.trace = List[Float32]()
+
+    def record(mut self, x: Buffer):
+        """Append one snapshot of the residual stream, if anybody asked."""
+        if not self.tracing:
+            return
+        for i in range(x.elements()):
+            self.trace.append(x.data[i])
+
+    def forget(mut self):
+        """Throw away what has been recorded so far, keeping the switch."""
+        self.trace.clear()
+
+    def snapshots(self, width: Int) raises -> Int:
+        """How many snapshots are in the trace."""
+        if width <= 0:
+            raise Error("a snapshot cannot be zero wide")
+        if len(self.trace) % width != 0:
+            raise Error("the trace is not a whole number of snapshots")
+        return len(self.trace) // width
 
 
 def attention_layer(

@@ -222,6 +222,11 @@ def forward(
 
     w.check(specs[0])
     embed(w, a, token, x)
+    # One snapshot before any layer and one after each, so snapshot k is the
+    # residual stream that layer k was handed. That numbering is what lets a
+    # comparison say which layer a divergence started in rather than that one
+    # happened. With the norm below it a model with n layers leaves n plus two.
+    s.record(x)
     var use_factors = len(factors) > 0
     for i in range(count):
         layer(
@@ -236,4 +241,16 @@ def forward(
             factors,
             use_factors,
         )
+        s.record(x)
     head(w, a, specs[0], x, s.norm, logits)
+    # And one more after the final norm, so the output head sits between the
+    # last snapshot and the logits with nothing else in it. Without this a
+    # disagreement that only shows up in the logits could be the norm, the
+    # head, or thirty layers of drift that the sums happened not to catch, and
+    # those are three different bugs. It costs a copy because `s.norm` cannot
+    # be read and `s` written in the same call.
+    if s.tracing:
+        var normed = Buffer(x.elements())
+        for i in range(normed.elements()):
+            normed.data[i] = s.norm.data[i]
+        s.record(normed)

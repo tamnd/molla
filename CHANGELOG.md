@@ -2,6 +2,13 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- A logit conformance corpus. Fourteen cases over SmolLM2 135M, Qwen 2.5 0.5B and Llama 3.1 8B at nine quantizations, comparing the residual stream after every layer and the whole final distribution against llama.cpp reading the same file. `scripts/gen-logits.py` writes the references and needs llama.cpp on PATH, `scripts/logit_oracle.mojo` checks molla against them and needs nothing, and `pixi run conformance-logits` runs it. See [docs/validation/logits.md](docs/validation/logits.md).
+- `Scratch` can record the residual stream. `tracing` is off by default and costs a bool test per layer, and with it on a model with n layers leaves n plus two snapshots per token: the embedding, one after each layer, and the final norm. A disagreement with llama.cpp comes back as a layer number rather than as a mismatch somewhere in a hundred million multiplies.
+
 ## [0.2.10] - 2026-09-02
 
 Weights get rewritten once and kept.

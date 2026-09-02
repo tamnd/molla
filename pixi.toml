@@ -53,4 +53,12 @@ conformance-template = { cmd = "mojo run -I src scripts/template_oracle.mojo scr
 # nothing molla ships uses them. Generating it is deterministic from a seed, so
 # CI regenerates rather than caching. See docs/validation/quant.md.
 conformance-quant = "mojo run -I src scripts/quant_oracle.mojo corpus/quant"
+# The logit conformance corpus. The reference files are committed because they
+# are a few hundred kilobytes and writing them needs llama.cpp on PATH, which
+# no machine in the fleet but the laptop has. The models they were taken
+# against are not committed and are not downloadable either, since most of them
+# are requantized locally, so `scripts/gen-logits.py` writes both and a case
+# whose model is not in `corpus/logits` is skipped. See
+# docs/validation/logits.md.
+conformance-logits = "mojo run -I src scripts/logit_oracle.mojo scripts/logit_cases.txt scripts/logits corpus/logits"
 conformance-template-full = { cmd = "mojo run -I src scripts/template_oracle.mojo scripts/template_cases.txt scripts/templates.tsv corpus/templates full", env = { TZ = "UTC" } }
