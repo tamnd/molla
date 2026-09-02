@@ -8,6 +8,8 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 - `molla.nn.quant`, which decodes ggml blocks back to float32. f32, f16, bf16, q4_0, q8_0, q4_k, q5_k and q6_k, which covers everything a Llama 3 or Qwen 3 q4_K_M file contains. This is the slow obvious version and it stays that way: the fused kernels get checked against it and it gets checked against the reference implementation, so a fast path that drifts fails against something rather than making a model quietly worse. See [docs/validation/quant.md](docs/validation/quant.md).
 - A quantization conformance corpus. `scripts/gen-quant.py` writes fixtures of random block bytes and the values the `gguf` package decodes them to, `scripts/quant_oracle.mojo` compares every one, and CI runs about half a million values per commit. The match is exact rather than within a tolerance, because both sides decode the same bytes in the same order and a tolerance would let a wrong nibble order through whenever the two nibbles happened to be close.
+- `molla.nn.tensor`, a weight view that holds an address and a shape and owns nothing, and a float32 buffer for activations. Shape is ggml's, so `dims[0]` is the fast axis and a weight printed as `[4096, 14336]` is 14336 rows of 4096.
+- `molla.nn.kernel`, the host arithmetic a transformer block is made of: a matvec that reads packed weights without dequantizing them first, rms_norm, softmax, silu and gelu and swiglu, the residual add, and argmax. Every fused path is checked against dequantizing the same bytes and taking a plain dot product. It is scalar and it is not fast yet, which is what issue #120 is for. See [docs/validation/kernel.md](docs/validation/kernel.md).
 
 ## [0.2.6] - 2026-09-02
 
