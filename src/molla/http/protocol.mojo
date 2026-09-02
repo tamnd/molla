@@ -66,6 +66,20 @@ staging buffer, so the pump has to stop on `STREAM_FULL` and hand back to the
 reactor rather than growing the buffer until the reader catches up.
 """
 
+from molla.api.openai import (
+    ApiRequest,
+    add_text_choice,
+    begin_text_body,
+    end_text_body,
+    parse_chat,
+    parse_completions,
+    write_chat_body,
+    write_chat_chunk,
+    write_error,
+    write_models,
+    write_text_chunk,
+)
+from molla.engine.runner import Runner, RunnerPtr, runner_at
 from molla.http.body import (
     BODY_DONE,
     BODY_FAILED,
@@ -82,6 +96,7 @@ from molla.http.request import (
 from molla.http.request import parse as parse_request
 from molla.http.serialize import ResponseWriter, write_decimal
 from molla.http.stream import (
+    STREAM_CLOSED,
     STREAM_FULL,
     STREAM_OK,
     StreamWriter,
@@ -89,6 +104,10 @@ from molla.http.stream import (
     sse_headers,
 )
 from molla.io.buffer import Buffer
+from molla.json.dom import Document
+from molla.json.dom import parse as parse_json
+from molla.json.reader import Reader
+from molla.json.serialize import Writer
 from molla.net.conn import Connection
 from molla.net.reactor import Protocol
 from molla.ops.log import LEVEL_DEBUG, LEVEL_ERROR, Logger
@@ -103,7 +122,7 @@ from molla.ops.metrics import (
     MetricsView,
 )
 from molla.build_info import MOJO_PIN, VERSION
-from molla.sys.clock import monotonic_ms, monotonic_ns
+from molla.sys.clock import monotonic_ms, monotonic_ns, unix_time
 from molla.sys.mem import as_ptr
 
 comptime DEFAULT_MAX_REQUESTS = 10000
@@ -124,6 +143,38 @@ reaching the cap here means something changed there."""
 comptime DEFAULT_STREAM_EVENTS = 8
 """Events the stand in streaming routes emit before ending. A demo number, and
 the seam where a token loop goes in M2."""
+
+comptime STREAM_DEMO = 0
+comptime STREAM_API = 1
+"""What a streaming connection is producing. The stand in routes count, the API
+routes decode."""
+
+comptime API_BURST = 4
+"""Tokens produced before an API stream hands the reactor back.
+
+A stream produces until the ring is full, which on a fast local socket is never,
+so without a cap one connection's whole completion runs inside one turn of the
+service loop and nothing else on that worker is looked at until it finishes. The
+reactor's own round budget then picks the connection straight back up, so this
+costs a few more passes rather than any throughput.
+"""
+
+comptime API_SLACK = 8
+"""Events an API stream may emit beyond one per token. Three of them are real,
+being the role chunk, the final chunk and the terminator, and the rest is room
+so that the event budget is never what ends a completion."""
+
+comptime STAGE_ROLE = 0
+comptime STAGE_TOKENS = 1
+comptime STAGE_FINAL = 2
+comptime STAGE_DONE = 3
+"""Where a streaming completion has got to.
+
+The first chunk carries the role and no text, the middle ones carry text, the
+last one carries the finish reason and the usage, and then there is `[DONE]`.
+They are stages rather than one function with flags because each one has to be
+written, offered to the ring, and only counted as sent once it fits.
+"""
 
 
 struct ConnState(Movable):
@@ -157,6 +208,14 @@ struct ConnState(Movable):
 
     var stream_left: Int
     var stream_index: Int
+    var stream_kind: Int
+    """Whether the events being produced are the stand in ones or a
+    completion's."""
+
+    var had_body: Bool
+    """Whether the request being answered arrived with one. A POST route needs
+    to tell an empty body from no body, and the reader is reset by then."""
+
     var scratch: Buffer
     """Where a stream event's payload is built, reused like everything else
     here, so producing an event does not allocate."""
@@ -191,6 +250,8 @@ struct ConnState(Movable):
         self.streaming = False
         self.stream_left = 0
         self.stream_index = 0
+        self.stream_kind = STREAM_DEMO
+        self.had_body = False
         self.scratch = Buffer(256, counter)
         self.metered_in = 0
         self.metered_out = 0
@@ -213,6 +274,8 @@ struct ConnState(Movable):
         self.streaming = False
         self.stream_left = 0
         self.stream_index = 0
+        self.stream_kind = STREAM_DEMO
+        self.had_body = False
         self.scratch.clear()
         self.metered_in = 0
         self.metered_out = 0
@@ -249,7 +312,11 @@ comptime ROUTE_BOOM = 5
 comptime ROUTE_ADMIN_VERSION = 6
 comptime ROUTE_ADMIN_HEALTH = 7
 comptime ROUTE_ADMIN_METRICS = 8
-"""One integer per path this stand in answers.
+comptime ROUTE_CHAT = 9
+comptime ROUTE_COMPLETIONS = 10
+comptime ROUTE_MODELS = 11
+comptime ROUTE_MODEL_ONE = 12
+"""One integer per path this server answers.
 
 It used to be one Bool per route passed down through three functions, which was
 fine at four routes and would have been nine arguments at nine. Resolving once
@@ -258,16 +325,46 @@ buffer and the one that has them copied out, agree on the answer by
 construction rather than by both being edited the same way.
 """
 
+comptime PREFIX_MODEL = StaticString("/v1/models/")
+
+
+def _span_starts[o: MutOrigin](data: Span[UInt8, o], text: StringSpan) -> Bool:
+    """Whether a target begins with a fixed prefix."""
+    var want = text.byte_length()
+    if len(data) < want:
+        return False
+    var p = text.unsafe_ptr()
+    for i in range(want):
+        if data[i] != p.unsafe_load(i):
+            return False
+    return True
+
 
 def _route_of[o: MutOrigin](target: Span[UInt8, o]) -> Int:
     """Which route a target names, or `ROUTE_NONE` for a 404.
 
-    A chain of comparisons rather than a router. Nine paths, all short, all
-    known at compile time, and M2 replaces the whole thing with a real router.
-    Building one now would be building it twice.
+    A chain of comparisons rather than a router. A dozen paths, all short, all
+    known at compile time, and a table would not be faster until there are
+    enough of them to miss the cache walking it. The one that is not an
+    equality is `/v1/models/{id}`, where the id is whatever follows and the
+    handler is what decides whether it names the model that is loaded.
+
+    Query strings are not stripped, which is deliberate rather than missing.
+    None of these routes takes a parameter, and a target with one on it is a
+    client doing something this server does not do, so it gets a 404 rather
+    than being quietly answered as though the parameter was understood.
     """
     if _span_is(target, "/"):
         return ROUTE_ROOT
+    if _span_is(target, "/v1/chat/completions"):
+        return ROUTE_CHAT
+    if _span_is(target, "/v1/completions"):
+        return ROUTE_COMPLETIONS
+    if _span_is(target, "/v1/models"):
+        return ROUTE_MODELS
+    if _span_starts(target, PREFIX_MODEL):
+        if len(target) > PREFIX_MODEL.byte_length():
+            return ROUTE_MODEL_ONE
     if _span_is(target, "/healthz"):
         return ROUTE_HEALTHZ
     if _span_is(target, "/stream/sse"):
@@ -338,6 +435,36 @@ struct HttpProtocol(Movable, Protocol):
     var metrics: MetricsView
     """Every worker's counters, for the one route that adds them up."""
 
+    var engine: Int
+    """Address of the `Runner` this worker generates with, or zero for a
+    server that was started without a model.
+
+    An address for the same reason the logger and the metrics view are one. The
+    protocol lives inside a reactor, the reactors live in a list the server
+    owns, and the runner is a local of the function that started the server, so
+    a reference would either move or outlive something."""
+
+    var json: Writer
+    var doc: Document
+    var reader: Reader
+    """One of each per worker, reused across requests, because a completion
+    body is built once and a chunk is built once per token."""
+
+    var api_slot: Int
+    """The connection that holds the model right now, or minus one. There is
+    one because there is one sequence, which is the whole of M2's scheduling."""
+
+    var api_stage: Int
+    var api_chat: Bool
+    var api_done: Bool
+    var api_delta: String
+    """Text produced and not yet accepted by the ring. Held rather than
+    written and forgotten, because an event that did not fit is offered again
+    and the token behind it has already been generated."""
+
+    var api_id: String
+    var api_created: Int
+
     def __init__(out self):
         self.states = List[ConnState]()
         self.req = Request()
@@ -357,6 +484,26 @@ struct HttpProtocol(Movable, Protocol):
         self.logger = Logger()
         self.meter = Meter()
         self.metrics = MetricsView()
+        self.engine = 0
+        self.json = Writer(0, 8192)
+        self.doc = Document(0, 256)
+        self.reader = Reader(0, 4096)
+        self.api_slot = -1
+        self.api_stage = STAGE_DONE
+        self.api_chat = False
+        self.api_done = False
+        self.api_delta = String("")
+        self.api_id = String("")
+        self.api_created = 0
+
+    def configure_engine(mut self, engine: Int):
+        """Hand this worker the model it answers with.
+
+        Zero, which is the default, is a server with no model. That is not an
+        error state: the admin routes and the stand in routes still work, and
+        the API routes say there is nothing loaded rather than pretending.
+        """
+        self.engine = engine
 
     def configure_fault(mut self, enabled: Bool):
         """Turn the raising route on. Only a test or `molla drain` does this."""
@@ -421,6 +568,7 @@ struct HttpProtocol(Movable, Protocol):
                 self.aborted += 1
                 self.states[conn.slot].stream.abort()
                 self.states[conn.slot].streaming = False
+            self._release(conn.slot)
             self._meter_bytes(conn.slot, conn)
         self.closed += 1
         self.meter.dec(M_CONNECTIONS_OPEN)
@@ -639,6 +787,7 @@ struct HttpProtocol(Movable, Protocol):
         `on_writable` comes back to this.
         """
         var now = monotonic_ms()
+        var produced = 0
         while True:
             # Flush before producing rather than after, so a single event on an
             # idle connection is framed and queued on its own instead of waiting
@@ -658,9 +807,26 @@ struct HttpProtocol(Movable, Protocol):
             # socket is momentarily full is a generator running at the speed of
             # the slowest reader, and the events that pile up go out as one
             # chunk rather than as one chunk each.
-            if self._write_stream_event(slot, now) == STREAM_FULL:
+            var rc = self._write_stream_event(slot, now)
+            if rc == STREAM_FULL:
                 return False
+            if rc == STREAM_CLOSED:
+                # The producer failed part way through a body whose headers
+                # have already left. There is no status left to send, so the
+                # connection is cut without the terminal chunk, which is the
+                # one signal a client reads as a truncated response.
+                self.errors += 1
+                self.states[slot].stream.abort()
+                self.states[slot].streaming = False
+                self.states[slot].closing = True
+                self._release(slot)
+                return True
             self.states[slot].stream_left -= 1
+            if self.states[slot].stream_kind == STREAM_API:
+                produced += 1
+                if produced >= API_BURST:
+                    # Hand the reactor back. See `API_BURST`.
+                    return False
 
         self.states[slot].streaming = False
         self.states[slot].stream_left = 0
@@ -673,8 +839,14 @@ struct HttpProtocol(Movable, Protocol):
 
         The payload is built into the connection's scratch buffer rather than
         into a String, so the streaming path allocates as little as the plain
-        response path does. In M2 this is where a token goes.
+        response path does.
+
+        A completion's events go the other way, to `_api_event`, because what
+        they carry is a token that has to be generated first and generating one
+        can fail.
         """
+        if self.states[slot].stream_kind == STREAM_API:
+            return self._api_event(slot, now)
         var index = self.states[slot].stream_index
         self.states[slot].stream_index = index + 1
         self.states[slot].scratch.clear()
@@ -717,27 +889,38 @@ struct HttpProtocol(Movable, Protocol):
         var keep = self.states[slot].keep_alive
         var base = as_ptr(conn.input.base())
         var is_get = span_eq(base, self.req.method, "GET") or head
+        var is_post = span_eq(base, self.req.method, "POST")
         var target = Span[UInt8, MutAnyOrigin](
             unsafe_ptr=base.unsafe_offset(self.req.target.start),
             length=self.req.target.length,
         )
         self.states[slot].out_at = 0
-        self._write_default(slot, _route_of(target), is_get, keep, head)
+        self.states[slot].had_body = False
+        self._write_default(
+            slot, _route_of(target), target, is_get, is_post, keep, head
+        )
 
     def _respond_after_body(mut self, slot: Int, mut conn: Connection):
         """Answer a request whose body has just finished arriving."""
         var head = self.states[slot].is_head
         var keep = self.states[slot].keep_alive
         var is_get = _span_is(self.states[slot].method(), "GET") or head
-        var route = _route_of(self.states[slot].target())
+        var is_post = _span_is(self.states[slot].method(), "POST")
+        var target = self.states[slot].target()
+        var route = _route_of(target)
         self.states[slot].out_at = 0
-        self._write_default(slot, route, is_get, keep, head)
+        self.states[slot].had_body = True
+        self._write_default(slot, route, target, is_get, is_post, keep, head)
 
-    def _write_default(
+    def _write_default[
+        o: MutOrigin
+    ](
         mut self,
         slot: Int,
         route: Int,
+        target: Span[UInt8, o],
         is_get: Bool,
+        is_post: Bool,
         keep: Bool,
         head: Bool,
     ):
@@ -757,7 +940,7 @@ struct HttpProtocol(Movable, Protocol):
         `molla.sys.mem` matter more here than the error handling does.
         """
         try:
-            self._route(slot, route, is_get, keep, head)
+            self._route(slot, route, target, is_get, is_post, keep, head)
         except e:
             self.handler_errors += 1
             self.errors += 1
@@ -770,6 +953,7 @@ struct HttpProtocol(Movable, Protocol):
             _ = self.states[slot].writer.respond_error(500, head)
             self.states[slot].keep_alive = False
             self.states[slot].streaming = False
+            self._release(slot)
         self._account(slot)
 
     def _account(mut self, slot: Int):
@@ -797,20 +981,25 @@ struct HttpProtocol(Movable, Protocol):
             entry.field_int("slot", slot)
             _ = entry.end()
 
-    def _route(
+    def _route[
+        o: MutOrigin
+    ](
         mut self,
         slot: Int,
         route: Int,
+        target: Span[UInt8, o],
         is_get: Bool,
+        is_post: Bool,
         keep: Bool,
         head: Bool,
     ) raises:
-        """The stand in handler, and the three admin routes that are real.
+        """Every route this server has, dispatched on the resolved id.
 
-        The application routes are a stand in: a root, a health check and two
-        streams, which is enough to exercise framing end to end and is
-        deliberately not a router. M2 replaces them with one, and the seam is
-        here so that when it does, nothing above or below has to move.
+        The OpenAI routes are the real ones and everything they need is behind
+        `self.engine`. Next to them are what M0 and M1 left: a root, a health
+        check and two streams that count, which are what the framing, the
+        backpressure and the soak tests exercise, and which stay because a
+        server with a model loaded is a bad place to test chunked encoding.
 
         The `/molla` routes are not a stand in. They are what #16 asks for and
         what an operator gets: a version, a health check that answers before
@@ -832,6 +1021,12 @@ struct HttpProtocol(Movable, Protocol):
         """
         if route == ROUTE_BOOM and self.allow_fault:
             raise Error("the handler for /boom raised, which is its whole job")
+        if route == ROUTE_CHAT or route == ROUTE_COMPLETIONS:
+            self._completion(slot, route == ROUTE_CHAT, is_post, keep, head)
+            return
+        if route == ROUTE_MODELS or route == ROUTE_MODEL_ONE:
+            self._models(slot, route, target, is_get, keep, head)
+            return
         if route == ROUTE_HEALTHZ:
             _ = self.states[slot].writer.respond_str(
                 200, "text/plain", "ok\n", keep, head
@@ -925,3 +1120,497 @@ struct HttpProtocol(Movable, Protocol):
         self.states[slot].streaming = True
         self.states[slot].stream_left = self.stream_events
         self.states[slot].stream_index = 0
+
+    def _release(mut self, slot: Int):
+        """Give the model back, if this connection is what had it.
+
+        Called from every way a request can end, including the client hanging
+        up mid stream, because a runner left busy is a server that answers 503
+        forever and has to be restarted.
+        """
+        if self.api_slot != slot or self.engine == 0:
+            return
+        var runner = runner_at(self.engine)
+        runner[].finish()
+        self.api_slot = -1
+        self.api_stage = STAGE_DONE
+        self.api_delta = String("")
+
+    def _api_error(
+        mut self,
+        slot: Int,
+        status: Int,
+        message: StringSpan,
+        kind: StringSpan,
+        keep: Bool,
+        head: Bool,
+    ):
+        """A refusal in the shape the OpenAI clients raise from.
+
+        Keep alive survives, unlike `_refuse`. A refusal here is a complete
+        response with a length on it and the framing was never in doubt, so
+        cutting the connection would only make the client open another one.
+        """
+        self.errors += 1
+        if not write_error(self.json, message, kind, ""):
+            _ = self.states[slot].writer.respond_error(status, head)
+            self.states[slot].keep_alive = False
+            return
+        _ = self.states[slot].writer.respond(
+            status, "application/json", self.json.bytes(), keep, head
+        )
+
+    def _models[
+        o: MutOrigin
+    ](
+        mut self,
+        slot: Int,
+        route: Int,
+        target: Span[UInt8, o],
+        is_get: Bool,
+        keep: Bool,
+        head: Bool,
+    ) raises:
+        """`/v1/models` and `/v1/models/{id}`.
+
+        One model, because this build loads one file. The id is the whole
+        reference the server was started with, so that a client which reads it
+        here and sends it back in a request matches rather than being told the
+        model it just listed is not loaded.
+        """
+        if not is_get:
+            self._api_error(
+                slot,
+                405,
+                "the models routes answer GET and nothing else",
+                "invalid_request_error",
+                keep,
+                head,
+            )
+            return
+        if self.engine == 0:
+            self._api_error(
+                slot,
+                503,
+                (
+                    "this server was started without a model, so there is"
+                    " nothing to list"
+                ),
+                "server_error",
+                keep,
+                head,
+            )
+            return
+        var runner = runner_at(self.engine)
+        if route == ROUTE_MODEL_ONE:
+            var skip = PREFIX_MODEL.byte_length()
+            var want = Span[UInt8, MutAnyOrigin](
+                unsafe_ptr=as_ptr(Int(target.unsafe_ptr()) + skip),
+                length=len(target) - skip,
+            )
+            if not runner[].answers_to(
+                String(StringSpan(unsafe_from_utf8=want))
+            ):
+                self._api_error(
+                    slot,
+                    404,
+                    "that model is not loaded, this server has '"
+                    + runner[].id
+                    + "'",
+                    "invalid_request_error",
+                    keep,
+                    head,
+                )
+                return
+        if not write_models(
+            self.json, runner[].id, runner[].created, route == ROUTE_MODEL_ONE
+        ):
+            raise Error("the models response did not fit in its buffer")
+        _ = self.states[slot].writer.respond(
+            200, "application/json", self.json.bytes(), keep, head
+        )
+
+    def _parse_body(
+        mut self, slot: Int, chat: Bool, keep: Bool, head: Bool, mut ok: Bool
+    ) -> ApiRequest:
+        """The body as an `ApiRequest`, or a 400 saying what was wrong with it.
+
+        The failure is answered here rather than raised, because everything
+        that can go wrong reading a request body is the caller's to fix and a
+        500 would say the opposite.
+        """
+        try:
+            if chat:
+                return parse_chat(self.doc, self.json)
+            return parse_completions(self.doc)
+        except e:
+            ok = False
+            self._api_error(
+                slot, 400, String(e), "invalid_request_error", keep, head
+            )
+            return ApiRequest(chat)
+
+    def _completion(
+        mut self, slot: Int, chat: Bool, is_post: Bool, keep: Bool, head: Bool
+    ) raises:
+        """`/v1/chat/completions` and `/v1/completions`.
+
+        The same function for both because they differ in three places: where
+        the prompt comes from, what the response is called, and what a choice
+        holds. Everything between, which is the parsing, the refusals, the
+        sampler and the token loop, is one path and stays one path.
+        """
+        if not is_post:
+            self._api_error(
+                slot,
+                405,
+                "a completion is a POST",
+                "invalid_request_error",
+                keep,
+                head,
+            )
+            return
+        if self.engine == 0:
+            self._api_error(
+                slot,
+                503,
+                (
+                    "this server was started without a model, so there is"
+                    " nothing to complete with"
+                ),
+                "server_error",
+                keep,
+                head,
+            )
+            return
+        if not self.states[slot].had_body:
+            self._api_error(
+                slot,
+                400,
+                "a completion needs a json body and this request had none",
+                "invalid_request_error",
+                keep,
+                head,
+            )
+            return
+        var runner = runner_at(self.engine)
+        if runner[].busy:
+            self._api_error(
+                slot,
+                503,
+                (
+                    "this build decodes one sequence at a time and one is"
+                    " already running, so this request would have to wait on a"
+                    " scheduler that does not exist yet"
+                ),
+                "server_error",
+                keep,
+                head,
+            )
+            return
+
+        self.doc.clear()
+        if not parse_json(
+            self.doc, self.reader, self.states[slot].body.bytes()
+        ):
+            self._api_error(
+                slot,
+                400,
+                "the request body is not valid json",
+                "invalid_request_error",
+                keep,
+                head,
+            )
+            return
+        var ok = True
+        var req = self._parse_body(slot, chat, keep, head, ok)
+        if not ok:
+            return
+        if req.have_model and not runner[].answers_to(req.model):
+            self._api_error(
+                slot,
+                404,
+                "no model named '"
+                + req.model
+                + "' is loaded, this server has '"
+                + runner[].id
+                + "'",
+                "invalid_request_error",
+                keep,
+                head,
+            )
+            return
+        if not req.have_seed:
+            # A request that did not pin a seed gets a fresh one, so two
+            # identical requests are two samples. Pinning the default instead
+            # would make a server that repeats itself, which reads as the model
+            # being broken.
+            req.sampling.seed = UInt64(monotonic_ns())
+        var count = req.prompts()
+        if req.stream and count != 1:
+            self._api_error(
+                slot,
+                400,
+                (
+                    "a streaming request takes one prompt, because the choices"
+                    " of a batch would interleave on one stream"
+                ),
+                "invalid_request_error",
+                keep,
+                head,
+            )
+            return
+        if req.stream:
+            self._stream_completion(slot, chat, req, keep, head)
+            return
+        self._whole_completion(slot, chat, req, count, keep, head)
+
+    def _prompt_of(
+        mut self, chat: Bool, req: ApiRequest, index: Int
+    ) raises -> List[Int]:
+        """One prompt, as ids, whichever way it arrived."""
+        var runner = runner_at(self.engine)
+        if chat:
+            return runner[].encode(runner[].render(req.messages_json), True)
+        if req.uses_ids:
+            return req.id_prompts[index].copy()
+        return runner[].encode(req.texts[index], False)
+
+    def _begin(mut self, chat: Bool, req: ApiRequest, index: Int) raises -> Int:
+        """Prefill one prompt. Returns how many tokens it was."""
+        var runner = runner_at(self.engine)
+        var prompt = self._prompt_of(chat, req, index)
+        runner[].start(
+            prompt,
+            req.sampling,
+            req.bias_ids,
+            req.bias_vals,
+            req.max_tokens,
+            req.stops.copy(),
+        )
+        return len(prompt)
+
+    def _whole_completion(
+        mut self,
+        slot: Int,
+        chat: Bool,
+        req: ApiRequest,
+        count: Int,
+        keep: Bool,
+        head: Bool,
+    ) raises:
+        """A completion the caller wanted in one piece.
+
+        The whole generation happens here, which means this worker answers
+        nothing else until it is done. That is what one sequence at a time
+        costs, it is why the streaming path exists, and it is the thing M3
+        changes.
+        """
+        var runner = runner_at(self.engine)
+        var id = runner[].next_id("chatcmpl-" if chat else "cmpl-")
+        var created = unix_time()
+        var model = runner[].id
+        try:
+            if chat:
+                var prompt_tokens = self._begin(chat, req, 0)
+                while runner[].advance():
+                    pass
+                var content = runner[].all_text()
+                var reason = runner[].reason
+                var produced = runner[].produced
+                runner[].finish()
+                if not write_chat_body(
+                    self.json,
+                    id,
+                    created,
+                    model,
+                    content,
+                    reason,
+                    prompt_tokens,
+                    produced,
+                ):
+                    raise Error("the completion did not fit in its buffer")
+            else:
+                var total_prompt = 0
+                var total_completion = 0
+                if not begin_text_body(self.json, id, created, model):
+                    raise Error("the completion did not fit in its buffer")
+                for i in range(count):
+                    var prompt_tokens = self._begin(chat, req, i)
+                    while runner[].advance():
+                        pass
+                    var text = runner[].all_text()
+                    if req.echo:
+                        text = self._echo_of(req, i) + text
+                    var reason = runner[].reason
+                    total_prompt += prompt_tokens
+                    total_completion += runner[].produced
+                    runner[].finish()
+                    if not add_text_choice(self.json, text, i, reason):
+                        raise Error("the completion did not fit in its buffer")
+                if not end_text_body(self.json, total_prompt, total_completion):
+                    raise Error("the completion did not fit in its buffer")
+        except e:
+            runner[].finish()
+            self._api_error(
+                slot, 400, String(e), "invalid_request_error", keep, head
+            )
+            return
+        _ = self.states[slot].writer.respond(
+            200, "application/json", self.json.bytes(), keep, head
+        )
+
+    def _echo_of(mut self, req: ApiRequest, index: Int) raises -> String:
+        """The prompt as text, for a request that asked for it back."""
+        if not req.uses_ids:
+            return req.texts[index]
+        var runner = runner_at(self.engine)
+        return runner[].detokenize(req.id_prompts[index])
+
+    def _stream_completion(
+        mut self,
+        slot: Int,
+        chat: Bool,
+        req: ApiRequest,
+        keep: Bool,
+        head: Bool,
+    ) raises:
+        """Prefill, write the SSE headers, and let the pump do the rest."""
+        var runner = runner_at(self.engine)
+        try:
+            _ = self._begin(chat, req, 0)
+        except e:
+            runner[].finish()
+            self._api_error(
+                slot, 400, String(e), "invalid_request_error", keep, head
+            )
+            return
+        self.api_chat = chat
+        self.api_done = False
+        self.api_delta = String("")
+        self.api_stage = STAGE_ROLE if chat else STAGE_TOKENS
+        self.api_id = runner[].next_id("chatcmpl-" if chat else "cmpl-")
+        self.api_created = unix_time()
+        self.api_slot = slot
+        self.states[slot].stream_kind = STREAM_API
+        self._start_stream(slot, True, keep, head)
+        if not self.states[slot].streaming:
+            runner[].finish()
+            self.api_slot = -1
+            return
+        # The event budget, which is one per token plus the fixed ones. What
+        # ends the stream is `STAGE_DONE`, and this is only here so that a bug
+        # in the stages cannot turn into a connection that produces forever.
+        self.states[slot].stream_left = req.max_tokens + API_SLACK
+
+    def _build_chunk(mut self, role: Bool, last: Bool) -> Bool:
+        """One chunk of a streaming completion, into the JSON writer."""
+        var runner = runner_at(self.engine)
+        var id = self.api_id
+        var model = runner[].id
+        var delta = self.api_delta
+        var reason = runner[].reason
+        var prompt_tokens = runner[].prompt_tokens
+        var produced = runner[].produced
+        if self.api_chat:
+            return write_chat_chunk(
+                self.json,
+                id,
+                self.api_created,
+                model,
+                role,
+                delta.as_bytes(),
+                last,
+                reason,
+                prompt_tokens,
+                produced,
+            )
+        return write_text_chunk(
+            self.json,
+            id,
+            self.api_created,
+            model,
+            delta.as_bytes(),
+            last,
+            reason,
+            prompt_tokens,
+            produced,
+        )
+
+    def _next_delta(mut self, slot: Int) -> Bool:
+        """Generate until there is text to send or the answer is finished.
+
+        More than one token can go by without producing anything a client may
+        see, because a stop string can straddle tokens and what might be the
+        first half of one is held back. False means generating raised.
+        """
+        var runner = runner_at(self.engine)
+        try:
+            while not self.api_done and self.api_delta.byte_length() == 0:
+                if not runner[].advance():
+                    self.api_done = True
+                    break
+                self.api_delta = runner[].delta(False)
+            if self.api_done and self.api_delta.byte_length() == 0:
+                self.api_delta = runner[].delta(True)
+        except e:
+            var entry = self.logger.begin(LEVEL_ERROR)
+            entry.message("generation failed mid stream")
+            entry.field_int("slot", slot)
+            entry.field("detail", String(e))
+            _ = entry.end()
+            return False
+        return True
+
+    def _api_event(mut self, slot: Int, now: Int) -> Int:
+        """One event of a streaming completion.
+
+        Each stage builds its payload, offers it to the stream, and only moves
+        on once the stream took it. An event that does not fit is offered again
+        on the next turn with the same bytes, which is the whole reason the
+        text that has been generated and not yet sent is held in a field rather
+        than in a local.
+        """
+        if self.api_stage == STAGE_ROLE:
+            if not self._build_chunk(True, False):
+                return STREAM_CLOSED
+            var rc = self.states[slot].stream.event(
+                "", self.json.bytes(), "", now
+            )
+            if rc == STREAM_OK:
+                self.api_stage = STAGE_TOKENS
+            return rc
+
+        if self.api_stage == STAGE_TOKENS:
+            if not self._next_delta(slot):
+                return STREAM_CLOSED
+            if self.api_delta.byte_length() > 0:
+                if not self._build_chunk(False, False):
+                    return STREAM_CLOSED
+                var rc = self.states[slot].stream.event(
+                    "", self.json.bytes(), "", now
+                )
+                if rc == STREAM_OK:
+                    self.api_delta = String("")
+                return rc
+            self.api_stage = STAGE_FINAL
+
+        if self.api_stage == STAGE_FINAL:
+            if not self._build_chunk(False, True):
+                return STREAM_CLOSED
+            var rc = self.states[slot].stream.event(
+                "", self.json.bytes(), "", now
+            )
+            if rc == STREAM_OK:
+                self.api_stage = STAGE_DONE
+            return rc
+
+        # The terminator, which is a literal and not JSON. A client that parses
+        # every data line as an object breaks on it, which is why it is written
+        # down in the specification and why it is here.
+        var done = String("[DONE]")
+        var rc = self.states[slot].stream.event("", done.as_bytes(), "", now)
+        if rc == STREAM_OK:
+            self._release(slot)
+            self.states[slot].stream_left = 0
+        return rc

@@ -8,6 +8,7 @@ an unreachable except, so only wrap the ones that actually raise.
 from harness import Suite, finish
 
 import test_allocs
+import test_api
 import test_client
 import test_concurrency
 import test_dns
@@ -158,6 +159,7 @@ def main():
         test_jinja.run(suite)
     except e:
         suite.fail("test_jinja", String(e))
+    test_api.run(suite)
     test_stream.run(suite)
     test_json.run(suite)
     test_tls.run(suite)
