@@ -2,7 +2,11 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.2.9] - 2026-09-02
+
+The model is behind a socket.
+
+`molla serve` answers OpenAI chat and completion requests against a GGUF file on disk, streaming and not, and the OpenAI Python SDK talks to it with nothing configured but `base_url`. One worker and one sequence at a time, so a second request in flight gets a 503 rather than being queued behind a scheduler that does not exist yet.
 
 ### Added
 
