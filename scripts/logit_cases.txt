@@ -1,0 +1,31 @@
+# The logit conformance cases. Tab separated: case name, source model,
+# quantization to requantize the source into, prompt.
+#
+# A quantization of "-" means run the source file as it is. Anything else is a
+# llama-quantize type name, and the requantized file is named after the source
+# and the type so several prompts against one file share it.
+#
+# The source paths are where the fleet keeps its models. A case whose source is
+# missing is skipped rather than failed, because no machine here has all of
+# them and the ones that are large are large.
+#
+# The eight quantized types molla decodes all appear below. SmolLM2 is 576 wide
+# and 576 is not a multiple of 256, so llama.cpp falls back off the K quants
+# for most of its tensors and only ffn_down, which is 1536 wide, comes out as
+# one. That is why the K quant rows still say what they say: the file has
+# thirty real q4_K tensors in it and the rest are the fallback, and both halves
+# get read.
+smollm2-q8_0-capital	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	-	The capital of France is
+smollm2-q8_0-count	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	-	One, two, three, four
+smollm2-q8_0-code	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	-	def add(a, b): return
+smollm2-f16-capital	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	F16	The capital of France is
+smollm2-q4_0-capital	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	Q4_0	The capital of France is
+smollm2-q4_1-capital	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	Q4_1	The capital of France is
+smollm2-q5_0-capital	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	Q5_0	The capital of France is
+smollm2-q5_1-capital	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	Q5_1	The capital of France is
+smollm2-q4_k-capital	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	Q4_K_M	The capital of France is
+smollm2-q5_k-capital	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	Q5_K_M	The capital of France is
+smollm2-q6_k-capital	~/models/SmolLM2-135M-Instruct-Q8_0.gguf	Q6_K	The capital of France is
+qwen25-q5_0-capital	~/models/qwen2.5-0.5b-instruct-q4_k_m.gguf	-	The capital of France is
+qwen25-q5_0-count	~/models/qwen2.5-0.5b-instruct-q4_k_m.gguf	-	One, two, three, four
+llama31-q4_k-capital	~/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf	-	The capital of France is

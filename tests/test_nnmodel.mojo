@@ -107,6 +107,7 @@ def run(mut suite: Suite) raises:
     test_softcap(suite)
     test_factors(suite)
     test_forward(suite)
+    test_trace(suite)
     test_errors(suite)
 
 
@@ -417,6 +418,166 @@ def test_forward(mut suite: Suite) raises:
         if not _close(with_history.data[i], no_history.data[i], 1e-5):
             differs = True
     suite.check(differs, "and a token's logits depend on the tokens before it")
+
+    keep(arena)
+
+
+def test_trace(mut suite: Suite) raises:
+    """The residual stream recorded on the way through.
+
+    What matters is the numbering. Snapshot zero has to be the embedding
+    before any layer touched it and snapshot n has to be what layer n minus
+    one left, because `scripts/logit_oracle.mojo` turns a disagreement into a
+    layer number by that indexing and an off by one there would name the wrong
+    layer every time. So the ends are checked against values that come from
+    somewhere other than the trace: the embedding row itself, and the stream
+    `forward` finished with.
+    """
+    suite.group("model trace")
+
+    var arena = Arena()
+    var spec = _spec()
+    var w = ModelWeights()
+    w.embedding = arena.tensor(_rows(), WIDTH, VOCAB)
+    w.output_norm = arena.tensor(_ones(WIDTH), WIDTH, 1)
+
+    var ident = arena.tensor(_identity(WIDTH), WIDTH, WIDTH)
+    var gain = arena.tensor(_ones(WIDTH), WIDTH, 1)
+    var lw = LayerWeights()
+    lw.attn_norm = gain
+    lw.ffn_norm = gain
+    lw.wq = ident
+    lw.wk = ident
+    lw.wv = ident
+    lw.wo = ident
+    lw.gate = ident
+    lw.up = ident
+    lw.down = ident
+
+    var specs = List[BlockSpec]()
+    var layers = List[LayerWeights]()
+    var keys = List[List[Float32]]()
+    var values = List[List[Float32]]()
+    for _ in range(2):
+        specs.append(spec)
+        layers.append(lw)
+        keys.append(_zeros(WIDTH * 2))
+        values.append(_zeros(WIDTH * 2))
+
+    var s = Scratch(spec, 4)
+    var a = arch_of(ARCH_LLAMA)
+    var x = Buffer(WIDTH)
+    var logits = Buffer(VOCAB)
+
+    suite.check(not s.tracing, "a scratch does not record until it is asked")
+    forward(
+        a,
+        w,
+        specs,
+        layers,
+        s,
+        x,
+        1,
+        0,
+        0,
+        keys,
+        values,
+        List[Float32](),
+        logits,
+    )
+    suite.check(
+        len(s.trace) == 0, "and a pass with it off leaves nothing behind"
+    )
+
+    s.tracing = True
+    var fresh_k = List[List[Float32]]()
+    var fresh_v = List[List[Float32]]()
+    for _ in range(2):
+        fresh_k.append(_zeros(WIDTH * 2))
+        fresh_v.append(_zeros(WIDTH * 2))
+    var traced = Buffer(WIDTH)
+    forward(
+        a,
+        w,
+        specs,
+        layers,
+        s,
+        traced,
+        1,
+        0,
+        0,
+        fresh_k,
+        fresh_v,
+        List[Float32](),
+        logits,
+    )
+
+    suite.check(
+        s.snapshots(WIDTH) == 4,
+        "two layers give four snapshots for a token",
+    )
+
+    var lookup = Buffer(WIDTH)
+    embed(w, a, 1, lookup)
+    var same = True
+    for i in range(WIDTH):
+        if s.trace[i] != lookup.data[i]:
+            same = False
+    suite.check(same, "and the first one is the embedding, before any layer")
+
+    var last = 2 * WIDTH
+    var ended = True
+    for i in range(WIDTH):
+        if s.trace[last + i] != traced.data[i]:
+            ended = False
+    suite.check(ended, "and the one after that is what the last layer left")
+
+    var normed = 3 * WIDTH
+    var final = True
+    for i in range(WIDTH):
+        if s.trace[normed + i] != s.norm.data[i]:
+            final = False
+    suite.check(final, "and the last one is the norm the head read")
+
+    var moved = False
+    for i in range(WIDTH):
+        if s.trace[WIDTH + i] != s.trace[i]:
+            moved = True
+    suite.check(moved, "and the one between them is neither of those")
+
+    # A second token appends rather than replacing, so a prefill of n tokens
+    # leaves n times the snapshots in the order they were taken. The oracle
+    # indexes into that as position times snapshots plus layer and would read
+    # the wrong token if this ever started overwriting.
+
+    var second = Buffer(WIDTH)
+    forward(
+        a,
+        w,
+        specs,
+        layers,
+        s,
+        second,
+        2,
+        1,
+        1,
+        fresh_k,
+        fresh_v,
+        List[Float32](),
+        logits,
+    )
+    suite.check(s.snapshots(WIDTH) == 8, "a second token appends its own four")
+    var kept = True
+    for i in range(WIDTH):
+        if s.trace[i] != lookup.data[i]:
+            kept = False
+    suite.check(kept, "and does not disturb the first token's")
+
+    s.forget()
+    suite.check(
+        s.snapshots(WIDTH) == 0 and s.tracing,
+        "forgetting empties the trace and leaves the switch alone",
+    )
 
     keep(arena)
 

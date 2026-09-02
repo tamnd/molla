@@ -36,7 +36,7 @@ Everything binds to the mapping. The kernels are host kernels, so a tensor copie
 
 ## What was run
 
-`molla generate <model.gguf> <tokenizer.json> "<prompt>" [n] [ctx]`. It is the first thing in molla whose output is judged by reading it rather than asserted, and it stays that way until #30 puts the logits beside llama.cpp's.
+`molla generate <model.gguf> <tokenizer.json> "<prompt>" [n] [ctx]`. It was the first thing in molla whose output was judged by reading it rather than asserted. The reading still happens, and the numbers underneath it are now checked against llama.cpp by [logits.md](logits.md).
 
 | Model | Quantization | Prompt | Output |
 | --- | --- | --- | --- |
@@ -64,7 +64,7 @@ The token is chosen by a `Sampler`, which the caller owns and the session is han
 
 There is no chat template applied and no server. `molla generate` takes raw text and prints raw text, so a prompt that should have been wrapped in an instruction template is not. That is #29.
 
-There is no comparison against llama.cpp. Two models producing sensible English is evidence and it is not a measurement, and the difference matters because most of the ways to be slightly wrong here still produce sensible English. #30 is the measurement.
+Two models producing sensible English is evidence and it is not a measurement, and the difference matters because most of the ways to be slightly wrong here still produce sensible English. The measurement is #30 and it is in [logits.md](logits.md), which compares the residual stream after every layer and the whole final distribution against llama.cpp on fourteen cases.
 
 The vocabulary comes from a `tokenizer.json` and not from the GGUF. Reading the vocabulary and merges out of the file's metadata is real work with its own failure modes, and doing it as a side errand of the decode loop is how a tokenizer ends up with no oracle behind it.
 

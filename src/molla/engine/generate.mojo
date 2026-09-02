@@ -7,9 +7,10 @@ running the same tokens by the other route. None of that says the whole thing
 produces English, because a stack of correct pieces assembled in a plausible
 order is exactly the failure this project keeps designing against.
 
-So this exists to be run by a person, on a real file, and read. It is the first
-thing in molla whose output is judged rather than asserted, and it stays that
-way until #30 puts the logits beside llama.cpp's and compares numbers.
+So this exists to be run by a person, on a real file, and read. What it prints
+is still judged rather than asserted, but the numbers behind it are not: #30
+puts the whole forward pass beside llama.cpp's, layer by layer, in
+`scripts/logit_oracle.mojo`.
 
 The tokenizer comes from a `tokenizer.json` beside the model rather than out of
 the GGUF. The vocabulary and merges are in the file's metadata and reading them
