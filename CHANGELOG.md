@@ -2,7 +2,9 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.2.6] - 2026-09-02
+
+molla can now say what a machine has and put a model's weights on it.
 
 ### Added
 
