@@ -54,6 +54,21 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
         self.cols = cols
         self.rows = rows
 
+    @staticmethod
+    def none() -> Self:
+        """A weight the model does not have.
+
+        Address zero, which is not a place any mapping can start, so a tensor
+        that is absent and a tensor that is present are told apart by the one
+        field that cannot lie about it. The alternative is a boolean beside
+        every weight, and two things that have to agree are one thing that can
+        disagree.
+        """
+        return Self(0, 0, 0, 0)
+
+    def present(self) -> Bool:
+        return self.address != 0
+
     def base(self) -> RawPtr:
         return RawPtr(unsafe_from_address=self.address)
 
