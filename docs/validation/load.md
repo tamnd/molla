@@ -22,6 +22,24 @@ Every tensor gets one of three placements, and the choice is made once in `plan_
 
 `unified` is not `host` with a different name. They do the same amount of work today, which is none, but they answer different questions: a kernel asking whether it can be handed this address gets yes from one and no from the other. Collapsing them would put that distinction back into every call site, which is the scattered special case the issue says not to write.
 
+## A weight knows which memory it is in
+
+That question used to have no answer anywhere in the type system. A placement was a decision the loader made and then forgot, and every tensor that came out of `bind` was a host address whether or not a copy to a card had happened, so a host kernel handed a device weight would have dereferenced a driver handle and faulted on a thread with no idea a placement had ever taken place.
+
+So a `Tensor` carries its place, and `Tensor.base`, which is the one call every host kernel makes to get at bytes, refuses a weight in a device pool and names its shape. The cost is an integer compare once per matvec rather than once per row, because a weight is in one memory for its whole life and the test is hoisted out of the row loop the same way the layout test already is. `Tensor.device_address` is the mirror of it and refuses a host weight, and a unified weight passes both, which is the whole point of unified.
+
+What connects the two halves is `Residency`, which is what a load hands the binder: for each position in the file's tensor directory, which memory that tensor ended up in and where on the device if it moved. It is indexed by directory position rather than by name because that is what the binder already has after it looks a weight up and what a placement already carries, so the two meet without either growing a table of strings. An empty `Residency` answers host for everything, which is what every caller that loads with a device budget of zero gets, and that is still every caller that generates a token until [#143](https://github.com/tamnd/molla/issues/143) lands.
+
+## The plan reads the copy that will be read
+
+A load with a warm repack cache used to fault in the model file while `bind` pointed the kernels at the cache beside it. Every byte of that read was wasted and the bytes that were going to be read stayed cold.
+
+`plan_load` can now be told about the cache, and then it plans against the copy of each weight that `bind` is going to use. A tensor the cache has is sourced from the cache in the planar layout, a tensor with no planar form is sourced from the file, and the same rule decides what the read stage warms and what the copy stage sends to the card. Which means a device pool holds the layout the device kernels want on a machine that has a cache, and the ggml layout on one that does not, and the tensor says which without anybody going back to the file to ask.
+
+A placement therefore carries two sizes. `bytes` is what the tensor occupies in the model file and stays on record because the repack reads from there. `length` is the source that is actually read, which is larger for a quantized weight, because the planar layout trades size for a kernel that does not have to walk a block header per group. On the 8B that is 4685 MiB in the file and 9573 MiB read.
+
+The load counts the bytes it copied to the device and refuses to finish if that disagrees with what the plan placed. They are computed from the same placements a few dozen lines apart, so the only way they differ is a drain loop that skipped a tensor or took one twice, and a card that is missing one weight out of 292 generates text that is almost right, which is the worst failure in the file.
+
 The device side is one pool allocation rather than one allocation per tensor. 292 allocations of a few megabytes each is 292 driver round trips and a fragmented heap for no benefit, since the lifetime of every tensor is the lifetime of the model. Each tensor gets a byte offset into the pool, aligned to 256, and the test suite checks that slots are aligned, in order, and never overlap. Getting that wrong writes one tensor over another and the model still loads and still produces words, just wrong ones, so it is worth an assertion rather than a code review.
 
 When the model does not fit, the planner runs in two passes. Anything read once per token goes to the card first, and the token embedding goes last, because the embedding is the largest single tensor in a q4_K_M 8B and it is read once per token for one row. Trading the whole embedding for four more attention blocks on the card is the right trade and the planner makes it without being asked.
