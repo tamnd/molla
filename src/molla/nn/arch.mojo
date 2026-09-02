@@ -60,6 +60,12 @@ struct Arch(Copyable, ImplicitlyCopyable, Movable):
     var qk_norm: Bool
     """Whether each head of the query and key is rms normed before rope."""
 
+    var qkv_bias: Bool
+    """Whether the three attention projections carry a bias. Qwen 2 does, Qwen
+    3 dropped it, and Llama never had one. A bias molla does not add is a
+    constant vector missing from every head of every layer, which is a model
+    that runs at full speed and writes noise."""
+
     var post_norms: Bool
     """Whether each sublayer's output is normed on the way to the residual
     add, as well as its input being normed on the way in."""
@@ -108,6 +114,7 @@ struct Arch(Copyable, ImplicitlyCopyable, Movable):
         self.act = ACT_SILU
         self.neox = True
         self.qk_norm = False
+        self.qkv_bias = False
         self.post_norms = False
         self.window = 0
         self.window_pattern = 0
@@ -146,7 +153,11 @@ def arch_of(id: Int) raises -> Arch:
         return a
 
     if id == ARCH_QWEN2:
+        # A bias on each of the three attention projections, which Qwen 3
+        # dropped and which nothing in the metadata announces. A file has the
+        # tensors or it does not.
         var a = Arch(ARCH_QWEN2, "qwen2")
+        a.qkv_bias = True
         a.supported = True
         return a
 
@@ -311,6 +322,7 @@ def block_spec(a: Arch, g: Geometry, layer: Int) raises -> BlockSpec:
     )
     spec.gated = a.gated
     spec.act = a.act
+    spec.qkv_bias = a.qkv_bias
     return spec
 
 
@@ -334,6 +346,9 @@ def tensor_names(a: Arch, layer: Int) -> List[String]:
     out.append(p + "attn_k.weight")
     out.append(p + "attn_v.weight")
     out.append(p + "attn_output.weight")
+    out.append(p + "attn_q.bias" if a.qkv_bias else "")
+    out.append(p + "attn_k.bias" if a.qkv_bias else "")
+    out.append(p + "attn_v.bias" if a.qkv_bias else "")
     out.append(p + "attn_q_norm.weight" if a.qk_norm else "")
     out.append(p + "attn_k_norm.weight" if a.qk_norm else "")
     out.append(p + "ffn_norm.weight")

@@ -213,6 +213,7 @@ def run(mut suite: Suite) raises:
     test_hand(suite)
     test_against_reference(suite)
     test_qk_norm(suite)
+    test_qkv_bias(suite)
     test_post_norms(suite)
     test_mlp_shapes(suite)
     test_cache(suite)
@@ -499,6 +500,144 @@ def test_qk_norm(mut suite: Suite) raises:
         not _close(keys[7], keys2[7], 1e-4),
         "and leaving the norms out changes the key that gets cached",
     )
+
+    keep(arena)
+
+
+def _ramp(n: Int, first: Float32, step: Float32) -> List[Float32]:
+    var out = List[Float32]()
+    for i in range(n):
+        out.append(first + Float32(i) * step)
+    return out^
+
+
+def test_qkv_bias(mut suite: Suite) raises:
+    """Qwen 2's bias on each of the three attention projections."""
+    suite.group("block attention biases")
+
+    var arena = Arena()
+    var spec = _spec()
+    spec.qkv_bias = True
+
+    var w = LayerWeights()
+    w.attn_norm = arena.tensor(_ones(WIDTH), WIDTH, 1)
+    w.ffn_norm = arena.tensor(_ones(WIDTH), WIDTH, 1)
+    w.wq = arena.tensor(_identity(WIDTH), WIDTH, WIDTH)
+    w.wk = arena.tensor(_identity(WIDTH), WIDTH, WIDTH)
+    w.wv = arena.tensor(_identity(WIDTH), WIDTH, WIDTH)
+    w.wo = arena.tensor(_identity(WIDTH), WIDTH, WIDTH)
+    w.gate = arena.tensor(_identity(WIDTH), WIDTH, HIDDEN)
+    w.up = arena.tensor(_identity(WIDTH), WIDTH, HIDDEN)
+    w.down = arena.tensor(_identity(HIDDEN), HIDDEN, WIDTH)
+    w.q_bias = arena.tensor(_ramp(WIDTH, 0.5, 0.25), WIDTH, 1)
+    w.k_bias = arena.tensor(_ramp(WIDTH, -0.5, 0.125), WIDTH, 1)
+    w.v_bias = arena.tensor(_ramp(WIDTH, 0.25, 0.5), WIDTH, 1)
+    w.check(spec)
+
+    var x = Buffer(WIDTH)
+    for i in range(WIDTH):
+        x.data[i] = Float32(i + 1)
+    var s = Scratch(spec, 4)
+    var keys = _zeros(WIDTH)
+    var values = _zeros(WIDTH)
+    attention_layer(spec, w, x, s, keys, values, 0, 0, List[Float32](), False)
+
+    # The value is the one projection nothing rotates or norms afterwards, so
+    # what lands in the cache is the normed input plus the bias and it can be
+    # worked out by hand. The projections are the identity, so the input to all
+    # three is the same vector.
+    var divisor = Float32(sqrt(Float64(25.5) + Float64(EPS)))
+    suite.check(
+        _close(values[0], 1.0 / divisor + 0.25, 1e-6),
+        "a cached value is the projection plus its bias",
+    )
+    suite.check(
+        _close(values[3], 4.0 / divisor + 1.75, 1e-6),
+        "and every element gets its own, not the first one repeated",
+    )
+
+    # A bias of all zeroes has to give exactly what no bias at all gives.
+    # Anything else means the bias path is doing something besides adding.
+    var plain_spec = _spec()
+    var plain = LayerWeights()
+    plain.attn_norm = w.attn_norm
+    plain.ffn_norm = w.ffn_norm
+    plain.wq = w.wq
+    plain.wk = w.wk
+    plain.wv = w.wv
+    plain.wo = w.wo
+    plain.gate = w.gate
+    plain.up = w.up
+    plain.down = w.down
+
+    var zeroed = plain
+    zeroed.q_bias = arena.tensor(_zeros(WIDTH), WIDTH, 1)
+    zeroed.k_bias = arena.tensor(_zeros(WIDTH), WIDTH, 1)
+    zeroed.v_bias = arena.tensor(_zeros(WIDTH), WIDTH, 1)
+
+    var a = Buffer(WIDTH)
+    var b = Buffer(WIDTH)
+    for i in range(WIDTH):
+        a.data[i] = Float32(i + 1)
+        b.data[i] = Float32(i + 1)
+    var ka = _zeros(WIDTH)
+    var va = _zeros(WIDTH)
+    var kb = _zeros(WIDTH)
+    var vb = _zeros(WIDTH)
+    attention_layer(spec, zeroed, a, s, ka, va, 0, 0, List[Float32](), False)
+    attention_layer(
+        plain_spec, plain, b, s, kb, vb, 0, 0, List[Float32](), False
+    )
+
+    var same = True
+    for i in range(WIDTH):
+        if ka[i] != kb[i] or va[i] != vb[i] or a.data[i] != b.data[i]:
+            same = False
+    suite.check(same, "a bias of zeroes is the same layer as no bias at all")
+
+    suite.check(
+        not _close(keys[0], kb[0], 1e-4),
+        "and a bias that is not zero changes the key that gets cached",
+    )
+
+    # Both directions of the disagreement, since either one is a model that
+    # runs and writes noise.
+    var failed = False
+    try:
+        plain.check(spec)
+    except:
+        failed = True
+    suite.check(
+        failed,
+        "an architecture that wants biases and a file without them is refused",
+    )
+
+    failed = False
+    try:
+        w.check(plain_spec)
+    except:
+        failed = True
+    suite.check(
+        failed, "and so is a file with them for an architecture that has none"
+    )
+
+    var partial = w
+    partial.v_bias = Tensor.none()
+    failed = False
+    try:
+        partial.check(spec)
+    except:
+        failed = True
+    suite.check(failed, "two of the three is refused as well")
+
+    var wrong = w
+    wrong.q_bias = arena.tensor(_ones(WIDTH - 1), WIDTH - 1, 1)
+    failed = False
+    try:
+        wrong.check(spec)
+    except:
+        failed = True
+    suite.check(failed, "and a bias of the wrong width")
 
     keep(arena)
 

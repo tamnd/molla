@@ -30,6 +30,7 @@ intermediate in, and that is the trade rather than an oversight.
 
 from molla.nn.attention import AttnSpec, attend
 from molla.nn.kernel import (
+    add_bias_at,
     add_into,
     gelu,
     matvec,
@@ -79,6 +80,10 @@ struct BlockSpec(Copyable, ImplicitlyCopyable, Movable):
     var act: Int
     """`ACT_SILU` or `ACT_GELU`."""
 
+    var qkv_bias: Bool
+    """Whether the three attention projections carry a bias. Qwen 2 does and
+    almost nothing since does."""
+
     def __init__(
         out self,
         attn: AttnSpec,
@@ -99,6 +104,7 @@ struct BlockSpec(Copyable, ImplicitlyCopyable, Movable):
         self.eps = eps
         self.gated = True
         self.act = ACT_SILU
+        self.qkv_bias = False
 
     def q_width(self) -> Int:
         return self.attn.heads * self.attn.head_dim
@@ -116,6 +122,9 @@ struct LayerWeights(Copyable, ImplicitlyCopyable, Movable):
     var wk: Tensor
     var wv: Tensor
     var wo: Tensor
+    var q_bias: Tensor
+    var k_bias: Tensor
+    var v_bias: Tensor
     var q_norm: Tensor
     var k_norm: Tensor
     var ffn_norm: Tensor
@@ -133,6 +142,9 @@ struct LayerWeights(Copyable, ImplicitlyCopyable, Movable):
         self.wk = nothing
         self.wv = nothing
         self.wo = nothing
+        self.q_bias = nothing
+        self.k_bias = nothing
+        self.v_bias = nothing
         self.q_norm = nothing
         self.k_norm = nothing
         self.ffn_norm = nothing
@@ -171,6 +183,34 @@ struct LayerWeights(Copyable, ImplicitlyCopyable, Movable):
                 "a layer has one of the query and key norms and not the other"
             )
 
+        # Two sided, the same way the gate projection is. A file that has no
+        # biases for an architecture that wants them is a model missing a
+        # constant vector per head, and a file that has them for one that does
+        # not is a model with an extra one, and both run at full speed and
+        # write noise. Either direction means the table and the file disagree
+        # about what this model is, and that is worth refusing rather than
+        # picking a side.
+        var biases = 0
+        if self.q_bias.present():
+            biases += 1
+        if self.k_bias.present():
+            biases += 1
+        if self.v_bias.present():
+            biases += 1
+        if spec.qkv_bias and biases != 3:
+            raise Error(
+                "this architecture puts a bias on each attention projection"
+                " and the file has "
+                + String(biases)
+                + " of the three"
+            )
+        if not spec.qkv_bias and biases != 0:
+            raise Error(
+                "the file has attention biases and the architecture table says"
+                " this family has none, so one of the two is wrong about what"
+                " this model is"
+            )
+
         _shape(self.attn_norm, spec.width, 1, "attn_norm")
         _shape(self.wq, spec.width, spec.q_width(), "wq")
         _shape(self.wk, spec.width, spec.kv_width(), "wk")
@@ -188,6 +228,10 @@ struct LayerWeights(Copyable, ImplicitlyCopyable, Movable):
         if self.q_norm.present():
             _shape(self.q_norm, spec.attn.head_dim, 1, "q_norm")
             _shape(self.k_norm, spec.attn.head_dim, 1, "k_norm")
+        if spec.qkv_bias:
+            _shape(self.q_bias, spec.q_width(), 1, "q_bias")
+            _shape(self.k_bias, spec.kv_width(), 1, "k_bias")
+            _shape(self.v_bias, spec.kv_width(), 1, "v_bias")
 
 
 def _shape(t: Tensor, cols: Int, rows: Int, name: String) raises:
@@ -287,6 +331,14 @@ def attention_layer(
     # are written, so a temporary would be a copy of a copy.
     matvec_into(w.wk, s.norm.data, 0, keys, at)
     matvec_into(w.wv, s.norm.data, 0, values, at)
+
+    # Qwen 2 biases all three projections. Before the per head norm and before
+    # rope, because the bias is part of the projection and everything after it
+    # is applied to what the projection produced.
+    if spec.qkv_bias:
+        add_bias_at(s.q.data, 0, spec.q_width(), w.q_bias)
+        add_bias_at(keys, at, kv_width, w.k_bias)
+        add_bias_at(values, at, kv_width, w.v_bias)
 
     # Qwen 3 normalises each head of q and k before rotating it. This is before
     # rope rather than after, because rope is a rotation and a rotation of a

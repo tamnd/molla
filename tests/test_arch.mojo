@@ -102,6 +102,11 @@ def test_rows(mut suite: Suite) raises:
         qwen3.qk_norm and not qwen2.qk_norm,
         "and qwen3 norms each head of the query and key where qwen2 does not",
     )
+    suite.check(
+        qwen2.qkv_bias and not qwen3.qkv_bias,
+        "while qwen2 biases the three attention projections and qwen3 does not",
+    )
+    suite.check(not llama.qkv_bias, "and no llama has ever had one")
 
     var gemma2 = arch_of(ARCH_GEMMA2)
     suite.check(
@@ -198,25 +203,42 @@ def test_names(mut suite: Suite) raises:
         "tensor names carry the layer number",
     )
     suite.check(
-        names[1] == "" and names[6] == "" and names[9] == "",
+        names[1] == "" and names[9] == "" and names[12] == "",
         "and a llama has no post norms and no query norms",
     )
     suite.check(
-        names[10] == "blk.7.ffn_gate.weight",
+        names[6] == "" and names[7] == "" and names[8] == "",
+        "and no attention biases either",
+    )
+    suite.check(
+        names[13] == "blk.7.ffn_gate.weight",
         "and it does have a gate projection",
     )
 
     var qwen = tensor_names(arch_of(ARCH_QWEN3), 0)
     suite.check(
-        qwen[6] == "blk.0.attn_q_norm.weight"
-        and qwen[7] == "blk.0.attn_k_norm.weight",
+        qwen[9] == "blk.0.attn_q_norm.weight"
+        and qwen[10] == "blk.0.attn_k_norm.weight",
         "a qwen3 has the two per head norms",
+    )
+    suite.check(qwen[6] == "", "and dropped the biases its predecessor carried")
+
+    var qwen2 = tensor_names(arch_of(ARCH_QWEN2), 0)
+    suite.check(
+        qwen2[6] == "blk.0.attn_q.bias"
+        and qwen2[7] == "blk.0.attn_k.bias"
+        and qwen2[8] == "blk.0.attn_v.bias",
+        "a qwen2 asks for a bias on each of the three projections",
+    )
+    suite.check(
+        qwen2[9] == "",
+        "and has no per head norms, which is the other way round",
     )
 
     var gemma = tensor_names(arch_of(ARCH_GEMMA3), 2)
     suite.check(
         gemma[1] == "blk.2.post_attention_norm.weight"
-        and gemma[9] == "blk.2.post_ffw_norm.weight",
+        and gemma[12] == "blk.2.post_ffw_norm.weight",
         "and a gemma3 has the two post norms",
     )
     suite.check(
