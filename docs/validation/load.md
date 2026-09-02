@@ -43,7 +43,7 @@ Both runs are the same file, `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`, 492073923
 
 The M4 run:
 
-```
+```console
 plan   292 tensors, 4685 MiB, metal Apple M4
 plan   4685 MiB unified, which the device reads from the mapping
 read   10%  397 MiB  2349 MiB/s
@@ -56,7 +56,7 @@ done   292 tensors in 3746 ms
 
 The gpc run:
 
-```
+```console
 plan   292 tensors, 4685 MiB, cuda NVIDIA GeForce RTX 4090
 plan   4685 MiB to the device pool, 0 MiB left on the host, budget 19584 MiB
 read   10%  4685 MiB  36601 MiB/s
@@ -75,7 +75,7 @@ The 486 ms read and the 473 ms copy overlap almost completely, which is why the 
 
 ## Four things that were wrong first
 
-**The device pool freed itself while eight threads were still writing to counters.** This is the same Mojo lifetime hazard documented in `docs/validation/threading.md`, met for the second time. The drain loop ends when the last tensor is popped, which happens before the worker that pushed it has come back around its own loop. The drain loop was the last visible use of the job struct, so Mojo destroyed the job, freed the atomics and the queue inside it, and left live workers incrementing memory the allocator had handed to something else. It surfaced as `index 245249457586176 is out of bounds, valid range is 0 to 5`, which is a claim counter read back as a stale heap pointer, reported a long way from the cause. `molla.sys.mem.keep(job)` after the joins is the fix and there is a comment on it saying why.
+**The job struct freed itself while eight threads were still writing to it.** This is the same Mojo lifetime hazard documented in `docs/validation/threading.md`, met for the second time. The drain loop ends when the last tensor is popped, which happens before the worker that pushed it has come back around its own loop. The drain loop was the last visible use of the job struct, so Mojo destroyed the job, freed the atomics and the queue inside it, and left live workers incrementing memory the allocator had handed to something else. It surfaced as `index 245249457586176 is out of bounds, valid range is 0 to 5`, which is a claim counter read back as a stale heap pointer, reported a long way from the cause. `molla.sys.mem.keep(job)` after the joins is the fix and there is a comment on it saying why.
 
 **max-core refuses to compile on a machine with no GPU.** Three of the five boxes have no accelerator, and the first version of the device pool took `pixi run build` down on all three with `constraint failed: Unknown GPU architecture detected`. The constraint fires when a function is instantiated and not when a struct is declared, so a struct with `DeviceContext` and `DeviceBuffer` fields is fine on a GPU free box as long as nothing calls its `__init__`. Every call into the device path is behind `comptime if has_accelerator()`. This is worth stating plainly: accelerator support is decided when you compile, not when you run, and a molla binary built on a CPU only box has no device code in it.
 
@@ -97,7 +97,7 @@ The repack is not built. The issue asks for GGML block layout to be rewritten in
 
 ## Reproducing
 
-```
+```console
 pixi run build
 ./build/molla devices
 ./build/molla load ~/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
