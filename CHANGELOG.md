@@ -2,6 +2,15 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `molla.nn.repack`, a planar weight layout and a transform into it from all eight quantized ggml types. A row becomes its int8 quants followed by float32 planes of scale, and a value is `dscale[g] * q[i] + mscale[g]`. Centring folds into the byte and a block minimum folds into a sign, so q4_0, q5_0, q6_k and q8_0 have no offset plane at all. A repacked row decodes to bit for bit the same float32 values as the blocks it came from, which the tests assert with no tolerance.
+- `molla.model.repack`, a cache file beside the model holding the repacked weights. It is keyed on a digest of the model header, its directory and its length, plus the layout version and the target, and any of those changing is a miss rather than a wrong answer. The file is written under a temporary name and renamed, so a load that dies halfway leaves nothing to find, and deleting the cache costs one slow load and nothing else. See [docs/validation/repack.md](docs/validation/repack.md).
+- The repack runs on the transfer pool the load already has, between the page touching loop and the ready queue push, so it reads the bytes a worker has just faulted in rather than reading the file a second time. A repack that fails records its errno, the load carries on, and the half written cache is thrown away.
+- A hit and a miss are both reported. `molla load` says which it got and why, and `molla generate` and `molla serve` bind to the cache when there is one. A repack that silently reruns on every load is the thing the cache exists to prevent, and the only way to notice it is to be told.
+
 ## [0.2.9] - 2026-09-02
 
 The model is behind a socket.

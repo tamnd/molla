@@ -91,9 +91,13 @@ The transfer pool runs against a real file on real threads and what it checks is
 
 There is no device copy in the suite. The copy needs an accelerator and three of the five machines do not have one, so the numbers above are what proves that half.
 
-## What is not here
+## The repack rides along on this pool
 
-The repack is not built. The issue asks for GGML block layout to be rewritten into the layout a kernel wants, once at load, cached on disk. That is split into #120 and blocked on #26, because a repack needs a destination layout and no kernel has defined one yet. Writing a cache format now would mean guessing at the layout, and a stale cache that silently returns weights in last week's layout is worse than no cache: it produces a model that loads fine and answers badly.
+The fifth thing #25 asked for was that the ggml block layout is rewritten once at load into the layout a kernel wants, cached on disk. That was split into #120 and held until #26 had defined a destination, since writing a cache format against a layout nobody had chosen yet would have meant a cache that loads fine and answers badly the first time the layout moved.
+
+It landed on this pool rather than beside it. A worker that has just faulted a tensor's pages in is holding the warmest copy of those bytes there will ever be, so that is the moment to transform them, and the alternative of a second pass after the load reads four gigabytes twice. What a worker does with the result is one `pwrite` per few megabytes at an offset decided before any thread started, so the repack adds no coordination between workers and none with the drain thread. A repack that fails records an errno in one atomic slot, the load finishes normally, and the half written cache is thrown away.
+
+That is why there is a fourth stage in `stage_name` and a `repack` line in the report. See [repack.md](repack.md) for the layout, the cache key and the eight ways a cache is refused.
 
 ## Reproducing
 
