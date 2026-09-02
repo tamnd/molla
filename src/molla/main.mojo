@@ -9,6 +9,7 @@ from std.sys import argv, exit
 
 from molla.build_info import MOJO_PIN, VERSION
 from molla.engine.generate import run_generate
+from molla.engine.sample import SamplerConfig
 from molla.host import detect
 from molla.http.server import run_http
 from molla.jinja.bench import run_template
@@ -97,6 +98,14 @@ def print_usage():
     print(
         "  generate <model> <tokenizer.json> <prompt> [n] [ctx]  generate text"
     )
+    print(
+        "                  sampling: --temp --top-k --top-p --min-p --typical"
+    )
+    print(
+        "                  --repeat-penalty --frequency-penalty"
+        " --presence-penalty"
+    )
+    print("                  --repeat-last-n --seed, and no flags means greedy")
     print("  devices         list what this machine can put a tensor on")
     print("  config get [key] print a setting and where its value came from")
     print("  tls <host>      connect over TLS and print what was negotiated")
@@ -162,6 +171,61 @@ def run_config(args: List[String]):
     print(describe_setting(config.get(key)))
     if len(problems) > 0:
         exit(1)
+
+
+def _flag_float(key: String, text: String) raises -> Float32:
+    try:
+        return Float32(Float64(text))
+    except:
+        raise Error("--" + key + " wants a number and got '" + text + "'")
+
+
+def _flag_int(key: String, text: String) raises -> Int:
+    try:
+        return atol(text)
+    except:
+        raise Error("--" + key + " wants a whole number and got '" + text + "'")
+
+
+def sampling_flag(mut config: SamplerConfig, arg: String) raises -> Bool:
+    """One `--name=value` sampling flag, or False when it is not one.
+
+    The same long form with an equals sign the configuration flags use, so
+    there is one shape of flag in the binary rather than two. A space separated
+    form needs a table of which flags take a value, and that table is what goes
+    stale.
+    """
+    if not arg.startswith("--"):
+        return False
+    var body = arg[byte = 2 : arg.byte_length()]
+    var eq = body.find("=")
+    if eq < 0:
+        return False
+    var key = String(body[byte=0:eq].strip())
+    var val = String(body[byte = eq + 1 : body.byte_length()].strip())
+    if key == "temp":
+        config.temperature = _flag_float(key, val)
+    elif key == "top-k":
+        config.top_k = _flag_int(key, val)
+    elif key == "top-p":
+        config.top_p = _flag_float(key, val)
+    elif key == "min-p":
+        config.min_p = _flag_float(key, val)
+    elif key == "typical":
+        config.typical_p = _flag_float(key, val)
+    elif key == "repeat-penalty":
+        config.repeat_penalty = _flag_float(key, val)
+    elif key == "frequency-penalty":
+        config.frequency_penalty = _flag_float(key, val)
+    elif key == "presence-penalty":
+        config.presence_penalty = _flag_float(key, val)
+    elif key == "repeat-last-n":
+        config.repeat_last_n = _flag_int(key, val)
+    elif key == "seed":
+        config.seed = UInt64(_flag_int(key, val))
+    else:
+        return False
+    return True
 
 
 def main():
@@ -389,12 +453,31 @@ def main():
             exit(2)
         var limit = 0
         var context = 0
+        var sampling = SamplerConfig()
         try:
-            if len(args) > 5:
-                limit = atol(args[5])
-            if len(args) > 6:
-                context = atol(args[6])
-            run_generate(args[2], args[3], args[4], limit, context)
+            # The two numbers stay positional and the sampling settings are
+            # named, in either order. Nobody is going to remember a ninth
+            # position, and the two that were already there are in scripts.
+            var positional = 0
+            for i in range(5, len(args)):
+                if sampling_flag(sampling, args[i]):
+                    continue
+                if args[i].startswith("--"):
+                    raise Error(
+                        String("'") + args[i] + "' is not a flag this takes"
+                    )
+                if positional == 0:
+                    limit = atol(args[i])
+                elif positional == 1:
+                    context = atol(args[i])
+                else:
+                    raise Error(
+                        String("'")
+                        + args[i]
+                        + "' is one argument more than this takes"
+                    )
+                positional += 1
+            run_generate(args[2], args[3], args[4], limit, context, sampling)
         except e:
             print("molla generate:", e)
             exit(1)

@@ -60,7 +60,7 @@ That greedy decoding gives the same answer twice, which is the cheapest statemen
 
 ## What this is not
 
-There is no sampling. `pick` is the argmax, which is a sampler with the temperature at zero, and it is here rather than in a sampler module because a decode loop with nothing choosing the next token cannot be run at all. Temperature, top-k, top-p, min-p, penalties and seeds are #28.
+The token is chosen by a `Sampler`, which the caller owns and the session is handed. Temperature, top-k, top-p, min-p, typical, the penalties and the seed are #28 and are in [sampling.md](sampling.md). The default is greedy, so everything written above still describes what `molla generate` does when nobody passes a flag.
 
 There is no chat template applied and no server. `molla generate` takes raw text and prints raw text, so a prompt that should have been wrapped in an instruction template is not. That is #29.
 

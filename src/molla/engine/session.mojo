@@ -21,15 +21,18 @@ whole prompt at once is a different kernel and not a different loop, and it is
 worth having only once there is something to measure it against. What this
 gives is correct tokens, which is what the milestone asks for.
 
-Sampling is #28. This picks the argmax, which is a sampler with the temperature
-at zero and no state, and it is here rather than in a sampler module because a
-decode loop with nothing choosing the next token cannot be run at all.
+The token is chosen by a `Sampler`, which the caller owns rather than the
+session. A sampler carries the recent window the penalties look at and the draw
+counter the randomness comes from, and both of those belong to the request that
+asked for them: two requests against the same weights want their own settings
+and their own seed, and a session that made its own sampler would be handing
+every caller the same one.
 """
 
 from molla.engine.bind import Bound
 from molla.engine.cache import KvCache
+from molla.engine.sample import Sampler
 from molla.nn.block import Scratch
-from molla.nn.kernel import argmax
 from molla.nn.model import forward, frequency_factors
 from molla.nn.tensor import Buffer
 
@@ -126,16 +129,14 @@ struct Session(Movable):
         for i in range(len(tokens)):
             self.step(b, tokens[i])
 
-    def pick(self) raises -> Int:
-        """The greedy token, from the logits the last step left."""
-        var at = argmax(self.logits.data, 0, self.logits.elements())
-        if at < 0:
-            raise Error("there are no logits to pick from yet")
-        return at
+    def pick(mut self, mut sampler: Sampler) raises -> Int:
+        """One token, from the logits the last step left."""
+        return sampler.pick(self.logits)
 
     def generate(
         mut self,
         b: Bound,
+        mut sampler: Sampler,
         prompt: List[Int],
         limit: Int,
         stop: Int = -1,
@@ -146,14 +147,21 @@ struct Session(Movable):
         included in what comes back. A caller that wants to see it can compare
         the length against the limit, and a caller that wants to keep going can
         pass a stop of minus one.
+
+        The prompt goes into the sampler as well as into the model. The
+        penalties are meant to see the whole text and not only the part this
+        run wrote, so a prompt that already repeats a phrase counts against
+        repeating it again.
         """
         if limit < 0:
             raise Error("cannot generate a negative number of tokens")
         self.cache.reserve(len(prompt) + limit)
+        for i in range(len(prompt)):
+            sampler.observe(prompt[i])
         self.prefill(b, prompt)
         var out = List[Int]()
         for _ in range(limit):
-            var next = self.pick()
+            var next = self.pick(sampler)
             if next == stop:
                 break
             out.append(next)
