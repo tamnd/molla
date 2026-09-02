@@ -45,6 +45,7 @@ from molla.nn.quant import (
     f32_at,
     supported,
 )
+from molla.nn.repack import LAYOUT_PLANAR, planar_row_dot, unpack_run
 from molla.nn.tensor import Buffer, Tensor
 from molla.sys.mmap import RawPtr
 
@@ -336,6 +337,15 @@ def matvec(w: Tensor, x: Buffer, mut out: Buffer) raises:
         )
     var stride = w.row_bytes()
     var p = w.base()
+    if w.layout == LAYOUT_PLANAR:
+        # Hoisted rather than tested per row. A weight is one layout for its
+        # whole life, so the branch belongs outside the loop that runs once per
+        # output and not inside it.
+        for r in range(w.rows):
+            out.data[r] = planar_row_dot(
+                w.kind, p, r * stride, x.data, 0, w.cols
+            )
+        return
     for r in range(w.rows):
         out.data[r] = row_dot(w.kind, p, r * stride, x.data, 0, w.cols)
 
@@ -377,6 +387,12 @@ def matvec_into(
         )
     var stride = w.row_bytes()
     var p = w.base()
+    if w.layout == LAYOUT_PLANAR:
+        for r in range(w.rows):
+            out[at_out + r] = planar_row_dot(
+                w.kind, p, r * stride, x, at_in, w.cols
+            )
+        return
     for r in range(w.rows):
         out[at_out + r] = row_dot(w.kind, p, r * stride, x, at_in, w.cols)
 
@@ -408,7 +424,7 @@ def rms_norm_at(
     var scale = Float32(1.0 / sqrt(sum / Float64(n) + Float64(eps)))
 
     var g = Buffer(n)
-    dequant_run(gain.kind, gain.base(), 0, n, g.data, 0)
+    unpack_run(gain.kind, gain.layout, gain.base(), 0, n, g.data, 0)
     for i in range(n):
         x[at + i] = x[at + i] * scale * g.data[i]
 
@@ -446,7 +462,7 @@ def rms_norm(mut out: Buffer, x: Buffer, gain: Tensor, eps: Float32) raises:
     # `base()` already points at the first byte of the tensor, so the offset
     # into it is zero. Passing the address again reads the weight from the
     # weight's own address squared, which is a segfault on a good day.
-    dequant_run(gain.kind, gain.base(), 0, n, g.data, 0)
+    unpack_run(gain.kind, gain.layout, gain.base(), 0, n, g.data, 0)
     for i in range(n):
         out.data[i] = x.data[i] * scale * g.data[i]
 
@@ -534,7 +550,7 @@ def add_bias_at(mut x: List[Float32], at: Int, n: Int, bias: Tensor) raises:
             + String(bias.elements())
         )
     var b = Buffer(n)
-    dequant_run(bias.kind, bias.base(), 0, n, b.data, 0)
+    unpack_run(bias.kind, bias.layout, bias.base(), 0, n, b.data, 0)
     for i in range(n):
         x[at + i] += b.data[i]
 

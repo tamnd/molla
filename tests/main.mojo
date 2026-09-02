@@ -9,6 +9,7 @@ from harness import Suite, finish
 
 import test_allocs
 import test_api
+import test_cache
 import test_client
 import test_concurrency
 import test_dns
@@ -21,6 +22,7 @@ import test_block
 import test_engine
 import test_kernel
 import test_nnmodel
+import test_repack
 import test_rope
 import test_sample
 import test_tensor
@@ -79,6 +81,14 @@ def main():
         test_kernel.run(suite)
     except e:
         suite.fail("test_kernel", String(e))
+    try:
+        test_repack.run(suite)
+    except e:
+        suite.fail("test_repack", String(e))
+    try:
+        test_cache.run(suite)
+    except e:
+        suite.fail("test_cache", String(e))
     try:
         test_rope.run(suite)
     except e:

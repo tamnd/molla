@@ -28,11 +28,15 @@ rather than one per tensor, because a few hundred separate allocations on a card
 fragment the address space and cost a driver round trip each, and because the
 engine wants one base pointer and a table of offsets.
 
-What is not here is the repack. The issue asks for the GGML block layout to be
-rewritten into the layout a kernel wants and cached on disk, and there is no
-kernel yet, so there is no layout to rewrite into. Guessing one now would mean
-writing a cache keyed on a format that the first real kernel changes. That half
-is #120 and it is blocked on #26.
+The repack rides along on the same threads. A worker that has just faulted a
+tensor's pages in is holding the warmest copy of those bytes that will ever
+exist, so if a repack is wanted that is the moment to do it, and the layout
+transform costs the arithmetic rather than the memory traffic. The alternative,
+a second pass after the load, reads four gigabytes twice. What a worker does
+with the result is one `pwrite` per few megabytes into a temporary file at an
+offset that was decided before any thread started, so the workers never talk to
+each other and never talk to this thread. See `molla.model.repack` for the cache
+that comes out of it and for what makes one safe to reuse.
 
 Two things about the numbers that took a machine to find out. Free memory
 reported by a device is not usable as a budget, because under WSL2 a 4090
@@ -49,6 +53,20 @@ from std.sys.info import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext
 
 from molla.model.gguf import Gguf
+from molla.model.repack import (
+    RepackPlan,
+    SCRATCH_BYTES,
+    abandon_cache,
+    cache_path,
+    commit_cache,
+    model_key,
+    open_cache,
+    open_cache_file,
+    plan_repack,
+    repack_tensor,
+    temp_path,
+    write_head,
+)
 from molla.model.spec import tensor_bytes
 from molla.sys.atomic import AtomicBlock
 from molla.sys.clock import monotonic_ms
@@ -77,7 +95,8 @@ comptime WHERE_DEVICE = 2
 comptime STAGE_PLAN = 0
 comptime STAGE_READ = 1
 comptime STAGE_COPY = 2
-comptime STAGE_DONE = 3
+comptime STAGE_REPACK = 3
+comptime STAGE_DONE = 4
 
 comptime SLOT_ALIGN = 256
 """Device buffers want their offsets aligned. 256 is the coarsest alignment any
@@ -106,6 +125,8 @@ def stage_name(stage: Int) -> String:
         return String("read")
     if stage == STAGE_COPY:
         return String("copy")
+    if stage == STAGE_REPACK:
+        return String("repack")
     return String("done")
 
 
@@ -264,7 +285,25 @@ comptime SLOT_SINK = 2
 """Where the touched bytes are added up, so the loop cannot be optimised away.
 Nothing reads it for meaning."""
 
-comptime SLOT_COUNT = 3
+comptime SLOT_REPACK_ERR = 3
+"""The first errno a repack worker hit, or zero. One slot for all of them,
+because the answer to any of them is the same: abandon the cache and load
+without one, and say which errno it was."""
+
+comptime SLOT_COUNT = 4
+
+
+@fieldwise_init
+struct WorkerArg(Copyable, ImplicitlyCopyable, Movable):
+    """What one transfer thread is handed.
+
+    The job and which worker this is, and the second one only exists because a
+    repack needs a scratch buffer it does not share. A thread entry point takes
+    one integer, so the two travel as the address of one of these.
+    """
+
+    var job: Int
+    var index: Int
 
 
 struct LoadJob(Movable):
@@ -285,6 +324,28 @@ struct LoadJob(Movable):
     var cursor: AtomicBlock
     var ready: MpscQueue
 
+    var repack_fd: Int
+    """The cache being written, or -1 when this load is not repacking."""
+
+    var repack_kind: List[Int]
+    """Per tensor, the ggml type to repack it as, or -1 to leave it alone. One
+    entry per placement rather than a list of the repacked ones, so a worker
+    that has claimed tensor `i` needs no search to find out what to do with
+    it."""
+
+    var repack_cols: List[Int]
+    var repack_rows: List[Int]
+    var repack_off: List[Int]
+    var scratch: List[Int]
+    """One buffer address per worker, allocated before any thread starts."""
+
+    var scratch_hold: List[List[UInt8]]
+    """What those addresses point into. Held here so the buffers outlive the
+    threads reading them, which a list of raw addresses cannot say on its
+    own."""
+
+    var scratch_bytes: Int
+
     def __init__(out self, mut plan: Plan, base: Int) raises:
         self.base = base
         self.page = page_size()
@@ -298,21 +359,81 @@ struct LoadJob(Movable):
         self.ready = MpscQueue(round_up_pow2(self.count + 2))
         if not self.cursor.is_valid() or not self.ready.is_valid():
             raise Error("could not allocate the transfer queue")
+        self.repack_fd = -1
+        self.repack_kind = List[Int]()
+        self.repack_cols = List[Int]()
+        self.repack_rows = List[Int]()
+        self.repack_off = List[Int]()
+        self.scratch = List[Int]()
+        self.scratch_hold = List[List[UInt8]]()
+        self.scratch_bytes = 0
+
+    def attach_repack(mut self, rp: RepackPlan, fd: Int, workers: Int) raises:
+        """Say that the workers should also repack, and give them room to.
+
+        The per tensor arrays are indexed by placement, which is directory
+        order, which is what a worker has after it claims one. The scratch is
+        allocated here, on this thread, before anything is spawned, because a
+        transfer worker reaches everything it touches through a raw address and
+        allocating inside one is the kind of thing that works until the day two
+        of them do it at once.
+        """
+        self.repack_fd = fd
+        self.scratch_bytes = SCRATCH_BYTES
+        for _ in range(self.count):
+            self.repack_kind.append(-1)
+            self.repack_cols.append(0)
+            self.repack_rows.append(0)
+            self.repack_off.append(0)
+        for j in range(rp.count()):
+            var i = rp.index[j]
+            if i < 0 or i >= self.count:
+                continue
+            self.repack_kind[i] = rp.kind[j]
+            self.repack_cols[i] = rp.cols[j]
+            self.repack_rows[i] = rp.rows[j]
+            self.repack_off[i] = rp.dst_off[j]
+        for _ in range(workers):
+            var one = List[UInt8](capacity=self.scratch_bytes)
+            for _ in range(self.scratch_bytes):
+                one.append(0)
+            self.scratch_hold.append(one^)
+        for k in range(workers):
+            self.scratch.append(Int(self.scratch_hold[k].unsafe_ptr()))
+
+    def repacking(self) -> Bool:
+        return self.repack_fd >= 0
 
 
 def _transfer(arg: Int) abi("C") -> Int:
-    """One transfer thread. Claims tensors and faults their pages in.
+    """One transfer thread. Claims tensors, faults their pages in, repacks.
 
     The touch loop is what actually reads the file. `madvise` starts the reads
     and the loop waits for them, one byte per page, and the byte goes into a
     running sum that is stored at the end so nothing can decide the loop has no
     effect and delete it.
+
+    The repack happens between the touch and the push, which is the whole reason
+    it is here rather than in a pass of its own. The pages this tensor lives in
+    were pulled in a microsecond ago by this thread, so the transform reads them
+    out of cache. Doing it after the load instead would mean reading the model a
+    second time from a page cache that a four gigabyte load has already put
+    under pressure.
+
+    A repack that fails does not fail the load. The errno goes in a slot, this
+    thread carries on faulting pages, and the caller throws the half written
+    cache away and runs on the ggml layout. That is the correct order of
+    priorities: a model that loads slowly is a model that loads.
     """
-    var job = Pointer[LoadJob, MutAnyOrigin](unsafe_from_address=arg)
+    var me = Pointer[WorkerArg, MutAnyOrigin](unsafe_from_address=arg)
+    var job = Pointer[LoadJob, MutAnyOrigin](unsafe_from_address=me[].job)
+    var slot = me[].index
     _ = set_thread_name("molla-load")
     var next = job[].cursor.slot(SLOT_NEXT)
     var warmed = job[].cursor.slot(SLOT_BYTES)
+    var failed = job[].cursor.slot(SLOT_REPACK_ERR)
     var page = job[].page
+    var repacking = job[].repack_fd >= 0 and slot < len(job[].scratch)
     var sink = UInt64(0)
     while True:
         var i = next.add(1)
@@ -329,6 +450,20 @@ def _transfer(arg: Int) abi("C") -> Int:
         if length > 0:
             sink += UInt64(p.unsafe_load(length - 1))
         _ = warmed.add(length)
+        if repacking and job[].repack_kind[i] >= 0 and failed.load() == 0:
+            var rc = repack_tensor(
+                job[].base,
+                job[].offsets[i],
+                job[].repack_kind[i],
+                job[].repack_cols[i],
+                job[].repack_rows[i],
+                job[].repack_fd,
+                job[].repack_off[i],
+                job[].scratch[slot],
+                job[].scratch_bytes,
+            )
+            if rc != 0:
+                _ = failed.add(rc if rc > 0 else 1)
         while not job[].ready.push(i):
             _ = sleep_ms(1)
     _ = job[].cursor.slot(SLOT_SINK).add(Int(sink & 0xFFFF))
@@ -389,6 +524,16 @@ struct LoadReport(Copyable, ImplicitlyCopyable, Movable):
     var device: String
     var left_behind: Int
 
+    var repacked: Int
+    """Tensors written into the repack cache on this load. Zero on a hit and
+    zero when there is no cache, and the note says which."""
+
+    var repack_bytes: Int
+    var repack_note: String
+    """What happened to the cache, in one line. Always said out loud, because a
+    repack that silently reruns on every load is the thing the cache exists to
+    prevent and the only way to notice it is to be told."""
+
     def read_mib_s(self) -> Int:
         if self.read_ms <= 0:
             return 0
@@ -444,7 +589,11 @@ def worker_count(requested: Int) -> Int:
 
 
 def load(
-    g: Gguf, var plan: Plan, workers: Int = 0, stream: Bool = True
+    g: Gguf,
+    var plan: Plan,
+    workers: Int = 0,
+    stream: Bool = True,
+    repack_for: StringSpan = "",
 ) raises -> Weights:
     """Run the plan. Reads on a thread pool, copies on this thread.
 
@@ -458,6 +607,12 @@ def load(
     Progress goes out during the load and not after it, in tenths, because a
     load that takes thirty seconds and says nothing is indistinguishable from a
     hang and gets killed by someone who was right to kill it.
+
+    `repack_for` is the model's own path and turns the repack on. Empty means
+    the caller either found a usable cache already or does not want one, and
+    this function does not go looking: deciding whether a cache is worth
+    trusting needs the model key, and the caller has already computed it to ask
+    that question.
     """
     var started = monotonic_ms()
     var count = plan.count()
@@ -487,7 +642,36 @@ def load(
         total_ms=0,
         device=plan.device.name,
         left_behind=plan.left_behind,
+        repacked=0,
+        repack_bytes=0,
+        repack_note=String("nothing was repacked on this load"),
     )
+
+    var temp = String("")
+    var final = String("")
+    if repack_for.byte_length() > 0:
+        var rp = plan_repack(g)
+        if rp.count() == 0:
+            report.repack_note = String(
+                "nothing in this file has a repacked form"
+            )
+        else:
+            temp = temp_path(repack_for)
+            final = cache_path(repack_for)
+            try:
+                var fd = open_cache_file(temp)
+                write_head(fd, rp)
+                job.attach_repack(rp, fd, threads)
+                report.repacked = rp.count()
+                report.repack_bytes = rp.total
+            except e:
+                # A model directory that cannot be written to is a normal thing
+                # to run against and not a reason to refuse to load, so this
+                # says what happened and carries on without a cache.
+                temp = String("")
+                report.repacked = 0
+                report.repack_note = String("no cache written: ") + String(e)
+
     var out = Weights(plan^, report)
 
     comptime if has_accelerator():
@@ -497,9 +681,15 @@ def load(
     var read_started = monotonic_ms()
     var pool_threads = List[Thread]()
     var entry: ThreadFunc = _transfer
-    for _ in range(threads):
+    # Filled before any address is taken. Appending to a list moves what is
+    # already in it, so a thread started against element zero and then handed
+    # a grown list is a thread reading freed memory.
+    var args = List[WorkerArg](capacity=threads)
+    for k in range(threads):
+        args.append(WorkerArg(Int(Pointer(to=job)), k))
+    for k in range(threads):
         var one = Thread()
-        var rc = spawn(entry, Int(Pointer(to=job)), one)
+        var rc = spawn(entry, Int(Pointer(to=args[k])), one)
         if not rc.is_ok():
             raise Error(rc.describe("could not start a transfer thread"))
         pool_threads.append(one^)
@@ -537,10 +727,36 @@ def load(
     # its last use and handing out an address is not a use it can see, so
     # without this the queue and the counters are freed while a live thread is
     # still incrementing them. It shows up as a claim index that is a stale heap
-    # pointer, which is a bounds error a long way from the cause.
+    # pointer, which is a bounds error a long way from the cause. The worker
+    # arguments are held for the same reason and the scratch buffers ride along
+    # inside the job.
     out.report.warmed_bytes = job.cursor.slot(SLOT_BYTES).load()
-    keep(job)
     out.report.read_ms = monotonic_ms() - read_started
+
+    if temp.byte_length() > 0:
+        var failed = job.cursor.slot(SLOT_REPACK_ERR).load()
+        if failed != 0:
+            abandon_cache(job.repack_fd, temp)
+            out.report.repacked = 0
+            out.report.repack_bytes = 0
+            out.report.repack_note = String(
+                "the repack failed and was thrown away, errno "
+            ) + String(failed)
+        else:
+            try:
+                commit_cache(job.repack_fd, temp, final)
+                out.report.repack_note = (
+                    String("repack cache written to ") + final
+                )
+            except e:
+                out.report.repacked = 0
+                out.report.repack_bytes = 0
+                out.report.repack_note = String("no cache written: ") + String(
+                    e
+                )
+        job.repack_fd = -1
+    keep(job)
+    keep(args)
 
     comptime if has_accelerator():
         if out.pool:
@@ -652,6 +868,18 @@ def _report_done(report: LoadReport):
             stage_name(STAGE_COPY)
             + "   nothing to copy, the weights are read where they lie"
         )
+    if report.repacked > 0:
+        print(
+            stage_name(STAGE_REPACK)
+            + " "
+            + String(report.repacked)
+            + " tensors, "
+            + _mib(report.repack_bytes)
+            + ", "
+            + report.repack_note
+        )
+    else:
+        print(stage_name(STAGE_REPACK) + " " + report.repack_note)
     print(
         stage_name(STAGE_DONE)
         + "   "
@@ -662,11 +890,34 @@ def _report_done(report: LoadReport):
     )
 
 
-def run_load(path: StringSpan, workers: Int = 0) raises:
-    """Entry point for `molla load` on a GGUF file."""
+def run_load(path: StringSpan, workers: Int = 0, repack: Bool = True) raises:
+    """Entry point for `molla load` on a GGUF file.
+
+    Reports a hit or a miss either way. A load that already has a cache says so
+    and does not write one, and a load that does not says why, so the question
+    of whether the repack is being redone every time has an answer on the
+    screen rather than in a stopwatch.
+    """
     var g = Gguf(path)
     var dev = default_device()
     var plan = plan_load(g, dev, -1)
-    var weights = load(g, plan^, workers, True)
+
+    var want = String("")
+    var cache = open_cache(path, model_key(g))
+    if cache.usable:
+        print(
+            stage_name(STAGE_REPACK)
+            + " hit, "
+            + String(cache.count())
+            + " tensors, "
+            + _mib(cache.bytes())
+            + " already repacked"
+        )
+    elif repack:
+        print(stage_name(STAGE_REPACK) + " miss, " + cache.reason)
+        want = String(path)
+
+    var weights = load(g, plan^, workers, True, want)
     _ = weights.report.tensors
+    cache.close()
     g.close()

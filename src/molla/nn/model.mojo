@@ -22,7 +22,7 @@ from std.math import sqrt, tanh
 from molla.nn.arch import Arch
 from molla.nn.block import BlockSpec, LayerWeights, Scratch, layer
 from molla.nn.kernel import matvec, rms_norm
-from molla.nn.quant import dequant_run
+from molla.nn.repack import unpack_run
 from molla.nn.tensor import Buffer, Tensor
 
 
@@ -118,8 +118,14 @@ def embed(w: ModelWeights, a: Arch, token: Int, mut out: Buffer) raises:
     if out.elements() != w.embedding.cols:
         raise Error("the residual stream is not the width of the embedding")
     var at = token * w.embedding.row_bytes()
-    dequant_run(
-        w.embedding.kind, w.embedding.base(), at, out.elements(), out.data, 0
+    unpack_run(
+        w.embedding.kind,
+        w.embedding.layout,
+        w.embedding.base(),
+        at,
+        out.elements(),
+        out.data,
+        0,
     )
     if a.scale_embedding:
         var by = Float32(sqrt(Float64(out.elements())))
@@ -157,7 +163,15 @@ def frequency_factors(w: ModelWeights) raises -> List[Float32]:
     var n = w.rope_freqs.elements()
     for _ in range(n):
         out.append(0.0)
-    dequant_run(w.rope_freqs.kind, w.rope_freqs.base(), 0, n, out, 0)
+    unpack_run(
+        w.rope_freqs.kind,
+        w.rope_freqs.layout,
+        w.rope_freqs.base(),
+        0,
+        n,
+        out,
+        0,
+    )
     return out^
 
 
