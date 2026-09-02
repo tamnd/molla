@@ -21,6 +21,7 @@ import test_engine
 import test_kernel
 import test_nnmodel
 import test_rope
+import test_sample
 import test_tensor
 import test_host
 import test_http
@@ -101,6 +102,10 @@ def main():
         test_engine.run(suite)
     except e:
         suite.fail("test_engine", String(e))
+    try:
+        test_sample.run(suite)
+    except e:
+        suite.fail("test_sample", String(e))
     try:
         test_dns.run(suite)
     except e:

@@ -15,6 +15,7 @@ from harness import Suite
 
 from molla.engine.bind import Bound
 from molla.engine.cache import KvCache
+from molla.engine.sample import Sampler, SamplerConfig
 from molla.engine.session import Session
 from molla.model.spec import ARCH_LLAMA, Geometry
 from molla.nn.arch import arch_of
@@ -328,8 +329,9 @@ def test_generate(mut suite: Suite) raises:
     var prompt = List[Int]()
     prompt.append(1)
 
+    var greedy = Sampler(SamplerConfig(), VOCAB)
     var s = Session(b, 16)
-    var out = s.generate(b, prompt, 4)
+    var out = s.generate(b, greedy, prompt, 4)
     suite.check(len(out) == 4, "four tokens asked for and four came back")
     for i in range(len(out)):
         suite.check(
@@ -341,16 +343,18 @@ def test_generate(mut suite: Suite) raises:
         "the prompt and the continuation are both in the cache",
     )
 
+    var second = Sampler(SamplerConfig(), VOCAB)
     var again = Session(b, 16)
-    var repeat = again.generate(b, prompt, 4)
+    var repeat = again.generate(b, second, prompt, 4)
     var same = len(repeat) == len(out)
     for i in range(len(out)):
         if repeat[i] != out[i]:
             same = False
     suite.check(same, "greedy decoding gives the same answer twice")
 
+    var third = Sampler(SamplerConfig(), VOCAB)
     var stopped = Session(b, 16)
-    var early = stopped.generate(b, prompt, 4, out[0])
+    var early = stopped.generate(b, third, prompt, 4, out[0])
     suite.check(
         len(early) == 0,
         "a stop token that is the first thing picked ends it at once",

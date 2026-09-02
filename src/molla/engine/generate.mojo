@@ -19,6 +19,7 @@ errand of the decode loop is how a tokenizer ends up with no oracle behind it.
 """
 
 from molla.engine.bind import bind
+from molla.engine.sample import Sampler, SamplerConfig
 from molla.engine.session import Session as Decode
 from molla.model.gguf import Gguf
 from molla.model.load import load, plan_load
@@ -39,12 +40,37 @@ allocating what the file allows would be gigabytes for a prompt of nine
 words."""
 
 
+def describe(c: SamplerConfig) -> String:
+    """What the sampler was asked for, in one line.
+
+    Printed with the model and the context because a run that reads oddly is
+    the first thing anybody argues about, and the argument is shorter when the
+    settings that produced it are in the same output as the text.
+    """
+    if c.greedy():
+        return String("greedy")
+    var out = String("temp ") + String(c.temperature)
+    if c.top_k > 0:
+        out += ", top-k " + String(c.top_k)
+    if c.top_p < 1.0:
+        out += ", top-p " + String(c.top_p)
+    if c.min_p > 0:
+        out += ", min-p " + String(c.min_p)
+    if c.typical_p < 1.0:
+        out += ", typical " + String(c.typical_p)
+    if c.penalizing():
+        out += ", penalties over " + String(c.repeat_last_n)
+    out += ", seed " + String(c.seed)
+    return out
+
+
 def run_generate(
     model_path: String,
     tokenizer_path: String,
     prompt: String,
     limit: Int,
     context: Int,
+    sampling: SamplerConfig = SamplerConfig(),
 ) raises:
     """Load, prefill, decode, and print as it goes.
 
@@ -53,7 +79,17 @@ def run_generate(
     character can be spread across three of them, so decoding them one at a
     time prints a replacement character in the middle of any word the tokenizer
     split somewhere unexpected.
+
+    The default sampling is greedy, so running this with no flags gives the
+    same tokens every time and a run that reads badly is the model or the
+    kernels rather than a draw that went somewhere unlikely.
     """
+    # Before the file is opened. The sampler checks its own settings when it is
+    # built, but that happens after the weights are mapped, and telling
+    # somebody their top-p is out of range only once an 8B has finished loading
+    # is a slow way to report a typo.
+    sampling.check()
+
     var started = monotonic_ms()
     var g = Gguf(model_path)
     var dev = default_device()
@@ -92,6 +128,9 @@ def run_generate(
         take = want - len(ids)
 
     var decode = Decode(b, want)
+    var sampler = Sampler(sampling, b.vocab())
+    for i in range(len(ids)):
+        sampler.observe(ids[i])
     print(
         "model:    ",
         g.architecture(),
@@ -108,6 +147,7 @@ def run_generate(
         "MiB of cache",
     )
     print("prompt:   ", len(ids), "tokens")
+    print("sampling: ", describe(sampling))
     print("load:     ", loaded - started, "ms")
     print()
 
@@ -118,7 +158,7 @@ def run_generate(
     var stream = DecodeStream(True)
     var written = 0
     for _ in range(take):
-        var next = decode.pick()
+        var next = decode.pick(sampler)
         if next == eos:
             break
         print(stream.step(tokenizer, next), end="")
