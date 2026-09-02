@@ -345,5 +345,40 @@ def rotate_heads(
             + " values but the buffer holds "
             + String(x.elements())
         )
+    rotate_run(spec, x.data, 0, heads, head_dim, pos, factors, use_factors)
+
+
+def rotate_run(
+    spec: RopeSpec,
+    mut x: List[Float32],
+    at: Int,
+    heads: Int,
+    head_dim: Int,
+    pos: Int,
+    factors: List[Float32],
+    use_factors: Bool,
+) raises:
+    """`rotate_heads` starting at an offset into a plain list.
+
+    Which is what a key cache is: one long list per layer with a token's heads
+    laid end to end at `slot * kv_heads * head_dim`. A key is rotated once,
+    where it is, on the way in, rather than every time it is read.
+    """
+    if head_dim < spec.dim:
+        raise Error(
+            "a rotary dimension of "
+            + String(spec.dim)
+            + " does not fit in a head of "
+            + String(head_dim)
+        )
+    if at < 0 or len(x) < at + heads * head_dim:
+        raise Error(
+            "rope wants "
+            + String(heads * head_dim)
+            + " values from offset "
+            + String(at)
+            + " but the run ends at "
+            + String(len(x))
+        )
     for h in range(heads):
-        rotate_scaled(spec, x.data, h * head_dim, pos, factors, use_factors)
+        rotate_scaled(spec, x, at + h * head_dim, pos, factors, use_factors)

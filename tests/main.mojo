@@ -14,8 +14,11 @@ import test_dns
 import test_gguf
 import test_load
 import test_quant
+import test_arch
 import test_attention
+import test_block
 import test_kernel
+import test_nnmodel
 import test_rope
 import test_tensor
 import test_host
@@ -81,6 +84,18 @@ def main():
         test_attention.run(suite)
     except e:
         suite.fail("test_attention", String(e))
+    try:
+        test_arch.run(suite)
+    except e:
+        suite.fail("test_arch", String(e))
+    try:
+        test_block.run(suite)
+    except e:
+        suite.fail("test_block", String(e))
+    try:
+        test_nnmodel.run(suite)
+    except e:
+        suite.fail("test_nnmodel", String(e))
     try:
         test_dns.run(suite)
     except e:

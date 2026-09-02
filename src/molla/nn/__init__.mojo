@@ -3,9 +3,11 @@
 This sits between `molla.model`, which knows what a file says, and the engine,
 which knows what a model does. Nothing here holds state that outlives a call.
 It knows how a quantized block is laid out, what a tensor's shape and stride
-are, how to multiply two of them, where a position goes and how a query is
-scored against the keys before it. What those keys are kept in and how long
-they live is the engine's problem.
+are, how to multiply two of them, where a position goes, how a query is scored
+against the keys before it, what one layer is made of, and what each
+architecture does differently. What those keys are kept in and how long they
+live is the engine's problem, and so is what to do with the logits that come
+out of the top.
 
 The rule for this package is that there is always a slow version and it is
 always kept. A fused kernel that reads packed bytes and accumulates in one pass

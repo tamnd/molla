@@ -281,6 +281,79 @@ def matvec(w: Tensor, x: Buffer, mut out: Buffer) raises:
         out.data[r] = row_dot(w.kind, p, r * stride, x.data, 0, w.cols)
 
 
+def matvec_into(
+    w: Tensor,
+    x: List[Float32],
+    at_in: Int,
+    mut out: List[Float32],
+    at_out: Int,
+) raises:
+    """`matvec` reading and writing runs of plain lists.
+
+    The key and value projections write straight into the cache, which is one
+    long list per layer rather than a buffer per token, and a query is
+    normalised per head over a run of itself. Both want an offset, and `Buffer`
+    deliberately has no view type, because a view over a list the cache grows
+    is a lifetime problem in exchange for one loop.
+    """
+    if at_in < 0 or at_out < 0:
+        raise Error("a matvec offset cannot be negative")
+    if len(x) < at_in + w.cols:
+        raise Error(
+            "matvec wants "
+            + String(w.cols)
+            + " values from offset "
+            + String(at_in)
+            + " but the input ends at "
+            + String(len(x))
+        )
+    if len(out) < at_out + w.rows:
+        raise Error(
+            "matvec wants room for "
+            + String(w.rows)
+            + " rows at offset "
+            + String(at_out)
+            + " but the output ends at "
+            + String(len(out))
+        )
+    var stride = w.row_bytes()
+    var p = w.base()
+    for r in range(w.rows):
+        out[at_out + r] = row_dot(w.kind, p, r * stride, x, at_in, w.cols)
+
+
+def rms_norm_at(
+    mut x: List[Float32], at: Int, n: Int, gain: Tensor, eps: Float32
+) raises:
+    """Root mean square norm in place over a run.
+
+    Qwen 3 normalises each head of the query and the key separately, so this
+    runs over `head_dim` at a time inside a vector that is thirty two heads
+    wide. Gemma normalises a sublayer's output on its way to the residual add,
+    which is the whole width but still in place. Neither wants a second buffer.
+    """
+    if at < 0 or n <= 0:
+        raise Error("a norm needs a non negative offset and a positive width")
+    if len(x) < at + n:
+        raise Error("a norm was pointed past the end of its buffer")
+    if gain.elements() != n:
+        raise Error(
+            "rms_norm wants a gain of "
+            + String(n)
+            + " but got "
+            + String(gain.elements())
+        )
+    var sum = Float64(0)
+    for i in range(n):
+        sum += Float64(x[at + i]) * Float64(x[at + i])
+    var scale = Float32(1.0 / sqrt(sum / Float64(n) + Float64(eps)))
+
+    var g = Buffer(n)
+    dequant_run(gain.kind, gain.base(), 0, n, g.data, 0)
+    for i in range(n):
+        x[at + i] = x[at + i] * scale * g.data[i]
+
+
 def rms_norm(mut out: Buffer, x: Buffer, gain: Tensor, eps: Float32) raises:
     """Root mean square norm, which is layer norm without the mean subtracted.
 
