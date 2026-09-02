@@ -18,6 +18,8 @@ from harness import Suite
 
 from molla.sys.device import (
     DEV_CPU,
+    build_target_arch,
+    build_targets_gpu,
     default_device,
     devices,
 )
@@ -145,6 +147,18 @@ def _check_devices(mut suite: Suite) raises:
     suite.check(ok_memory, "and each reports free memory within its total")
     suite.check(ok_named, "and each has an api and a name")
 
+    # A build made on a machine with no GPU has no device code in it, so the
+    # only honest thing the enumeration can report there is the host. The two
+    # have to agree or one of them is lying about the machine.
+    suite.check(
+        (accelerators > 0) == build_targets_gpu(),
+        "a build with no device code finds no devices",
+    )
+    suite.check(
+        (build_target_arch() == "none") != build_targets_gpu(),
+        "and it names the architecture it was built for or says none",
+    )
+
     var chosen = default_device()
     if accelerators == 0:
         suite.check(
@@ -167,6 +181,7 @@ def _check_devices(mut suite: Suite) raises:
                 unified_matches = False
         suite.check(unified_matches, "and metal is the unified one")
 
+    print("  built for " + build_target_arch())
     print(
         "  devices  "
         + String(len(all))

@@ -19,6 +19,8 @@ every tensor and molla still runs.
 dependency. See docs/adr/0002-accept-max-core.md for what that costs.
 """
 
+from std.sys.info import _accelerator_arch, has_accelerator
+
 from max.gpu.host import DeviceContext
 
 comptime DEV_CPU = 0
@@ -80,6 +82,25 @@ def _kind_of(api: String) -> Int:
     return DEV_DISCRETE
 
 
+def build_targets_gpu() -> Bool:
+    """Whether this build can talk to an accelerator at all.
+
+    This is a property of the machine that ran the compiler, not of the machine
+    running the binary. `max-core` bakes the device architecture in at compile
+    time, so a build made on a box with no GPU has no device code in it and
+    will report no accelerators even if you carry it to a box that has one.
+    That is worth knowing before trusting a binary you did not build here.
+    """
+    return has_accelerator()
+
+
+def build_target_arch() -> String:
+    """What architecture this build was compiled for, or `none`."""
+    comptime if has_accelerator():
+        return String(_accelerator_arch())
+    return String("none")
+
+
 def host_device() -> Device:
     """The CPU entry, which is present on every machine and needs no runtime."""
     return Device(DEV_CPU, 0, String("cpu"), String("host"))
@@ -91,19 +112,26 @@ def devices() raises -> List[Device]:
     A machine with no accelerator returns a list of one rather than an empty
     list or an error, because "there is nowhere to put this" is never the
     answer: host memory is always somewhere to put it.
+
+    The accelerator half of this is behind `comptime if` because `max-core`
+    resolves the device architecture at compile time and refuses to compile at
+    all on a machine it cannot name one for. Three of our five boxes have no
+    GPU, so leaving the call unguarded would mean molla does not build on the
+    machines that most need the CPU path to work. See `build_targets_gpu`.
     """
     var out = List[Device]()
     out.append(host_device())
 
-    var count = DeviceContext.number_of_devices()
-    for i in range(count):
-        var ctx = DeviceContext(device_id=i)
-        var api = String(ctx.api())
-        var one = Device(_kind_of(api), i, api, String(ctx.name()))
-        var memory = ctx.get_memory_info()
-        one.free = Int(memory[0])
-        one.total = Int(memory[1])
-        out.append(one^)
+    comptime if has_accelerator():
+        var count = DeviceContext.number_of_devices()
+        for i in range(count):
+            var ctx = DeviceContext(device_id=i)
+            var api = String(ctx.api())
+            var one = Device(_kind_of(api), i, api, String(ctx.name()))
+            var memory = ctx.get_memory_info()
+            one.free = Int(memory[0])
+            one.total = Int(memory[1])
+            out.append(one^)
     return out^
 
 
