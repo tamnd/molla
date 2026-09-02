@@ -121,3 +121,5 @@ scripts/gen-logits.py scripts/logit_cases.txt scripts/logits corpus/logits
 ```
 
 That writes the requantized models into `corpus/logits`, which is gitignored, and the reference files into `scripts/logits`, which is not. The first run takes a few minutes and most of it is `llama-server` starting up once per case.
+
+There is no CI job for it, unlike the quantization and tokenizer corpora, and that is not an oversight. Those two check against files a runner can fetch in seconds. This one needs five gigabytes of model that is not downloadable, because most of the corpus was requantized locally and none of it is published, so a job on a hosted runner would skip all fourteen cases and report a pass for having done nothing. It runs on a machine that has the models, which today means the laptop.
