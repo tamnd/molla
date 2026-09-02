@@ -10,12 +10,21 @@ anything that looks like a crash.
 from harness import Suite
 
 from molla.nn.quant import Q_F16, Q_F32, Q_Q4_K, Q_Q6_K, Q_Q8_0
-from molla.nn.tensor import Buffer, Tensor
+from molla.nn.repack import LAYOUT_PLANAR
+from molla.nn.tensor import (
+    WHERE_DEVICE,
+    WHERE_HOST,
+    WHERE_UNIFIED,
+    Buffer,
+    Tensor,
+    place_name,
+)
 
 
 def run(mut suite: Suite) raises:
     test_geometry(suite)
     test_rows(suite)
+    test_residency(suite)
     test_buffer(suite)
 
 
@@ -101,6 +110,86 @@ def test_rows(mut suite: Suite) raises:
     except:
         raised = True
     suite.check(raised, "and so is a negative row")
+
+
+def test_residency(mut suite: Suite) raises:
+    """Which memory a weight is in, and who is allowed to read it.
+
+    The address is a plausible looking number rather than a real allocation on
+    purpose. What is being tested is that the wrong side is refused before it
+    dereferences anything, so a test that needed a real device pointer to prove
+    it would be a test that only runs on two of the five machines.
+    """
+    suite.group("tensor residency")
+
+    var host = Tensor(0x1000, Q_Q8_0, 64, 4)
+    suite.check(host.place == WHERE_HOST, "a weight is on the host by default")
+    suite.check(not host.on_device(), "so nothing has to be kept away from it")
+    suite.check(
+        Int(host.base()) == 0x1000, "and a host kernel gets the address back"
+    )
+
+    var raised = False
+    try:
+        _ = host.device_address()
+    except:
+        raised = True
+    suite.check(raised, "a device kernel cannot read a host weight")
+
+    var card = host.resident(0x7F00, WHERE_DEVICE)
+    suite.check(card.on_device(), "a weight moved to a pool says so")
+    suite.check(
+        card.device_address() == 0x7F00, "and a device kernel gets the pool"
+    )
+    suite.check(
+        card.kind == host.kind and card.cols == 64 and card.rows == 4,
+        "moving a weight does not change what it is",
+    )
+    suite.check(
+        card.layout == host.layout,
+        "and a copy of bytes is not a transform of them, so the layout rides",
+    )
+
+    raised = False
+    var message = String("")
+    try:
+        _ = card.base()
+    except e:
+        raised = True
+        message = String(e)
+    suite.check(raised, "a host kernel cannot read a device weight")
+    suite.check(
+        message
+        == "a 64 by 4 weight is on the device and a host kernel cannot read it",
+        "and the error says which weight it was, in the shape it was bound as",
+    )
+
+    # Unified is the case that both sides read. A machine with one pool of
+    # memory would waste half of it if a mapping the GPU can already see had to
+    # be copied before a kernel could touch it.
+    var shared = host.resident(0x1000, WHERE_UNIFIED)
+    suite.check(
+        not shared.on_device(), "a unified weight is not out of a host reach"
+    )
+    suite.check(Int(shared.base()) == 0x1000, "so a host kernel still reads it")
+    suite.check(
+        shared.device_address() == 0x1000,
+        "and a device kernel reads the same address, with no copy between",
+    )
+
+    var planar = card.as_planar(0x7F00)
+    suite.check(
+        planar.layout == LAYOUT_PLANAR and planar.on_device(),
+        "repacking a resident weight leaves it where it is",
+    )
+
+    suite.check(Tensor.none().place == WHERE_HOST, "an absent weight is host")
+    suite.check(
+        place_name(WHERE_HOST) == "host"
+        and place_name(WHERE_UNIFIED) == "unified"
+        and place_name(WHERE_DEVICE) == "device",
+        "every place has a name a report can print",
+    )
 
 
 def test_buffer(mut suite: Suite) raises:

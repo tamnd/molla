@@ -54,6 +54,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 
 from molla.model.gguf import Gguf
 from molla.model.repack import (
+    RepackCache,
     RepackPlan,
     SCRATCH_BYTES,
     abandon_cache,
@@ -68,6 +69,12 @@ from molla.model.repack import (
     write_head,
 )
 from molla.model.spec import tensor_bytes
+from molla.nn.tensor import (
+    WHERE_DEVICE,
+    WHERE_HOST,
+    WHERE_UNIFIED,
+    place_name,
+)
 from molla.sys.atomic import AtomicBlock
 from molla.sys.clock import monotonic_ms
 from molla.sys.device import Device, default_device
@@ -82,15 +89,6 @@ from molla.sys.thread import (
     sleep_ms,
     spawn,
 )
-
-comptime WHERE_HOST = 0
-"""In the mapping, and read from there. No copy and no allocation."""
-
-comptime WHERE_UNIFIED = 1
-"""In the mapping, and the accelerator can read it there. Also no copy."""
-
-comptime WHERE_DEVICE = 2
-"""Copied into a slot in the device pool."""
 
 comptime STAGE_PLAN = 0
 comptime STAGE_READ = 1
@@ -130,14 +128,6 @@ def stage_name(stage: Int) -> String:
     return String("done")
 
 
-def place_name(place: Int) -> String:
-    if place == WHERE_HOST:
-        return String("host")
-    if place == WHERE_UNIFIED:
-        return String("unified")
-    return String("device")
-
-
 @fieldwise_init
 struct Placement(Copyable, ImplicitlyCopyable, Movable):
     """Where one tensor goes, decided before anything is read."""
@@ -146,16 +136,39 @@ struct Placement(Copyable, ImplicitlyCopyable, Movable):
     """Position in the file's tensor directory, which is also read order."""
 
     var offset: Int
-    """Absolute byte offset in the file, not the offset the directory holds."""
+    """Absolute byte offset in the file, not the offset the directory holds.
+    The repack reads from here, so it stays the file's own number even for a
+    tensor whose bytes are going to be taken from the cache instead."""
 
     var bytes: Int
+    """What this tensor occupies in the model file."""
+
+    var source: Int
+    """Absolute host address of the bytes that will actually be read.
+
+    In the model file's mapping, or in the repack cache's when the cache has a
+    copy of this tensor. Which one it is does not need recording, because
+    nothing downstream asks: the read stage warms this address and the copy
+    stage copies from it. The plan holds addresses into two mappings and is
+    only valid while both are open."""
+
+    var length: Int
+    """How many bytes that source is. The planar form of a tensor is not the
+    same size as the file's, so this is not `bytes` on a cache hit."""
+
     var place: Int
     var slot: Int
     """Byte offset in the device pool, or -1 for a tensor that is not copied."""
 
 
 struct Plan(Movable):
-    """A whole file's worth of placements, and what they add up to."""
+    """A whole file's worth of placements, and what they add up to.
+
+    Holds raw addresses into the model file's mapping and, when there was a
+    cache to plan against, into the cache's. Both have to stay open for as long
+    as the plan is worth anything, which is the same rule a `Bound` follows for
+    the same reason.
+    """
 
     var placements: List[Placement]
     var device: Device
@@ -216,22 +229,64 @@ def _lookup_only(name: String) -> Bool:
 
 
 def plan_load(g: Gguf, dev: Device, budget: Int) raises -> Plan:
+    """Decide where every tensor in this file goes, with no repack cache.
+
+    Every tensor is read from the model file in the layout the file has, which
+    is what a first load against a model does and what a load on a machine with
+    nowhere to write a cache does forever.
+    """
+    return plan_load(g, dev, budget, RepackCache())
+
+
+def plan_load(
+    g: Gguf, dev: Device, budget: Int, cache: RepackCache
+) raises -> Plan:
     """Decide where every tensor in this file goes.
 
-    Reads the directory and nothing else, so a machine can be told what a load
-    would do without having the memory to do it.
+    Reads the two directories and nothing else, so a machine can be told what a
+    load would do without having the memory to do it.
+
+    The cache is what decides where a tensor's bytes come from, and it decides
+    it for the host and the device the same way. A tensor the cache has is read
+    from the cache in the planar layout, because that is what `bind` is going
+    to point the kernels at and warming the file's copy of it would be warming
+    pages nothing will touch. A tensor the cache does not have is read from the
+    file. So a device pool holds planar bytes on a machine that has a cache and
+    ggml bytes on one that does not, and either way the tensor says which.
     """
     var plan = Plan(dev)
     plan.budget = device_budget(dev) if budget < 0 else budget
 
     var count = len(g.tensors)
     var sizes = List[Int](capacity=count)
+    var sources = List[Int](capacity=count)
+    var lengths = List[Int](capacity=count)
     var chosen = List[Bool](capacity=count)
     for i in range(count):
         var size = tensor_bytes(g.tensors[i])
         sizes.append(size)
         chosen.append(False)
         plan.total_bytes += size
+
+        var at = g.mapping.address + g.data_start + g.tensors[i].offset
+        var length = size
+        var hit = cache.find(g.text(g.tensors[i].name))
+        if hit >= 0:
+            # The same three comparisons `bind` makes, so the bytes this warms
+            # are the bytes the kernels will read. A cache entry that does not
+            # match the file is one `bind` will skip, and warming it would warm
+            # the wrong pages and leave the right ones cold.
+            var cached = cache.tensor(hit)
+            var rows = Int(g.tensors[i].d1) if g.tensors[i].n_dims > 1 else 1
+            if (
+                cached.kind == g.tensors[i].kind
+                and cached.cols == Int(g.tensors[i].d0)
+                and cached.rows == rows
+            ):
+                at = cached.address
+                length = cached.bytes()
+        sources.append(at)
+        lengths.append(length)
 
     # Two passes so the tensors that are read every token get the device first,
     # and the embedding gets whatever is left. Within a pass it is directory
@@ -243,7 +298,7 @@ def plan_load(g: Gguf, dev: Device, budget: Int) raises -> Plan:
                 var name = g.text(g.tensors[i].name)
                 if _lookup_only(name) != (pass_id == 1):
                     continue
-                var need = _align(sizes[i], SLOT_ALIGN)
+                var need = _align(lengths[i], SLOT_ALIGN)
                 if used + need > plan.budget:
                     plan.left_behind += 1
                     continue
@@ -257,15 +312,21 @@ def plan_load(g: Gguf, dev: Device, budget: Int) raises -> Plan:
         if chosen[i]:
             place = WHERE_DEVICE
             at = slot
-            slot += _align(sizes[i], SLOT_ALIGN)
-            plan.device_bytes += sizes[i]
+            slot += _align(lengths[i], SLOT_ALIGN)
+            plan.device_bytes += lengths[i]
         else:
             if dev.accelerator() and dev.unified():
                 place = WHERE_UNIFIED
-            plan.host_bytes += sizes[i]
+            plan.host_bytes += lengths[i]
         plan.placements.append(
             Placement(
-                i, g.data_start + g.tensors[i].offset, sizes[i], place, at
+                i,
+                g.data_start + g.tensors[i].offset,
+                sizes[i],
+                sources[i],
+                lengths[i],
+                place,
+                at,
             )
         )
     return plan^
@@ -315,12 +376,23 @@ struct LoadJob(Movable):
     """
 
     var base: Int
-    """Address of the mapping, so a worker needs no reference to it."""
+    """Address of the model file's mapping, so a worker needs no reference to
+    it. The repack reads from here and only from here."""
 
     var page: Int
     var count: Int
     var offsets: List[Int]
+    """Per tensor, the file offset the repack reads from."""
+
+    var warm: List[Int]
+    """Per tensor, the absolute address the read stage faults in. The file for
+    most loads and the repack cache for a tensor the cache already has, because
+    warming a copy of a weight that nothing is going to read is the one kind of
+    io a load can do that is pure waste."""
+
     var lengths: List[Int]
+    """How long each of those is. Not the file size when the source is the
+    cache."""
     var cursor: AtomicBlock
     var ready: MpscQueue
 
@@ -351,10 +423,12 @@ struct LoadJob(Movable):
         self.page = page_size()
         self.count = plan.count()
         self.offsets = List[Int](capacity=self.count)
+        self.warm = List[Int](capacity=self.count)
         self.lengths = List[Int](capacity=self.count)
         for i in range(self.count):
             self.offsets.append(plan.placements[i].offset)
-            self.lengths.append(plan.placements[i].bytes)
+            self.warm.append(plan.placements[i].source)
+            self.lengths.append(plan.placements[i].length)
         self.cursor = AtomicBlock(SLOT_COUNT)
         self.ready = MpscQueue(round_up_pow2(self.count + 2))
         if not self.cursor.is_valid() or not self.ready.is_valid():
@@ -439,7 +513,7 @@ def _transfer(arg: Int) abi("C") -> Int:
         var i = next.add(1)
         if i >= job[].count:
             break
-        var start = job[].base + job[].offsets[i]
+        var start = job[].warm[i]
         var length = job[].lengths[i]
         _ = will_need(start, length)
         var p = RawPtr(unsafe_from_address=start)
@@ -484,10 +558,24 @@ struct DevicePool(Copyable, ImplicitlyCopyable, Movable):
     var pool: DeviceBuffer[DType.uint8]
     var bytes: Int
 
-    def __init__(out self, index: Int, bytes: Int) raises:
-        self.ctx = DeviceContext(device_id=index)
+    var device: Device
+    """Which device this came off. Carried rather than looked up again, because
+    a pool and a device that disagree is a copy onto a card nothing is going to
+    run a kernel on, and there is no way to notice that from the numbers."""
+
+    def __init__(out self, device: Device, bytes: Int) raises:
+        self.ctx = DeviceContext(device_id=device.index)
         self.pool = self.ctx.enqueue_create_buffer[DType.uint8](bytes)
         self.bytes = bytes
+        self.device = device
+
+    def base(self) -> Int:
+        """Where the pool starts, in the device's own addresses."""
+        return Int(self.pool.unsafe_ptr())
+
+    def slot_address(self, slot: Int) -> Int:
+        """Where one tensor starts, for a kernel argument."""
+        return self.base() + slot
 
     def copy_in(mut self, slot: Int, host: Int, length: Int) raises:
         """Queue one tensor's bytes into its slot.
@@ -524,6 +612,16 @@ struct LoadReport(Copyable, ImplicitlyCopyable, Movable):
     var device: String
     var left_behind: Int
 
+    var resident: Int
+    """Tensors that ended up in the device pool."""
+
+    var pool_bytes: Int
+    """What the pool allocation actually is, which is the slots plus the
+    alignment between them. Reported next to `device_bytes` because a gap
+    between the two that is bigger than a few hundred bytes a tensor means the
+    slots were sized from something other than what got copied into them, and
+    that reads as a model that loads and then produces noise."""
+
     var repacked: Int
     """Tensors written into the repack cache on this load. Zero on a hit and
     zero when there is no cache, and the note says which."""
@@ -544,6 +642,40 @@ struct LoadReport(Copyable, ImplicitlyCopyable, Movable):
         if self.copy_ms <= 0:
             return 0
         return (self.device_bytes // MIB) * 1000 // self.copy_ms
+
+
+struct Residency(Copyable, Movable):
+    """Where each tensor ended up, indexed by position in the directory.
+
+    Directory index and not name, because that is what the binder already has
+    after it looks a weight up and it is what a placement already carries, so
+    the two meet without either of them growing a table of strings.
+
+    An empty one answers host for everything, which is what a caller that never
+    ran a device load should get and what every test that does not care about
+    placement gets by writing nothing.
+    """
+
+    var place: List[Int]
+    var address: List[Int]
+    """Where the tensor is on the device, or zero for one that did not move."""
+
+    def __init__(out self):
+        self.place = List[Int]()
+        self.address = List[Int]()
+
+    def count(self) -> Int:
+        return len(self.place)
+
+    def place_of(self, index: Int) -> Int:
+        if index < 0 or index >= len(self.place):
+            return WHERE_HOST
+        return self.place[index]
+
+    def address_of(self, index: Int) -> Int:
+        if index < 0 or index >= len(self.address):
+            return 0
+        return self.address[index]
 
 
 struct Weights(Movable):
@@ -568,7 +700,34 @@ struct Weights(Movable):
         """Address of the pool on the device, or zero when there is not one."""
         if not self.pool:
             return 0
-        return Int(self.pool.value().pool.unsafe_ptr())
+        return self.pool.value().base()
+
+    def residency(self) raises -> Residency:
+        """Where every tensor in the file ended up, by directory index.
+
+        The one thing `bind` needs out of a load. Everything else in here is
+        either accounting or the allocation itself, and handing the binder a
+        whole `Weights` would let it reach the pool, the plan and the report
+        when the only question it has is where one weight is.
+        """
+        var out = Residency()
+        var at = self.device_base()
+        for i in range(self.plan.count()):
+            var one = self.plan.placements[i]
+            var address = 0
+            if one.place == WHERE_DEVICE:
+                if at == 0:
+                    raise Error(
+                        "the plan put tensor "
+                        + String(one.index)
+                        + " on "
+                        + self.plan.device.name
+                        + " and this load has no pool to put it in"
+                    )
+                address = at + one.slot
+            out.place.append(one.place)
+            out.address.append(address)
+        return out^
 
 
 def worker_count(requested: Int) -> Int:
@@ -620,7 +779,7 @@ def load(
     for i in range(count):
         if plan.placements[i].place == WHERE_DEVICE:
             pool_bytes = _align(
-                plan.placements[i].slot + plan.placements[i].bytes, SLOT_ALIGN
+                plan.placements[i].slot + plan.placements[i].length, SLOT_ALIGN
             )
 
     if stream:
@@ -642,6 +801,8 @@ def load(
         total_ms=0,
         device=plan.device.name,
         left_behind=plan.left_behind,
+        resident=0,
+        pool_bytes=pool_bytes,
         repacked=0,
         repack_bytes=0,
         repack_note=String("nothing was repacked on this load"),
@@ -676,7 +837,7 @@ def load(
 
     comptime if has_accelerator():
         if pool_bytes > 0:
-            out.pool = DevicePool(out.plan.device.index, pool_bytes)
+            out.pool = DevicePool(out.plan.device, pool_bytes)
 
     var read_started = monotonic_ms()
     var pool_threads = List[Thread]()
@@ -697,6 +858,7 @@ def load(
     var drained = 0
     var reported = -1
     var copy_ms = 0
+    var copied = 0
     while drained < count:
         var index = 0
         if not job.ready.pop(index):
@@ -707,9 +869,9 @@ def load(
             var at = monotonic_ms()
             comptime if has_accelerator():
                 if out.pool:
-                    out.pool.value().copy_in(
-                        one.slot, g.mapping.address + one.offset, one.bytes
-                    )
+                    out.pool.value().copy_in(one.slot, one.source, one.length)
+                    out.report.resident += 1
+                    copied += one.length
             copy_ms += monotonic_ms() - at
         drained += 1
         if stream:
@@ -763,6 +925,21 @@ def load(
             var at = monotonic_ms()
             out.pool.value().wait()
             copy_ms += monotonic_ms() - at
+            # The plan said how many bytes would be on the card and this counts
+            # what was put there. They are computed from the same placements a
+            # few dozen lines apart, so the only way they disagree is a drain
+            # loop that skipped a tensor or took one twice, and a card that is
+            # missing one weight out of three hundred generates text that is
+            # almost right, which is the worst failure in the file.
+            if copied != out.plan.device_bytes:
+                raise Error(
+                    "the plan placed "
+                    + String(out.plan.device_bytes)
+                    + " bytes on "
+                    + out.plan.device.name
+                    + " and the load copied "
+                    + String(copied)
+                )
     out.report.copy_ms = copy_ms
     out.report.total_ms = monotonic_ms() - started
 
@@ -863,6 +1040,14 @@ def _report_done(report: LoadReport):
             + String(report.copy_mib_s())
             + " MiB/s"
         )
+        print(
+            stage_name(STAGE_COPY)
+            + "   "
+            + String(report.resident)
+            + " tensors resident in a "
+            + _mib(report.pool_bytes)
+            + " pool"
+        )
     else:
         print(
             stage_name(STAGE_COPY)
@@ -900,10 +1085,13 @@ def run_load(path: StringSpan, workers: Int = 0, repack: Bool = True) raises:
     """
     var g = Gguf(path)
     var dev = default_device()
-    var plan = plan_load(g, dev, -1)
 
+    # The cache is opened before the plan and not after it, because the plan is
+    # what decides which copy of each weight gets read and a cache that turns up
+    # afterwards is a cache the plan could not use.
     var want = String("")
     var cache = open_cache(path, model_key(g))
+    var plan = plan_load(g, dev, -1, cache)
     if cache.usable:
         print(
             stage_name(STAGE_REPACK)

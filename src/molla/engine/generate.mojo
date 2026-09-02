@@ -99,14 +99,17 @@ def run_generate(
     # Everything stays in the mapping. The kernels are host kernels, so a
     # tensor copied to a card is a tensor they cannot read, and a budget of
     # zero says so rather than leaving it to a placement heuristic that has no
-    # way to know what will read the result.
+    # way to know what will read the result. The budget stops being zero when
+    # there is a device forward pass to read the result, which is #143.
     #
     # A hit binds to the repacked weights and a miss binds to the file and
     # writes the repack on the way past, so the first run against a model is
-    # the slow one and says so.
+    # the slow one and says so. The cache goes to the plan as well as to the
+    # binder, so the read stage warms the copy of each weight that the kernels
+    # are going to read rather than the one in the file beside it.
     var cache = open_cache(model_path, model_key(g))
     var repack_for = String("") if cache.usable else model_path
-    var weights = load(g, plan_load(g, dev, 0), 0, False, repack_for)
+    var weights = load(g, plan_load(g, dev, 0, cache), 0, False, repack_for)
     var loaded = monotonic_ms()
 
     var b = bind(g, cache)

@@ -29,6 +29,7 @@ from molla.model.load import (
     WHERE_DEVICE,
     WHERE_HOST,
     WHERE_UNIFIED,
+    Residency,
     device_budget,
     load,
     place_name,
@@ -154,6 +155,7 @@ def run(mut suite: Suite) raises:
     _check_budget(suite)
     _check_plan(suite, path)
     _check_load(suite, path)
+    _check_residency(suite, path)
     _check_names(suite)
 
     _remove(path)
@@ -332,6 +334,69 @@ def _check_load(mut suite: Suite, path: String) raises:
         worker_count(3) == 3, "a worker count that is asked for is used"
     )
     suite.check(worker_count(0) >= 1, "and one that is not is at least one")
+
+    g.close()
+
+
+def _check_residency(mut suite: Suite, path: String) raises:
+    """What a load hands the binder, and what an empty one answers.
+
+    An empty residency is not a placeholder. It is what every caller that loads
+    with a device budget of zero gets, which today is every caller that
+    generates a token, so its answers matter as much as a real one's.
+    """
+    suite.group("load residency")
+
+    var empty = Residency()
+    suite.check(empty.count() == 0, "an empty residency covers no tensors")
+    suite.check(
+        empty.place_of(0) == WHERE_HOST, "and answers host for all of them"
+    )
+    suite.check(
+        empty.address_of(0) == 0, "with no device address to go with it"
+    )
+    suite.check(
+        empty.place_of(-1) == WHERE_HOST and empty.place_of(9999) == WHERE_HOST,
+        "including for an index it has never heard of",
+    )
+
+    var g = Gguf(path)
+    var plan = plan_load(g, _fake(DEV_CPU, String("cpu"), 0), -1)
+    var weights = load(g, plan^, 1, False)
+    var res = weights.residency()
+    suite.check(
+        res.count() == len(_sizes()), "a load reports on every tensor it placed"
+    )
+    var all_host = True
+    var no_address = True
+    for i in range(res.count()):
+        if res.place_of(i) != WHERE_HOST:
+            all_host = False
+        if res.address_of(i) != 0:
+            no_address = False
+    suite.check(all_host, "and a host load says host for each of them")
+    suite.check(no_address, "and hands out no device addresses")
+
+    # A unified plan is the interesting one on this laptop and on nothing else
+    # in the fleet. Nothing is copied and nothing is allocated, and the weights
+    # still come back marked so a device kernel knows it may read the mapping.
+    var shared = plan_load(g, _fake(DEV_UNIFIED, String("metal"), 16 * GIB), -1)
+    var on_metal = load(g, shared^, 1, False)
+    suite.check(
+        not on_metal.pool, "a unified load allocates nothing on the device"
+    )
+    var res2 = on_metal.residency()
+    var all_unified = True
+    for i in range(res2.count()):
+        if res2.place_of(i) != WHERE_UNIFIED:
+            all_unified = False
+        if res2.address_of(i) != 0:
+            no_address = False
+    suite.check(all_unified, "and every weight comes back unified")
+    suite.check(
+        no_address,
+        "with no address of its own, because the mapping already is one",
+    )
 
     g.close()
 

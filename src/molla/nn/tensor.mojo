@@ -17,11 +17,38 @@ GGUF directory prints as `[4096, 14336]` has 14336 rows of 4096, and a matvec
 against it takes a vector of 4096 and returns one of 14336. Getting that
 backwards produces a shape error rather than wrong numbers, which is the one
 mercy in the whole layout.
+
+A `Tensor` also says which memory its address is in. That is one integer and it
+exists because the alternative is a segfault: a device pointer is a number the
+driver understands and a load instruction does not, so a host kernel handed one
+does not fail where the mistake was made. `base` is the single call every host
+kernel makes to get at the bytes, so the check goes there and costs an integer
+compare against a matvec.
 """
 
 from molla.nn.quant import block_bytes, block_elements, supported
 from molla.nn.repack import LAYOUT_GGML, LAYOUT_PLANAR, planar_row_bytes
 from molla.sys.mmap import RawPtr
+
+comptime WHERE_HOST = 0
+"""In host memory. The model file's mapping, the repack cache, or a buffer."""
+
+comptime WHERE_UNIFIED = 1
+"""In host memory that an accelerator can also read. Apple silicon has one pool
+of memory and a mapped file already is a device visible buffer, so this is a
+host place with a note attached: host kernels read it exactly as they read
+`WHERE_HOST`, and a device kernel may read it too without a copy."""
+
+comptime WHERE_DEVICE = 2
+"""In a device pool. A host kernel cannot follow this address."""
+
+
+def place_name(place: Int) -> String:
+    if place == WHERE_HOST:
+        return String("host")
+    if place == WHERE_UNIFIED:
+        return String("unified")
+    return String("device")
 
 
 struct Tensor(Copyable, ImplicitlyCopyable, Movable):
@@ -59,6 +86,12 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
     minimum from the type it came from and needs to be told which one that was.
     """
 
+    var place: Int
+    """Which memory the address is in. One of `WHERE_HOST`, `WHERE_UNIFIED` or
+    `WHERE_DEVICE`. Independent of the layout: a device pool holds planar bytes
+    on a machine that has a repack cache and ggml bytes on one that does not,
+    and those are two questions with different answers about the same weight."""
+
     def __init__(
         out self,
         address: Int,
@@ -66,12 +99,14 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
         cols: Int,
         rows: Int,
         layout: Int = LAYOUT_GGML,
+        place: Int = WHERE_HOST,
     ):
         self.address = address
         self.kind = kind
         self.cols = cols
         self.rows = rows
         self.layout = layout
+        self.place = place
 
     @staticmethod
     def none() -> Self:
@@ -83,13 +118,57 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
         every weight, and two things that have to agree are one thing that can
         disagree.
         """
-        return Self(0, 0, 0, 0, LAYOUT_GGML)
+        return Self(0, 0, 0, 0, LAYOUT_GGML, WHERE_HOST)
 
     def present(self) -> Bool:
         return self.address != 0
 
-    def base(self) -> RawPtr:
+    def on_device(self) -> Bool:
+        """Whether a host kernel has to be kept away from these bytes.
+
+        Unified is not on the device by this question's meaning. The whole
+        point of a unified device is that both sides read the same pages, so a
+        unified weight answers no here and a device kernel still gets to use
+        it.
+        """
+        return self.place == WHERE_DEVICE
+
+    def base(self) raises -> RawPtr:
+        """The bytes, for a host kernel to read.
+
+        Raises for a weight that lives in a device pool. That address means
+        something to the driver and nothing to a load instruction, so following
+        one is a fault somewhere far from whatever placed the tensor, on a
+        thread that has no idea a placement happened. Every host kernel goes
+        through here, so this is the one place the question has to be asked,
+        and it is asked once per matvec rather than once per row.
+        """
+        if self.place == WHERE_DEVICE:
+            raise Error(
+                "a "
+                + String(self.cols)
+                + " by "
+                + String(self.rows)
+                + " weight is on the device and a host kernel cannot read it"
+            )
         return RawPtr(unsafe_from_address=self.address)
+
+    def device_address(self) raises -> Int:
+        """The address, for a device kernel.
+
+        The mirror of `base`, and it refuses the host case for the same reason
+        in the other direction. A unified weight passes, because on a machine
+        with one pool of memory the mapping is the device buffer.
+        """
+        if self.place == WHERE_HOST:
+            raise Error(
+                "a "
+                + String(self.cols)
+                + " by "
+                + String(self.rows)
+                + " weight is on the host and a device kernel cannot read it"
+            )
+        return self.address
 
     def elements(self) -> Int:
         return self.cols * self.rows
@@ -143,7 +222,21 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
         an edit of the mapped file, so a tensor that has been repacked and one
         that has not are two views and never the same one mutated.
         """
-        return Self(address, self.kind, self.cols, self.rows, LAYOUT_PLANAR)
+        return Self(
+            address, self.kind, self.cols, self.rows, LAYOUT_PLANAR, self.place
+        )
+
+    def resident(self, address: Int, place: Int) -> Self:
+        """The same weight and layout, in another memory.
+
+        The layout rides along because a copy to a device is a copy of bytes
+        and not a transform of them. A planar weight uploaded to a card is
+        still planar and a ggml one still needs unpacking, and the kernel on
+        the other side has to be told which without going back to the file.
+        """
+        return Self(
+            address, self.kind, self.cols, self.rows, self.layout, place
+        )
 
 
 struct Buffer(Movable):

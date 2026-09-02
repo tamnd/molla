@@ -29,6 +29,7 @@ from molla.model.repack import (
     open_cache,
     plan_repack,
 )
+from molla.model.spec import tensor_bytes
 from molla.nn.quant import Q_F32, Q_Q4_0, Q_Q8_0, dequant_run
 from molla.nn.repack import LAYOUT_PLANAR, unpack_run
 from molla.sys.device import DEV_CPU, Device
@@ -186,6 +187,7 @@ def run(mut suite: Suite) raises:
     try:
         test_plan(suite, path)
         test_hit(suite, path)
+        test_sources(suite, path)
         test_rejects(suite, path)
     finally:
         _remove(cache)
@@ -298,6 +300,69 @@ def test_hit(mut suite: Suite, path: String) raises:
                 bad = k
                 break
         suite.check(bad == -1, "a cached tensor decodes the same " + names[i])
+
+    hit.close()
+    g.close()
+
+
+def test_sources(mut suite: Suite, path: String) raises:
+    """A plan made against a cache reads the cache and not the file.
+
+    This is what makes a device load hold the layout the device kernels want.
+    The pool is filled from whatever the plan called each tensor's source, so a
+    plan that still points at the model file is a card full of ggml blocks and
+    a set of kernels that cannot read them.
+    """
+    suite.group("load sources")
+
+    var g = Gguf(path)
+    var hit = open_cache(path, model_key(g))
+    suite.check(hit.usable, "the cache from the last test is still there")
+
+    var plan = plan_load(g, _host(), 0, hit)
+    var names = _names()
+    var cache_lo = hit.mapping.address
+    var cache_hi = cache_lo + hit.mapping.length
+    var file_lo = g.mapping.address
+    var file_hi = file_lo + g.mapping.length
+
+    var grew = 0
+    for i in range(2):
+        var at = g.tensor_index(names[i])
+        var one = plan.placements[at]
+        suite.check(
+            one.source >= cache_lo and one.source < cache_hi,
+            "a repacked tensor is read out of the cache " + names[i],
+        )
+        var t = hit.tensor(hit.find(names[i]))
+        suite.check(
+            one.length == t.bytes(),
+            "and its length is the planar length " + names[i],
+        )
+        suite.check(
+            one.bytes == tensor_bytes(g.tensors[at]),
+            "while the file size stays on record " + names[i],
+        )
+        grew += one.length - one.bytes
+    suite.check(grew > 0, "the planar form of a quantized weight is bigger")
+
+    # The f32 tensor has no planar form, is not in the cache, and has to still
+    # come from the file. A plan that sent every tensor to the cache would be
+    # reading past the end of one.
+    var norm = g.tensor_index("output_norm.weight")
+    suite.check(
+        plan.placements[norm].source >= file_lo
+        and plan.placements[norm].source < file_hi,
+        "a tensor with no planar form is still read out of the file",
+    )
+
+    var summed = 0
+    for i in range(plan.count()):
+        summed += plan.placements[i].length
+    suite.check(
+        plan.host_bytes == summed,
+        "the host figure counts the bytes that get read, not the file's",
+    )
 
     hit.close()
     g.close()

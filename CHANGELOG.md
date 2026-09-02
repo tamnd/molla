@@ -8,6 +8,13 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 - A logit conformance corpus. Fourteen cases over SmolLM2 135M, Qwen 2.5 0.5B and Llama 3.1 8B at nine quantizations, comparing the residual stream after every layer and the whole final distribution against llama.cpp reading the same file. `scripts/gen-logits.py` writes the references and needs llama.cpp on PATH, `scripts/logit_oracle.mojo` checks molla against them and needs nothing, and `pixi run conformance-logits` runs it. See [docs/validation/logits.md](docs/validation/logits.md).
 - `Scratch` can record the residual stream. `tracing` is off by default and costs a bool test per layer, and with it on a model with n layers leaves n plus two snapshots per token: the embedding, one after each layer, and the final norm. A disagreement with llama.cpp comes back as a layer number rather than as a mismatch somewhere in a hundred million multiplies.
+- A weight knows which memory it is in. A `Tensor` carries one of host, unified or device, `Tensor.base` refuses a weight in a device pool and names its shape rather than handing a host kernel an address it cannot follow, and `Tensor.device_address` refuses a host one. A unified weight passes both, which is what unified means. See [docs/validation/load.md](docs/validation/load.md).
+- `Residency`, which is what a load hands the binder: which memory each tensor ended up in, by position in the file's directory, and where on the device if it moved. An empty one binds everything to the host, which is what every caller that loads with a device budget of zero gets.
+
+### Changed
+
+- `plan_load` can be told about the repack cache, and then it plans against the copy of each weight that `bind` is going to read. A cached tensor is sourced from the cache in the planar layout and one with no planar form is sourced from the file, so a warm load stops faulting in a copy of the model that nothing will touch, and a device pool holds the layout the device kernels want. `molla load`, `molla generate` and `molla serve` all pass the cache through.
+- A load checks that the bytes it copied to the device add up to the bytes the plan placed there, and refuses to finish when they do not. A card missing one weight out of 292 produces text that is almost right.
 
 ## [0.2.10] - 2026-09-02
 

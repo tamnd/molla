@@ -22,6 +22,24 @@ Every tensor gets one of three placements, and the choice is made once in `plan_
 
 `unified` is not `host` with a different name. They do the same amount of work today, which is none, but they answer different questions: a kernel asking whether it can be handed this address gets yes from one and no from the other. Collapsing them would put that distinction back into every call site, which is the scattered special case the issue says not to write.
 
+## A weight knows which memory it is in
+
+That question used to have no answer anywhere in the type system. A placement was a decision the loader made and then forgot, and every tensor that came out of `bind` was a host address whether or not a copy to a card had happened, so a host kernel handed a device weight would have dereferenced a driver handle and faulted on a thread with no idea a placement had ever taken place.
+
+So a `Tensor` carries its place, and `Tensor.base`, which is the one call every host kernel makes to get at bytes, refuses a weight in a device pool and names its shape. The cost is an integer compare once per matvec rather than once per row, because a weight is in one memory for its whole life and the test is hoisted out of the row loop the same way the layout test already is. `Tensor.device_address` is the mirror of it and refuses a host weight, and a unified weight passes both, which is the whole point of unified.
+
+What connects the two halves is `Residency`, which is what a load hands the binder: for each position in the file's tensor directory, which memory that tensor ended up in and where on the device if it moved. It is indexed by directory position rather than by name because that is what the binder already has after it looks a weight up and what a placement already carries, so the two meet without either growing a table of strings. An empty `Residency` answers host for everything, which is what every caller that loads with a device budget of zero gets, and that is still every caller that generates a token until [#143](https://github.com/tamnd/molla/issues/143) lands.
+
+## The plan reads the copy that will be read
+
+A load with a warm repack cache used to fault in the model file while `bind` pointed the kernels at the cache beside it. Every byte of that read was wasted and the bytes that were going to be read stayed cold.
+
+`plan_load` can now be told about the cache, and then it plans against the copy of each weight that `bind` is going to use. A tensor the cache has is sourced from the cache in the planar layout, a tensor with no planar form is sourced from the file, and the same rule decides what the read stage warms and what the copy stage sends to the card. Which means a device pool holds the layout the device kernels want on a machine that has a cache, and the ggml layout on one that does not, and the tensor says which without anybody going back to the file to ask.
+
+A placement therefore carries two sizes. `bytes` is what the tensor occupies in the model file and stays on record because the repack reads from there. `length` is the source that is actually read, which is larger for a quantized weight, because the planar layout trades size for a kernel that does not have to walk a block header per group. On the 8B that is 4685 MiB in the file and 9573 MiB read.
+
+The load counts the bytes it copied to the device and refuses to finish if that disagrees with what the plan placed. They are computed from the same placements a few dozen lines apart, so the only way they differ is a drain loop that skipped a tensor or took one twice, and a card that is missing one weight out of 292 generates text that is almost right, which is the worst failure in the file.
+
 The device side is one pool allocation rather than one allocation per tensor. 292 allocations of a few megabytes each is 292 driver round trips and a fragmented heap for no benefit, since the lifetime of every tensor is the lifetime of the model. Each tensor gets a byte offset into the pool, aligned to 256, and the test suite checks that slots are aligned, in order, and never overlap. Getting that wrong writes one tensor over another and the model still loads and still produces words, just wrong ones, so it is worth an assertion rather than a code review.
 
 When the model does not fit, the planner runs in two passes. Anything read once per token goes to the card first, and the token embedding goes last, because the embedding is the largest single tensor in a q4_K_M 8B and it is read once per token for one row. Trading the whole embedding for four more attention blocks on the card is the right trade and the planner makes it without being asked.
@@ -72,6 +90,40 @@ The two numbers are not comparable and it would be dishonest to present them as 
 **The gpc progress lines are the overlap, printed.** The percentage counts tensors drained and the MiB column counts bytes faulted in, and on gpc the byte column is already at 4685 MiB when the tensor column says 10 per cent. That is eight workers finishing the whole read in roughly a tenth of a second while the drain thread is still handing tensors to the driver one at a time. The read stage is not waiting on the copy stage and the copy stage is not waiting on the read stage, which is what the queue is for. The declining MiB/s figure on those lines is the same finished byte count divided by a growing elapsed time, so it decays toward the honest average rather than reporting anything new.
 
 The 486 ms read and the 473 ms copy overlap almost completely, which is why the total is 499 ms and not 959 ms.
+
+## What the pool holds once the cache is warm
+
+Both runs above are a first run against a model, when there is no repack cache and the plan has nothing to read but the file. What residency changed is the second run, so both machines were run again on the same 8B after the cache had been written. The progress lines are cut from both.
+
+The M4:
+
+```console
+repack hit, 226 tensors, 9572 MiB already repacked
+plan   292 tensors, 4685 MiB, metal Apple M4
+plan   9573 MiB unified, which the device reads from the mapping
+copy   nothing to copy, the weights are read where they lie
+repack nothing was repacked on this load
+done   292 tensors in 3700 ms
+```
+
+gpc:
+
+```console
+repack hit, 226 tensors, 9572 MiB already repacked
+plan   292 tensors, 4685 MiB, cuda NVIDIA GeForce RTX 4090
+plan   9573 MiB to the device pool, 0 MiB left on the host, budget 19584 MiB
+read   9573 MiB on 8 threads in 926 ms, 10338 MiB/s
+copy   9573 MiB to NVIDIA GeForce RTX 4090 in 919 ms, 10416 MiB/s
+copy   292 tensors resident in a 9573 MiB pool
+repack nothing was repacked on this load
+done   292 tensors in 954 ms
+```
+
+The two plan lines are the point. The first counts the file, which has not changed, and the second counts what is going to be read. The difference between 4685 and 9573 is the planar layout the repack wrote. Before this the planner knew only the first number, so the read stage faulted in the model file while the binder pointed the kernels at the cache beside it, and all 4685 MiB of that was work nobody used.
+
+On the M4 the second number costs nothing to satisfy, which is the unified claim written out in bytes: 9573 MiB became readable from a Metal kernel with no allocation and no copy anywhere in the run. On the 4090 it costs a 9573 MiB pool, and the plan line, the copy line and the resident line are three separate counts of the same quantity, arrived at from the placements at three different points in the load, which the loader compares before it will report success.
+
+The cold half of the gpc run is worth recording too, because the table above is a warm page cache and says so. The same 8B read for the first time after landing on the disk took 3551 ms at 1319 MiB/s, and the copy behind it took 695 ms. That 1319 MiB/s is the storage number for that box and the 9639 MiB/s in the table is not.
 
 ## Four things that were wrong first
 
