@@ -29,9 +29,23 @@ Acceptance: systems suite green on macOS and Linux, zero allocation parse path v
 
 GGUF reader to model spec, a Llama and Qwen dense architecture, weight loading, single sequence prefill and decode on CPU and one GPU, sampling, the tokenizer, the Jinja engine, and `/v1/chat/completions`, `/v1/completions`, and `/v1/models` with streaming.
 
-Acceptance: a real q4_K_M model generates coherent text on the M4 GPU, the 4090, and Linux CPU. Logits agree with llama.cpp within tolerance. The template and tokenizer suites are green for the covered families. The OpenAI Python SDK streams successfully.
+Acceptance: a real q4_K_M model generates coherent text on Linux CPU, macOS and Windows. Logits agree with llama.cpp within tolerance on the host kernels. The template and tokenizer suites are green for the covered families. The OpenAI Python SDK streams successfully.
 
 This is the milestone that turns the project from a document into something people can try.
+
+The acceptance line above used to ask for the M4 GPU and the 4090 as well, and the GPU half of it moved. Nothing in M2's scope wrote a device kernel, so the milestone was being asked to pass on three backends while having one. That work is M2b, which is the next section and did not exist when this was first written.
+
+M2 does not close on the strength of that rewrite. The rule at the top of this page is that a milestone closes only when it has passed on at least two device classes with one of them a GPU, and it is D8 in the design, and a milestone is not the place to make an exception to it. M2's checklist is complete and M2 stays open until a real model generates text on the M4 GPU and on the 4090, which is the point where the fourth item of M2b lands.
+
+## M2b: kernels on the GPU, 6 to 8 weeks
+
+The milestone where molla stops being a CPU program. Device buffers and weight residency, a quantized matvec written for Metal and CUDA, the rest of a block beside it, the KV cache in device memory, and a backend that is chosen and printed rather than assumed.
+
+`max-core` is already required at runtime for every token molla generates, which is D6, and `molla.sys.device` already enumerates through it. A kernel launch is the part of that dependency the engine has not used yet. `max/kernels` has no quantized matmul that will launch on an Apple GPU below an M5 and the M4 is the reference machine, so the Apple GPU kernels are ours and the same source has to compile for the 4090.
+
+Acceptance: `molla generate` produces the same greedy text on the host, the M4 GPU and the 4090 for the same model, prompt and seed. The fourteen case logit corpus from M2 passes on all three backends against the same committed reference files, with tolerances stated per target. `docs/validation/bench.md` has a table per fleet machine with molla, llama.cpp and Ollama in it.
+
+The bench table is not a gate here. Being faster than llama.cpp is an M7 gate with a number attached. What this milestone owes is knowing the distance, because a performance number first taken at the end is a number nobody can bisect.
 
 ## M3: serving properly, 8 to 10 weeks
 
