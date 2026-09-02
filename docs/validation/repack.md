@@ -102,6 +102,18 @@ End to end, the check the issue asks for is that the second load of a model prod
 
 **The directory entry fields overlapped.** The name length was written at offset 32 in an entry whose byte count field ended at offset 36, so a name length and the top four bytes of a size were the same four bytes. Both readers and both writers agreed with each other, so the cache round tripped perfectly and would have started producing wrong tensor sizes the first time a tensor was bigger than four gigabytes. It was found by reading the two functions side by side rather than by a test, which is the honest account: no test in this file would have caught it.
 
+## What it is worth today
+
+Less than it will be, and the reason is worth writing down rather than discovering later.
+
+`planar_row_dot` is scalar. It reads one int8, converts it to a float32, multiplies and adds, and does that `cols` times per output. What the repack took away is the nibble extraction, the scale table lookup and the two float multiplies per group, and what is left is the multiply and add, which was always the bulk of the loop. So the win is real and it is small.
+
+Alternating between the two paths on this laptop with the same binary and the same prompt, a Qwen 2.5 0.5B whose weights are all q5_0 decodes at 326 to 331 ms/token planar against 347 to 348 fused. A SmolLM2 135M at q8_0 is a wash, 89 to 91 against 91. q8_0 being a wash is what you would expect: the fused path for it was already reading signed bytes with one float16 scale per 32, so there was nothing there to unpack and the planar version does the same work with a float32 scale instead of a float16 one.
+
+Those are relative numbers from one machine, taken minutes apart, and the absolute values mean nothing. Both fleet Linux boxes were busy with somebody else's build when this was measured.
+
+The load side is where the number is large and unambiguous. A cached load of SmolLM2 finishes in 4 ms against 192 ms for the load that writes the cache, because the second one is a map and a directory walk and nothing else.
+
 ## Reproducing
 
 ```console
