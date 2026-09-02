@@ -2,7 +2,11 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.2.11] - 2026-09-03
+
+molla checks itself against llama.cpp a layer at a time, and a weight knows which memory it is in.
+
+Two things. The first is a conformance corpus: fourteen cases over three models at nine quantizations, comparing the residual stream after every layer and the whole final distribution against llama.cpp reading the same file, so a disagreement comes back as a layer number rather than as output that reads very slightly wrong. The second is the type system learning that a card has its own memory, which is the first piece of M2b and what every device kernel after it binds against.
 
 ### Added
 
