@@ -1,4 +1,4 @@
-# Quantized matmul from max/kernels on two GPUs
+# Quantized matmul on two GPUs
 
 The M0 kernel spike. Issue #5 asks whether `max/kernels` is usable directly from our own Mojo code, on an Apple GPU and an NVIDIA GPU, without the MAX runtime, and it says the answer decides D6. The answer is no, for a reason that is not the one anyone expected, and the licensing argument in the README was already wrong before this spike started. All of that is below with the evidence, along with the numerics, because "you need a proprietary runtime" is a different claim from "the kernels do not work" and both matter to the decision in issue #7.
 
@@ -145,3 +145,104 @@ The second is to write our own kernels and depend only on `mojo-compiler`. The s
 The third is that D6 does not survive at all.
 
 Choosing is issue #7. What this spike owed it was the facts, and the facts are that the split the README is built on does not exist.
+
+## The matvec molla ships
+
+Everything above is the M0 spike, which answered a licensing question and threw its kernel away. This section is the kernel that stayed, `molla.nn.gpu.planar_matvec_kernel`, added for issue #141. It is the same claim in a narrower form: the same weights give the same answer on a device as they do on a host, on both vendors, over every quantization molla reads.
+
+It is a matvec and not a matmul, because decode is one token at a time and a matmul with a batch of one is a matvec with wasted machinery around it. Prefill wants the matmul and does not have it yet.
+
+### What it computes and what it reads
+
+One thread block per output row, `TILE` threads in the block, each walking the row with a stride of `TILE`, then a tree reduction through shared memory. `TILE` is 128.
+
+It reads the planar layout from `molla.nn.repack` and refuses anything still in ggml blocks. That is the whole reason the planar layout exists. A ggml block is a header, a bit plane and a nibble order, and unpacking one is a dozen dependent integer operations before a single multiply, with each thread pulling bytes out of a header the thread beside it also needs. Planar is one signed byte per value with the scales in planes at the end of the row, so thread `t` reads byte `t` and the hardware coalesces the row into as few transactions as it has lanes.
+
+The group size and whether the type carries a minimum plane are compile time parameters, so there are three instantiations of one function rather than three functions, and there are no target specific branches inside it at all. That is what D7 asks for, and the results below are the second piece of evidence that it is achievable.
+
+### How it is checked
+
+`scripts/kernel_oracle.mojo`, run by `pixi run conformance-kernels`, reads the same fixtures `pixi run conformance-quant` does and multiplies each of them by a fixed vector three ways.
+
+| Path | What it is |
+| --- | --- |
+| ggml on the host | `molla.nn.kernel.matvec` reading the block bytes the fixture holds |
+| planar on the host | the same, after `molla.nn.repack` has rewritten those bytes |
+| planar on the device | `molla.nn.gpu.device_matvec` reading a copy of the planar bytes in a device pool |
+
+Three rather than two so that a failure comes with a suspect. A disagreement between the first and the second is the repack, which is host arithmetic that never goes near a GPU. A disagreement between the second and the third is the kernel. Reporting one number for both would mean every device failure arrived with two possible causes and no way to separate them.
+
+The activation vector is signed and never zero. That matters more than it looks like it should. A kernel that dropped the sign of the quants, or read the minimum plane with the wrong sign, still agrees with the host to several digits when every input is positive, because the errors cancel across a row.
+
+The fixtures are viewed as two blocks per row, so a row stride bug has somewhere to show itself, and 64 or 512 columns against a tile of 128 means both the case where a thread walks the row more than once and the case where most threads contribute nothing are exercised rather than assumed.
+
+### The tolerance
+
+| Tolerance | Value | Why |
+| --- | --- | --- |
+| float32 output, ggml on the host against planar on the device | 1e-5 of the peak magnitude in the host reference | Float32 accumulation over a few hundred terms costs a few times 1e-7 whatever order it happens in, so this leaves two orders of magnitude of headroom for a reduction tree that sums the row in a different order from the host loop |
+
+The same gate the spike used for a float32 output, for the same reason, stated against the peak magnitude of the output rather than per element because a dot product over hundreds of terms lands near zero often enough that a per element relative error is meaningless there.
+
+It is loose in one direction and tight in the other. Two orders of magnitude of headroom sounds generous, and it is nowhere near enough to hide any of the failures this is looking for. A swapped nibble, a scale read from the wrong group and a row stride that is off by a row all move a result by a recognisable fraction of the whole. The one that actually happened during development moved four of the eight types by between 1.5 and 28.6 times the peak.
+
+### Results
+
+Both machines, every format, as a fraction of the peak magnitude in the host reference.
+
+| Format | Shape | M4, Metal | 4090, sm_89 |
+| --- | --- | --- | --- |
+| q4_0 | 256 by 64 | 2.21e-07 | 2.21e-07 |
+| q4_1 | 256 by 64 | 1.61e-07 | 1.61e-07 |
+| q5_0 | 256 by 64 | 8.24e-08 | 8.24e-08 |
+| q5_1 | 256 by 64 | 2.06e-07 | 2.06e-07 |
+| q8_0 | 256 by 64 | 1.07e-07 | 1.07e-07 |
+| q4_k | 256 by 512 | 2.40e-07 | 2.40e-07 |
+| q4_k, from a real model | 256 by 512 | 3.16e-07 | 3.16e-07 |
+| q5_k | 256 by 512 | 1.49e-07 | 1.49e-07 |
+| q6_k | 256 by 512 | 2.21e-07 | 2.21e-07 |
+| q6_k, from a real model | 256 by 512 | 1.69e-07 | 1.69e-07 |
+
+Worst case 3.16e-07, which is a factor of thirty inside the gate.
+
+The two columns are not merely close. Every figure the oracle prints on the two machines is identical, including the raw absolute errors and the repack and kernel columns that are not in this table. Same source, two vendors, two entirely different compilers and two entirely different memory systems, and the output does not differ anywhere it can be measured. The spike saw the same thing on a much simpler kernel; this one has shared memory, a reduction tree and three compile time instantiations in it and still does.
+
+That is worth being slightly suspicious of, so it is worth saying what would break it. The reduction is a fixed tree over a fixed number of threads, so the association is the same on both machines, and float32 addition is deterministic once the association is fixed. There is no fast math, no fused multiply add that fires on one target and not the other in a way that changes the result, and no atomic. Identical output is what this kernel should produce, and if a change ever makes the two columns diverge, the divergence is the finding.
+
+The M4 run reports `built for metal:4 running on metal Apple M4` and the 4090 run reports `built for nvidia:sm_89 running on cuda NVIDIA GeForce RTX 4090`, both against `max-core` 26.5.0.
+
+### The fleet
+
+Per D8.
+
+| Machine | What ran | Result |
+| --- | --- | --- |
+| M4, aarch64-apple-darwin | the full suite, and the oracle on Metal | suite green, ten formats inside tolerance |
+| gpc, i9-13900K on WSL2, x86_64 | the full suite, and the oracle on the 4090 | ten formats inside tolerance, suite green apart from issue #87, which fails the same way on main |
+| server1, EPYC, x86_64 | the full suite | green, the matvec compiled out and the refusals ran |
+
+Three of the five, which is every machine that can build this at all. server2 and server3 have no SDK on them.
+
+The three machines with no accelerator are not idle here. `check_matvec` is deliberately separate from the launch so that everything a device matvec refuses is testable without a device, and `tests/test_gpu.mojo` runs those refusals everywhere. The one that matters is the residency check, and the reason it matters is below.
+
+### A device kernel handed a host address reads zeros
+
+Found while getting the first launch to work, and it is the reason `check_matvec` refuses a weight that is not in a device pool rather than trusting the caller.
+
+On the M4, through `max-core` 26.5.0, a Metal kernel given a plain host allocation does not fault. It reads zeros. Every row of the output comes back as exactly zero and nothing anywhere reports an error. Wrapping the host memory in a `DeviceBuffer` with `owning=False` does not change it: the pointer value is the same and it still reads zeros.
+
+The same probe found the other half of it. A device buffer's `unsafe_ptr()` is a device address, 1099512152064 in the run that was recorded, and reading it from the host segfaults. `map_to_host()` on the same buffer returns 4470079744, a real host address for the same bytes, with no copy. So unified memory on this machine is one physical pool with two different addresses into it, and not one address that both sides can use.
+
+That matters beyond this kernel, because `WHERE_UNIFIED` in `molla.nn.tensor` was written on the assumption that a mapped file already is a device visible buffer and a device kernel can read it where it lies. It cannot. That is a real bug in a claim this repository has already published and it gets its own issue rather than being quietly fixed here.
+
+For this kernel the consequence is narrower and the fix is a refusal. A model bound to host memory and multiplied on a device would run at full speed and answer with noise, which is the single worst failure mode available to an inference engine, so the check is in the one place every launch goes through and it names what would have happened.
+
+### What is not covered
+
+Only matvec. Attention, the softmax, the norms and the elementwise operations are all still host only, and putting the rest of a block on the device is issue #142.
+
+No AMD, which D8 already records as a gap, and no arm64 Linux GPU, which nothing in the fleet has.
+
+Nothing here is a speed measurement. Every call in the oracle uploads its activations and downloads its result, which is most of what a call costs at these shapes, and the weights are a few hundred kilobytes rather than a few gigabytes, so the memory system this kernel was designed around is not being exercised at all. Timings arrive when the residual stream stops making the trip, which is issue #143, and they go in their own document.
+
+The corpus is the quantization corpus, so the shapes are small and rectangular and chosen to exercise the bit unpacking rather than the hardware. A 4096 by 4096 weight has not been through this kernel.

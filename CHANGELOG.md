@@ -2,6 +2,14 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- A quantized matvec that runs on the GPU. `molla.nn.gpu` holds one kernel, compiled for Metal and for CUDA out of one source, reading the planar layout `molla.nn.repack` writes. One thread block per output row, `TILE` threads walking the row with a stride of `TILE`, then a tree reduction in shared memory. The group size and whether the type carries a minimum plane are compile time parameters, so there are three instantiations of one function and no target specific branch anywhere inside it.
+- `pixi run conformance-kernels`, which multiplies every fixture in the quantization corpus three ways, ggml on the host, planar on the host and planar on the device, so a disagreement can be attributed to the repack or to the kernel rather than arriving with two suspects. Ten formats agree on both an M4 and a 4090 within 3.16e-07 of peak against a gate of 1e-5, and every figure it prints is identical on the two machines. See [docs/validation/kernels.md](docs/validation/kernels.md).
+- A device matvec refuses a weight that is not in a device pool. A device kernel handed a host address does not fault, it reads zeros, so a model bound that way runs at full speed and answers with noise. The check is separate from the launch so it runs on the machines in the fleet with no accelerator, which is most of them.
+
 ## [0.2.11] - 2026-09-03
 
 molla checks itself against llama.cpp a layer at a time, and a weight knows which memory it is in.
