@@ -60,6 +60,23 @@ The EPYC servers also report `avx2` rather than `avx512`. These are virtualised 
 
 Core counts on the servers show physical equal to logical. That is what the hypervisor presents, not a claim about the underlying silicon. Anything that sizes a thread pool from the physical count will size it correctly here by accident rather than by knowing the truth, which is fine for now but should not be relied on when the scheduler starts caring about the difference.
 
+## What each machine reports as a device
+
+`molla.sys.device` enumerates placements and the suite prints what it found, so every run on every box records this rather than anyone having to remember it. The CPU entry is always first and is always present, so a machine with no accelerator reports one device and not zero.
+
+| Machine | Built for | Devices | Accelerator | Memory reported |
+| --- | --- | --- | --- | --- |
+| macbook | `metal:4` | 2 | `metal`, Apple M4 | 16384 MiB |
+| server1 | `none` | 1 | none | n/a |
+| server2 | `none` | 1 | none | n/a |
+| gpc | `nvidia:sm_89` | 2 | `cuda`, NVIDIA GeForce RTX 4090 | 21760 MiB |
+
+Two of these are not what you would guess and both cost time to find, so they are written down.
+
+**Accelerator support is decided when you compile, not when you run.** `max-core` resolves the device architecture at compile time and refuses to compile at all on a machine it cannot name one for, with a `constraint failed: Unknown GPU architecture detected` and a list of every architecture it does know. That is not a warning and not a runtime error, it is a failed build, so the first version of `molla.sys.device` broke `pixi run build` outright on server1. Three of the five machines here have no GPU and they are the ones keeping the CPU path honest, so the device enumeration is behind `comptime if has_accelerator()`. The consequence is that a binary built on a CPU only box has no device code in it and will report no accelerators even if you carry it to a box that has one. `build_targets_gpu()` and `build_target_arch()` exist so that fact is visible instead of surprising, and the suite asserts the two answers agree.
+
+**Device free memory is not trustworthy under WSL2.** `nvidia-smi` on gpc reports 24564 MiB total with 50 MiB in use, and `get_memory_info` on the same card in the same minute reports 21760 MiB free and 21760 MiB total. Both numbers are below the physical total and they are equal to each other, which means the free figure is not tracking anything. So a fit calculation on gpc has to work from the total that the device reports and a headroom margin, not from its free number, and any place that wants to know how much room is left should treat this box as a machine that will not tell it. The M4 does not have this problem: it reports 16384 MiB total and 16383 MiB free, which moves as you allocate.
+
 One thing that is not pinned: pixi itself. The fleet currently runs 0.77.1 and 0.78.0 and both resolve the same lock file to the same toolchain, which is the property we actually want. Pinning pixi as well would be pinning the thing that does the pinning, and it has not caused a problem yet.
 
 ## Reproducing
