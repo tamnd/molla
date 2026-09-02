@@ -91,6 +91,40 @@ The two numbers are not comparable and it would be dishonest to present them as 
 
 The 486 ms read and the 473 ms copy overlap almost completely, which is why the total is 499 ms and not 959 ms.
 
+## What the pool holds once the cache is warm
+
+Both runs above are a first run against a model, when there is no repack cache and the plan has nothing to read but the file. What residency changed is the second run, so both machines were run again on the same 8B after the cache had been written. The progress lines are cut from both.
+
+The M4:
+
+```console
+repack hit, 226 tensors, 9572 MiB already repacked
+plan   292 tensors, 4685 MiB, metal Apple M4
+plan   9573 MiB unified, which the device reads from the mapping
+copy   nothing to copy, the weights are read where they lie
+repack nothing was repacked on this load
+done   292 tensors in 3700 ms
+```
+
+gpc:
+
+```console
+repack hit, 226 tensors, 9572 MiB already repacked
+plan   292 tensors, 4685 MiB, cuda NVIDIA GeForce RTX 4090
+plan   9573 MiB to the device pool, 0 MiB left on the host, budget 19584 MiB
+read   9573 MiB on 8 threads in 926 ms, 10338 MiB/s
+copy   9573 MiB to NVIDIA GeForce RTX 4090 in 919 ms, 10416 MiB/s
+copy   292 tensors resident in a 9573 MiB pool
+repack nothing was repacked on this load
+done   292 tensors in 954 ms
+```
+
+The two plan lines are the point. The first counts the file, which has not changed, and the second counts what is going to be read. The difference between 4685 and 9573 is the planar layout the repack wrote. Before this the planner knew only the first number, so the read stage faulted in the model file while the binder pointed the kernels at the cache beside it, and all 4685 MiB of that was work nobody used.
+
+On the M4 the second number costs nothing to satisfy, which is the unified claim written out in bytes: 9573 MiB became readable from a Metal kernel with no allocation and no copy anywhere in the run. On the 4090 it costs a 9573 MiB pool, and the plan line, the copy line and the resident line are three separate counts of the same quantity, arrived at from the placements at three different points in the load, which the loader compares before it will report success.
+
+The cold half of the gpc run is worth recording too, because the table above is a warm page cache and says so. The same 8B read for the first time after landing on the disk took 3551 ms at 1319 MiB/s, and the copy behind it took 695 ms. That 1319 MiB/s is the storage number for that box and the 9639 MiB/s in the table is not.
+
 ## Four things that were wrong first
 
 **The job struct freed itself while eight threads were still writing to it.** This is the same Mojo lifetime hazard documented in `docs/validation/threading.md`, met for the second time. The drain loop ends when the last tensor is popped, which happens before the worker that pushed it has come back around its own loop. The drain loop was the last visible use of the job struct, so Mojo destroyed the job, freed the atomics and the queue inside it, and left live workers incrementing memory the allocator had handed to something else. It surfaced as `index 245249457586176 is out of bounds, valid range is 0 to 5`, which is a claim counter read back as a stale heap pointer, reported a long way from the cause. `molla.sys.mem.keep(job)` after the joins is the fix and there is a comment on it saying why.
