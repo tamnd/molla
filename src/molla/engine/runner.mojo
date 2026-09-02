@@ -200,6 +200,23 @@ struct Runner(Movable):
             + " positions"
         )
 
+    def repack(self) -> String:
+        """Whether this model bound to a repack cache, in one line.
+
+        Said out loud at startup for the same reason `molla load` says it: a
+        repack that reruns on every start is the thing the cache exists to
+        prevent, and a server that is quietly doing it every time looks exactly
+        like one that is not.
+        """
+        if self.cache.usable:
+            return (
+                String(self.cache.count())
+                + " tensors from cache, "
+                + String(self.cache.bytes() // (1 << 20))
+                + " MiB"
+            )
+        return self.cache.reason
+
     def answers_to(self, name: String) -> Bool:
         """Whether a request's `model` field names this model.
 

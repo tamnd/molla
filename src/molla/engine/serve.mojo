@@ -80,6 +80,7 @@ def run_serve(
     var runner = Runner(model_path, tokenizer_path, model_path, context)
     print("  model         ", runner.describe())
     print("  tokenizer     ", tokenizer_path)
+    print("  repack        ", runner.repack())
     print(
         "  chat template ",
         "yes" if runner.has_chat else "no, /v1/chat/completions is off",
