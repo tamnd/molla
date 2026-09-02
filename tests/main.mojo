@@ -14,6 +14,8 @@ import test_dns
 import test_gguf
 import test_load
 import test_quant
+import test_kernel
+import test_tensor
 import test_host
 import test_http
 import test_io
@@ -61,6 +63,14 @@ def main():
         test_quant.run(suite)
     except e:
         suite.fail("test_quant", String(e))
+    try:
+        test_tensor.run(suite)
+    except e:
+        suite.fail("test_tensor", String(e))
+    try:
+        test_kernel.run(suite)
+    except e:
+        suite.fail("test_kernel", String(e))
     try:
         test_dns.run(suite)
     except e:
