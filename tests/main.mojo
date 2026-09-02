@@ -20,6 +20,7 @@ import test_arch
 import test_attention
 import test_block
 import test_engine
+import test_gpu
 import test_kernel
 import test_nnmodel
 import test_repack
@@ -85,6 +86,10 @@ def main():
         test_repack.run(suite)
     except e:
         suite.fail("test_repack", String(e))
+    try:
+        test_gpu.run(suite)
+    except e:
+        suite.fail("test_gpu", String(e))
     try:
         test_cache.run(suite)
     except e:
