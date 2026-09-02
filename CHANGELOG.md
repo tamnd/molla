@@ -2,7 +2,11 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.2.10] - 2026-09-02
+
+Weights get rewritten once and kept.
+
+The ggml block layout is a compression format and a good one, and it is the wrong thing to read in an inner loop. molla now unpacks it once at load into a planar layout the kernels want, and writes the result beside the model so the next load maps it instead of doing the work again. A cached load of a 135M finishes in 4 ms against 192 ms for the load that writes the cache.
 
 ### Added
 
