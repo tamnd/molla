@@ -2,6 +2,15 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `molla.engine.cache`, the keys and values one sequence has accumulated. Contiguous, one list per layer, float32, allocated once when the session is made. A sequence that would run past the end of the context is refused rather than wrapping onto slot zero, because a cache that wraps gives a model that is still fluent and has forgotten its instructions, and nobody reads that as an error.
+- `molla.engine.session`, prefill and decode as one loop rather than two. The check that matters is that prefilling a prompt and then decoding leaves the cache byte for byte identical to feeding the same tokens one at a time, which is the statement that both routes agree about position. See [docs/validation/decode.md](docs/validation/decode.md).
+- `molla.engine.bind`, which points the network at a file's bytes. By name, against the architecture table, with every shape checked before a token is computed rather than on the first forward pass.
+- `molla generate <model.gguf> <tokenizer.json> "<prompt>" [n] [ctx]`, which is molla generating text for the first time. SmolLM2 135M at q8_0 and Llama 3.1 8B Instruct at q4_K_M both produce coherent English, the second of those through the precomputed rope frequency factors that Llama 3.1 ships in the file. It is scalar and single threaded, about 90 ms a token on the 135M and 5.5 seconds a token on the 8B, which is what issue #120 exists to change.
+
 ## [0.2.7] - 2026-09-02
 
 The arithmetic a transformer is made of, checked against something outside molla.
