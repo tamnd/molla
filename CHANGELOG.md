@@ -10,6 +10,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 - `pixi run conformance-kernels`, which multiplies every fixture in the quantization corpus three ways, ggml on the host, planar on the host and planar on the device, so a disagreement can be attributed to the repack or to the kernel rather than arriving with two suspects. Ten formats agree on both an M4 and a 4090 within 3.16e-07 of peak against a gate of 1e-5, and every figure it prints is identical on the two machines. See [docs/validation/kernels.md](docs/validation/kernels.md).
 - A device matvec refuses a weight that is not in a device pool. A device kernel handed a host address does not fault, it reads zeros, so a model bound that way runs at full speed and answers with noise. The check is separate from the launch so it runs on the machines in the fleet with no accelerator, which is most of them.
 
+### Fixed
+
+- `Tensor.device_address` refuses a unified weight. It used to let one through on the grounds that a machine with one pool of memory has one address, and that is false: a device buffer's own pointer segfaults when read from the host, `map_to_host` returns a different address for the same bytes with no copy, and a kernel handed the host one reads zeros without reporting anything. The memory is shared and the address space is not. Nothing measured changes, a unified load still allocates nothing and copies nothing, and what a unified placement promises is now about what the pool cost rather than about what a kernel can be given. Making it mean something to a kernel again is [#152](https://github.com/tamnd/molla/issues/152). See [docs/validation/load.md](docs/validation/load.md).
+
 ## [0.2.11] - 2026-09-03
 
 molla checks itself against llama.cpp a layer at a time, and a weight knows which memory it is in.
