@@ -507,6 +507,38 @@ def swiglu(mut gate: Buffer, up: Buffer) raises:
         gate.data[i] = silu(gate.data[i]) * up.data[i]
 
 
+def add_bias_at(mut x: List[Float32], at: Int, n: Int, bias: Tensor) raises:
+    """Add a bias vector to a run in place.
+
+    Qwen 2 puts one of these on each of the three attention projections, so it
+    runs over the query at `heads * head_dim` and over the key and the value at
+    `kv_heads * head_dim`, and in the key and value cases the run is a slot in
+    the middle of the cache rather than the whole of a buffer. That is why it
+    takes an offset and a length instead of a `Buffer`.
+
+    Read through the dequant path like any other weight. Biases are f32 in
+    every file anybody ships, because they are a few thousand values and
+    quantizing them saves nothing, and reading them through the same path
+    anyway costs one dispatch and means a file that does quantize them works
+    rather than producing noise.
+    """
+    if at < 0 or n <= 0:
+        raise Error("a bias needs a non negative offset and a positive width")
+    if len(x) < at + n:
+        raise Error("a bias was pointed past the end of its buffer")
+    if bias.elements() != n:
+        raise Error(
+            "a bias of "
+            + String(n)
+            + " was wanted and the file has one of "
+            + String(bias.elements())
+        )
+    var b = Buffer(n)
+    dequant_run(bias.kind, bias.base(), 0, n, b.data, 0)
+    for i in range(n):
+        x[at + i] += b.data[i]
+
+
 def add_into(mut acc: Buffer, x: Buffer) raises:
     """The residual add, which is the only reason a deep network trains."""
     if acc.elements() != x.elements():

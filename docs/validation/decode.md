@@ -41,7 +41,10 @@ Everything binds to the mapping. The kernels are host kernels, so a tensor copie
 | Model | Quantization | Prompt | Output |
 | --- | --- | --- | --- |
 | SmolLM2 135M Instruct | q8_0 | The capital of France is | Paris. Paris is the largest city in France and the capital of the French department of ... |
+| Qwen 2.5 0.5B Instruct | q5_0 | The capital of France is | Paris. It is the largest city in Europe and the second largest in the world. |
 | Llama 3.1 8B Instruct | q4_K_M | The capital of France is | a city of grandeur and beauty, with a rich history |
+
+The 0.5B is wrong about Europe and that is the model rather than molla. What it demonstrates is the Qwen 2 attention biases, which is issue #131: without them the same file at the same speed produced Chinese and Russian fragments in the same sentence.
 
 The 8B is the interesting one, because it is the path that reads `rope_freqs.weight` off the file. Llama 3.1's position scaling arrives precomputed as one factor per rope pair rather than as a scheme to apply, and a model that ignores it is coherent at short context and falls apart at long, which is not something a twelve token sample would have shown either way. What the sample does show is that the factors were read and applied without breaking the short case.
 

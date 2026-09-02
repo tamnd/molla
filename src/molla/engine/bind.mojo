@@ -132,52 +132,54 @@ def bind_model(g: Gguf) raises -> ModelWeights:
     return out
 
 
+def asked_for(g: Gguf, name: String) raises -> Tensor:
+    """A tensor the architecture may or may not have asked for.
+
+    An empty name is one this family does not have and stays a `none`. A name
+    that is there is one the table asked for, so a file without it is a
+    mismatch between what molla believes the architecture is and what this file
+    actually contains, and binding it as absent would run the layer without a
+    norm or without a bias and produce text.
+    """
+    if name.byte_length() == 0:
+        return Tensor.none()
+    var out = find(g, name)
+    if not out.present():
+        raise Error("the architecture wants " + name + " and it is missing")
+    return out
+
+
 def bind_layer(g: Gguf, a: Arch, layer: Int) raises -> LayerWeights:
     """One layer's weights, by name, in the order `LayerWeights` declares them.
 
     The two lists are walked together rather than the names being looked up
     field by field, which is what keeps the table in `arch.mojo` and the struct
-    in `block.mojo` from drifting apart. A name the architecture does not have
-    is the empty string and stays a `none` here.
+    in `block.mojo` from drifting apart.
     """
     var names = tensor_names(a, layer)
-    if len(names) != 13:
+    if len(names) != 16:
         raise Error(
             "the architecture table gave "
             + String(len(names))
-            + " tensor names for a layer that has 13 fields"
+            + " tensor names for a layer that has 16 fields"
         )
     var w = LayerWeights()
     w.attn_norm = require(g, names[0])
-    w.attn_post_norm = find(g, names[1])
+    w.attn_post_norm = asked_for(g, names[1])
     w.wq = require(g, names[2])
     w.wk = require(g, names[3])
     w.wv = require(g, names[4])
     w.wo = require(g, names[5])
-    w.q_norm = find(g, names[6])
-    w.k_norm = find(g, names[7])
-    w.ffn_norm = require(g, names[8])
-    w.ffn_post_norm = find(g, names[9])
-    w.gate = find(g, names[10])
-    w.up = require(g, names[11])
-    w.down = require(g, names[12])
-
-    # A name the table asked for and the file does not have is a mismatch
-    # between what molla believes the architecture is and what this file
-    # actually contains. Loading it as absent would run the layer without the
-    # norm and produce text.
-    if names[1].byte_length() > 0 and not w.attn_post_norm.present():
-        raise Error("the architecture wants " + names[1] + " and it is missing")
-    if names[6].byte_length() > 0 and not w.q_norm.present():
-        raise Error("the architecture wants " + names[6] + " and it is missing")
-    if names[7].byte_length() > 0 and not w.k_norm.present():
-        raise Error("the architecture wants " + names[7] + " and it is missing")
-    if names[9].byte_length() > 0 and not w.ffn_post_norm.present():
-        raise Error("the architecture wants " + names[9] + " and it is missing")
-    if names[10].byte_length() > 0 and not w.gate.present():
-        raise Error(
-            "the architecture wants " + names[10] + " and it is missing"
-        )
+    w.q_bias = asked_for(g, names[6])
+    w.k_bias = asked_for(g, names[7])
+    w.v_bias = asked_for(g, names[8])
+    w.q_norm = asked_for(g, names[9])
+    w.k_norm = asked_for(g, names[10])
+    w.ffn_norm = require(g, names[11])
+    w.ffn_post_norm = asked_for(g, names[12])
+    w.gate = asked_for(g, names[13])
+    w.up = require(g, names[14])
+    w.down = require(g, names[15])
     return w
 
 

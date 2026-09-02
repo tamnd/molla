@@ -25,6 +25,7 @@ Every model molla runs is that, with different answers to the questions below. I
 | Which activation | `act` | silu for Llama, Qwen and Gemma 3. gelu for Gemma 2. |
 | How is rope paired | `neox` | False for Llama, true for almost everything else. |
 | Are q and k normed per head | `qk_norm` | Qwen 3 and Gemma 3. |
+| Do the attention projections carry a bias | `qkv_bias` | Qwen 2. Qwen 3 dropped it and Llama never had one. |
 | Are sublayer outputs normed | `post_norms` | Gemma 2 and Gemma 3. |
 | Is there a sliding window | `window`, `window_pattern` | Gemma alternates, Mistral does not. |
 | Do windowed layers use a different rope base | `local_rope_base` | Gemma 3. |
@@ -41,6 +42,8 @@ Add the id in `src/molla/model/spec.mojo` if it is not already there, and map th
 Add a row to `arch_of` in `src/molla/nn/arch.mojo`. Start from `Arch(id, name)`, which is a gated silu decoder with neox pairing and nothing else, and set only what differs. Leave `supported` false.
 
 Add the tensor names to `tensor_names` if the model has weights the existing families do not. The order there matches the fields of `LayerWeights`, and a name a layer does not have is the empty string rather than a shorter list.
+
+A field that adds a tensor should be refused in both directions. `LayerWeights.check` errors when the table asks for something the file does not have and when the file has something the table does not ask for, because either way the table and the file disagree about what the model is and picking a side silently gives a model that runs at full speed and writes noise.
 
 Add checks to `tests/test_arch.mojo` for the two or three facts that would give a model that talks rather than a model that crashes. The pairing and the per head norms are always worth writing down twice. So is any alternation, because the phase is off by one in the obvious implementation.
 
