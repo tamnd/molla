@@ -8,6 +8,7 @@ binary thinks it is running on. The real command surface arrives with M2.
 from std.sys import argv, exit
 
 from molla.build_info import MOJO_PIN, VERSION
+from molla.engine.generate import run_generate
 from molla.host import detect
 from molla.http.server import run_http
 from molla.jinja.bench import run_template
@@ -93,6 +94,9 @@ def print_usage():
         " with it"
     )
     print("  load <path>     load a model's weights and report each stage")
+    print(
+        "  generate <model> <tokenizer.json> <prompt> [n] [ctx]  generate text"
+    )
     print("  devices         list what this machine can put a tensor on")
     print("  config get [key] print a setting and where its value came from")
     print("  tls <host>      connect over TLS and print what was negotiated")
@@ -375,6 +379,24 @@ def main():
             run_load(args[2], workers)
         except e:
             print("molla load:", e)
+            exit(1)
+    elif command == "generate":
+        if len(args) < 5:
+            print(
+                "molla generate: expected a gguf file, a tokenizer.json, and a"
+                " prompt"
+            )
+            exit(2)
+        var limit = 0
+        var context = 0
+        try:
+            if len(args) > 5:
+                limit = atol(args[5])
+            if len(args) > 6:
+                context = atol(args[6])
+            run_generate(args[2], args[3], args[4], limit, context)
+        except e:
+            print("molla generate:", e)
             exit(1)
     elif command == "devices":
         try:

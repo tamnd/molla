@@ -17,6 +17,7 @@ import test_quant
 import test_arch
 import test_attention
 import test_block
+import test_engine
 import test_kernel
 import test_nnmodel
 import test_rope
@@ -96,6 +97,10 @@ def main():
         test_nnmodel.run(suite)
     except e:
         suite.fail("test_nnmodel", String(e))
+    try:
+        test_engine.run(suite)
+    except e:
+        suite.fail("test_engine", String(e))
     try:
         test_dns.run(suite)
     except e:
