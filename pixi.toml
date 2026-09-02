@@ -11,6 +11,12 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 # commit with a green CI run behind it, not something that happens on a Tuesday
 # because someone ran an update. See docs/validation/toolchain.md.
 mojo = "==1.0.0"
+# The runtime max/kernels calls into, and the only sanctioned route to a device
+# buffer, since D1 keeps FFI to libc and the platform TLS library. It is
+# proprietary and it is required to run molla, not only to build it. That is a
+# real cost and it is named in the README rather than buried here. The decision,
+# with the alternative that was rejected, is in docs/adr/0002-accept-max-core.md.
+max-core = "==26.5.0"
 
 [tasks]
 mkbuild = { cmd = "mkdir -p build" }

@@ -9,11 +9,14 @@ The pin lives in two places. `pixi.toml` is the one that matters, and `src/molla
 | Item | Value |
 | --- | --- |
 | Mojo | 1.0.0, build ed45d567 |
+| max-core | 26.5.0 |
 | Channel | `https://conda.modular.com/max` |
 | Package license | LicenseRef-Modular-Proprietary |
 | Pinned in | `pixi.toml` |
 
 One thing worth being straight about: the Mojo language and standard library are open source under Apache-2.0, but the toolchain we install here is the prebuilt conda package from Modular's channel, and that package is distributed under Modular's own license. So molla's source is Apache-2.0 and molla's dependencies are Apache-2.0, but the compiler you use to build it today is not. That is a real gap between what the README claims and what a fresh `pixi install` actually pulls down, and it belongs in the openness charter rather than in a footnote. Building the toolchain from the open source tree is the fix, and it is not something we have done yet.
+
+`max-core` is the second half of that gap and it is worse, because it is not only a build time cost. The `mojo` package ships one library, `std.mojoc`, and that is the whole standard library. Everything else lives in `max-core`: `max.mojoc`, `layout.mojoc`, `linalg.mojoc`, `quantization.mojoc`, `kv_cache.mojoc` and about twenty more. There is no way to reach a GPU from Mojo today without it, since the device runtime is behind `max.gpu.host` and molla's dependency rules keep FFI to libc and the platform TLS library. So `max-core` is a runtime dependency and not a developer convenience: a machine that runs molla on a GPU has this package installed. The decision and the alternative that was rejected are in `docs/adr/0002-accept-max-core.md`.
 
 ## The fleet
 
