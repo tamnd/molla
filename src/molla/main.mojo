@@ -13,6 +13,7 @@ from molla.http.server import run_http
 from molla.jinja.bench import run_template
 from molla.json.bench import run_json_bench
 from molla.model.gguf import run_gguf
+from molla.model.load import run_load
 from molla.model.repo import run_model_spec
 from molla.model.safetensors import run_safetensors
 from molla.net.allocs import run_allocs
@@ -23,6 +24,7 @@ from molla.net.soak_http import run_http_soak
 from molla.net.soak_net import run_net_soak
 from molla.ops.config import describe_setting, load_config
 from molla.registry.pull import run_pull
+from molla.sys.device import run_devices
 from molla.sys.mem import AllocCounter
 from molla.sys.poll import USES_KQUEUE
 from molla.tls.client import probe, run_tls
@@ -90,6 +92,8 @@ def print_usage():
         "  spec <path>     print what a model is and what this build can do"
         " with it"
     )
+    print("  load <path>     load a model's weights and report each stage")
+    print("  devices         list what this machine can put a tensor on")
     print("  config get [key] print a setting and where its value came from")
     print("  tls <host>      connect over TLS and print what was negotiated")
     print("  pull <ref>      pull a blob from ghcr.io and check its digest")
@@ -359,6 +363,24 @@ def main():
             run_model_spec(args[2])
         except e:
             print("molla spec:", e)
+            exit(1)
+    elif command == "load":
+        if len(args) < 3:
+            print("molla load: expected a gguf file")
+            exit(2)
+        var workers = 0
+        try:
+            if len(args) > 3:
+                workers = atol(args[3])
+            run_load(args[2], workers)
+        except e:
+            print("molla load:", e)
+            exit(1)
+    elif command == "devices":
+        try:
+            run_devices()
+        except e:
+            print("molla devices:", e)
             exit(1)
     elif command == "tls":
         if len(args) < 3:

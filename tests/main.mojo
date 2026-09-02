@@ -12,6 +12,7 @@ import test_client
 import test_concurrency
 import test_dns
 import test_gguf
+import test_load
 import test_host
 import test_http
 import test_io
@@ -51,6 +52,10 @@ def main():
         test_safetensors.run(suite)
     except e:
         suite.fail("test_safetensors", String(e))
+    try:
+        test_load.run(suite)
+    except e:
+        suite.fail("test_load", String(e))
     try:
         test_dns.run(suite)
     except e:
