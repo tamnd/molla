@@ -522,6 +522,11 @@ struct Reactor[P: Protocol](Movable):
         So this keeps going while it is making progress, and if it runs out of
         rounds while still making progress it puts the slot on `again`, which
         makes the next pass come straight back to it instead of waiting.
+
+        A protocol that has just done something expensive can end the loop early
+        by calling `Connection.yield_now`, and that lands on `again` the same
+        way. See the docstring on the flag for why a round budget alone is not
+        enough once a round can be a forward pass through a language model.
         """
         var now = monotonic_ms()
         var keep = True
@@ -536,6 +541,8 @@ struct Reactor[P: Protocol](Movable):
 
         var rounds = 0
         var moving = True
+        var gave_way = False
+        self.conns[slot].yielded = False
         while keep and moving and rounds < SERVICE_ROUNDS:
             rounds += 1
             var input_before = self.conns[slot].input.length
@@ -546,18 +553,22 @@ struct Reactor[P: Protocol](Movable):
                 keep = self.proto.on_readable(self.conns[slot])
                 if not keep:
                     break
+                gave_way = self.conns[slot].yielded
 
             # `on_writable` is for a protocol that produces without being asked,
             # which is what a streaming response is. It only makes sense when
             # there is somewhere to put the output, so either the socket said it
             # had room or the protocol said it has more, and in the second case
             # there is no edge coming and waiting for one is the hang.
-            if (writable or self.conns[slot].producing) and self.conns[
-                slot
-            ].writable() > 0:
+            if (
+                not gave_way
+                and (writable or self.conns[slot].producing)
+                and self.conns[slot].writable() > 0
+            ):
                 keep = self.proto.on_writable(self.conns[slot])
                 if not keep:
                     break
+                gave_way = self.conns[slot].yielded
 
             if self.conns[slot].wants_write():
                 var wrote = self.conns[slot].flush()
@@ -579,10 +590,17 @@ struct Reactor[P: Protocol](Movable):
                 or wrote_any > 0
             )
 
-        if keep and moving and rounds == SERVICE_ROUNDS:
-            # Still going when the budget ran out. Come back next pass without
-            # blocking rather than hoping for an edge that has already been
-            # spent.
+            # Broken out of after the flush rather than at the call that set it,
+            # so what the protocol just produced is on its way to the socket
+            # instead of sitting in the ring until the next pass.
+            if gave_way:
+                self.conns[slot].yielded = False
+                break
+
+        if keep and (gave_way or (moving and rounds == SERVICE_ROUNDS)):
+            # Either the budget ran out with work still moving or the protocol
+            # asked for a breath. Come back next pass without blocking rather
+            # than hoping for an edge that has already been spent.
             self.again.append(slot)
 
         if not keep:

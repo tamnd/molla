@@ -16,6 +16,7 @@ from std.memory import stack_allocation
 
 from harness import Suite
 
+from molla.net.conn import Connection
 from molla.net.context import ServerContext
 from molla.net.listener import (
     SHARDED_ACCEPT,
@@ -24,7 +25,7 @@ from molla.net.listener import (
     open_listener,
 )
 from molla.net.protocol import EchoProtocol
-from molla.net.reactor import Reactor
+from molla.net.reactor import Protocol, Reactor
 from molla.net.server import Server, default_workers
 from molla.net.wheel import SLOTS, TICK_MS, Wheel
 from molla.sys.clock import monotonic_ms
@@ -329,6 +330,86 @@ def _check_backpressure(mut suite: Suite) raises:
     reactor.shutdown()
 
 
+struct YieldProtocol(Movable, Protocol):
+    """A protocol whose every produce is expensive, so it hands back after one.
+
+    Echo stands in for a protocol whose unit of work is a memcpy. This one
+    stands in for a streaming completion, where one produce is a forward pass
+    through a language model and staying on the connection for a whole round
+    budget means everything else on that worker waits eight tokens.
+    """
+
+    var produced: Int
+    var started: Bool
+
+    def __init__(out self):
+        self.produced = 0
+        self.started = False
+
+    def on_open(mut self, mut conn: Connection):
+        pass
+
+    def on_readable(mut self, mut conn: Connection) -> Bool:
+        if conn.input.length == 0:
+            return True
+        conn.input.consume(conn.input.length)
+        self.started = True
+        conn.produce(True)
+        return self._one(conn)
+
+    def on_writable(mut self, mut conn: Connection) -> Bool:
+        if not self.started:
+            return True
+        return self._one(conn)
+
+    def _one(mut self, mut conn: Connection) -> Bool:
+        if conn.queue_str("x") == 1:
+            self.produced += 1
+        conn.yield_now()
+        return True
+
+    def on_close(mut self, mut conn: Connection):
+        pass
+
+
+def _check_yield(mut suite: Suite) raises:
+    suite.group("net.reactor yield")
+
+    var listener = open_listener(ListenAddress(UInt16(0)), False)
+    var port = bound_port(listener)
+    var reactor = Reactor[YieldProtocol](YieldProtocol(), 60000, 0)
+    reactor.add_listener(listener)
+
+    var client = _client(port)
+    var steps = 0
+    while reactor.accepted < 1 and steps < MAX_STEPS:
+        _ = reactor.poll_once(5)
+        steps += 1
+    suite.check(reactor.accepted == 1, "the reactor accepted a connection")
+
+    _ = _send_pattern(client, 1, 1)
+    steps = 0
+    while reactor.proto.produced == 0 and steps < MAX_STEPS:
+        _ = reactor.poll_once(5)
+        steps += 1
+
+    # Two rather than one, and both are the point. The readable event produces
+    # once and yields, which is what stops the round budget from spending eight
+    # of them, and the yield puts the slot on `again`, which the same pass then
+    # picks up for the second. Without the yield this would be eight.
+    suite.check(reactor.proto.produced == 2, "a yield ends the round loop")
+    suite.check(len(reactor.again) == 1, "and asks for the next pass")
+
+    _ = reactor.poll_once(5)
+    suite.check(
+        reactor.proto.produced == 3,
+        "which comes back without waiting for an edge",
+    )
+
+    _ = close(client)
+    reactor.shutdown()
+
+
 def _check_idle_timeout(mut suite: Suite) raises:
     suite.group("net.reactor idle timeout")
 
@@ -472,6 +553,7 @@ def run(mut suite: Suite) raises:
     _check_wheel(suite)
     _check_reactor(suite)
     _check_backpressure(suite)
+    _check_yield(suite)
     _check_idle_timeout(suite)
     _check_unix_socket(suite)
     _check_server(suite)

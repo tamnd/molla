@@ -19,8 +19,10 @@ than to run four and corrupt a cache. See the docstring on
 
 The cost is visible and worth saying out loud: a request that is not streaming
 holds the server for its whole generation, so a health check behind a long
-completion waits for it. A streaming request goes back to the event loop
-between tokens, so the admin routes stay answerable through one.
+completion waits for it. A streaming request hands the reactor back after every
+token, so the admin routes stay answerable through one at the cost of about one
+token of delay. See `Connection.yield_now` for what makes that a token rather
+than eight of them.
 
 ## The model is a local
 

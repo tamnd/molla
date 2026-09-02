@@ -149,14 +149,21 @@ comptime STREAM_API = 1
 """What a streaming connection is producing. The stand in routes count, the API
 routes decode."""
 
-comptime API_BURST = 4
+comptime API_BURST = 1
 """Tokens produced before an API stream hands the reactor back.
 
 A stream produces until the ring is full, which on a fast local socket is never,
 so without a cap one connection's whole completion runs inside one turn of the
-service loop and nothing else on that worker is looked at until it finishes. The
-reactor's own round budget then picks the connection straight back up, so this
-costs a few more passes rather than any throughput.
+service loop and nothing else on that worker is looked at until it finishes.
+
+One rather than a handful, and the number matters because a token is not a
+memcpy. Handing back after four tokens still meant a health check behind a
+streaming completion waited more than five seconds on one machine in the fleet
+and under one on another, which is the same bug wearing a faster clock. The
+handing back is `Connection.yield_now`, which ends the reactor's round loop
+rather than merely one round of it, so what a request arriving mid stream waits
+for is one token and a poll. A token is two orders of magnitude more work than a
+turn of that loop, so producing one at a time costs nothing anybody can measure.
 """
 
 comptime API_SLACK = 8
@@ -825,7 +832,10 @@ struct HttpProtocol(Movable, Protocol):
             if self.states[slot].stream_kind == STREAM_API:
                 produced += 1
                 if produced >= API_BURST:
-                    # Hand the reactor back. See `API_BURST`.
+                    # Hand the reactor back. See `API_BURST`. The yield is what
+                    # ends the round loop; without it this returns into a loop
+                    # that immediately asks for another token.
+                    conn.yield_now()
                     return False
 
         self.states[slot].streaming = False

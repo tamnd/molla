@@ -22,7 +22,7 @@ The server runs one worker. There is one model, one session and one sampler behi
 
 That is a worse server than the one M3 will have, and it is an honest one. Queueing without a scheduler means a client waiting on a socket with no idea it is second. Interleaving without paging means two sequences writing over each other's cache, which does not crash: it produces fluent output that has forgotten the instruction, and nobody reads that as an error. The scheduler is issue #31 and it is the thing that turns the runner into a list.
 
-The cost is visible in one place. A request that is not streaming holds the worker for its whole generation, so a health check behind a sixty token completion waits seven seconds for it. A streaming request goes back to the event loop between tokens, so `/molla/health` answers through one in the usual microseconds, which is checked by hand below.
+The cost is visible in one place. A request that is not streaming holds the worker for its whole generation, so a health check behind a sixty token completion waits seven seconds for it. A streaming request goes back to the event loop between tokens, so `/molla/health` answers through one in about the time one token takes, which is checked by hand below.
 
 ## What is refused, and why refusing is the feature
 
@@ -53,7 +53,17 @@ None of these was found by the compiler and one of them would not have been foun
 
 **An event that does not fit must not be lost.** The stand in streaming routes advance their event counter before they know the event fits, which is harmless when the payload is a demo number and loses a token when it is not. The API path holds the built chunk in `api_delta` and only clears it once `stream.event` returns OK, and a stage transition happens only after a successful write.
 
-**A stream that never yields makes the busy path unreachable.** `_pump_stream` produces until the ring is full, and on a loopback socket the ring is never full, so an entire completion would run inside one turn of the service loop and nothing else on that worker would be looked at until it finished. That is not a throughput problem, it is a correctness one: the 503 that a second request is supposed to get cannot be sent by a worker that is not being serviced. An API stream now produces four tokens and hands back. The reactor's own round budget picks the connection straight up again, so it costs a few more passes through the loop and no throughput, and it is applied only to API streams so the demo, soak, drain and allocation behaviour is exactly what it was.
+**A stream that never yields makes the busy path unreachable.** `_pump_stream` produces until the ring is full, and on a loopback socket the ring is never full, so an entire completion would run inside one turn of the service loop and nothing else on that worker would be looked at until it finished. That is not a throughput problem, it is a correctness one: the 503 that a second request is supposed to get cannot be sent by a worker that is not being serviced. An API stream now produces one token and hands back, and it is applied only to API streams so the demo, soak, drain and allocation behaviour is exactly what it was.
+
+Handing back once per token is not by itself enough, and that is the part the fleet found rather than the laptop. The reactor gives a connection eight rounds of read, produce and write per pass, which is the right budget when a round is a memcpy and the wrong one when a round is a forward pass through a language model, so a stream that returned after one token was simply asked for another seven before anything else on the worker was looked at. `Connection.yield_now` is the fix: a protocol that has just done something expensive sets it, the reactor ends the round loop rather than the round, and the slot goes on the same `again` list that a spent round budget uses, so the next pass comes straight back to it without blocking. What a request arriving mid stream now waits for is one token and one poll.
+
+| Health check behind a 200 token stream | Steady state |
+| --- | --- |
+| Four tokens per hand back, eight rounds per pass | 1.8 to 2.1 s |
+| One token per hand back, eight rounds per pass | 0.3 to 0.9 s |
+| One token per hand back, yield ends the pass | 0.13 to 0.22 s |
+
+The last row is one token time, which is the floor: a token is not interruptible and a request that arrives during one waits for it. The same is true of the prefill, and the prefill is the one visible remaining case, since a health check issued while a thirty six token prompt is being read waits the two or three seconds that takes. Total stream time is unchanged across all three rows, so none of this cost throughput.
 
 ## Streaming
 
