@@ -10,6 +10,7 @@ from std.sys import argv, exit
 from molla.build_info import MOJO_PIN, VERSION
 from molla.engine.generate import run_generate
 from molla.engine.sample import SamplerConfig
+from molla.engine.serve import run_serve
 from molla.host import detect
 from molla.http.server import run_http
 from molla.jinja.bench import run_template
@@ -106,6 +107,14 @@ def print_usage():
         " --presence-penalty"
     )
     print("                  --repeat-last-n --seed, and no flags means greedy")
+    print(
+        "  serve <model> <tokenizer.json>  answer OpenAI requests against a"
+        " model"
+    )
+    print(
+        "                  --host --port --ctx, and 127.0.0.1:8000 when"
+        " nothing says"
+    )
     print("  devices         list what this machine can put a tensor on")
     print("  config get [key] print a setting and where its value came from")
     print("  tls <host>      connect over TLS and print what was negotiated")
@@ -130,7 +139,7 @@ def print_usage():
     )
     print("                  that one host, not a redirect it sends you to.")
     print()
-    print("Nothing serves yet. See the roadmap for what lands when:")
+    print("See the roadmap for what lands when:")
     print("  https://github.com/tamnd/molla/blob/main/docs/roadmap.md")
 
 
@@ -480,6 +489,57 @@ def main():
             run_generate(args[2], args[3], args[4], limit, context, sampling)
         except e:
             print("molla generate:", e)
+            exit(1)
+    elif command == "serve":
+        if len(args) < 4:
+            print("molla serve: expected a gguf file and a tokenizer.json")
+            exit(2)
+        var serve_host = String("127.0.0.1")
+        var serve_port: UInt16 = 8000
+        var serve_context = 0
+        try:
+            # Named flags rather than positions, because a host and a port and
+            # a context length are three numbers nobody is going to remember
+            # the order of, and every one of them has a default worth having.
+            for i in range(4, len(args)):
+                var arg = args[i]
+                if not arg.startswith("--"):
+                    raise Error(
+                        String("'")
+                        + arg
+                        + "' is one argument more than this takes"
+                    )
+                var body = arg[byte = 2 : arg.byte_length()]
+                var eq = body.find("=")
+                if eq < 0:
+                    raise Error(
+                        String("'") + arg + "' wants a value, as --name=value"
+                    )
+                var key = String(body[byte=0:eq].strip())
+                var val = String(
+                    body[byte = eq + 1 : body.byte_length()].strip()
+                )
+                if key == "host":
+                    serve_host = val
+                elif key == "port":
+                    serve_port = UInt16(_flag_int(key, val))
+                elif key == "ctx":
+                    serve_context = _flag_int(key, val)
+                else:
+                    raise Error(
+                        String("'") + arg + "' is not a flag this takes"
+                    )
+            exit(
+                run_serve(
+                    args[2],
+                    args[3],
+                    serve_host,
+                    serve_port,
+                    serve_context,
+                )
+            )
+        except e:
+            print("molla serve:", e)
             exit(1)
     elif command == "devices":
         try:

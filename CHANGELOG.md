@@ -2,6 +2,16 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `molla.api.openai`, the OpenAI wire format: request parsing, the response and streaming chunk builders, and the error envelope. Everything under `molla.api` is somebody else's API written down in Mojo and holds no opinions of its own, which is decision D2. Fields this build does not implement are refused with a 400 that names them rather than accepted and ignored, because `tools` accepted and ignored looks exactly like the model deciding not to call one.
+- `molla.engine.runner`, one loaded model plus the state of the one request using it. It owns the mapping, the weights, the tokenizer, the compiled chat template, the session and the sampler, and the protocol reaches it by address. Stop strings are held rather than searched for afterwards, since a stop string can straddle two tokens and half of one must not go out to a streaming client.
+- `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/v1/models/{id}`, streaming and not, on the reactor that has been there since M0. The OpenAI Python SDK streams a conversation against it with nothing configured but `base_url`, and raises `NotFoundError` and `BadRequestError` from the error envelope rather than a generic `APIError`. See [docs/validation/openai.md](docs/validation/openai.md).
+- `molla serve <model.gguf> <tokenizer.json>`, with `--host`, `--port` and `--ctx`. One worker and one sequence at a time: a second request arriving while one is running gets a 503 saying so, rather than being queued behind a scheduler that does not exist yet. A streaming request goes back to the event loop between tokens, so the admin routes stay answerable through one.
+- `Connection.yield_now`, which a protocol calls when it has just done something expensive and wants the rest of the reactor looked at before it is asked for more. The reactor gives a connection eight rounds of read, produce and write per pass, which is right when a round is a memcpy and wrong when it is a forward pass through a language model. Without it a health check behind a streaming completion waited eight tokens, which was two seconds on a 135M model and would be a minute and a half on an 8B. It is one token now, and total stream time is unchanged.
+
 ## [0.2.8] - 2026-09-02
 
 A model file goes in one end and English comes out the other.

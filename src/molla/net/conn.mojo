@@ -91,6 +91,20 @@ struct Connection(Movable):
     no edge left to come back on. Set it and the reactor calls `on_writable`
     while there is room, whether or not the poller said anything."""
 
+    var yielded: Bool
+    """The protocol produced something expensive and wants the rest of the
+    reactor looked at before it is asked for more.
+
+    The reactor gives a connection several rounds of read, produce and write per
+    pass, which is right when a round is a memcpy and wrong when it is a forward
+    pass through a language model. Without this, a streaming completion holds
+    the worker for the whole round budget, and at a tenth of a second a token
+    that is a second or two before anything else on that worker is looked at.
+    Setting it ends the round loop and puts the connection on the list that is
+    picked straight back up next pass, so the cost is one poll and the reactor
+    gets a turn in between.
+    """
+
     var bytes_in: Int
     var bytes_out: Int
     var short_writes: Int
@@ -119,6 +133,7 @@ struct Connection(Movable):
         self.closed = False
         self.write_interest = False
         self.producing = False
+        self.yielded = False
         self.bytes_in = 0
         self.bytes_out = 0
         self.short_writes = 0
@@ -150,6 +165,7 @@ struct Connection(Movable):
         self.closed = False
         self.write_interest = False
         self.producing = False
+        self.yielded = False
         self.bytes_in = 0
         self.bytes_out = 0
         self.short_writes = 0
@@ -213,6 +229,10 @@ struct Connection(Movable):
 
     def queue_str(mut self, text: StringSpan) -> Int:
         return self.output.push_str(text)
+
+    def yield_now(mut self):
+        """Ask the reactor to come back next pass rather than this round."""
+        self.yielded = True
 
     def produce(mut self, more: Bool):
         """Say whether there is more to write on the protocol's own initiative.
