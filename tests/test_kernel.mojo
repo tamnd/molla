@@ -39,7 +39,10 @@ from molla.nn.quant import (
     Q_F16,
     Q_F32,
     Q_Q4_0,
+    Q_Q4_1,
     Q_Q4_K,
+    Q_Q5_0,
+    Q_Q5_1,
     Q_Q5_K,
     Q_Q6_K,
     Q_Q8_0,
@@ -113,7 +116,12 @@ def _blocks(kind: Int, count: Int, seed: UInt64) raises -> List[UInt8]:
             _put16(out, at + 208, _scale_bits(Int(rng.next() & 3)))
         else:
             _put16(out, at, _scale_bits(Int(rng.next() & 3)))
-            if kind == Q_Q4_K or kind == Q_Q5_K:
+            if (
+                kind == Q_Q4_K
+                or kind == Q_Q5_K
+                or kind == Q_Q4_1
+                or kind == Q_Q5_1
+            ):
                 _put16(out, at + 2, _scale_bits(Int(rng.next() & 3)))
     return out^
 
@@ -398,6 +406,9 @@ def test_row_dot(mut suite: Suite) raises:
 def _names() -> List[Int]:
     var out = List[Int]()
     out.append(Q_Q4_0)
+    out.append(Q_Q4_1)
+    out.append(Q_Q5_0)
+    out.append(Q_Q5_1)
     out.append(Q_Q8_0)
     out.append(Q_Q4_K)
     out.append(Q_Q5_K)
@@ -408,6 +419,12 @@ def _names() -> List[Int]:
 def _label(kind: Int) -> String:
     if kind == Q_Q4_0:
         return "q4_0"
+    if kind == Q_Q4_1:
+        return "q4_1"
+    if kind == Q_Q5_0:
+        return "q5_0"
+    if kind == Q_Q5_1:
+        return "q5_1"
     if kind == Q_Q8_0:
         return "q8_0"
     if kind == Q_Q4_K:

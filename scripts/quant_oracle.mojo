@@ -22,7 +22,10 @@ from molla.nn.quant import (
     Q_BF16,
     Q_F16,
     Q_Q4_0,
+    Q_Q4_1,
     Q_Q4_K,
+    Q_Q5_0,
+    Q_Q5_1,
     Q_Q5_K,
     Q_Q6_K,
     Q_Q8_0,
@@ -38,6 +41,9 @@ def _names() -> List[String]:
         String("f16"),
         String("bf16"),
         String("q4_0"),
+        String("q4_1"),
+        String("q5_0"),
+        String("q5_1"),
         String("q8_0"),
         String("q4_k"),
         String("q5_k"),
@@ -46,7 +52,18 @@ def _names() -> List[String]:
 
 
 def _kinds() -> List[Int]:
-    return [Q_F16, Q_BF16, Q_Q4_0, Q_Q8_0, Q_Q4_K, Q_Q5_K, Q_Q6_K]
+    return [
+        Q_F16,
+        Q_BF16,
+        Q_Q4_0,
+        Q_Q4_1,
+        Q_Q5_0,
+        Q_Q5_1,
+        Q_Q8_0,
+        Q_Q4_K,
+        Q_Q5_K,
+        Q_Q6_K,
+    ]
 
 
 def _f32_at(p: RawPtr, at: Int) -> Float32:

@@ -12,12 +12,17 @@ Every quantized ggml tensor is a run of fixed size blocks. A block holds a set n
 | f16 | 2 | 1 | the value |
 | bf16 | 2 | 1 | the top half of a float32 |
 | q4_0 | 18 | 32 | `d:f16`, `qs[16]` |
+| q4_1 | 20 | 32 | `d:f16`, `m:f16`, `qs[16]` |
+| q5_0 | 22 | 32 | `d:f16`, `qh:u32`, `qs[16]` |
+| q5_1 | 24 | 32 | `d:f16`, `m:f16`, `qh:u32`, `qs[16]` |
 | q8_0 | 34 | 32 | `d:f16`, `qs[32]:i8` |
 | q4_k | 144 | 256 | `d:f16`, `dmin:f16`, `scales[12]`, `qs[128]` |
 | q5_k | 176 | 256 | `d:f16`, `dmin:f16`, `scales[12]`, `qh[32]`, `qs[128]` |
 | q6_k | 210 | 256 | `ql[128]`, `qh[64]`, `scales[16]:i8`, `d:f16` |
 
-Those eight are what `molla.nn.quant` reads. A Llama 3.1 8B q4_K_M contains three of them, 193 tensors of q4_k, 33 of q6_k and 66 of f32, and a Qwen 3 dense at the same quantization is the same three. The rest are there because they cost a screenful each and a model that uses one is otherwise a model molla refuses.
+Those eleven are what `molla.nn.quant` reads. A Llama 3.1 8B q4_K_M contains three of them, 193 tensors of q4_k, 33 of q6_k and 66 of f32, and a Qwen 3 dense at the same quantization is the same three. The rest are there because they cost a screenful each and a model that uses one is otherwise a model molla refuses.
+
+The q4_1, q5_0 and q5_1 rows were added for a specific file. A Qwen 2.5 0.5B download named `qwen2.5-0.5b-instruct-q4_k_m.gguf` turns out to be q5_0 for every weight in it, which is issue #129. The name a file is published under says what somebody meant to produce and the type numbers in the directory say what it is, and only one of those two is worth believing. So the rule here is to read what the directory says and refuse loudly when there is no decoder for it, which is what happened, rather than to assume the name.
 
 The IQ formats and the two and three bit K quants are not here. Each of those needs its own codebook table, none appears in a model molla runs today, and adding one that nothing exercises is a decoder that rots. `molla.model.spec` still knows their block geometry, so `molla gguf` and `molla spec` still read the directory of a file full of them and say what it is. Knowing what a file claims to be and being able to run it are separate questions and the code keeps them separate.
 
@@ -27,7 +32,11 @@ The IQ formats and the two and three bit K quants are not here. Each of those ne
 
 **q6_k puts its scale last.** Every other format here starts with a float16 scale at offset zero. q6_k ends with one at offset 208, and offset zero is the low bit plane. A decoder that assumes the scale is at the front reads two bytes of packed quants as a float16, gets a number that is usually small and occasionally enormous, and produces a tensor that is wrong by a random factor per block. There is no reason for the difference beyond the order the formats were added to ggml.
 
-A third one is smaller but the same shape: the q6_k scales are signed and the q4_k and q5_k ones are not. An unsigned reading of `0xFF` is 255 and a signed one is minus one, so a group of sixteen values comes out with the wrong sign and roughly 255 times too large.
+**The trailing digit is not a version.** q4_0 and q5_0 centre their integers, so a q4_0 nibble of eight decodes to zero and the range is symmetric. q4_1 and q5_1 store the minimum the block actually had and their integers run from zero upwards, so a nibble of zero is that minimum rather than the bottom of a symmetric range. Read a q4_1 as if it were centred and every weight in the tensor is off by eight scales, uniformly, which is a shift and not noise.
+
+The fifth bits in q5_0 and q5_1 sit in a thirty two bit word at the front rather than beside their nibbles. Bit `l` belongs to element `l` and bit `l + 16` belongs to element `l + 16`, which is the same halving the nibbles use, so the word is read as one little endian integer and indexed rather than walked byte by byte.
+
+Another one is smaller but the same shape: the q6_k scales are signed and the q4_k and q5_k ones are not. An unsigned reading of `0xFF` is 255 and a signed one is minus one, so a group of sixteen values comes out with the wrong sign and roughly 255 times too large.
 
 ## The scale packing
 
@@ -52,6 +61,9 @@ $ uv run --with gguf --with numpy scripts/gen-quant.py corpus/quant 512 ~/models
 f16  512 blocks  1024 bytes  512 values
 bf16  512 blocks  1024 bytes  512 values
 q4_0  512 blocks  9216 bytes  16384 values
+q4_1  512 blocks  10240 bytes  16384 values
+q5_0  512 blocks  11264 bytes  16384 values
+q5_1  512 blocks  12288 bytes  16384 values
 q8_0  512 blocks  17408 bytes  16384 values
 q4_k  512 blocks  73728 bytes  131072 values
 q5_k  512 blocks  90112 bytes  131072 values
@@ -63,6 +75,9 @@ $ pixi run conformance-quant
 f16  512 blocks, 512 values  exact
 bf16  512 blocks, 512 values  exact
 q4_0  512 blocks, 16384 values  exact
+q4_1  512 blocks, 16384 values  exact
+q5_0  512 blocks, 16384 values  exact
+q5_1  512 blocks, 16384 values  exact
 q8_0  512 blocks, 16384 values  exact
 q4_k  512 blocks, 131072 values  exact
 q4_k-real  512 blocks, 131072 values  exact
@@ -74,7 +89,7 @@ every format matches the oracle exactly
 
 CI runs the synthetic half at 4096 blocks per format, which is about half a million values. The fixtures are deterministic from a fixed seed so there is nothing to download and nothing to cache.
 
-The second way is `tests/test_quant.mojo`, 47 checks that run in the ordinary suite with no Python anywhere. Those are the geometry table, the error paths, and a handful of blocks built by hand so the expected value is something a person worked out rather than something another program said. An oracle tells you that a decoder disagrees with the reference. It does not tell you which of the two is wrong, or why, and a hand built block that pins where a nibble lands does.
+The second way is `tests/test_quant.mojo`, 60 checks that run in the ordinary suite with no Python anywhere. Those are the geometry table, the error paths, and a handful of blocks built by hand so the expected value is something a person worked out rather than something another program said. An oracle tells you that a decoder disagrees with the reference. It does not tell you which of the two is wrong, or why, and a hand built block that pins where a nibble lands does.
 
 One of those checks is that the geometry in `molla.nn.quant` agrees with the table `molla.model.spec` uses to add up a tensor directory. Those are two separate tables on purpose, since a file can contain a type molla can size but not decode, and two tables that disagree means a tensor whose length is computed one way and read the other.
 
