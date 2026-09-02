@@ -76,6 +76,8 @@ A target that cannot pass numerics is listed as unsupported. It does not ship as
 
 **Load bearing as of the D6 gate.** D6 accepts `max-core` for CPU and CUDA, and `max/kernels` has no quantized matmul that will launch on an Apple GPU below an M5, so the Apple GPU kernels are ours. The per target numerics tests this decision asks for are now the only thing standing between portable and a claim that decays quietly.
 
+**Exercised at M2b.** The device kernels this decision is about are being written there, against the logit corpus M2 built, and the per target tolerance table it asks for is part of that milestone's exit criteria.
+
 **Status: achievable, not inherited.** The M0 kernel spike wrote one naive Q4_K matmul with no compile time branches at all, compiled it for Metal and for sm_89, and got byte identical output from an M4 and a 4090. So the claim holds for code we write. It is not how `max/kernels` is organised, which has three separate quantized matmul implementations in three separate places with different entry points, weight layouts and dtypes. The first two tolerances the second paragraph promised are also now stated, in [docs/validation/kernels.md](validation/kernels.md), because this decision asked for them without giving any.
 
 ## D8: real hardware gates every milestone
