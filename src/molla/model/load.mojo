@@ -1,0 +1,672 @@
+"""Getting weights out of a file and into the place a kernel will read them.
+
+A model load is not one operation, it is two that want to happen at the same
+time. One is io: four or five gigabytes have to come off a disk, and a single
+thread asking for one page at a time will get a fraction of what the device can
+do. The other is the host to device copy, which on a discrete card is the
+slowest link in the chain and is idle for as long as the io is serial. Doing
+them one after another takes the sum of the two, and doing them together takes
+the larger. That is the whole design: a pool of transfer threads pulls tensors
+off the mapping in file order while the thread that owns the device drains a
+queue of finished tensors and enqueues their copies.
+
+Where a tensor ends up is a placement decision made once, in `plan_load`, and
+not a branch scattered through the copy loop. There are three answers and they
+are not the same:
+
+Host. The tensor stays in the mapping. There is no copy and no allocation, the
+kernel reads the file's own pages, and the only work is faulting them in.
+
+Unified. The same thing, except the accelerator can read those pages too. On
+Apple silicon there is no host and device split, so a mapped file already is the
+device visible buffer and copying it into one would be work done for nothing.
+This is a placement, not a special case: the plan says every tensor is unified
+and the copy stage has nothing to do.
+
+Device. The tensor is copied into a slot in one large device buffer. One buffer
+rather than one per tensor, because a few hundred separate allocations on a card
+fragment the address space and cost a driver round trip each, and because the
+engine wants one base pointer and a table of offsets.
+
+What is not here is the repack. The issue asks for the GGML block layout to be
+rewritten into the layout a kernel wants and cached on disk, and there is no
+kernel yet, so there is no layout to rewrite into. Guessing one now would mean
+writing a cache keyed on a format that the first real kernel changes. That half
+is #120 and it is blocked on #26.
+
+Two things about the numbers that took a machine to find out. Free memory
+reported by a device is not usable as a budget, because under WSL2 a 4090
+reports free equal to total and both below the physical size. So the budget
+comes off the total with a reserve held back, and the reserve is not small: a
+card that is full is a card that fails the first allocation the kernels make.
+And the reserve is a fraction rather than a constant, because ten per cent of a
+24 GB card and ten per cent of a 8 GB one are different amounts of the same
+thing.
+"""
+
+from std.sys.info import has_accelerator
+
+from max.gpu.host import DeviceBuffer, DeviceContext
+
+from molla.model.gguf import Gguf
+from molla.model.spec import tensor_bytes
+from molla.sys.atomic import AtomicBlock
+from molla.sys.clock import monotonic_ms
+from molla.sys.device import Device, default_device
+from molla.sys.mem import keep
+from molla.sys.mmap import RawPtr, page_size, will_need
+from molla.sys.queue import MpscQueue, round_up_pow2
+from molla.sys.thread import (
+    Thread,
+    ThreadFunc,
+    cpu_count,
+    set_thread_name,
+    sleep_ms,
+    spawn,
+)
+
+comptime WHERE_HOST = 0
+"""In the mapping, and read from there. No copy and no allocation."""
+
+comptime WHERE_UNIFIED = 1
+"""In the mapping, and the accelerator can read it there. Also no copy."""
+
+comptime WHERE_DEVICE = 2
+"""Copied into a slot in the device pool."""
+
+comptime STAGE_PLAN = 0
+comptime STAGE_READ = 1
+comptime STAGE_COPY = 2
+comptime STAGE_DONE = 3
+
+comptime SLOT_ALIGN = 256
+"""Device buffers want their offsets aligned. 256 is the coarsest alignment any
+current backend asks for, so one number covers all of them."""
+
+comptime MIB = 1024 * 1024
+
+comptime MIN_RESERVE = 512 * MIB
+"""Held back from the device however small it is. A card with nothing left is a
+card where the first kv cache allocation fails, which is a worse failure than
+one tensor staying on the host."""
+
+comptime RESERVE_SHARE = 10
+"""And at least a tenth of the card, because ten per cent of 24 GB and ten per
+cent of 8 GB are different amounts of the same thing."""
+
+comptime MAX_WORKERS = 8
+"""More transfer threads than this stops helping. The limit is the device, and
+past a handful of readers the queue depth is deep enough to keep it busy."""
+
+
+def stage_name(stage: Int) -> String:
+    if stage == STAGE_PLAN:
+        return String("plan")
+    if stage == STAGE_READ:
+        return String("read")
+    if stage == STAGE_COPY:
+        return String("copy")
+    return String("done")
+
+
+def place_name(place: Int) -> String:
+    if place == WHERE_HOST:
+        return String("host")
+    if place == WHERE_UNIFIED:
+        return String("unified")
+    return String("device")
+
+
+@fieldwise_init
+struct Placement(Copyable, ImplicitlyCopyable, Movable):
+    """Where one tensor goes, decided before anything is read."""
+
+    var index: Int
+    """Position in the file's tensor directory, which is also read order."""
+
+    var offset: Int
+    """Absolute byte offset in the file, not the offset the directory holds."""
+
+    var bytes: Int
+    var place: Int
+    var slot: Int
+    """Byte offset in the device pool, or -1 for a tensor that is not copied."""
+
+
+struct Plan(Movable):
+    """A whole file's worth of placements, and what they add up to."""
+
+    var placements: List[Placement]
+    var device: Device
+    var total_bytes: Int
+    var host_bytes: Int
+    var device_bytes: Int
+    var budget: Int
+    var left_behind: Int
+    """Tensors that wanted the device and did not fit in the budget. Zero is the
+    normal case and a report says so when it is not, because a model that half
+    fits runs at a speed nobody expects and should not have to be guessed at."""
+
+    def __init__(out self, device: Device):
+        self.placements = List[Placement]()
+        self.device = device
+        self.total_bytes = 0
+        self.host_bytes = 0
+        self.device_bytes = 0
+        self.budget = 0
+        self.left_behind = 0
+
+    def count(self) -> Int:
+        return len(self.placements)
+
+    def uses_device(self) -> Bool:
+        return self.device_bytes > 0
+
+
+def device_budget(dev: Device) -> Int:
+    """How many bytes of this device molla is willing to fill.
+
+    Off the total rather than off the free figure, on purpose. A 4090 under WSL2
+    reports free equal to total and both below the physical size of the card, so
+    the free number is not tracking anything there and sizing an allocation from
+    it would be sizing it from a constant that happens to look like a
+    measurement. The total is wrong in a knowable direction and the reserve
+    covers it.
+    """
+    if not dev.accelerator() or dev.unified():
+        return 0
+    var reserve = dev.total // RESERVE_SHARE
+    if reserve < MIN_RESERVE:
+        reserve = MIN_RESERVE
+    if dev.total <= reserve:
+        return 0
+    return dev.total - reserve
+
+
+def _lookup_only(name: String) -> Bool:
+    """Whether this tensor is read one row at a time rather than in full.
+
+    The token embedding is the biggest tensor in most quantized models and the
+    least worth having on a card: a forward pass gathers one row per token from
+    it and touches nothing else. So when the budget runs short it is the first
+    thing to leave behind, which is what llama.cpp does too.
+    """
+    return name.startswith("token_embd") or name.startswith("tok_embeddings")
+
+
+def plan_load(g: Gguf, dev: Device, budget: Int) raises -> Plan:
+    """Decide where every tensor in this file goes.
+
+    Reads the directory and nothing else, so a machine can be told what a load
+    would do without having the memory to do it.
+    """
+    var plan = Plan(dev)
+    plan.budget = device_budget(dev) if budget < 0 else budget
+
+    var count = len(g.tensors)
+    var sizes = List[Int](capacity=count)
+    var chosen = List[Bool](capacity=count)
+    for i in range(count):
+        var size = tensor_bytes(g.tensors[i])
+        sizes.append(size)
+        chosen.append(False)
+        plan.total_bytes += size
+
+    # Two passes so the tensors that are read every token get the device first,
+    # and the embedding gets whatever is left. Within a pass it is directory
+    # order, which is file order, which is the order the reads will happen in.
+    if dev.accelerator() and not dev.unified() and plan.budget > 0:
+        var used = 0
+        for pass_id in range(2):
+            for i in range(count):
+                var name = g.text(g.tensors[i].name)
+                if _lookup_only(name) != (pass_id == 1):
+                    continue
+                var need = _align(sizes[i], SLOT_ALIGN)
+                if used + need > plan.budget:
+                    plan.left_behind += 1
+                    continue
+                used += need
+                chosen[i] = True
+
+    var slot = 0
+    for i in range(count):
+        var place = WHERE_HOST
+        var at = -1
+        if chosen[i]:
+            place = WHERE_DEVICE
+            at = slot
+            slot += _align(sizes[i], SLOT_ALIGN)
+            plan.device_bytes += sizes[i]
+        else:
+            if dev.accelerator() and dev.unified():
+                place = WHERE_UNIFIED
+            plan.host_bytes += sizes[i]
+        plan.placements.append(
+            Placement(
+                i, g.data_start + g.tensors[i].offset, sizes[i], place, at
+            )
+        )
+    return plan^
+
+
+def _align(n: Int, to: Int) -> Int:
+    return ((n + to - 1) // to) * to
+
+
+comptime SLOT_NEXT = 0
+"""Next tensor index to claim. One atomic add is the whole scheduler."""
+
+comptime SLOT_BYTES = 1
+"""Bytes faulted in so far, which is what the progress line reports."""
+
+comptime SLOT_SINK = 2
+"""Where the touched bytes are added up, so the loop cannot be optimised away.
+Nothing reads it for meaning."""
+
+comptime SLOT_COUNT = 3
+
+
+struct LoadJob(Movable):
+    """What the transfer threads share.
+
+    Deliberately flat. A worker reaches this through a raw address handed to a
+    thin function entry point, so everything it touches has to be reachable
+    without a borrow, and the two lists are read only for the whole run.
+    """
+
+    var base: Int
+    """Address of the mapping, so a worker needs no reference to it."""
+
+    var page: Int
+    var count: Int
+    var offsets: List[Int]
+    var lengths: List[Int]
+    var cursor: AtomicBlock
+    var ready: MpscQueue
+
+    def __init__(out self, mut plan: Plan, base: Int) raises:
+        self.base = base
+        self.page = page_size()
+        self.count = plan.count()
+        self.offsets = List[Int](capacity=self.count)
+        self.lengths = List[Int](capacity=self.count)
+        for i in range(self.count):
+            self.offsets.append(plan.placements[i].offset)
+            self.lengths.append(plan.placements[i].bytes)
+        self.cursor = AtomicBlock(SLOT_COUNT)
+        self.ready = MpscQueue(round_up_pow2(self.count + 2))
+        if not self.cursor.is_valid() or not self.ready.is_valid():
+            raise Error("could not allocate the transfer queue")
+
+
+def _transfer(arg: Int) abi("C") -> Int:
+    """One transfer thread. Claims tensors and faults their pages in.
+
+    The touch loop is what actually reads the file. `madvise` starts the reads
+    and the loop waits for them, one byte per page, and the byte goes into a
+    running sum that is stored at the end so nothing can decide the loop has no
+    effect and delete it.
+    """
+    var job = Pointer[LoadJob, MutAnyOrigin](unsafe_from_address=arg)
+    _ = set_thread_name("molla-load")
+    var next = job[].cursor.slot(SLOT_NEXT)
+    var warmed = job[].cursor.slot(SLOT_BYTES)
+    var page = job[].page
+    var sink = UInt64(0)
+    while True:
+        var i = next.add(1)
+        if i >= job[].count:
+            break
+        var start = job[].base + job[].offsets[i]
+        var length = job[].lengths[i]
+        _ = will_need(start, length)
+        var p = RawPtr(unsafe_from_address=start)
+        var at = 0
+        while at < length:
+            sink += UInt64(p.unsafe_load(at))
+            at += page
+        if length > 0:
+            sink += UInt64(p.unsafe_load(length - 1))
+        _ = warmed.add(length)
+        while not job[].ready.push(i):
+            _ = sleep_ms(1)
+    _ = job[].cursor.slot(SLOT_SINK).add(Int(sink & 0xFFFF))
+    return 0
+
+
+struct DevicePool(Copyable, ImplicitlyCopyable, Movable):
+    """One buffer on the device, and the slots cut out of it.
+
+    Never constructed on a machine with no accelerator. `max-core` resolves the
+    device architecture at compile time and refuses to compile a build for a
+    machine it cannot name one for, so every call that reaches this is behind a
+    `comptime if has_accelerator()`. Declaring the struct is free; instantiating
+    its constructor is what would break the CPU boxes.
+    """
+
+    var ctx: DeviceContext
+    var pool: DeviceBuffer[DType.uint8]
+    var bytes: Int
+
+    def __init__(out self, index: Int, bytes: Int) raises:
+        self.ctx = DeviceContext(device_id=index)
+        self.pool = self.ctx.enqueue_create_buffer[DType.uint8](bytes)
+        self.bytes = bytes
+
+    def copy_in(mut self, slot: Int, host: Int, length: Int) raises:
+        """Queue one tensor's bytes into its slot.
+
+        Asynchronous, which is the point. The call returns once the copy is on
+        the stream, so the thread that issues it goes straight back to draining
+        the ready queue while the card is still moving the last one.
+        """
+        var view = self.pool.create_sub_buffer[DType.uint8](slot, length)
+        self.ctx.enqueue_copy(view, RawPtr(unsafe_from_address=host))
+
+    def wait(mut self) raises:
+        self.ctx.synchronize()
+
+
+@fieldwise_init
+struct LoadReport(Copyable, ImplicitlyCopyable, Movable):
+    """What a load did, in the terms a slow one has to be explained in."""
+
+    var tensors: Int
+    var host_bytes: Int
+    var device_bytes: Int
+    var warmed_bytes: Int
+    """What the transfer threads actually faulted in. It should equal the two
+    above added together and it is recorded separately so that it can be
+    checked, because a claim loop that skips a tensor or takes one twice is
+    otherwise invisible: the load still finishes and the weights are still
+    wrong."""
+
+    var workers: Int
+    var read_ms: Int
+    var copy_ms: Int
+    var total_ms: Int
+    var device: String
+    var left_behind: Int
+
+    def read_mib_s(self) -> Int:
+        if self.read_ms <= 0:
+            return 0
+        var bytes = self.host_bytes + self.device_bytes
+        return (bytes // MIB) * 1000 // self.read_ms
+
+    def copy_mib_s(self) -> Int:
+        if self.copy_ms <= 0:
+            return 0
+        return (self.device_bytes // MIB) * 1000 // self.copy_ms
+
+
+struct Weights(Movable):
+    """A loaded model: the plan that placed it and the pool that holds it.
+
+    The pool is optional because most of the fleet has nowhere to put one, and
+    because a unified device wants the mapping rather than a copy of it. A
+    `Weights` with no pool is not a failed load, it is a model that lives in the
+    file's own pages.
+    """
+
+    var plan: Plan
+    var pool: Optional[DevicePool]
+    var report: LoadReport
+
+    def __init__(out self, var plan: Plan, report: LoadReport):
+        self.plan = plan^
+        self.pool = None
+        self.report = report
+
+    def device_base(self) raises -> Int:
+        """Address of the pool on the device, or zero when there is not one."""
+        if not self.pool:
+            return 0
+        return Int(self.pool.value().pool.unsafe_ptr())
+
+
+def worker_count(requested: Int) -> Int:
+    """How many transfer threads to start.
+
+    Half the cores, capped, because the other half of a load is the kernel
+    faulting pages in and it wants somewhere to run. One on a single core box,
+    which is not a special case so much as the same formula's floor.
+    """
+    if requested > 0:
+        return requested
+    var half = cpu_count() // 2
+    if half < 1:
+        return 1
+    if half > MAX_WORKERS:
+        return MAX_WORKERS
+    return half
+
+
+def load(
+    g: Gguf, var plan: Plan, workers: Int = 0, stream: Bool = True
+) raises -> Weights:
+    """Run the plan. Reads on a thread pool, copies on this thread.
+
+    The two stages overlap. Workers claim tensors with one atomic add, fault
+    their pages in, and push the index onto a queue. This thread pops indices
+    and enqueues the device copy for each one as it arrives, so the card starts
+    moving the first tensor while the pool is still reading the second. On a
+    host or unified plan there is nothing to enqueue and this thread does
+    nothing but report progress.
+
+    Progress goes out during the load and not after it, in tenths, because a
+    load that takes thirty seconds and says nothing is indistinguishable from a
+    hang and gets killed by someone who was right to kill it.
+    """
+    var started = monotonic_ms()
+    var count = plan.count()
+    var pool_bytes = 0
+    for i in range(count):
+        if plan.placements[i].place == WHERE_DEVICE:
+            pool_bytes = _align(
+                plan.placements[i].slot + plan.placements[i].bytes, SLOT_ALIGN
+            )
+
+    if stream:
+        _report_plan(plan, pool_bytes)
+
+    var threads = worker_count(workers)
+    if threads > count:
+        threads = count if count > 0 else 1
+
+    var job = LoadJob(plan, g.mapping.address)
+    var report = LoadReport(
+        tensors=count,
+        host_bytes=plan.host_bytes,
+        device_bytes=plan.device_bytes,
+        warmed_bytes=0,
+        workers=threads,
+        read_ms=0,
+        copy_ms=0,
+        total_ms=0,
+        device=plan.device.name,
+        left_behind=plan.left_behind,
+    )
+    var out = Weights(plan^, report)
+
+    comptime if has_accelerator():
+        if pool_bytes > 0:
+            out.pool = DevicePool(out.plan.device.index, pool_bytes)
+
+    var read_started = monotonic_ms()
+    var pool_threads = List[Thread]()
+    var entry: ThreadFunc = _transfer
+    for _ in range(threads):
+        var one = Thread()
+        var rc = spawn(entry, Int(Pointer(to=job)), one)
+        if not rc.is_ok():
+            raise Error(rc.describe("could not start a transfer thread"))
+        pool_threads.append(one^)
+
+    var drained = 0
+    var reported = -1
+    var copy_ms = 0
+    while drained < count:
+        var index = 0
+        if not job.ready.pop(index):
+            _ = sleep_ms(1)
+            continue
+        var one = out.plan.placements[index]
+        if one.place == WHERE_DEVICE:
+            var at = monotonic_ms()
+            comptime if has_accelerator():
+                if out.pool:
+                    out.pool.value().copy_in(
+                        one.slot, g.mapping.address + one.offset, one.bytes
+                    )
+            copy_ms += monotonic_ms() - at
+        drained += 1
+        if stream:
+            var tenth = drained * 10 // count
+            if tenth != reported and tenth > 0:
+                reported = tenth
+                _report_tick(
+                    tenth, job.cursor.slot(SLOT_BYTES).load(), read_started
+                )
+
+    for i in range(len(pool_threads)):
+        _ = pool_threads[i].join()
+    # The drain loop ends when the last tensor is popped, which is before the
+    # worker that pushed it has finished its own loop. Mojo destroys a local at
+    # its last use and handing out an address is not a use it can see, so
+    # without this the queue and the counters are freed while a live thread is
+    # still incrementing them. It shows up as a claim index that is a stale heap
+    # pointer, which is a bounds error a long way from the cause.
+    out.report.warmed_bytes = job.cursor.slot(SLOT_BYTES).load()
+    keep(job)
+    out.report.read_ms = monotonic_ms() - read_started
+
+    comptime if has_accelerator():
+        if out.pool:
+            var at = monotonic_ms()
+            out.pool.value().wait()
+            copy_ms += monotonic_ms() - at
+    out.report.copy_ms = copy_ms
+    out.report.total_ms = monotonic_ms() - started
+
+    if stream:
+        _report_done(out.report)
+    return out^
+
+
+def _mib(bytes: Int) -> String:
+    return String(bytes // MIB) + " MiB"
+
+
+def _report_plan(plan: Plan, pool_bytes: Int):
+    print(
+        stage_name(STAGE_PLAN)
+        + "   "
+        + String(plan.count())
+        + " tensors, "
+        + _mib(plan.total_bytes)
+        + ", "
+        + plan.device.api
+        + " "
+        + plan.device.name
+    )
+    if plan.device.unified() and plan.device.accelerator():
+        print(
+            stage_name(STAGE_PLAN)
+            + "   "
+            + _mib(plan.host_bytes)
+            + " unified, which the device reads from the mapping"
+        )
+    elif pool_bytes > 0:
+        print(
+            stage_name(STAGE_PLAN)
+            + "   "
+            + _mib(plan.device_bytes)
+            + " to the device pool, "
+            + _mib(plan.host_bytes)
+            + " left on the host, budget "
+            + _mib(plan.budget)
+        )
+    else:
+        print(
+            stage_name(STAGE_PLAN)
+            + "   "
+            + _mib(plan.host_bytes)
+            + " on the host, no device pool"
+        )
+    if plan.left_behind > 0:
+        print(
+            stage_name(STAGE_PLAN)
+            + "   "
+            + String(plan.left_behind)
+            + " tensors did not fit the budget and stay on the host"
+        )
+
+
+def _report_tick(tenth: Int, bytes: Int, started: Int):
+    var elapsed = monotonic_ms() - started
+    var rate = 0
+    if elapsed > 0:
+        rate = (bytes // MIB) * 1000 // elapsed
+    print(
+        stage_name(STAGE_READ)
+        + "   "
+        + String(tenth * 10)
+        + "%  "
+        + _mib(bytes)
+        + "  "
+        + String(rate)
+        + " MiB/s"
+    )
+
+
+def _report_done(report: LoadReport):
+    print(
+        stage_name(STAGE_READ)
+        + "   "
+        + _mib(report.host_bytes + report.device_bytes)
+        + " on "
+        + String(report.workers)
+        + " threads in "
+        + String(report.read_ms)
+        + " ms, "
+        + String(report.read_mib_s())
+        + " MiB/s"
+    )
+    if report.device_bytes > 0:
+        print(
+            stage_name(STAGE_COPY)
+            + "   "
+            + _mib(report.device_bytes)
+            + " to "
+            + report.device
+            + " in "
+            + String(report.copy_ms)
+            + " ms, "
+            + String(report.copy_mib_s())
+            + " MiB/s"
+        )
+    else:
+        print(
+            stage_name(STAGE_COPY)
+            + "   nothing to copy, the weights are read where they lie"
+        )
+    print(
+        stage_name(STAGE_DONE)
+        + "   "
+        + String(report.tensors)
+        + " tensors in "
+        + String(report.total_ms)
+        + " ms"
+    )
+
+
+def run_load(path: StringSpan, workers: Int = 0) raises:
+    """Entry point for `molla load` on a GGUF file."""
+    var g = Gguf(path)
+    var dev = default_device()
+    var plan = plan_load(g, dev, -1)
+    var weights = load(g, plan^, workers, True)
+    _ = weights.report.tensors
+    g.close()

@@ -149,3 +149,17 @@ def default_device() raises -> Device:
         if all[i].accelerator():
             return all[i]
     return all[0]
+
+
+def run_devices() raises:
+    """Entry point for `molla devices`."""
+    print("built for      " + build_target_arch())
+    var all = devices()
+    for i in range(len(all)):
+        var one = all[i]
+        var line = one.api + "  " + one.name
+        if one.accelerator():
+            line += "  index " + String(one.index)
+            line += ", " + String(one.total // (1 << 20)) + " MiB"
+            line += ", unified" if one.unified() else ", its own memory"
+        print(line)

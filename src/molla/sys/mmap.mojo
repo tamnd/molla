@@ -23,7 +23,8 @@ one build fail to lower, which is what happened the first time this module kept
 its own.
 """
 
-from std.ffi import c_int, external_call
+from std.ffi import c_int, c_size_t, external_call
+from std.sys.info import CompilationTarget
 
 from molla.sys.errno import errno_name, get_errno
 from molla.sys.file import SEEK_END, SEEK_SET, close_fd, lseek, open_read
@@ -37,6 +38,64 @@ comptime MAP_PRIVATE = 0x02
 comptime MAP_FAILED = -1
 """mmap reports failure as (void *)-1, not NULL, because NULL is a legal
 address to map at."""
+
+comptime MADV_WILLNEED = 3
+"""Tell the kernel these pages are about to be read. Also the same number on
+both platforms, along with MADV_NORMAL, MADV_RANDOM and MADV_SEQUENTIAL."""
+
+
+def _sc_pagesize() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 29
+    else:
+        return 30
+
+
+comptime SC_PAGESIZE = _sc_pagesize()
+
+
+def page_size() -> Int:
+    """Bytes per page, or 4096 if the call fails.
+
+    Worth asking rather than assuming, because the answer is 4096 on x86_64 and
+    16384 on Apple silicon, and both a `madvise` alignment and a loop that
+    touches one byte per page get four times too much or four times too little
+    work from the wrong constant.
+    """
+    var n = Int(external_call["sysconf", Int](c_int(SC_PAGESIZE)))
+    if n < 1:
+        return 4096
+    return n
+
+
+def will_need(address: Int, length: Int) -> Bool:
+    """Ask the kernel to start reading the pages at this address.
+
+    This is a hint and it is allowed to do nothing, which is why it returns a
+    bool rather than a `SysResult` and why nothing branches on the answer. What
+    it buys is readahead. Without it a loop that touches one byte per page waits
+    for one page at a time and gets a fraction of what the device can do, and
+    with it the reads are already in flight by the time the loop arrives. The
+    range is widened to whole pages because `madvise` rejects an address that is
+    not page aligned, and widening is safe here because a neighbouring page of a
+    file we are walking is a page we are about to want anyway.
+
+    Takes a bare address rather than a `Mapping` so a worker thread can call it
+    without holding a reference to the mapping, which it cannot do through a
+    thin function entry point.
+    """
+    if length <= 0:
+        return False
+    var page = page_size()
+    var begin = address - (address % page)
+    var rc = Int(
+        external_call["madvise", c_int](
+            RawPtr(unsafe_from_address=begin),
+            c_size_t(address + length - begin),
+            c_int(MADV_WILLNEED),
+        )
+    )
+    return rc == 0
 
 
 struct Mapping(Movable):
@@ -116,6 +175,14 @@ struct Mapping(Movable):
 
     def base(self) -> RawPtr:
         return RawPtr(unsafe_from_address=self.address)
+
+    def will_need(self, start: Int, length: Int) -> Bool:
+        """Ask the kernel to start reading this range of the file now."""
+        if not self.mapped or start < 0 or length <= 0:
+            return False
+        if start + length > self.length:
+            return False
+        return will_need(self.address + start, length)
 
     def close(mut self):
         if not self.mapped:
