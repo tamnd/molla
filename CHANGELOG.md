@@ -2,6 +2,13 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `molla.nn.quant`, which decodes ggml blocks back to float32. f32, f16, bf16, q4_0, q8_0, q4_k, q5_k and q6_k, which covers everything a Llama 3 or Qwen 3 q4_K_M file contains. This is the slow obvious version and it stays that way: the fused kernels get checked against it and it gets checked against the reference implementation, so a fast path that drifts fails against something rather than making a model quietly worse. See [docs/validation/quant.md](docs/validation/quant.md).
+- A quantization conformance corpus. `scripts/gen-quant.py` writes fixtures of random block bytes and the values the `gguf` package decodes them to, `scripts/quant_oracle.mojo` compares every one, and CI runs about half a million values per commit. The match is exact rather than within a tolerance, because both sides decode the same bytes in the same order and a tolerance would let a wrong nibble order through whenever the two nibbles happened to be close.
+
 ## [0.2.6] - 2026-09-02
 
 molla can now say what a machine has and put a model's weights on it.

@@ -212,6 +212,35 @@ jobs:
       - name: Run the corpus
         run: pixi run conformance-template-full
 
+  # Every ggml block format molla decodes, checked value for value against the
+  # `gguf` package on half a million values of random block bytes. The fixtures
+  # are generated from a fixed seed rather than downloaded, so there is nothing
+  # to cache. See docs/validation/quant.md and issue #26.
+  quant:
+    name: Quantization conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@194d461b21b6c5717c722ffc597fa91ed2ff29fa # v0.9.1
+        with:
+          cache: true
+          locked: true
+      - name: Generate the fixtures
+        run: |
+          python3 -m venv /tmp/quant-venv
+          /tmp/quant-venv/bin/pip install --quiet --disable-pip-version-check gguf numpy
+          /tmp/quant-venv/bin/python scripts/gen-quant.py corpus/quant 4096
+      - name: Run the corpus
+        run: pixi run conformance-quant
+
   # Numerics and performance need real devices, so they run on the fleet
   # rather than on hosted runners. See D7 and D8 in docs/design.md.
   # Gated on the label so forks and doc changes do not queue on hardware.
@@ -270,7 +299,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [docs, workflows, shell, build, tokenizer, template]
+    needs: [docs, workflows, shell, build, tokenizer, template, quant]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

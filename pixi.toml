@@ -48,4 +48,9 @@ conformance-tokenizer-full = "mojo run -I src scripts/tokenizer_oracle.mojo scri
 # tier is one repository per distinct template and is for iterating locally.
 # See docs/validation/jinja.md.
 conformance-template = { cmd = "mojo run -I src scripts/template_oracle.mojo scripts/template_cases.txt scripts/templates.tsv corpus/templates quick", env = { TZ = "UTC" } }
+# The quantization conformance corpus. `scripts/gen-quant.py` writes it and
+# needs numpy and the `gguf` package, which are not pixi dependencies because
+# nothing molla ships uses them. Generating it is deterministic from a seed, so
+# CI regenerates rather than caching. See docs/validation/quant.md.
+conformance-quant = "mojo run -I src scripts/quant_oracle.mojo corpus/quant"
 conformance-template-full = { cmd = "mojo run -I src scripts/template_oracle.mojo scripts/template_cases.txt scripts/templates.tsv corpus/templates full", env = { TZ = "UTC" } }
