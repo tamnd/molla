@@ -1,0 +1,256 @@
+"""The matvec, on a GPU, from one source that compiles for Metal and for CUDA.
+
+Decode is memory bound and almost every byte it touches is a weight, so this is
+the kernel that decides whether a device is being used or merely owned. It is
+also the kernel `max/kernels` does not have: its K quant matmul is CPU only, its
+four bit GPU matmul is NVIDIA only and wants a weight layout of its own, and its
+Apple quantized matmuls refuse to launch below an M5. The M4 is the reference
+machine. So this one is ours, which is what D7 says happens when the dependency
+does not cover a target.
+
+It reads the planar layout from `molla.nn.repack` rather than ggml blocks. That
+is the whole reason the planar layout exists. A ggml block is a header, a bit
+plane and a nibble order, and unpacking one is a dozen dependent integer
+operations before a single multiply; reading a row of it across the threads of a
+block would have each thread pulling bytes from a different part of a header
+that the thread beside it also needs. Planar is one signed byte per value with
+the scales in planes at the end of the row, so thread `t` reads byte `t`, the
+thread beside it reads the byte beside it, and the hardware coalesces the row
+into as few transactions as it has lanes.
+
+One block per output row, `TILE` threads in it, each walking the row with a
+stride of `TILE`, then a tree reduction in shared memory. That is the arrangement
+a matvec wants rather than the one a matmul wants: there is one input vector and
+every thread in the block reads the same elements of it, so it stays in cache and
+the only traffic that scales with the model is the weight row, read once, in
+order, by consecutive lanes.
+
+`TILE` and the group size and whether the type carries a minimum are all compile
+time parameters, so there are three instantiations of one function rather than
+three functions, and the divergence between targets is a launch geometry rather
+than a second source file. That is what D7 asks for and it is cheap here because
+the arithmetic is genuinely identical on both vendors.
+
+There is no host fallback. A build with no device code in it raises when asked
+for a device matvec rather than quietly running the host kernel and reporting a
+number that says nothing about the device. D7 says a target that cannot pass
+numerics is unsupported, and a silent fallback is how a target stays listed as
+supported for a year after it stopped working.
+
+The activations still come in and go out as host buffers, so every call pays for
+an upload and a download that a real forward pass would not. That is deliberate
+and temporary: keeping the whole residual stream on the device is #143, and
+until there is something to keep it there for, a kernel that could only be
+called with device buffers could not be checked against the host at all.
+"""
+
+from std.gpu import block_idx, thread_idx
+from std.memory import AddressSpace, stack_allocation
+from std.sys.info import has_accelerator
+
+from max.gpu import barrier
+from max.gpu.host import DeviceContext
+
+from molla.nn.repack import LAYOUT_PLANAR, group_size, has_min
+from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
+
+comptime TILE = 128
+"""Threads per output row.
+
+A power of two because the reduction halves the live set every step, and 128
+because it is at or under the maximum threadgroup width every target in the
+fleet reports while still being wide enough that a 4096 wide row is 32 elements
+of work per thread. It is a parameter of the kernel rather than a constant
+inside it so that changing it is a launch site edit and not a rewrite, which is
+the form D7 asks divergence between targets to take.
+"""
+
+
+def planar_matvec_kernel[
+    tile: Int, group: Int, with_min: Bool
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+):
+    """`o[r] = dot(planar row r of w, x)`, one thread block per row.
+
+    The scales are read through a float32 view of the same bytes rather than
+    assembled a byte at a time. A planar row is a multiple of four bytes long by
+    construction and the quant plane is a multiple of the group size, so the
+    scale planes are four byte aligned in every row of every tensor, and a
+    device buffer starts at an alignment far larger than that.
+
+    Shapes arrive as `Int32` because a kernel argument has to be device
+    passable and `Int` is not. Nothing here is near two billion.
+    """
+    var cols = Int(cols_dev)
+    var stride = Int(stride_dev)
+    var r = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+
+    var row = r * stride
+    var groups = cols // group
+    # Two views of the same bytes rather than one view and a conversion. The
+    # quants are signed and the plane is read through a signed pointer for that
+    # reason: converting a `UInt8` to an `Int8` after loading it is a value
+    # conversion and not a reinterpretation, and it turns every quant of 128 and
+    # up into something that is not the negative number the repack wrote. Four
+    # of the eight types centre their quants, so half the corpus is wrong and
+    # the other half is exact, which is a failure that looks like a type table
+    # bug rather than like a cast.
+    var quants = w.bitcast[Int8]()
+    var scales = w.bitcast[Float32]()
+    var d_base = (row + cols) // 4
+    var m_base = d_base + groups
+
+    var acc = Float32(0)
+    var i = t
+    while i < cols:
+        var gi = i // group
+        var q = Float32(Int(quants[unsafe_offset=row + i]))
+        var a = x[unsafe_offset=i]
+        acc += scales[unsafe_offset=d_base + gi] * q * a
+        comptime if with_min:
+            acc += scales[unsafe_offset=m_base + gi] * a
+        i += tile
+
+    # The reduction is over the block rather than over a warp because `tile` is
+    # a parameter and the warp width is not the same number on the two vendors.
+    # A shuffle based version would be faster and would put a target specific
+    # constant in the one place D7 says not to put one.
+    var part = stack_allocation[
+        tile, Float32, address_space=AddressSpace.SHARED
+    ]()
+    part[unsafe_offset=t] = acc
+    barrier()
+    var step = tile // 2
+    while step > 0:
+        if t < step:
+            part[unsafe_offset=t] = (
+                part[unsafe_offset=t] + part[unsafe_offset=t + step]
+            )
+        barrier()
+        step //= 2
+    if t == 0:
+        o[unsafe_offset=r] = part[unsafe_offset=0]
+
+
+def device_ready() -> Bool:
+    """Whether this build has device code in it at all.
+
+    A property of the machine that compiled the binary and not of the one
+    running it, for the reason `molla.sys.device.build_targets_gpu` gives.
+    """
+    return has_accelerator()
+
+
+def check_matvec(w: Tensor, x: Buffer, out_elements: Int) raises:
+    """Everything a device matvec refuses, asked without a device.
+
+    Separate from the launch so that the refusals are testable on the three
+    machines in the fleet that have no accelerator. All four of these are
+    conditions a caller can hit by wiring the engine up wrong, and the one that
+    matters most is the residency check: a weight still sitting in a mapping has
+    a host address, and a Metal kernel handed a host address does not fault, it
+    reads zeros. Refusing here is the difference between a shape error and a
+    model that runs at full speed and answers with noise.
+    """
+    if w.layout != LAYOUT_PLANAR:
+        raise Error(
+            "the device matvec reads the planar layout and this weight is"
+            " still in ggml blocks, so it has to be repacked first"
+        )
+    if group_size(w.kind) == 0:
+        raise Error(
+            "ggml type " + String(w.kind) + " has no planar form to read"
+        )
+    if w.place != WHERE_DEVICE:
+        raise Error(
+            "the device matvec wants a weight in a device pool and this one is"
+            " in host memory, which a device kernel reads as zeros rather than"
+            " as an error"
+        )
+    if x.elements() != w.cols:
+        raise Error(
+            "the device matvec wants an input of "
+            + String(w.cols)
+            + " but got "
+            + String(x.elements())
+        )
+    if out_elements != w.rows:
+        raise Error(
+            "the device matvec wants an output of "
+            + String(w.rows)
+            + " but got "
+            + String(out_elements)
+        )
+
+
+def _launch[
+    tile: Int, group: Int, with_min: Bool
+](ctx: DeviceContext, w: Tensor, x: Buffer, mut out: Buffer) raises:
+    """One instantiation, and the transfers around it.
+
+    The input and output buffers are created per call, which is the wrong thing
+    to do in a decode loop and the right thing to do in a numerics check. #143
+    is where the residual stream stops making the trip.
+    """
+    var d_x = ctx.enqueue_create_buffer[DType.float32](w.cols)
+    var d_o = ctx.enqueue_create_buffer[DType.float32](w.rows)
+    with d_x.map_to_host() as h:
+        for i in range(w.cols):
+            h[i] = x.data[i]
+    ctx.enqueue_function[planar_matvec_kernel[tile, group, with_min]](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
+        Pointer[Float32, MutAnyOrigin](
+            unsafe_from_address=Int(d_x.unsafe_ptr())
+        ),
+        Pointer[Float32, MutAnyOrigin](
+            unsafe_from_address=Int(d_o.unsafe_ptr())
+        ),
+        Int32(w.cols),
+        Int32(w.row_bytes()),
+        grid_dim=(w.rows, 1, 1),
+        block_dim=(tile, 1, 1),
+    )
+    ctx.synchronize()
+    with d_o.map_to_host() as h:
+        for r in range(w.rows):
+            out.data[r] = h[r]
+
+
+def device_matvec(
+    ctx: DeviceContext, w: Tensor, x: Buffer, mut out: Buffer
+) raises:
+    """`out[r] = dot(row r of w, x)` on the accelerator `ctx` opened.
+
+    The dispatch is over the two things the layout varies by, which are the
+    group size and whether there is a minimum plane, and there are three live
+    combinations rather than four: everything with a minimum groups by 32, and
+    the only type that groups by 16 is q6_k, which centres its quants and has no
+    minimum at all.
+    """
+    check_matvec(w, x, out.elements())
+    comptime if not has_accelerator():
+        raise Error(
+            "this build has no device code in it, so there is no device matvec"
+            " to run. Accelerator support is decided when molla is compiled,"
+            " not when it is run"
+        )
+    else:
+        var g = group_size(w.kind)
+        if g == 32 and has_min(w.kind):
+            _launch[TILE, 32, True](ctx, w, x, out)
+        elif g == 32:
+            _launch[TILE, 32, False](ctx, w, x, out)
+        elif g == 16 and not has_min(w.kind):
+            _launch[TILE, 16, False](ctx, w, x, out)
+        else:
+            raise Error(
+                "no device matvec is compiled for a group of "
+                + String(g)
+                + " with a minimum plane"
+            )

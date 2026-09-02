@@ -53,6 +53,12 @@ conformance-template = { cmd = "mojo run -I src scripts/template_oracle.mojo scr
 # nothing molla ships uses them. Generating it is deterministic from a seed, so
 # CI regenerates rather than caching. See docs/validation/quant.md.
 conformance-quant = "mojo run -I src scripts/quant_oracle.mojo corpus/quant"
+# The device kernel against the host one, over the same corpus
+# `conformance-quant` reads. Not run by CI, because no runner GitHub offers has
+# a GPU in it, so this is a task somebody runs on a machine that does and pastes
+# into docs/validation/kernels.md. It exits 2 rather than 1 on a build with no
+# device code, so a machine without an accelerator is a skip and not a failure.
+conformance-kernels = "mojo run -I src scripts/kernel_oracle.mojo corpus/quant"
 # The logit conformance corpus. The reference files are committed because they
 # are a few hundred kilobytes and writing them needs llama.cpp on PATH, which
 # no machine in the fleet but the laptop has. The models they were taken
