@@ -2,7 +2,11 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.2.8] - 2026-09-02
+
+A model file goes in one end and English comes out the other.
+
+This is the first release where molla runs a real model. `molla generate` reads a GGUF, prefills a prompt, decodes it and prints tokens as they arrive, with the sampling settings anyone would expect on the command line. There is no server yet and no comparison against llama.cpp, both of which are the rest of M2.
 
 ### Added
 
