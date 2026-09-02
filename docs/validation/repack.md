@@ -14,7 +14,7 @@ So the repack does that arithmetic once and writes the answer down. What comes o
 
 One signed byte per value, then float32 planes of scale.
 
-```
+```text
 row = [ cols bytes of int8 quants ][ groups float32 dscale ][ groups float32 mscale ]
 ```
 
@@ -101,6 +101,19 @@ End to end, the check the issue asks for is that the second load of a model prod
 **The plan counted padding that was never written.** Tensors are laid out 64 byte aligned in the cache, and `plan.total` was computed by aligning after the last tensor as well as between them. Nothing is written into that trailing pad, so the header recorded a length the file did not have and every cache was rejected as truncated on the next load. It survived the first real model because the last repacked tensor in that file happened to end on a 64 byte boundary, which is the kind of thing a fixture with two small tensors finds in one run and a smoke test on a real model never finds at all.
 
 **The directory entry fields overlapped.** The name length was written at offset 32 in an entry whose byte count field ended at offset 36, so a name length and the top four bytes of a size were the same four bytes. Both readers and both writers agreed with each other, so the cache round tripped perfectly and would have started producing wrong tensor sizes the first time a tensor was bigger than four gigabytes. It was found by reading the two functions side by side rather than by a test, which is the honest account: no test in this file would have caught it.
+
+## Reproducing
+
+```console
+pixi run build
+rm -f ~/models/SmolLM2-135M-Instruct-Q8_0.gguf.molla-repack
+./build/molla load ~/models/SmolLM2-135M-Instruct-Q8_0.gguf
+./build/molla load ~/models/SmolLM2-135M-Instruct-Q8_0.gguf
+```
+
+The first says `repack miss, no cache file beside the model` and then `repack 211 tensors, 144 MiB, repack cache written to ...`. The second says `repack hit, 211 tensors, 144 MiB already repacked` and finishes in a few milliseconds instead of a couple of hundred.
+
+For the tokens, run `molla generate` twice with the cache deleted before the first and compare the output. Greedy sampling is the default, so anything other than an exact match is a bug rather than a draw that went somewhere unlikely.
 
 ## What this is not
 
