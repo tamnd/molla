@@ -34,10 +34,18 @@ comptime WHERE_HOST = 0
 """In host memory. The model file's mapping, the repack cache, or a buffer."""
 
 comptime WHERE_UNIFIED = 1
-"""In host memory that an accelerator can also read. Apple silicon has one pool
-of memory and a mapped file already is a device visible buffer, so this is a
-host place with a note attached: host kernels read it exactly as they read
-`WHERE_HOST`, and a device kernel may read it too without a copy."""
+"""In host memory on a machine whose accelerator shares the same physical pool.
+Host kernels read it exactly as they read `WHERE_HOST`, and the saving is real:
+a unified plan allocates nothing and copies nothing, which is measured in
+`docs/validation/load.md`.
+
+What it does not mean is that a device kernel can be handed this address. It
+cannot. Sharing a pool is not sharing an address space here: a device buffer's
+own pointer segfaults when read from the host, `map_to_host` returns a different
+address for the same bytes with no copy between them, and a Metal kernel given a
+host allocation reads zeros without faulting rather than reporting anything.
+This place is host memory with a note about what it did not cost, and issue #152
+is where it earns a device address."""
 
 comptime WHERE_DEVICE = 2
 """In a device pool. A host kernel cannot follow this address."""
@@ -126,10 +134,10 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
     def on_device(self) -> Bool:
         """Whether a host kernel has to be kept away from these bytes.
 
-        Unified is not on the device by this question's meaning. The whole
-        point of a unified device is that both sides read the same pages, so a
-        unified weight answers no here and a device kernel still gets to use
-        it.
+        Unified is not on the device by this question's meaning, and it is the
+        only place where that is the interesting half of the answer: a unified
+        weight is host memory a host kernel reads normally. It is not a device
+        address either, which is the other half and is `device_address`.
         """
         return self.place == WHERE_DEVICE
 
@@ -157,16 +165,31 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
         """The address, for a device kernel.
 
         The mirror of `base`, and it refuses the host case for the same reason
-        in the other direction. A unified weight passes, because on a machine
-        with one pool of memory the mapping is the device buffer.
+        in the other direction, except that the fault is worse in this
+        direction. A host kernel following a device address crashes. A device
+        kernel following a host address reads zeros and reports nothing, so a
+        model bound that way runs at full speed and answers with noise.
+
+        Unified is refused too, which is a correction. This used to let it
+        through on the grounds that one pool of memory means one address, and
+        that turned out to be false on the machine it was written for: a device
+        buffer's own pointer segfaults when read from the host, `map_to_host`
+        hands back a different address for the same bytes, and a kernel given
+        the host one reads zeros. Making a unified weight carry an address a
+        device can use is issue #152, and until then the honest answer is that
+        it has not got one.
         """
-        if self.place == WHERE_HOST:
+        if self.place != WHERE_DEVICE:
             raise Error(
                 "a "
                 + String(self.cols)
                 + " by "
                 + String(self.rows)
-                + " weight is on the host and a device kernel cannot read it"
+                + " weight is "
+                + place_name(self.place)
+                + " resident and has no address a device kernel can read. A"
+                " device kernel reads a host address as zeros rather than as an"
+                " error, so this refuses rather than returning one"
             )
         return self.address
 

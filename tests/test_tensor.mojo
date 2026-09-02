@@ -164,17 +164,33 @@ def test_residency(mut suite: Suite) raises:
         "and the error says which weight it was, in the shape it was bound as",
     )
 
-    # Unified is the case that both sides read. A machine with one pool of
-    # memory would waste half of it if a mapping the GPU can already see had to
-    # be copied before a kernel could touch it.
+    # Unified used to be the case that both sides read, and it is not. One pool
+    # of memory turned out not to mean one address: a device buffer's own
+    # pointer segfaults when read from the host, `map_to_host` hands back a
+    # different address for the same bytes, and a kernel given the host one
+    # reads zeros without faulting. So the saving unified names is real, the
+    # load allocates and copies nothing, and the address it carries is a host
+    # address and nothing more. Issue #152 is where it gets a device one.
     var shared = host.resident(0x1000, WHERE_UNIFIED)
     suite.check(
         not shared.on_device(), "a unified weight is not out of a host reach"
     )
     suite.check(Int(shared.base()) == 0x1000, "so a host kernel still reads it")
+    raised = False
+    message = String("")
+    try:
+        _ = shared.device_address()
+    except e:
+        raised = True
+        message = String(e)
+    suite.check(raised, "and a device kernel does not, sharing a pool or not")
     suite.check(
-        shared.device_address() == 0x1000,
-        "and a device kernel reads the same address, with no copy between",
+        "unified resident" in message,
+        "and the error says which of the three places it was in",
+    )
+    suite.check(
+        "zeros" in message,
+        "and what handing the address over anyway would have done",
     )
 
     var planar = card.as_planar(0x7F00)

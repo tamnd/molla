@@ -17,16 +17,16 @@ Every tensor gets one of three placements, and the choice is made once in `plan_
 | Placement | What it means | When |
 | --- | --- | --- |
 | `host` | The tensor is the mapping. No copy at all. | No accelerator, or the card ran out of budget. |
-| `unified` | The tensor is the mapping, and the device can already see it. | Apple silicon. |
+| `unified` | The tensor is the mapping, on a machine whose accelerator shares the same physical memory. No copy at all. | Apple silicon. |
 | `device` | The tensor is copied into a slot in one device pool buffer. | A card with its own memory and room for it. |
 
-`unified` is not `host` with a different name. They do the same amount of work today, which is none, but they answer different questions: a kernel asking whether it can be handed this address gets yes from one and no from the other. Collapsing them would put that distinction back into every call site, which is the scattered special case the issue says not to write.
+`unified` is not `host` with a different name. They do the same amount of work, which is none, and the difference is what that none is worth. A host placement on a machine with a card means the card is not being used for those bytes. A unified placement means the bytes are already in the memory the accelerator draws from, so the pool the plan asked for costs nothing to satisfy. That is a fact about the budget rather than about any address, which is a correction: see the section at the end on what a unified weight cannot do.
 
 ## A weight knows which memory it is in
 
 That question used to have no answer anywhere in the type system. A placement was a decision the loader made and then forgot, and every tensor that came out of `bind` was a host address whether or not a copy to a card had happened, so a host kernel handed a device weight would have dereferenced a driver handle and faulted on a thread with no idea a placement had ever taken place.
 
-So a `Tensor` carries its place, and `Tensor.base`, which is the one call every host kernel makes to get at bytes, refuses a weight in a device pool and names its shape. The cost is an integer compare once per matvec rather than once per row, because a weight is in one memory for its whole life and the test is hoisted out of the row loop the same way the layout test already is. `Tensor.device_address` is the mirror of it and refuses a host weight, and a unified weight passes both, which is the whole point of unified.
+So a `Tensor` carries its place, and `Tensor.base`, which is the one call every host kernel makes to get at bytes, refuses a weight in a device pool and names its shape. The cost is an integer compare once per matvec rather than once per row, because a weight is in one memory for its whole life and the test is hoisted out of the row loop the same way the layout test already is. `Tensor.device_address` is the mirror of it and refuses everything that is not in a device pool, unified included, for a reason the last section of this document goes into.
 
 What connects the two halves is `Residency`, which is what a load hands the binder: for each position in the file's tensor directory, which memory that tensor ended up in and where on the device if it moved. It is indexed by directory position rather than by name because that is what the binder already has after it looks a weight up and what a placement already carries, so the two meet without either growing a table of strings. An empty `Residency` answers host for everything, which is what every caller that loads with a device budget of zero gets, and that is still every caller that generates a token until [#143](https://github.com/tamnd/molla/issues/143) lands.
 
@@ -121,7 +121,7 @@ done   292 tensors in 954 ms
 
 The two plan lines are the point. The first counts the file, which has not changed, and the second counts what is going to be read. The difference between 4685 and 9573 is the planar layout the repack wrote. Before this the planner knew only the first number, so the read stage faulted in the model file while the binder pointed the kernels at the cache beside it, and all 4685 MiB of that was work nobody used.
 
-On the M4 the second number costs nothing to satisfy, which is the unified claim written out in bytes: 9573 MiB became readable from a Metal kernel with no allocation and no copy anywhere in the run. On the 4090 it costs a 9573 MiB pool, and the plan line, the copy line and the resident line are three separate counts of the same quantity, arrived at from the placements at three different points in the load, which the loader compares before it will report success.
+On the M4 the second number costs nothing to satisfy: 9573 MiB of weights ended up in the memory the GPU draws from with no allocation and no copy anywhere in the run. That is the saving unified names and it is the part that held up. What did not hold up is the sentence that used to follow it here, about a Metal kernel reading those bytes where they lie, and the last section is what replaced it. On the 4090 it costs a 9573 MiB pool, and the plan line, the copy line and the resident line are three separate counts of the same quantity, arrived at from the placements at three different points in the load, which the loader compares before it will report success.
 
 The cold half of the gpc run is worth recording too, because the table above is a warm page cache and says so. The same 8B read for the first time after landing on the disk took 3551 ms at 1319 MiB/s, and the copy behind it took 695 ms. That 1319 MiB/s is the storage number for that box and the 9639 MiB/s in the table is not.
 
@@ -160,3 +160,19 @@ pixi run build
 ```
 
 `molla load` takes an optional worker count as a second argument. The default is half the cores capped at eight, which is a floor to keep a four thread box from spawning two threads and a ceiling because past eight the transfer pool is waiting on the storage device rather than on itself.
+
+## What a unified weight cannot do
+
+The paragraph that used to be at the top of this document said that a unified weight passes both `base` and `device_address`, and that a device kernel reads the mapping where it lies with no copy between. The first device kernel, in [#141](https://github.com/tamnd/molla/issues/141), found that the second half of that is false, so this section replaces it and the tracking issue is [#152](https://github.com/tamnd/molla/issues/152).
+
+Probed on the M4 through max-core 26.5.0.
+
+A Metal kernel handed a plain host allocation does not fault. It reads zeros. Every row of the output comes back exactly zero and nothing anywhere reports an error. Wrapping the host memory in a `DeviceBuffer` with `owning=False` does not change it: the pointer value is identical and it still reads zeros.
+
+The other half of the probe explains why. A device buffer's `unsafe_ptr()` is a device address, 1099512152064 in the run that was recorded, and reading it from the host segfaults. `map_to_host()` on the same buffer returns 4470079744, a real host address for the same bytes, with no copy anywhere between the two. So the memory is shared and the address space is not. One physical pool, two different addresses into it, and a pointer from one side means nothing to the other.
+
+Nothing in the measured part of this document changes. A unified plan still allocates nothing and copies nothing, the M4 still loads 9573 MiB with no transfer, and every number in the tables above was taken before this was known and is unaffected by it, because none of them ever dereferenced anything.
+
+What changes is what the placement promises. `unified` now means that the weights are in the memory the accelerator draws from, which is a statement about what the pool cost rather than about what a kernel can be handed, and `Tensor.device_address` refuses a unified weight rather than returning a host address a kernel would read as zeros. Refusing is the right direction to be wrong in. A host kernel following a device address crashes on the spot; a device kernel following a host address produces a model that runs at full speed and answers with noise, and there is no test short of comparing logits that would catch it.
+
+Making unified mean something to a kernel again is the second half of #152: the load reads into the host mapping of a device buffer, so there is still exactly one copy of the bytes and still no transfer, and the tensor carries the device address instead of the mapping address. The number this document reports for a unified load has to stay the same afterwards, which is what makes it a change with a measurement attached rather than a rename.
