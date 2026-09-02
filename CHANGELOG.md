@@ -2,6 +2,14 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `max-core`, pinned to 26.5.0, as a required dependency. The `mojo` package ships the standard library and nothing else, and every device call lives in `max-core`, so there is no route to a GPU without it. This was accepted in [docs/adr/0002-accept-max-core.md](docs/adr/0002-accept-max-core.md) but had never been added to the manifest. It is a runtime dependency and not only a build time one, and it is proprietary. See [docs/validation/toolchain.md](docs/validation/toolchain.md).
+- `molla.sys.device`, which reports what a machine can put a tensor on: the api, the name, the index, and free and total memory, with a CPU entry that is always first and is a real placement rather than a fallback. The unified flag says whether a mapped file is already visible to the device or has to cross a bus, and it is read off the reported api rather than guessed from the build target.
+- `build_targets_gpu` and `build_target_arch`, because `max-core` resolves the device architecture at compile time. A build made on a machine with no GPU has no device code in it and reports no accelerators even on a machine that has one.
+
 ## [0.2.5] - 2026-09-02
 
 The tokenizer corpus has nothing left in it that molla refuses.

@@ -16,6 +16,13 @@ from std.memory import stack_allocation
 
 from harness import Suite
 
+from molla.sys.device import (
+    DEV_CPU,
+    build_target_arch,
+    build_targets_gpu,
+    default_device,
+    devices,
+)
 from molla.sys.errno import EBADF, EEXIST, ENOENT, ENOTSUP, errno_name
 from molla.sys.file import (
     DirEntry,
@@ -102,6 +109,92 @@ def run(mut suite: Suite) raises:
     _check_sync(suite)
     _check_signals(suite)
     _check_sockets(suite)
+    _check_devices(suite)
+
+
+def _check_devices(mut suite: Suite) raises:
+    """What is on this machine, which is different on every machine.
+
+    There is nothing to hard code here, so every check is a property that has
+    to hold whatever the box turns out to be. The names are printed rather
+    than asserted, because a device name is documentation and asserting one
+    would only say which machine wrote the test.
+    """
+    suite.group("sys.device")
+
+    var all = devices()
+    suite.check(len(all) >= 1, "there is always at least one device")
+    suite.check(all[0].kind == DEV_CPU, "and the first one is the host")
+    suite.check(all[0].api == "cpu", "which calls itself cpu")
+    suite.check(not all[0].accelerator(), "and is not an accelerator")
+    suite.check(all[0].unified(), "and shares memory with itself")
+
+    var accelerators = 0
+    var ok_indices = True
+    var ok_memory = True
+    var ok_named = True
+    for i in range(1, len(all)):
+        accelerators += 1
+        if all[i].index != i - 1:
+            ok_indices = False
+        # Free cannot exceed total and total cannot be zero, which is the
+        # cheapest way to catch the two members being read in the wrong order.
+        if all[i].total <= 0 or all[i].free < 0 or all[i].free > all[i].total:
+            ok_memory = False
+        if all[i].name.byte_length() == 0 or all[i].api.byte_length() == 0:
+            ok_named = False
+    suite.check(ok_indices, "accelerators are numbered from zero in order")
+    suite.check(ok_memory, "and each reports free memory within its total")
+    suite.check(ok_named, "and each has an api and a name")
+
+    # A build made on a machine with no GPU has no device code in it, so the
+    # only honest thing the enumeration can report there is the host. The two
+    # have to agree or one of them is lying about the machine.
+    suite.check(
+        (accelerators > 0) == build_targets_gpu(),
+        "a build with no device code finds no devices",
+    )
+    suite.check(
+        (build_target_arch() == "none") != build_targets_gpu(),
+        "and it names the architecture it was built for or says none",
+    )
+
+    var chosen = default_device()
+    if accelerators == 0:
+        suite.check(
+            chosen.kind == DEV_CPU,
+            "with no accelerator the default is the host",
+        )
+    else:
+        suite.check(
+            chosen.accelerator(), "the default device is an accelerator"
+        )
+        suite.check(
+            chosen.api == all[1].api, "and it is the first one enumerated"
+        )
+        # Metal means the host pointer is already device visible and CUDA means
+        # it is not. Getting this backwards would make every load either copy
+        # for nothing or read unmapped memory, so it is pinned by api name.
+        var unified_matches = True
+        for i in range(1, len(all)):
+            if (all[i].api == "metal") != all[i].unified():
+                unified_matches = False
+        suite.check(unified_matches, "and metal is the unified one")
+
+    print("  built for " + build_target_arch())
+    print(
+        "  devices  "
+        + String(len(all))
+        + " with "
+        + String(accelerators)
+        + " accelerator"
+        + ("" if accelerators == 1 else "s")
+    )
+    for i in range(len(all)):
+        var line = "    " + all[i].api + "  " + all[i].name
+        if all[i].total > 0:
+            line += "  " + String(all[i].total // (1 << 20)) + " MiB"
+        print(line)
 
 
 def _check_result(mut suite: Suite) raises:
