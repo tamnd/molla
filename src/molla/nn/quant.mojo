@@ -19,6 +19,9 @@ worse.
 The layouts are ggml's `block_q*` structs. Byte for byte:
 
     q4_0    d:f16, qs[16]                                 18 bytes,  32 values
+    q4_1    d:f16, m:f16, qs[16]                          20 bytes,  32 values
+    q5_0    d:f16, qh:u32, qs[16]                         22 bytes,  32 values
+    q5_1    d:f16, m:f16, qh:u32, qs[16]                  24 bytes,  32 values
     q8_0    d:f16, qs[32]:i8                              34 bytes,  32 values
     q4_k    d:f16, dmin:f16, scales[12], qs[128]         144 bytes, 256 values
     q5_k    d:f16, dmin:f16, scales[12], qh[32], qs[128] 176 bytes, 256 values
@@ -28,6 +31,13 @@ Note that q6_k puts its scale last and the others put it first. There is no
 reason for that beyond the order the formats were written in, and a decoder
 that assumes the scale is at offset zero reads sixteen signed scales as one
 float16 and produces numbers that are wrong without being obviously wrong.
+
+The trailing digit is not a version. A format ending in zero centres its
+integers, so a q4_0 nibble of eight is zero and the range is symmetric about it.
+A format ending in one carries a minimum instead and its integers run from zero
+upwards, so a nibble of zero is the minimum rather than the bottom of a
+symmetric range. Reading a q4_1 as a centred format gives every weight in the
+tensor an offset of eight scales, which is a model that still produces words.
 """
 
 from std.memory import bitcast
@@ -37,6 +47,9 @@ from molla.sys.mmap import RawPtr
 comptime Q_F32 = 0
 comptime Q_F16 = 1
 comptime Q_Q4_0 = 2
+comptime Q_Q4_1 = 3
+comptime Q_Q5_0 = 6
+comptime Q_Q5_1 = 7
 comptime Q_Q8_0 = 8
 comptime Q_Q4_K = 12
 comptime Q_Q5_K = 13
@@ -61,7 +74,9 @@ def supported(kind: Int) -> Bool:
     """
     if kind == Q_F32 or kind == Q_F16 or kind == Q_BF16:
         return True
-    if kind == Q_Q4_0 or kind == Q_Q8_0:
+    if kind == Q_Q4_0 or kind == Q_Q4_1 or kind == Q_Q8_0:
+        return True
+    if kind == Q_Q5_0 or kind == Q_Q5_1:
         return True
     return kind == Q_Q4_K or kind == Q_Q5_K or kind == Q_Q6_K
 
@@ -70,7 +85,9 @@ def block_elements(kind: Int) -> Int:
     """Values per block, or zero for a type this module cannot read."""
     if kind == Q_F32 or kind == Q_F16 or kind == Q_BF16:
         return 1
-    if kind == Q_Q4_0 or kind == Q_Q8_0:
+    if kind == Q_Q4_0 or kind == Q_Q4_1 or kind == Q_Q8_0:
+        return 32
+    if kind == Q_Q5_0 or kind == Q_Q5_1:
         return 32
     if kind == Q_Q4_K or kind == Q_Q5_K or kind == Q_Q6_K:
         return QK_K
@@ -85,6 +102,12 @@ def block_bytes(kind: Int) -> Int:
         return 2
     if kind == Q_Q4_0:
         return 18
+    if kind == Q_Q4_1:
+        return 20
+    if kind == Q_Q5_0:
+        return 22
+    if kind == Q_Q5_1:
+        return 24
     if kind == Q_Q8_0:
         return 34
     if kind == Q_Q4_K:
@@ -182,6 +205,15 @@ def dequant_block(
     if kind == Q_Q4_0:
         _q4_0(p, at, out, to)
         return
+    if kind == Q_Q4_1:
+        _q4_1(p, at, out, to)
+        return
+    if kind == Q_Q5_0:
+        _q5_0(p, at, out, to)
+        return
+    if kind == Q_Q5_1:
+        _q5_1(p, at, out, to)
+        return
     if kind == Q_Q8_0:
         _q8_0(p, at, out, to)
         return
@@ -210,6 +242,63 @@ def _q4_0(p: RawPtr, at: Int, mut out: List[Float32], to: Int):
         var b = _u8(p, at + 2 + l)
         out[to + l] = Float32((b & 0xF) - 8) * d
         out[to + l + 16] = Float32((b >> 4) - 8) * d
+
+
+def _q4_1(p: RawPtr, at: Int, mut out: List[Float32], to: Int):
+    """The same nibbles as q4_0 with a minimum instead of a fixed centre.
+
+    q4_0 subtracts eight from every value, which assumes the weights in a block
+    are spread evenly either side of zero. q4_1 stores the minimum the block
+    actually had, so a block whose values are all positive does not spend half
+    its range on numbers that are not there. Two bytes more per thirty two
+    values, and the nibbles are still sixteen apart in the output.
+    """
+    var d = f16_at(p, at)
+    var m = f16_at(p, at + 2)
+    for l in range(16):
+        var b = _u8(p, at + 4 + l)
+        out[to + l] = Float32(b & 0xF) * d + m
+        out[to + l + 16] = Float32(b >> 4) * d + m
+
+
+def _qh(p: RawPtr, at: Int) -> Int:
+    """The thirty two bit field of fifth bits, little endian."""
+    var out = 0
+    for i in range(4):
+        out |= _u8(p, at + i) << (i * 8)
+    return out
+
+
+def _q5_0(p: RawPtr, at: Int, mut out: List[Float32], to: Int):
+    """Four bits per value in a nibble and the fifth somewhere else entirely.
+
+    A five bit value does not divide a byte, so ggml keeps the low four bits
+    where q4_0 keeps them and gathers the thirty two fifth bits into one word
+    at the front of the block. Bit `l` of that word belongs to element `l` and
+    bit `l + 16` belongs to element `l + 16`, which matches the nibble order
+    rather than fighting it.
+    """
+    var d = f16_at(p, at)
+    var qh = _qh(p, at + 2)
+    for l in range(16):
+        var b = _u8(p, at + 6 + l)
+        var hl = ((qh >> l) << 4) & 0x10
+        var hh = (qh >> (l + 12)) & 0x10
+        out[to + l] = Float32(((b & 0xF) | hl) - 16) * d
+        out[to + l + 16] = Float32(((b >> 4) | hh) - 16) * d
+
+
+def _q5_1(p: RawPtr, at: Int, mut out: List[Float32], to: Int):
+    """q5_0's bit layout with q4_1's minimum, so nothing is centred."""
+    var d = f16_at(p, at)
+    var m = f16_at(p, at + 2)
+    var qh = _qh(p, at + 4)
+    for l in range(16):
+        var b = _u8(p, at + 8 + l)
+        var hl = ((qh >> l) << 4) & 0x10
+        var hh = (qh >> (l + 12)) & 0x10
+        out[to + l] = Float32((b & 0xF) | hl) * d + m
+        out[to + l + 16] = Float32((b >> 4) | hh) * d + m
 
 
 def _q8_0(p: RawPtr, at: Int, mut out: List[Float32], to: Int):

@@ -21,7 +21,10 @@ from molla.nn.quant import (
     Q_F16,
     Q_F32,
     Q_Q4_0,
+    Q_Q4_1,
     Q_Q4_K,
+    Q_Q5_0,
+    Q_Q5_1,
     Q_Q5_K,
     Q_Q6_K,
     Q_Q8_0,
@@ -69,6 +72,9 @@ def run(mut suite: Suite) raises:
     _check_geometry(suite)
     _check_scalars(suite)
     _check_q4_0(suite)
+    _check_q4_1(suite)
+    _check_q5_0(suite)
+    _check_q5_1(suite)
     _check_q8_0(suite)
     _check_q4_k(suite)
     _check_q5_k(suite)
@@ -86,6 +92,18 @@ def _check_geometry(mut suite: Suite) raises:
     suite.check(
         block_bytes(Q_Q4_0) == 18 and block_elements(Q_Q4_0) == 32,
         "q4_0 packs 32 values into 18 bytes",
+    )
+    suite.check(
+        block_bytes(Q_Q4_1) == 20 and block_elements(Q_Q4_1) == 32,
+        "q4_1 is the same 32 in 20, two more bytes for the minimum",
+    )
+    suite.check(
+        block_bytes(Q_Q5_0) == 22 and block_elements(Q_Q5_0) == 32,
+        "q5_0 is 22, four of them the fifth bits",
+    )
+    suite.check(
+        block_bytes(Q_Q5_1) == 24 and block_elements(Q_Q5_1) == 32,
+        "and q5_1 is 24, carrying both",
     )
     suite.check(
         block_bytes(Q_Q8_0) == 34 and block_elements(Q_Q8_0) == 32,
@@ -109,7 +127,19 @@ def _check_geometry(mut suite: Suite) raises:
     # length is computed one way and read the other.
     from molla.model.spec import encoding_of
 
-    var kinds = [Q_F32, Q_F16, Q_BF16, Q_Q4_0, Q_Q8_0, Q_Q4_K, Q_Q5_K, Q_Q6_K]
+    var kinds = [
+        Q_F32,
+        Q_F16,
+        Q_BF16,
+        Q_Q4_0,
+        Q_Q4_1,
+        Q_Q5_0,
+        Q_Q5_1,
+        Q_Q8_0,
+        Q_Q4_K,
+        Q_Q5_K,
+        Q_Q6_K,
+    ]
     var agree = True
     for i in range(len(kinds)):
         var enc = encoding_of(kinds[i])
@@ -179,6 +209,87 @@ def _check_q4_0(mut suite: Suite) raises:
     suite.check(
         out[17] == -8.0, "and a nibble of zero is the bottom of the range"
     )
+
+
+def _check_q4_1(mut suite: Suite) raises:
+    suite.group("quant q4_1")
+
+    var b = _bytes(20)
+    _put16(b, 0, HALF_ONE)
+    _put16(b, 2, 0xC000)  # a minimum of minus two
+    b[4] = 0x91
+    b[5] = 0x00
+
+    var out = _zeros(32)
+    dequant_block(Q_Q4_1, _ptr(b), 0, out, 0)
+
+    suite.check(
+        out[0] == -1.0,
+        "a q4_1 nibble is scaled and then shifted by the minimum",
+    )
+    suite.check(out[16] == 7.0, "and the high nibble is still sixteen along")
+    suite.check(
+        out[1] == -2.0,
+        "a nibble of zero is the minimum, because nothing here is centred",
+    )
+
+
+def _check_q5_0(mut suite: Suite) raises:
+    suite.group("quant q5_0")
+
+    var b = _bytes(22)
+    _put16(b, 0, HALF_ONE)
+    # The fifth bits: element 0 is bit 0, element 16 is bit 16, nothing else.
+    b[2] = 0x01
+    b[4] = 0x01
+    b[6] = 0x10  # low nibble 0, high nibble 1
+    b[7] = 0x0F  # low nibble 15, high nibble 0
+
+    var out = _zeros(32)
+    dequant_block(Q_Q5_0, _ptr(b), 0, out, 0)
+
+    suite.check(
+        out[0] == 0.0,
+        (
+            "the fifth bit is worth sixteen, so a nibble of zero with it set is"
+            " the centre"
+        ),
+    )
+    suite.check(
+        out[16] == 1.0,
+        (
+            "element sixteen takes its fifth bit from bit twenty eight, not bit"
+            " twelve"
+        ),
+    )
+    suite.check(
+        out[1] == -1.0, "and a nibble of fifteen without one is one below"
+    )
+    suite.check(
+        out[17] == -16.0, "as is a zero nibble without one at the floor"
+    )
+
+
+def _check_q5_1(mut suite: Suite) raises:
+    suite.group("quant q5_1")
+
+    var b = _bytes(24)
+    _put16(b, 0, HALF_ONE)
+    _put16(b, 2, 0xC000)  # a minimum of minus two
+    b[4] = 0x01  # the fifth bit of element zero
+    b[8] = 0x10  # low nibble 0, high nibble 1
+
+    var out = _zeros(32)
+    dequant_block(Q_Q5_1, _ptr(b), 0, out, 0)
+
+    suite.check(
+        out[0] == 14.0,
+        "a q5_1 value runs from zero to thirty one and is never centred",
+    )
+    suite.check(
+        out[16] == -1.0, "and the minimum applies to the high nibble as well"
+    )
+    suite.check(out[1] == -2.0, "an empty pair decodes to the minimum")
 
 
 def _check_q8_0(mut suite: Suite) raises:

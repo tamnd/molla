@@ -28,11 +28,15 @@ from molla.nn.quant import (
     Q_F16,
     Q_F32,
     Q_Q4_0,
+    Q_Q4_1,
     Q_Q4_K,
+    Q_Q5_0,
+    Q_Q5_1,
     Q_Q5_K,
     Q_Q6_K,
     Q_Q8_0,
     _k_scale,
+    _qh,
     bf16_at,
     block_bytes,
     block_elements,
@@ -111,6 +115,12 @@ def row_dot(
         var base = to + b * per
         if kind == Q_Q4_0:
             total += _dot_q4_0(p, block, x, base)
+        elif kind == Q_Q4_1:
+            total += _dot_q4_1(p, block, x, base)
+        elif kind == Q_Q5_0:
+            total += _dot_q5_0(p, block, x, base)
+        elif kind == Q_Q5_1:
+            total += _dot_q5_1(p, block, x, base)
         elif kind == Q_Q8_0:
             total += _dot_q8_0(p, block, x, base)
         elif kind == Q_Q4_K:
@@ -137,6 +147,55 @@ def _dot_q4_0(p: RawPtr, at: Int, x: List[Float32], base: Int) -> Float32:
         qx += Float32(b & 0xF) * lo + Float32(b >> 4) * hi
         sx += lo + hi
     return d * (qx - 8.0 * sx)
+
+
+def _dot_q4_1(p: RawPtr, at: Int, x: List[Float32], base: Int) -> Float32:
+    """`d * sum(q * x) + m * sum(x)`, with nothing centred."""
+    var d = f16_at(p, at)
+    var m = f16_at(p, at + 2)
+    var qx = Float32(0)
+    var sx = Float32(0)
+    for l in range(16):
+        var b = _u8(p, at + 4 + l)
+        var lo = x[base + l]
+        var hi = x[base + l + 16]
+        qx += Float32(b & 0xF) * lo + Float32(b >> 4) * hi
+        sx += lo + hi
+    return d * qx + m * sx
+
+
+def _dot_q5_0(p: RawPtr, at: Int, x: List[Float32], base: Int) -> Float32:
+    """q4_0's shape with the fifth bit put back before the centring."""
+    var d = f16_at(p, at)
+    var qh = _qh(p, at + 2)
+    var qx = Float32(0)
+    var sx = Float32(0)
+    for l in range(16):
+        var b = _u8(p, at + 6 + l)
+        var lo = x[base + l]
+        var hi = x[base + l + 16]
+        var ql = (b & 0xF) | (((qh >> l) << 4) & 0x10)
+        var qhh = (b >> 4) | ((qh >> (l + 12)) & 0x10)
+        qx += Float32(ql) * lo + Float32(qhh) * hi
+        sx += lo + hi
+    return d * (qx - 16.0 * sx)
+
+
+def _dot_q5_1(p: RawPtr, at: Int, x: List[Float32], base: Int) -> Float32:
+    var d = f16_at(p, at)
+    var m = f16_at(p, at + 2)
+    var qh = _qh(p, at + 4)
+    var qx = Float32(0)
+    var sx = Float32(0)
+    for l in range(16):
+        var b = _u8(p, at + 8 + l)
+        var lo = x[base + l]
+        var hi = x[base + l + 16]
+        var ql = (b & 0xF) | (((qh >> l) << 4) & 0x10)
+        var qhh = (b >> 4) | ((qh >> (l + 12)) & 0x10)
+        qx += Float32(ql) * lo + Float32(qhh) * hi
+        sx += lo + hi
+    return d * qx + m * sx
 
 
 def _dot_q8_0(p: RawPtr, at: Int, x: List[Float32], base: Int) -> Float32:
