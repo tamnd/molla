@@ -142,10 +142,12 @@ struct Runner(Movable):
         # against a model pays once and every start after it binds straight to
         # the cache. This run binds to whatever was there when it opened, which
         # on a miss is the file, so the repack a miss writes is for the next
-        # start and not for this one.
+        # start and not for this one. Either way the plan is told about the
+        # cache too, so the read stage warms the copy of each weight that this
+        # process is going to read.
         var cache = open_cache(model_path, model_key(g))
         var repack_for = String("") if cache.usable else model_path
-        var weights = load(g, plan_load(g, dev, 0), 0, False, repack_for)
+        var weights = load(g, plan_load(g, dev, 0, cache), 0, False, repack_for)
         var b = bind(g, cache)
         var geometry = read_geometry(g)
         var want = context if context > 0 else DEFAULT_CONTEXT
