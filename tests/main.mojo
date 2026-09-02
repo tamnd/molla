@@ -14,7 +14,9 @@ import test_dns
 import test_gguf
 import test_load
 import test_quant
+import test_attention
 import test_kernel
+import test_rope
 import test_tensor
 import test_host
 import test_http
@@ -71,6 +73,14 @@ def main():
         test_kernel.run(suite)
     except e:
         suite.fail("test_kernel", String(e))
+    try:
+        test_rope.run(suite)
+    except e:
+        suite.fail("test_rope", String(e))
+    try:
+        test_attention.run(suite)
+    except e:
+        suite.fail("test_attention", String(e))
     try:
         test_dns.run(suite)
     except e:
