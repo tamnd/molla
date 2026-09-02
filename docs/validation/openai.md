@@ -63,7 +63,7 @@ Handing back once per token is not by itself enough, and that is the part the fl
 | One token per hand back, eight rounds per pass | 0.3 to 0.9 s |
 | One token per hand back, yield ends the pass | 0.13 to 0.22 s |
 
-The last row is one token time, which is the floor: a token is not interruptible and a request that arrives during one waits for it. The same is true of the prefill, and the prefill is the one visible remaining case, since a health check issued while a thirty six token prompt is being read waits the two or three seconds that takes. Total stream time is unchanged across all three rows, so none of this cost throughput.
+The last row is one token time, which is the floor: a token is not interruptible and a request that arrives during one waits for it. The same is true of the prefill, and the prefill is the one visible remaining case, since a health check issued while a thirty six token prompt is being read waits the two or three seconds that takes. Total stream time is unchanged across all three rows, so none of this cost throughput. On the fleet machine where the first symptom was a five second timeout, the same measurement is now 0.11 to 0.19 seconds against a 0.10 second token.
 
 ## Streaming
 
@@ -110,6 +110,8 @@ ok
 $ curl -s -w " %{http_code}\n" $U/v1/completions -d '{"prompt":"x","max_tokens":2}'
 {"error":{"message":"this build decodes one sequence at a time and one is already running, ...","type":"server_error","param":null,"code":null}} 503
 ```
+
+Both answer in about a tenth of a second on the fleet machine, which is one token, and the shutdown after them is still clean.
 
 ## What is tested and what is not
 
