@@ -23,6 +23,7 @@ from molla.engine.sample import Sampler, SamplerConfig
 from molla.engine.session import Session as Decode
 from molla.model.gguf import Gguf
 from molla.model.load import load, plan_load
+from molla.model.repack import model_key, open_cache
 from molla.model.spec import read_geometry
 from molla.sys.clock import monotonic_ms
 from molla.sys.device import default_device
@@ -98,10 +99,16 @@ def run_generate(
     # tensor copied to a card is a tensor they cannot read, and a budget of
     # zero says so rather than leaving it to a placement heuristic that has no
     # way to know what will read the result.
-    var weights = load(g, plan_load(g, dev, 0), 0, False)
+    #
+    # A hit binds to the repacked weights and a miss binds to the file and
+    # writes the repack on the way past, so the first run against a model is
+    # the slow one and says so.
+    var cache = open_cache(model_path, model_key(g))
+    var repack_for = String("") if cache.usable else model_path
+    var weights = load(g, plan_load(g, dev, 0), 0, False, repack_for)
     var loaded = monotonic_ms()
 
-    var b = bind(g)
+    var b = bind(g, cache)
     var geometry = read_geometry(g)
     var want = context if context > 0 else DEFAULT_CONTEXT
     if geometry.context_length > 0 and want > geometry.context_length:
@@ -149,6 +156,16 @@ def run_generate(
     print("prompt:   ", len(ids), "tokens")
     print("sampling: ", describe(sampling))
     print("load:     ", loaded - started, "ms")
+    if cache.usable:
+        print(
+            "repack:   ",
+            cache.count(),
+            "tensors from cache,",
+            cache.bytes() // (1 << 20),
+            "MiB",
+        )
+    else:
+        print("repack:   ", cache.reason)
     print()
 
     var prefill_started = monotonic_ms()
@@ -177,5 +194,6 @@ def run_generate(
         # scalar decode of an 8B is five seconds a token and a rate in whole
         # tokens per second prints zero.
         print("rate:     ", (finished - prefilled) // written, "ms/token")
+    cache.close()
     g.close()
     _ = weights^

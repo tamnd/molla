@@ -37,6 +37,7 @@ from molla.engine.session import Session as Decode
 from molla.jinja.template import Template
 from molla.model.gguf import Gguf
 from molla.model.load import Weights, load, plan_load
+from molla.model.repack import RepackCache, model_key, open_cache
 from molla.model.spec import read_geometry
 from molla.sys.clock import unix_time
 from molla.sys.device import default_device
@@ -77,9 +78,13 @@ struct Runner(Movable):
 
     var g: Gguf
     var weights: Weights
+    var cache: RepackCache
+    """The repacked weights beside the model, when there are any. Held for the
+    same reason `g` is, which is that `b` points into it."""
+
     var b: Bound
-    """Addresses inside the mapping `g` holds. Nothing here owns bytes, so `g`
-    outliving `b` is the whole of the lifetime rule."""
+    """Addresses inside the two mappings `g` and `cache` hold. Nothing here owns
+    bytes, so those two outliving `b` is the whole of the lifetime rule."""
 
     var tokenizer: Tokenizer
     var counter: AllocCounter
@@ -132,8 +137,16 @@ struct Runner(Movable):
         # Everything stays in the mapping, for the reason `molla generate`
         # gives: the kernels are host kernels, so a tensor on a card is one
         # they cannot read.
-        var weights = load(g, plan_load(g, dev, 0), 0, False)
-        var b = bind(g)
+        #
+        # A miss repacks while it loads and a hit does not, so the first start
+        # against a model pays once and every start after it binds straight to
+        # the cache. This run binds to whatever was there when it opened, which
+        # on a miss is the file, so the repack a miss writes is for the next
+        # start and not for this one.
+        var cache = open_cache(model_path, model_key(g))
+        var repack_for = String("") if cache.usable else model_path
+        var weights = load(g, plan_load(g, dev, 0), 0, False, repack_for)
+        var b = bind(g, cache)
         var geometry = read_geometry(g)
         var want = context if context > 0 else DEFAULT_CONTEXT
         if geometry.context_length > 0 and want > geometry.context_length:
@@ -156,6 +169,7 @@ struct Runner(Movable):
         self.context = want
         self.g = g^
         self.weights = weights^
+        self.cache = cache^
         self.b = b^
         self.tokenizer = tokenizer^
         self.counter = counter
@@ -185,6 +199,23 @@ struct Runner(Movable):
             + String(self.context)
             + " positions"
         )
+
+    def repack(self) -> String:
+        """Whether this model bound to a repack cache, in one line.
+
+        Said out loud at startup for the same reason `molla load` says it: a
+        repack that reruns on every start is the thing the cache exists to
+        prevent, and a server that is quietly doing it every time looks exactly
+        like one that is not.
+        """
+        if self.cache.usable:
+            return (
+                String(self.cache.count())
+                + " tensors from cache, "
+                + String(self.cache.bytes() // (1 << 20))
+                + " MiB"
+            )
+        return self.cache.reason
 
     def answers_to(self, name: String) -> Bool:
         """Whether a request's `model` field names this model.

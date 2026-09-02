@@ -20,6 +20,7 @@ mercy in the whole layout.
 """
 
 from molla.nn.quant import block_bytes, block_elements, supported
+from molla.nn.repack import LAYOUT_GGML, LAYOUT_PLANAR, planar_row_bytes
 from molla.sys.mmap import RawPtr
 
 
@@ -48,11 +49,29 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
     var rows: Int
     """How many of those there are. One for a vector."""
 
-    def __init__(out self, address: Int, kind: Int, cols: Int, rows: Int):
+    var layout: Int
+    """Whether the bytes are the file's or the repack's.
+
+    `LAYOUT_GGML` means blocks exactly as the GGUF has them. `LAYOUT_PLANAR`
+    means `molla.nn.repack` has been over them and the address points into a
+    cache rather than into the model file. The type number is unchanged either
+    way, because the planar layout keeps the group size and the presence of a
+    minimum from the type it came from and needs to be told which one that was.
+    """
+
+    def __init__(
+        out self,
+        address: Int,
+        kind: Int,
+        cols: Int,
+        rows: Int,
+        layout: Int = LAYOUT_GGML,
+    ):
         self.address = address
         self.kind = kind
         self.cols = cols
         self.rows = rows
+        self.layout = layout
 
     @staticmethod
     def none() -> Self:
@@ -64,7 +83,7 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
         every weight, and two things that have to agree are one thing that can
         disagree.
         """
-        return Self(0, 0, 0, 0)
+        return Self(0, 0, 0, 0, LAYOUT_GGML)
 
     def present(self) -> Bool:
         return self.address != 0
@@ -85,6 +104,8 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
         that drifts further from the truth, which reads as a model that is
         coherent for the first layer and noise after it.
         """
+        if self.layout == LAYOUT_PLANAR:
+            return planar_row_bytes(self.kind, self.cols)
         if not supported(self.kind):
             raise Error(
                 "ggml type " + String(self.kind) + " has no known block size"
@@ -114,6 +135,15 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
 
     def bytes(self) raises -> Int:
         return self.row_bytes() * self.rows
+
+    def as_planar(self, address: Int) -> Self:
+        """The same weight and shape, pointing at its repacked bytes.
+
+        The address changes because a repack is a second copy in a cache and not
+        an edit of the mapped file, so a tensor that has been repacked and one
+        that has not are two views and never the same one mutated.
+        """
+        return Self(address, self.kind, self.cols, self.rows, LAYOUT_PLANAR)
 
 
 struct Buffer(Movable):

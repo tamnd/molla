@@ -38,6 +38,8 @@ The smaller checks are the other half. A softmax that sums to one, a norm with a
 
 ## What this is not
 
-It is not fast. Every loop here is scalar, there is no SIMD and no blocking and no threading, and a matvec against an 8B weight will be slower than it has any right to be. That is deliberate for now. Issue #120 is the repacking work and is where the layout gets chosen for the arithmetic rather than for the file format, and doing that before there is a correct scalar version to check against would be optimizing something nobody has shown to be right.
+It is not fast. Every loop here is scalar, there is no SIMD and no blocking and no threading, and a matvec against an 8B weight will be slower than it has any right to be. That is deliberate for now.
+
+Issue #120 landed on top of this and is where the layout gets chosen for the arithmetic rather than for the file format. `matvec` now tests the weight's layout once, outside the row loop, and takes either the fused ggml path described above or the planar one from `molla.nn.repack`. A weight is one layout for its whole life, so that branch belongs outside the loop that runs once per output and not inside it. The fused paths stay because a model with no cache beside it still has to load and still has to be right, and because they are the thing the planar path is checked against. See [repack.md](repack.md).
 
 What it is is the reference. When a fast path lands and the output degrades, there is a slow path to run the same weights through and a bisection to do, rather than a model that got worse for a reason nobody can name.
