@@ -2,7 +2,11 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.3.1] - 2026-09-03
+
+A unified machine can put weights where a device kernel can read them.
+
+One change, and it is the last thing standing between M2b and a forward pass on the M4. A Metal kernel cannot read a mapped file where it lies, which #153 admitted and this release acts on, so a unified device now gets a pool and slots exactly as a card does. The copy is the same asynchronous one the discrete path already used, which was measured rather than assumed, and what it costs on the M4 is written down next to what it replaces.
 
 ### Added
 
