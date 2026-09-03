@@ -297,35 +297,51 @@ def planar_matvec_kernel[
     var m_base = d_base + groups
 
     var acc = Float32(0)
-    var i = t
-    while i < cols:
-        var gi = i // group
-        var q: Float32
-        comptime if form == QUANT_I8:
-            q = Float32(Int(quants[unsafe_offset=row + i]))
-        else:
-            # Threads `i` and `i + 1` load the same byte, which is a cache hit
-            # and not a second trip to memory, and a warp still reads one
-            # contiguous run. Splitting the pair across one thread instead
-            # would halve the loads and change which thread sums which term,
-            # and that changes the last bits of every row. Not worth it for a
-            # kernel that is waiting on DRAM either way.
-            #
-            # Which half of the byte, and the sign extension under it, are
-            # arithmetic and not branches. Neighbouring threads take opposite
-            # halves, so a branch here is one every warp takes both sides of,
-            # and the whole loop body runs twice for every warp in the grid.
-            # `(n ^ 8) - 8` is the four bit two's complement sign extension.
+    comptime if form == QUANT_I8:
+        var i = t
+        while i < cols:
+            var gi = i // group
+            var q = Float32(Int(quants[unsafe_offset=row + i]))
+            var a = x[unsafe_offset=i]
+            acc += scales[unsafe_offset=d_base + gi] * q * a
+            comptime if with_min:
+                acc += scales[unsafe_offset=m_base + gi] * a
+            i += tile
+    else:
+        # A byte to a thread and both of its values, rather than a value to a
+        # thread with neighbouring threads sharing a byte. The sharing version
+        # was written first and measured 7 per cent slower than the byte wide
+        # layout it replaced while reading half the bytes, because a warp asking
+        # for sixteen contiguous bytes still pulls whole thirty two byte sectors
+        # and the other half of each sector is a different warp's problem. This
+        # way a warp asks for thirty two contiguous bytes and gets sixty four
+        # values out of them, so the sectors are read once and the number of
+        # load instructions halves as well.
+        #
+        # Both values of a byte sit in one group, because every group size here
+        # is even, so their scale and minimum are loaded once for the pair.
+        # `(n ^ 8) - 8` is the four bit two's complement sign extension, done
+        # with arithmetic because a branch on which nibble is which is one that
+        # every warp would take both sides of.
+        var i = t * 2
+        while i < cols:
+            var gi = i // group
             var b = Int(packed[unsafe_offset=row + (i >> 1)])
-            var n = (b >> ((i & 1) * 4)) & 0xF
+            var lo = b & 0xF
+            var hi = (b >> 4) & 0xF
             comptime if form == QUANT_S4:
-                n = (n ^ 8) - 8
-            q = Float32(n)
-        var a = x[unsafe_offset=i]
-        acc += scales[unsafe_offset=d_base + gi] * q * a
-        comptime if with_min:
-            acc += scales[unsafe_offset=m_base + gi] * a
-        i += tile
+                lo = (lo ^ 8) - 8
+                hi = (hi ^ 8) - 8
+            var a0 = x[unsafe_offset=i]
+            var a1 = x[unsafe_offset=i + 1]
+            var d = scales[unsafe_offset=d_base + gi]
+            acc += d * Float32(lo) * a0
+            acc += d * Float32(hi) * a1
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                acc += m * a0
+                acc += m * a1
+            i += tile * 2
 
     # The reduction is over the block rather than over a warp because `tile` is
     # a parameter and the warp width is not the same number on the two vendors.
