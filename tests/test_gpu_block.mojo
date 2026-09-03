@@ -35,7 +35,7 @@ from molla.model.spec import architecture_id
 from molla.nn.arch import arch_of
 from molla.nn.attention import AttnSpec
 from molla.nn.block import BlockSpec, LayerWeights, Scratch
-from molla.nn.gpu import SPAN, DeviceVec
+from molla.nn.gpu import MM_GROUPS, SPAN, DeviceVec
 from molla.nn.gpu_block import DeviceModel, DeviceScratch, device_forward
 from molla.nn.model import ModelWeights, forward
 from molla.nn.quant import Q_F32, Q_Q8_0
@@ -362,7 +362,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         # logits and both cache planes, because a chunk that gets the logits
         # right and the cache wrong answers the prompt and then drifts.
         var batch = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, len(tokens))
-        var bx = DeviceVec(ctx, (len(tokens) + SPAN) * WIDTH)
+        var bx = DeviceVec(ctx, (len(tokens) + SPAN * MM_GROUPS) * WIDTH)
         var bcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
         device_forward(
             ctx, model, batch, bx, tokens, 0, 0, bcache.keys, bcache.values
@@ -384,7 +384,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             else:
                 tail_run.append(tokens[i])
         var pair = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, len(tokens))
-        var px = DeviceVec(ctx, (len(tokens) + SPAN) * WIDTH)
+        var px = DeviceVec(ctx, (len(tokens) + SPAN * MM_GROUPS) * WIDTH)
         var pcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
         device_forward(
             ctx, model, pair, px, head_run, 0, 0, pcache.keys, pcache.values

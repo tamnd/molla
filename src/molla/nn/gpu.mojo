@@ -506,15 +506,31 @@ either side of it are large: on a 4090 a 514 token prompt through SmolLM2 runs
 at 2734 tokens a second here, 2089 at 128 threads and 1034 at 512.
 """
 
+comptime MM_GROUPS = 4
+"""How many groups of `SPAN` tokens one matmul block carries.
+
+Amortization the accumulators cannot pay for. A block covers `SPAN` tokens per
+group of threads because `SPAN` accumulators is as many as fit in registers, so
+without this a chunk of 64 tokens reads the whole weight matrix eight times,
+and on an 8B that was 52 GiB of reads a chunk and a prefill slower than
+decoding the prompt a token at a time.
+
+The groups share the weight row rather than the registers. Each one walks the
+same columns and keeps its own accumulators, so the row is fetched from memory
+once for the block and out of the L1 for the groups behind the first, and the
+traffic for a chunk falls by this factor with no register cost at all.
+"""
+
 comptime SPAN = 16 if CompilationTarget.is_macos() else 8
-"""How many tokens one matmul block carries at once.
+"""How many tokens one group of threads in a matmul block carries at once.
 
 The number that decides whether prefill is bandwidth bound or compute bound. A
 block reads and dequantizes a weight value once and multiplies it into `SPAN`
 accumulators, so the weight traffic and the conversion work for a chunk of `T`
 tokens are `ceil(T / SPAN)` passes over the matrix rather than `T` of them. It
 costs `SPAN * MM_TILE` floats of shared memory and `SPAN` registers of
-accumulator, and the second one is what stops it growing.
+accumulator, and the second one is what stops it growing. `MM_GROUPS` is how
+the amortization goes past what the registers allow.
 
 The two backends want different numbers and the difference is measured and
 consistent rather than noise. Metal is 11 per cent faster at sixteen than at
@@ -545,14 +561,21 @@ def planar_matmul_kernel[
     byte and turning it into a float, and both of those happen once here for
     `SPAN` multiplies rather than once for one.
 
-    The grid is `(ceil(tokens / SPAN), rows)` and the order is deliberate.
-    Blocks that share an output row differ only in the token index, and they
-    have to be co-resident for the L2 to serve that row once rather than once
-    each, so the token index is the fast axis.
+    The block is `MM_GROUPS` groups of `tile` threads. Every group walks the
+    whole weight row and holds `SPAN` accumulators of its own, so the row is
+    read from memory once for the block and out of the L1 for the groups behind
+    the first, and a block covers `SPAN * MM_GROUPS` tokens for one pass over
+    the weights. That is the difference between reading an 8B eight times a
+    chunk and reading it twice.
+
+    The grid is `(ceil(tokens / (SPAN * MM_GROUPS)), rows)` and the order is
+    deliberate. Blocks that share an output row differ only in the token index,
+    and they have to be co-resident for the L2 to serve that row once rather
+    than once each, so the token index is the fast axis.
 
     A chunk is not a multiple of `SPAN` in general, and the tail block runs its
     dead lanes off the end of the chunk rather than branching around them. Every
-    scratch vector a chunk uses is allocated with `SPAN` rows of slack for
+    scratch vector a chunk uses is allocated with a block of rows of slack for
     exactly this, so those lanes read real memory, compute a dot product of
     whatever is in it, and never store it. It costs the tail block alone a
     fraction of one launch and it keeps the inner loop free of a test.
@@ -564,7 +587,8 @@ def planar_matmul_kernel[
     var rows = Int(rows_dev)
     var tokens = Int(tokens_dev)
     var r = Int(block_idx.y)
-    var base = Int(block_idx.x) * SPAN
+    var g = Int(thread_idx.y)
+    var base = (Int(block_idx.x) * MM_GROUPS + g) * SPAN
     var t = Int(thread_idx.x)
 
     var row = r * stride
@@ -580,6 +604,9 @@ def planar_matmul_kernel[
     var live = tokens - base
     if live > SPAN:
         live = SPAN
+    # A group whose whole run is past the end of the chunk still walks the
+    # columns, because it shares the block's barriers and a group that returned
+    # early would leave the others waiting on a barrier it never reaches.
 
     # Every loop over `SPAN` below has a constant trip count so that the index
     # into `acc` is a constant after unrolling and the accumulators stay in
@@ -588,7 +615,8 @@ def planar_matmul_kernel[
     #
     # The dead lanes of a tail block read past the last token rather than
     # clamping onto it, which is why every scratch vector a chunk uses is
-    # allocated with `SPAN` rows of slack. Clamping would need a token index per
+    # allocated with `SPAN * MM_GROUPS` rows of slack. Clamping would need a
+    # token index per
     # lane held in a register for the length of the accumulation, which is
     # `SPAN` registers taken from the accumulators for arithmetic that is thrown
     # away. Reading slack is an affine offset the address unit folds in for
@@ -636,18 +664,19 @@ def planar_matmul_kernel[
     # threads wrote, which is the access the single accumulator version already
     # had, done `SPAN` times over rather than as `SPAN` tree walks in a row.
     var part = stack_allocation[
-        tile * SPAN, Float32, address_space=AddressSpace.SHARED
+        tile * SPAN * MM_GROUPS, Float32, address_space=AddressSpace.SHARED
     ]()
+    var mine = g * SPAN * tile
     for k in range(SPAN):
-        part[unsafe_offset=k * tile + t] = acc[k]
+        part[unsafe_offset=mine + k * tile + t] = acc[k]
     barrier()
     var step = tile // 2
     while step > 0:
         if t < step:
             for k in range(SPAN):
-                part[unsafe_offset=k * tile + t] = (
-                    part[unsafe_offset=k * tile + t]
-                    + part[unsafe_offset=k * tile + t + step]
+                part[unsafe_offset=mine + k * tile + t] = (
+                    part[unsafe_offset=mine + k * tile + t]
+                    + part[unsafe_offset=mine + k * tile + t + step]
                 )
         barrier()
         step //= 2
@@ -655,7 +684,7 @@ def planar_matmul_kernel[
     # One thread a token rather than one thread for the whole block, so the
     # tail is `SPAN` threads doing one epilogue each.
     if t < live:
-        var v = part[unsafe_offset=t * tile]
+        var v = part[unsafe_offset=mine + t * tile]
         var epi = Int(epi_dev)
         var out_at = (base + t) * rows + r
         if epi & EPI_BIAS != 0:
@@ -866,8 +895,12 @@ def _launch_mm[
         Int32(epi),
         Int32(w.rows),
         Int32(tokens),
-        grid_dim=((tokens + SPAN - 1) // SPAN, w.rows, 1),
-        block_dim=(tile, 1, 1),
+        grid_dim=(
+            (tokens + SPAN * MM_GROUPS - 1) // (SPAN * MM_GROUPS),
+            w.rows,
+            1,
+        ),
+        block_dim=(tile, MM_GROUPS, 1),
     )
 
 

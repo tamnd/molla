@@ -54,6 +54,7 @@ from molla.nn.gpu import (
     EPI_BIAS,
     EPI_GLU,
     EPI_NONE,
+    MM_GROUPS,
     SPAN,
     DeviceVec,
     device_matmul_into,
@@ -398,10 +399,10 @@ struct DeviceScratch(Movable):
             raise Error("a model needs a vocabulary to write logits into")
         if chunk <= 0:
             raise Error("a pass has to carry at least one token")
-        # `SPAN` rows of slack on everything a matmul reads, because the dead
-        # lanes of a tail block read past the last token of the chunk rather
-        # than clamping onto it. See `planar_matmul_kernel`.
-        var wide = chunk + (SPAN if chunk > 1 else 0)
+        # A block of slack on everything a matmul reads, because the dead lanes
+        # of a tail block read past the last token of the chunk rather than
+        # clamping onto it. See `planar_matmul_kernel`.
+        var wide = chunk + (SPAN * MM_GROUPS if chunk > 1 else 0)
         self.norm = DeviceVec(ctx, wide * spec.width)
         self.q = DeviceVec(ctx, wide * spec.q_width())
         self.heads_out = DeviceVec(ctx, wide * spec.q_width())
@@ -734,7 +735,7 @@ def device_forward(
         )
     # A chunk wants `SPAN - 1` rows of slack past its last token, because the
     # dead lanes of a tail matmul block read there. See `planar_matmul_kernel`.
-    var rows = run if run == 1 else run + SPAN - 1
+    var rows = run if run == 1 else run + SPAN * MM_GROUPS - 1
     if x.elements() < rows * m.width():
         raise Error(
             "the residual stream is "
