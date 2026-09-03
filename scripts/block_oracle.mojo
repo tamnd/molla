@@ -12,10 +12,10 @@ for every operation whether or not it is inside tolerance, which is what a
 document recording per target numerics needs, and it is where the numbers in
 `docs/validation/kernels.md` came from.
 
-The gate is per operation and not global. Three of these have a wider tolerance
-than the rest and the reasons are different in each case, so a single number
-across all of them would either be too loose to catch a real fault in the tight
-ones or would fail the loose ones for behaving as designed.
+The gate is per operation and not global. Four of them have their own tolerance
+and the reasons are different in each case, so a single number across all of
+them would either be too loose to catch a real fault in the tight ones or would
+fail the loose ones for behaving as designed.
 
 Usage:
 
@@ -74,6 +74,22 @@ Both reduce over a few hundred terms, and the host accumulates that in float64
 while Metal has no float64 to accumulate in. A float32 tree is what replaces it,
 which is closer to the float64 answer than a sequential float32 sum would be,
 and is still not the same number.
+"""
+
+comptime CAPPED = 1e-5
+"""For attention with a logit softcap, which is Gemma 2 and nothing else here.
+
+The cap multiplies its `tanh` by itself, and the cap is 50, so a float32 `tanh`
+that is a part in ten million from the float64 one the host takes arrives at the
+softmax fifty times that. Everything downstream of it is the ordinary attention
+path, so this is the one tolerance in the file that is set by a constant in a
+model file rather than by the arithmetic, and a model with a larger cap would
+want a larger number here.
+
+It is not a fudge for a difference nobody looked at. Going through `exp` rather
+than the target's own `tanh` took the 4090 from 2e-5 to 1.9e-6, which is where
+the float32 exponential runs out, and this leaves the five times headroom the
+other gates have rather than the five percent that number would have had.
 """
 
 comptime ANGLED = 2e-6
@@ -373,23 +389,31 @@ def _rope_case(
 
 def _attention(ctx: DeviceContext, mut bad: Int) raises:
     var gqa = AttnSpec(32, 8, 128)
-    _attend_case(ctx, bad, gqa, 512, 511, "attention grouped query")
+    _attend_case(
+        ctx, bad, gqa, 512, 511, "attention grouped query", Float32(WIDE)
+    )
 
     var mha = AttnSpec(8, 8, 64)
-    _attend_case(ctx, bad, mha, 128, 127, "attention multi head")
+    _attend_case(ctx, bad, mha, 128, 127, "attention multi head", Float32(WIDE))
 
     var windowed = AttnSpec(8, 2, 64)
     windowed.window = 128
-    _attend_case(ctx, bad, windowed, 512, 511, "attention sliding window")
+    _attend_case(
+        ctx, bad, windowed, 512, 511, "attention sliding window", Float32(WIDE)
+    )
 
     var sinks = AttnSpec(8, 2, 64)
     sinks.window = 128
     sinks.sinks = 4
-    _attend_case(ctx, bad, sinks, 512, 511, "attention window with sinks")
+    _attend_case(
+        ctx, bad, sinks, 512, 511, "attention window with sinks", Float32(WIDE)
+    )
 
     var capped = AttnSpec(8, 2, 64)
     capped.softcap = Float32(50.0)
-    _attend_case(ctx, bad, capped, 256, 255, "attention softcapped")
+    _attend_case(
+        ctx, bad, capped, 256, 255, "attention softcapped", Float32(CAPPED)
+    )
 
 
 def _attend_case(
@@ -399,6 +423,7 @@ def _attend_case(
     count: Int,
     pos: Int,
     name: String,
+    gate: Float32,
 ) raises:
     var width = spec.heads * spec.head_dim
     var kv_width = spec.kv_heads * spec.head_dim
@@ -428,7 +453,7 @@ def _attend_case(
     ctx.synchronize()
     var got = Buffer(width)
     dout.download(got)
-    _report(bad, name, got, want, Float32(WIDE))
+    _report(bad, name, got, want, gate)
 
 
 def main():
@@ -455,7 +480,9 @@ def main():
                 WIDE,
                 "reductions,",
                 ANGLED,
-                "rope, all as a fraction of the peak magnitude",
+                "rope,",
+                CAPPED,
+                "softcap, all as a fraction of the peak magnitude",
             )
             var bad = 0
             _norm(ctx, bad)

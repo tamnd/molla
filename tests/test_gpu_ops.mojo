@@ -18,12 +18,15 @@ per element, because half of these produce values that pass through zero and a
 relative error at an element that is nearly zero is a number with no meaning in
 it.
 
-Two of them are looser than the rest, for two different reasons. The norm and
-the attention reduce over a few hundred terms, and the host accumulates that in
-float64 while Metal has no float64 to accumulate in, so the device sums in
-float32 through a tree. Rope is loose because the host takes its `cos` and `sin`
-in float64 and the device takes them in float32. Both are differences in the
-arithmetic rather than faults on either side, and both are written down in
+Three of them are looser than the rest, for three different reasons. The norm
+and the attention reduce over a few hundred terms and the host accumulates that
+in float64, which Metal has not got, so the device sums in float32 through a
+tree. Rope is loose because the host takes its `cos` and `sin` in float64 and
+the device takes them in float32. A softcapped attention is looser still
+because the cap multiplies its own `tanh` by fifty, so a difference in the last
+digit of one arrives at the softmax fifty times larger.
+
+None of the three is a fault on either side, and all three are written down in
 `docs/validation/kernels.md` with the figures `scripts/block_oracle.mojo`
 printed on each GPU.
 """
@@ -491,15 +494,15 @@ def test_attend(mut suite: Suite, ctx: DeviceContext) raises:
     # shape every recent Llama and Qwen uses, and the mapping is where an off by
     # one reads the wrong head's keys and still produces plausible numbers.
     var spec = AttnSpec(8, 2, 32)
-    _attend_case(suite, ctx, spec, 40, 39, "grouped query")
+    _attend_case(suite, ctx, spec, 40, 39, "grouped query", 2e-6)
 
     # One key, which is the first token of a sequence and is where a softmax
     # over a single score has to come back as exactly one.
-    _attend_case(suite, ctx, spec, 1, 0, "a single key")
+    _attend_case(suite, ctx, spec, 1, 0, "a single key", 2e-6)
 
     # Multi head, where every query head has its own kv head.
     var mha = AttnSpec(4, 4, 32)
-    _attend_case(suite, ctx, mha, 20, 19, "multi head")
+    _attend_case(suite, ctx, mha, 20, 19, "multi head", 2e-6)
 
     # A sliding window, which is what masks most of the cache on a Mistral or a
     # Gemma 3 local layer. The device version scores the masked keys anyway and
@@ -507,19 +510,23 @@ def test_attend(mut suite: Suite, ctx: DeviceContext) raises:
     # the host does, so this is the case that proves the two agree.
     var windowed = AttnSpec(4, 2, 32)
     windowed.window = 8
-    _attend_case(suite, ctx, windowed, 40, 39, "a sliding window")
+    _attend_case(suite, ctx, windowed, 40, 39, "a sliding window", 2e-6)
 
     # A window with attention sinks, where the first few keys stay visible no
     # matter how far the window has moved past them.
     var sinks = AttnSpec(4, 2, 32)
     sinks.window = 8
     sinks.sinks = 3
-    _attend_case(suite, ctx, sinks, 40, 39, "sinks outside the window")
+    _attend_case(suite, ctx, sinks, 40, 39, "sinks outside the window", 2e-6)
 
     # Logit softcapping, which Gemma 2 applies to every attention score.
     var capped = AttnSpec(4, 2, 32)
     capped.softcap = Float32(50.0)
-    _attend_case(suite, ctx, capped, 30, 29, "softcapped scores")
+    # A cap of 50 multiplies its own tanh, so a float32 tanh a part in ten
+    # million from the host's float64 one reaches the softmax fifty times that.
+    # Hence the wider gate, which is set by a constant in a model file rather
+    # than by anything about the kernel.
+    _attend_case(suite, ctx, capped, 30, 29, "softcapped scores", 1e-5)
 
     var raised = False
     try:
@@ -549,6 +556,7 @@ def _attend_case(
     count: Int,
     pos: Int,
     name: String,
+    gate: Float32,
 ) raises:
     var width = spec.heads * spec.head_dim
     var kv_width = spec.kv_heads * spec.head_dim
@@ -583,8 +591,8 @@ def _attend_case(
     # dot product over `head_dim` and the sum over keys is another reduction on
     # top of it, both in float32 here against float64 on the host.
     var worst = _worst(got, want)
-    suite.check(worst < 2e-6, "device attention matches the host for " + name)
-    if worst >= 2e-6:
+    suite.check(worst < gate, "device attention matches the host for " + name)
+    if worst >= gate:
         suite.fail("device attention " + name, "worst " + String(worst))
 
 
