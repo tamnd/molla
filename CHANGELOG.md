@@ -2,7 +2,11 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.3.0] - 2026-09-03
+
+M2 closes and the GPU stops being a plan.
+
+This is the release that closes M2, which is the milestone where a real model produces coherent text through an OpenAI compatible endpoint. The device half of M2's exit criteria was never inside its own scope and moved to M2b, which is where the rest of this release comes from: a quantized matvec on the GPU, then the whole of the rest of a transformer block, both compiled for Metal and CUDA out of one source and both checked against the host on an M4 and a 4090.
 
 ### Added
 
