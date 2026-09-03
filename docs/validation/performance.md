@@ -103,6 +103,8 @@ Continuous batching last, and it belongs to M3 rather than here. It is the only 
 
 ## What is still not known
 
+All three of these were answered after this page was written, and the answers are in [max.md](max.md). Two of them changed the plan, so read that page before acting on the order above.
+
 Whether max-core 26.5 exposes graph capture from Mojo, and whether it exposes a grid wide barrier. Both were looked for and not found, but the packages ship compiled and the absence of a string in a binary is not the absence of an API. These are the first two things to establish, because #170 is shaped differently depending on the answers.
 
 Whether the launch cost is the same on Metal. The 4.9 microseconds is a CUDA through WSL2 number and Metal is a different driver with a different submission model, so the same measurement has to be taken on the M4 before any of this is assumed to apply there. The macbook is a loaded shared machine, which is a problem for measuring it and a reason to want a quiet Apple box in the fleet.
