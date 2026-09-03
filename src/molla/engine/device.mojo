@@ -238,10 +238,15 @@ struct DeviceSession(Movable):
         self.cache.advance()
 
     def fetch(mut self) raises:
-        """Bring the last step's logits back to the host."""
+        """Bring the last step's logits back to the host.
+
+        A copy rather than a mapping, because a mapping anywhere in the process
+        costs 1.3 GiB on its first call and this one would reach it on the first
+        token even with every upload fixed.
+        """
         if self.pos == 0:
             raise Error("there are no logits until a token has been run")
-        self.scratch.logits.download(self.logits)
+        self.scratch.logits.copy_out(self.logits)
 
     def prefill(mut self, tokens: List[Int]) raises:
         """The prompt. Only the last token's logits are worth anything."""

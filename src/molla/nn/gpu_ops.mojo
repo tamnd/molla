@@ -1091,12 +1091,12 @@ struct RopeTables(Movable):
             )
         var table = step_table(spec)
         self.steps = DeviceVec(ctx, pairs)
-        self.steps.upload_run(table, 0, pairs)
+        self.steps.copy_in(table)
         # A one element vector when there are no factors, because a device
         # buffer of length zero is not a thing and the kernel never reads it.
         self.factors = DeviceVec(ctx, pairs if use_factors else 1)
         if use_factors:
-            self.factors.upload_run(factors, 0, pairs)
+            self.factors.copy_in(factors)
         self.use_factors = use_factors
 
 
