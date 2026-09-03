@@ -239,10 +239,127 @@ For this kernel the consequence is narrower and the fix is a refusal. A model bo
 
 ### What is not covered
 
-Only matvec. Attention, the softmax, the norms and the elementwise operations are all still host only, and putting the rest of a block on the device is issue #142.
+Only matvec. Attention, the softmax, the norms and the elementwise operations are all still host only, and putting the rest of a block on the device is issue #142, which is the section below.
 
 No AMD, which D8 already records as a gap, and no arm64 Linux GPU, which nothing in the fleet has.
 
 Nothing here is a speed measurement. Every call in the oracle uploads its activations and downloads its result, which is most of what a call costs at these shapes, and the weights are a few hundred kilobytes rather than a few gigabytes, so the memory system this kernel was designed around is not being exercised at all. Timings arrive when the residual stream stops making the trip, which is issue #143, and they go in their own document.
 
 The corpus is the quantization corpus, so the shapes are small and rectangular and chosen to exercise the bit unpacking rather than the hardware. A 4096 by 4096 weight has not been through this kernel.
+
+## The rest of a block
+
+Issue #142, `molla.nn.gpu_ops`. The matvec above was one operation. This is everything else a transformer block does: the norm, rope, attention, the two gated feed forward shapes, the plain activations, the residual add, the scale and the argmax at the end of a decode step.
+
+They went across together rather than one at a time, and that is the design decision worth recording. At decode shapes each of these operations is tiny. A norm over 4096 values is 4096 multiplies. What is not tiny is the trip. Moving the residual stream to the host and back once costs more than every small operation in the block put together, so a block with one host operation left in the middle of it is a block that pays the full round trip anyway and gets nothing for the kernels that did go across. The set is the unit, not the operation.
+
+### What is in it
+
+| Kernel | Shape of the launch |
+| --- | --- |
+| `rms_norm_kernel` | one block, a tree reduction over the row, then a scale |
+| `softmax_kernel` | one block, a max tree then a sum tree over the same shared allocation |
+| `swiglu_kernel` | elementwise over the gate and the up projection, silu or gelu by compile time parameter |
+| `act_kernel` | elementwise, the same activation without a gate |
+| `add_into_kernel`, `scale_into_kernel` | elementwise, capped at 256 blocks |
+| `argmax_kernel` | one block, a tree carrying value and index together |
+| `rope_kernel` | one thread per pair, neox or adjacent by compile time parameter |
+| `attend_kernel` | one block per query head, three phases in one launch |
+
+`attend_kernel` is the one that earns the module. It scores, softmaxes and takes the weighted sum without leaving the kernel, so a head never writes its scores anywhere the host can see them. Masked positions get the lowest finite float32 rather than an actual negative infinity, so that subtracting the row maximum can never produce a nan, and the visibility test is written term for term against `AttnSpec.visible` so that sliding windows and attention sinks mean the same thing on both sides.
+
+There are no target specific branches in any of them, per D7. Where a target constant would have been the natural thing to reach for, it is a launch parameter instead: the reductions are trees over a tile rather than warp shuffles, and the tile is a parameter.
+
+### How it is checked
+
+Twice, in two places, for two different audiences.
+
+`tests/test_gpu_ops.mojo` runs in the suite and asserts. It compares each device operation against the host function that already has tests of its own, which is the only comparison worth making here. A device softmax that is internally consistent and disagrees with the host one by a thousandth is a model that answers differently depending on which backend it was started with, and nobody would ever trace that back to a reduction order. The whole file is one compile time branch, so it is a skip rather than a failure on the three machines with no GPU.
+
+`scripts/block_oracle.mojo`, run by `pixi run conformance-block`, prints the distance for every operation whether or not it passed. That is what a document recording per target numerics needs and it is what a test cannot give, because the only figure a test ever reports is one that already failed. It needs no fixtures at all, unlike every other conformance task in `pixi.toml`, so a machine with a GPU can run it straight after a clone.
+
+Inputs are a fixed wave with both signs and a spread of magnitudes, not random. A ramp would pass a norm that had its scale wrong by a constant, since every element would be off the same way. Random would give a test that fails one run in fifty, which is a test people learn to rerun.
+
+### The tolerances
+
+Four gates rather than one, because the reasons differ and a single number across all of them would be too loose to catch a real fault in the tight ones or would fail the loose ones for behaving as designed.
+
+| Gate | Value | Applies to | Why |
+| --- | --- | --- | --- |
+| tight | 1e-6 | activations, add, scale | every element touched once in an order that does not matter, so the two sides differ only where the host used a float64 intermediate |
+| wide | 2e-6 | the norm, attention | both reduce over a few hundred terms and the host accumulates in float64, which Metal has not got |
+| angled | 2e-6 | rope | the host takes its `cos` and `sin` in float64 and the device takes them in float32 |
+| capped | 1e-5 | attention with a logit softcap | the cap multiplies its own `tanh` by 50, so a difference in the last digit of one arrives at the softmax fifty times larger |
+
+Everything is measured as a fraction of the peak magnitude of the reference, except the softmax, which is measured absolutely. Relative to peak is the wrong question for a probability vector and it gets the answer backwards: a distribution over two thousand entries has a peak near a thousandth, so dividing by it inflates the difference most for the flattest distributions, which are the easiest case rather than the hardest. A probability is its own scale.
+
+The softcap gate is the one number here set by a constant in a model file rather than by the arithmetic, and a model with a cap larger than Gemma 2's 50 would want a larger number.
+
+### Results
+
+Both machines, every case the oracle runs, as a fraction of the peak magnitude in the host reference. The softmax rows are absolute.
+
+| Case | M4, Metal | 4090, sm_89 |
+| --- | --- | --- |
+| rms_norm 256 | 9.09e-08 | 9.09e-08 |
+| rms_norm 512 | 9.04e-08 | 0.00 |
+| rms_norm 4096 | 9.04e-08 | 9.04e-08 |
+| softmax 64 | 1.19e-07 | 1.19e-07 |
+| softmax 300 | 5.96e-08 | 1.49e-08 |
+| softmax 2048 | 2.01e-07 | 1.94e-07 |
+| swiglu | 5.09e-08 | 1.27e-08 |
+| geglu | 4.78e-09 | 3.18e-09 |
+| silu | 6.88e-08 | 3.44e-08 |
+| gelu | 1.72e-08 | 1.29e-08 |
+| add_into | 0.00 | 0.00 |
+| scale_into | 0.00 | 0.00 |
+| argmax over a vocabulary | index 99991, same as the host | index 99991, same as the host |
+| rope llama 3 | 1.06e-07 | 2.45e-07 |
+| rope llama 3 far out | 1.66e-07 | 2.63e-07 |
+| rope adjacent pairs | 1.21e-07 | 1.81e-07 |
+| rope yarn | 1.36e-07 | 2.73e-07 |
+| rope gemma 3 local | 1.07e-07 | 1.88e-07 |
+| rope gemma 3 global | 1.07e-07 | 2.14e-07 |
+| attention grouped query | 1.21e-06 | 1.15e-06 |
+| attention multi head | 6.59e-07 | 5.49e-07 |
+| attention sliding window | 6.57e-07 | 5.56e-07 |
+| attention window with sinks | 6.52e-07 | 5.59e-07 |
+| attention softcapped | 1.80e-06 | 1.91e-06 |
+
+Worst case is the softcapped attention at 1.91e-06 against its own 1e-5 gate, and everything under the tight and angled gates is at least four times inside.
+
+The two columns are not identical here, which is the interesting difference from the matvec above. That kernel produces the same bits on both vendors and this one does not, and the reason is that this one calls transcendental functions. `exp`, `cos`, `sin` and the reciprocal square root are library functions in each vendor's own runtime, correct to within a bit or so each and not to the same bit. Everything in the table that is exactly equal on both machines, and everything that is exactly zero, is a kernel that does not call one. That is the expected shape of the result rather than a worry, and a divergence appearing in one of the exact rows would be the finding.
+
+### What the 4090 found that the M4 could not
+
+Three corrections came out of running this on the second GPU, and all three are in the kernel rather than in a tolerance. This is the section that justifies the fleet.
+
+The first is rope on a long context. CUDA's float32 `cos` and `sin` reduce a large argument badly, and the angle at the fastest rotating pair is the position itself, so position 4096 is 652 whole turns and CUDA was 4e-4 of peak out where Metal was within 1e-7 of the float64 answer at the same point. The kernel now does its own Cody-Waite reduction before the call, splitting two pi across three float32 constants, which takes the 4090 to 2.6e-7 and leaves Metal where it was.
+
+The second is the softcap. CUDA's float32 `tanh` is further from the float64 one than Metal's, and Gemma 2 multiplies it by 50, so it reached the softmax at 2.04e-5 of peak. Computing the same function through `exp` instead, arranged so the exponential always lands in `(0, 1]` rather than overflowing on a large score, took it to 1.9e-6.
+
+The third was found by the oracle rather than by the second machine, and it is the one worth remembering. Rope failed on the M4 at 5.99e-6 against a 5e-6 gate, and the obvious fix was to widen the gate, which is what happened first. The oracle then showed the error growing with position: 4e-6 of peak at position 137 and 1.5e-4 at position 4096. The device was forming the rope frequency step from a float32 exponential where the host used a float64 one, about 1e-7 apart, and the angle multiplies that difference by the position. A tolerance wide enough for position 4096 would have covered a real fault at every position, and it would have gone on being not quite wide enough as contexts got longer. `molla.nn.rope.step_table` builds the steps on the host once per rope spec and uploads them, which is why the position 4096 row above now reports the same figure as the position 137 one.
+
+The general point is that a tolerance that has to grow with an input is not a tolerance, it is an unfixed bug with a number in front of it.
+
+### The fleet
+
+Per D8.
+
+| Machine | What ran | Result |
+| --- | --- | --- |
+| M4, aarch64-apple-darwin | the full suite, and the oracle on Metal | suite green at 2424 checks, all twenty five cases inside tolerance |
+| gpc, i9-13900K on WSL2, x86_64 | the full suite, and the oracle on the 4090 | all twenty five cases inside tolerance, suite green apart from issue #87, which fails the same way on main |
+| server1, EPYC, x86_64 | the full suite | green, the device code compiled out and the refusals ran |
+
+The refusals are the part that runs everywhere. Each host entry point checks its shapes and its residency before it reaches the compile time branch that holds the launch, so a machine with no GPU still tests that a mismatched length, a zero length and a weight outside a device pool are all rejected by name.
+
+### What is not covered
+
+No speed measurement, for the same reason as the matvec. Every case here uploads its input and downloads its result, which at these shapes is most of what the call costs, so the oracle measures agreement and nothing else. Timings arrive when the residual stream stops making the trip, which is issue #143.
+
+The block is not yet wired into a forward pass. These are the pieces and they agree with the host one at a time. A whole layer running end to end on the device, with the KV cache in device memory, is #143 as well.
+
+No prefill. Every shape here is a decode shape, one token at a time, and attention is one block per query head, which is the right split for a single query and the wrong one for a few hundred.
+
+No AMD, and no arm64 Linux GPU, both of which D8 already records as gaps.
