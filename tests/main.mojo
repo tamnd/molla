@@ -25,6 +25,7 @@ import test_attention
 import test_block
 import test_engine
 import test_gpu
+import test_gpu_block
 import test_gpu_ops
 import test_kernel
 import test_nnmodel
@@ -69,6 +70,7 @@ def run_on_device(mut suite: Suite):
             var ctx = DeviceContext()
             test_gpu.run_on_device(suite, ctx)
             test_gpu_ops.run_on_device(suite, ctx)
+            test_gpu_block.run_on_device(suite, ctx)
         except e:
             suite.fail("device tests", String(e))
 
@@ -120,6 +122,10 @@ def main():
         test_gpu_ops.run(suite)
     except e:
         suite.fail("test_gpu_ops", String(e))
+    try:
+        test_gpu_block.run(suite)
+    except e:
+        suite.fail("test_gpu_block", String(e))
     run_on_device(suite)
     try:
         test_cache.run(suite)

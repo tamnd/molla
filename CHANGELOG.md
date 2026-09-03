@@ -2,6 +2,21 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- A whole forward pass on the device. `molla.nn.gpu_block` is the twin of `block.mojo` and `model.mojo` together, operation for operation in the same order, and `molla.engine.device` is the twin of the session, holding the KV cache in device memory and the one context the process gets. A token goes in and a row of logits comes out with nothing in between crossing back to the host: the residual stream stays on the card from the embedding lookup to the final norm, and the keys and values are written where they will be read and never copied. On a 4090 an 8B Q4_K_M decodes at 12 ms/token against 5681 ms/token for the scalar host path, and both print the same text. See [docs/validation/device-decode.md](docs/validation/device-decode.md).
+- `molla generate --device`, which runs that pass. Provisional and deliberately a flag rather than a backend anything chooses, because choosing one properly and teaching the server to use it is #144.
+- The device matvec takes an offset, so a key projection lands in the layer cache at its slot with no kernel change. It is a pointer moved rather than an argument every kernel would have to apply and a bound it would have to be told, and the same call covers a bias over one run of a query and a per head norm over one head of a key where it already lies in the cache.
+- `device_unpack_row`, the embedding lookup on the card. The one read of a weight in a forward pass that is not a matvec, so it was the last thing keeping a token's first operation on the host.
+- The device forward pass is compared against the host one by the test suite on every machine that has a device. `tests/test_gpu_block.mojo` builds a two layer model twice out of the same planar bytes, once in host memory and once in a real pool, and checks the logits, the greedy pick, and the residual stream layer by layer. A kernel that is right about arithmetic and wrong about which buffer it was handed passes every test that looks at one kernel, which is why this one looks at all of them in order.
+
+### Changed
+
+- `load` takes a device context the caller already owns. A CUDA process gets one and hangs on the first allocation against a second, so an engine that is going to run kernels has to hand its own over rather than let a load make one behind it.
+- The two cache questions that are policy rather than storage, which slot a position goes in and what happens when the context fills, are free functions in `molla.engine.cache` and both caches call them. The day a slot stops being a position, one function changes and the host and device caches follow together.
+
 ## [0.3.1] - 2026-09-03
 
 A unified machine can put weights where a device kernel can read them.

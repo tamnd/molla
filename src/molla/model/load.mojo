@@ -800,6 +800,7 @@ def load(
     workers: Int = 0,
     stream: Bool = True,
     repack_for: StringSpan = "",
+    ctx: Optional[DeviceContext] = None,
 ) raises -> Weights:
     """Run the plan. Reads on a thread pool, copies on this thread.
 
@@ -819,6 +820,13 @@ def load(
     this function does not go looking: deciding whether a cache is worth
     trusting needs the model key, and the caller has already computed it to ask
     that question.
+
+    `ctx` is a device context the caller already owns. A CUDA process gets one
+    of them and hangs on the first allocation against a second, so a caller that
+    is going to run kernels against these weights has to hand its own over
+    rather than let this make a second one behind it. Nothing means this makes
+    its own, which is right for a load that is the only thing in the process
+    talking to the device, and that is what `molla load` is.
     """
     var started = monotonic_ms()
     var count = plan.count()
@@ -884,7 +892,10 @@ def load(
 
     comptime if has_accelerator():
         if pool_bytes > 0:
-            out.pool = DevicePool(out.plan.device, pool_bytes)
+            if ctx:
+                out.pool = DevicePool(out.plan.device, pool_bytes, ctx.value())
+            else:
+                out.pool = DevicePool(out.plan.device, pool_bytes)
 
     var read_started = monotonic_ms()
     var pool_threads = List[Thread]()
