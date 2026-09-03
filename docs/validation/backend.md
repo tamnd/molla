@@ -12,6 +12,8 @@ A benchmark run against the wrong backend is worse than one that refused to star
 
 So the two moods are separate. `--device=cuda` names a backend and is refused if that backend is absent, does not exist at that index, or the model does not fit on it. `--device=auto` asks for the best available and always answers, but when the answer is the host it carries the reason with it and prints it under the model line.
 
+The first two of those refusals happen before the model file is opened, because they are answerable without it. That ordering is the difference between `--device=cuda` on a machine with no CUDA and a typo in the path reporting the typo, which is the wrong half of the problem to be told about first.
+
 ## Fitting is asked, not estimated
 
 Whether a model fits is `plan_load` against that device with the real budget, and the answer is `left_behind == 0`. That is the same function that will place the tensors a minute later, so the decision and the load cannot disagree. An estimate here would have been a second copy of the reserve arithmetic and the two would have agreed until the day they did not.
