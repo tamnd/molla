@@ -42,12 +42,18 @@ from molla.nn.repack import (
     LAYOUT_GGML,
     LAYOUT_PLANAR,
     LAYOUT_VERSION,
+    QUANT_I8,
+    QUANT_S4,
+    QUANT_U4,
     group_size,
     has_min,
     planar_groups,
+    planar_quant_bytes,
     planar_row_bytes,
     planar_row_dot,
     planar_run,
+    quant_bits,
+    quant_form,
     repack_row,
     repackable,
     unpack_run,
@@ -213,13 +219,37 @@ def test_geometry(mut suite: Suite) raises:
     suite.check(planar_groups(Q_Q8_0, 256) == 8, "256 q8_0 values is 8 groups")
     suite.check(planar_groups(Q_Q6_K, 256) == 16, "and 16 q6_k ones")
 
-    # One byte per value plus one plane, or two planes when there is a minimum.
+    suite.check(
+        quant_form(Q_Q4_0) == QUANT_S4, "q4_0 quants are signed nibbles"
+    )
+    suite.check(
+        quant_form(Q_Q4_1) == QUANT_U4, "q4_1 keeps its nibbles unsigned"
+    )
+    suite.check(quant_form(Q_Q4_K) == QUANT_U4, "and so does q4_k")
+    suite.check(
+        quant_form(Q_Q5_K) == QUANT_I8, "a five bit type still takes a byte"
+    )
+    suite.check(quant_form(Q_Q8_0) == QUANT_I8, "and so does an eight bit one")
+    suite.check(quant_bits(Q_Q4_K) == 4, "four bit types are four bits wide")
+    suite.check(quant_bits(Q_Q6_K) == 8, "the rest are eight for now")
+
+    suite.check(
+        planar_quant_bytes(Q_Q8_0, 256) == 256,
+        "an eight bit quant plane is a byte a value",
+    )
+    suite.check(
+        planar_quant_bytes(Q_Q4_K, 256) == 128,
+        "and a four bit one is half that",
+    )
+
+    # The quant plane at the type's own width, plus one scale plane, or two
+    # planes when there is a minimum.
     suite.check(
         planar_row_bytes(Q_Q8_0, 256) == 256 + 8 * 4,
         "a centred row is the quants and one scale plane",
     )
     suite.check(
-        planar_row_bytes(Q_Q4_K, 256) == 256 + 8 * 4 + 8 * 4,
+        planar_row_bytes(Q_Q4_K, 256) == 128 + 8 * 4 + 8 * 4,
         "and a row with a minimum carries a second plane",
     )
     suite.check(

@@ -42,7 +42,15 @@ from max.gpu.host import DeviceContext
 
 from molla.nn.attention import AttnSpec
 from molla.nn.gpu import TILE, DeviceVec
-from molla.nn.repack import LAYOUT_PLANAR, group_size, has_min
+from molla.nn.repack import (
+    LAYOUT_PLANAR,
+    QUANT_I8,
+    QUANT_S4,
+    QUANT_U4,
+    group_size,
+    has_min,
+    quant_form,
+)
 from molla.nn.rope import RopeSpec, corr_range, step_table
 from molla.nn.tensor import WHERE_DEVICE, Tensor
 
@@ -295,7 +303,7 @@ def softcap_kernel(
 
 
 def planar_row_kernel[
-    group: Int, with_min: Bool
+    group: Int, with_min: Bool, form: Int
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     o: Pointer[Float32, MutAnyOrigin],
@@ -310,28 +318,40 @@ def planar_row_kernel[
     the embedding is the one place where the multiply a training framework does
     against a one hot vector is a row copy here.
 
-    The decoding is the matvec's, line for line: one signed byte per value, a
-    scale per group in a plane after the quants, and a minimum plane after that
-    for the two types that carry one. It is duplicated rather than shared
-    because the matvec's version is inside an accumulation loop that also reads
-    the input vector, and a shared helper would be a function call per element
-    in the hottest loop in the program to save six lines here.
+    The decoding is the matvec's, line for line: a value at whichever width
+    `quant_form` gives its type, a scale per group in a plane after the quants,
+    and a minimum plane after that for the types that carry one. It is
+    duplicated rather than shared because the matvec's version is inside an
+    accumulation loop that also reads the input vector, and a shared helper
+    would be a function call per element in the hottest loop in the program to
+    save a dozen lines here.
     """
     var cols = Int(cols_dev)
     var row = Int(row_dev) * Int(stride_dev)
-    var quants = w.bitcast[Int8]()
-    var scales = w.bitcast[Float32]()
+    var quants = w.unsafe_bitcast[Int8]()
+    var packed = w
+    var scales = w.unsafe_bitcast[Float32]()
     var groups = cols // group
-    var d_base = (row + cols) // 4
+    var quant_bytes = cols if form == QUANT_I8 else cols // 2
+    var d_base = (row + quant_bytes) // 4
     var m_base = d_base + groups
 
     var i = Int(block_idx.x * block_dim.x + thread_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     while i < cols:
         var gi = i // group
-        var v = scales[unsafe_offset=d_base + gi] * Float32(
-            Int(quants[unsafe_offset=row + i])
-        )
+        var q: Float32
+        comptime if form == QUANT_I8:
+            q = Float32(Int(quants[unsafe_offset=row + i]))
+        else:
+            # Arithmetic rather than a branch, for the reason `gpu.mojo` gives
+            # where the same two lines are.
+            var b = Int(packed[unsafe_offset=row + (i >> 1)])
+            var n = (b >> ((i & 1) * 4)) & 0xF
+            comptime if form == QUANT_S4:
+                n = (n ^ 8) - 8
+            q = Float32(n)
+        var v = scales[unsafe_offset=d_base + gi] * q
         comptime if with_min:
             v += scales[unsafe_offset=m_base + gi]
         o[unsafe_offset=i] = v
@@ -985,29 +1005,37 @@ def device_unpack_row(
     _need_device()
     comptime if has_accelerator():
         var g = group_size(w.kind)
-        if g == 32 and has_min(w.kind):
-            _unpack[32, True](ctx, w, out.ptr_at(at), row)
-        elif g == 32:
-            _unpack[32, False](ctx, w, out.ptr_at(at), row)
-        elif g == 16 and not has_min(w.kind):
-            _unpack[16, False](ctx, w, out.ptr_at(at), row)
+        var carries_min = has_min(w.kind)
+        var form = quant_form(w.kind)
+        if form == QUANT_U4 and g == 32 and carries_min:
+            _unpack[32, True, QUANT_U4](ctx, w, out.ptr_at(at), row)
+        elif form == QUANT_S4 and g == 32 and not carries_min:
+            _unpack[32, False, QUANT_S4](ctx, w, out.ptr_at(at), row)
+        elif form == QUANT_I8 and g == 32 and carries_min:
+            _unpack[32, True, QUANT_I8](ctx, w, out.ptr_at(at), row)
+        elif form == QUANT_I8 and g == 32:
+            _unpack[32, False, QUANT_I8](ctx, w, out.ptr_at(at), row)
+        elif form == QUANT_I8 and g == 16 and not carries_min:
+            _unpack[16, False, QUANT_I8](ctx, w, out.ptr_at(at), row)
         else:
             raise Error(
-                "no device row read is compiled for a group of "
+                "no device row read is compiled for quant form "
+                + String(form)
+                + " with a group of "
                 + String(g)
-                + " with a minimum plane"
+                + (" and a minimum plane" if carries_min else " and no minimum")
             )
 
 
 def _unpack[
-    group: Int, with_min: Bool
+    group: Int, with_min: Bool, form: Int
 ](
     ctx: DeviceContext,
     w: Tensor,
     o: Pointer[Float32, MutAnyOrigin],
     row: Int,
 ) raises:
-    ctx.enqueue_function[planar_row_kernel[group, with_min]](
+    ctx.enqueue_function[planar_row_kernel[group, with_min, form]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         o,
         Int32(w.cols),

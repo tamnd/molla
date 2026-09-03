@@ -13,10 +13,12 @@ is the whole reason the planar layout exists. A ggml block is a header, a bit
 plane and a nibble order, and unpacking one is a dozen dependent integer
 operations before a single multiply; reading a row of it across the threads of a
 block would have each thread pulling bytes from a different part of a header
-that the thread beside it also needs. Planar is one signed byte per value with
-the scales in planes at the end of the row, so thread `t` reads byte `t`, the
-thread beside it reads the byte beside it, and the hardware coalesces the row
-into as few transactions as it has lanes.
+that the thread beside it also needs. Planar is a value at a fixed width with
+the scales in planes at the end of the row, so thread `t` reads the byte at
+value `t`, the thread beside it reads the byte at value `t + 1`, and the
+hardware coalesces the row into as few transactions as it has lanes. At four
+bits a thread takes a whole byte and both of the values in it, so a warp still
+reads one contiguous run and gets twice as many values out of it.
 
 One block per output row, `TILE` threads in it, each walking the row with a
 stride of `TILE`, then a tree reduction in shared memory. That is the arrangement
@@ -25,11 +27,11 @@ every thread in the block reads the same elements of it, so it stays in cache an
 the only traffic that scales with the model is the weight row, read once, in
 order, by consecutive lanes.
 
-`TILE` and the group size and whether the type carries a minimum are all compile
-time parameters, so there are three instantiations of one function rather than
-three functions, and the divergence between targets is a launch geometry rather
-than a second source file. That is what D7 asks for and it is cheap here because
-the arithmetic is genuinely identical on both vendors.
+`TILE`, the group size, whether the type carries a minimum and how wide a quant
+is are all compile time parameters, so there are five instantiations of one
+function rather than five functions, and the divergence between targets is a
+launch geometry rather than a second source file. That is what D7 asks for and
+it is cheap here because the arithmetic is genuinely identical on both vendors.
 
 There is no host fallback. A build with no device code in it raises when asked
 for a device matvec rather than quietly running the host kernel and reporting a
@@ -51,7 +53,15 @@ from std.sys.info import has_accelerator
 from max.gpu import barrier
 from max.gpu.host import DeviceBuffer, DeviceContext
 
-from molla.nn.repack import LAYOUT_PLANAR, group_size, has_min
+from molla.nn.repack import (
+    LAYOUT_PLANAR,
+    QUANT_I8,
+    QUANT_S4,
+    QUANT_U4,
+    group_size,
+    has_min,
+    quant_form,
+)
 from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
 
 comptime TILE = 128
@@ -243,7 +253,7 @@ struct DeviceVec(Movable):
 
 
 def planar_matvec_kernel[
-    tile: Int, group: Int, with_min: Bool
+    tile: Int, group: Int, with_min: Bool, form: Int
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
@@ -255,9 +265,9 @@ def planar_matvec_kernel[
 
     The scales are read through a float32 view of the same bytes rather than
     assembled a byte at a time. A planar row is a multiple of four bytes long by
-    construction and the quant plane is a multiple of the group size, so the
-    scale planes are four byte aligned in every row of every tensor, and a
-    device buffer starts at an alignment far larger than that.
+    construction and so is its quant plane at either width, so the scale planes
+    are four byte aligned in every row of every tensor, and a device buffer
+    starts at an alignment far larger than that.
 
     Shapes arrive as `Int32` because a kernel argument has to be device
     passable and `Int` is not. Nothing here is near two billion.
@@ -269,29 +279,72 @@ def planar_matvec_kernel[
 
     var row = r * stride
     var groups = cols // group
-    # Two views of the same bytes rather than one view and a conversion. The
-    # quants are signed and the plane is read through a signed pointer for that
-    # reason: converting a `UInt8` to an `Int8` after loading it is a value
+    # Three views of the same bytes rather than one view and a conversion. The
+    # byte wide quants are signed and are read through a signed pointer for
+    # that reason: converting a `UInt8` to an `Int8` after loading it is a value
     # conversion and not a reinterpretation, and it turns every quant of 128 and
     # up into something that is not the negative number the repack wrote. Four
     # of the eight types centre their quants, so half the corpus is wrong and
     # the other half is exact, which is a failure that looks like a type table
-    # bug rather than like a cast.
-    var quants = w.bitcast[Int8]()
-    var scales = w.bitcast[Float32]()
-    var d_base = (row + cols) // 4
+    # bug rather than like a cast. The nibble wide ones are read unsigned and
+    # the sign extension is done in the open below, because there is no four
+    # bit type to reinterpret through.
+    var quants = w.unsafe_bitcast[Int8]()
+    var packed = w
+    var scales = w.unsafe_bitcast[Float32]()
+    var quant_bytes = cols if form == QUANT_I8 else cols // 2
+    var d_base = (row + quant_bytes) // 4
     var m_base = d_base + groups
 
     var acc = Float32(0)
-    var i = t
-    while i < cols:
-        var gi = i // group
-        var q = Float32(Int(quants[unsafe_offset=row + i]))
-        var a = x[unsafe_offset=i]
-        acc += scales[unsafe_offset=d_base + gi] * q * a
-        comptime if with_min:
-            acc += scales[unsafe_offset=m_base + gi] * a
-        i += tile
+    comptime if form == QUANT_I8:
+        var i = t
+        while i < cols:
+            var gi = i // group
+            var q = Float32(Int(quants[unsafe_offset=row + i]))
+            var a = x[unsafe_offset=i]
+            acc += scales[unsafe_offset=d_base + gi] * q * a
+            comptime if with_min:
+                acc += scales[unsafe_offset=m_base + gi] * a
+            i += tile
+    else:
+        # A byte to a thread and both of its values, so a warp reads thirty two
+        # contiguous bytes and gets sixty four values out of them. Both values
+        # of a byte sit in one group, because every group size here is even, so
+        # their scale and minimum are loaded once for the pair. `(n ^ 8) - 8` is
+        # the four bit two's complement sign extension, done with arithmetic
+        # because a branch on which nibble is which is one that every warp would
+        # take both sides of.
+        #
+        # Three other arrangements of this loop were written and measured on an
+        # RTX 4090 against an 8B: a value to a thread with two threads sharing a
+        # byte, four bytes to a thread through a `UInt32`, and that one again
+        # with the activations read four at a time into a SIMD accumulator. All
+        # four are within one per cent of each other, and all four leave the
+        # kernel reading 543 GB/s where `scripts/mem_probe.mojo` says this shape
+        # of access is worth 945. Whatever holds this kernel at three quarters
+        # of the byte wide layout's rate while it reads half the bytes is not in
+        # the inner loop, so the simplest of the four is the one that is here.
+        # See [docs/validation/layout.md](../../../docs/validation/layout.md).
+        var i = t * 2
+        while i < cols:
+            var gi = i // group
+            var b = Int(packed[unsafe_offset=row + (i >> 1)])
+            var lo = b & 0xF
+            var hi = (b >> 4) & 0xF
+            comptime if form == QUANT_S4:
+                lo = (lo ^ 8) - 8
+                hi = (hi ^ 8) - 8
+            var a0 = x[unsafe_offset=i]
+            var a1 = x[unsafe_offset=i + 1]
+            var d = scales[unsafe_offset=d_base + gi]
+            acc += d * Float32(lo) * a0
+            acc += d * Float32(hi) * a1
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                acc += m * a0
+                acc += m * a1
+            i += tile * 2
 
     # The reduction is over the block rather than over a warp because `tile` is
     # a parameter and the warp width is not the same number on the two vendors.
@@ -376,7 +429,7 @@ def check_matvec_shapes(w: Tensor, in_elements: Int, out_elements: Int) raises:
 
 
 def _launch[
-    tile: Int, group: Int, with_min: Bool
+    tile: Int, group: Int, with_min: Bool, form: Int
 ](
     ctx: DeviceContext,
     w: Tensor,
@@ -384,7 +437,7 @@ def _launch[
     o: Pointer[Float32, MutAnyOrigin],
 ) raises:
     """One instantiation, launched. No transfer either side of it."""
-    ctx.enqueue_function[planar_matvec_kernel[tile, group, with_min]](
+    ctx.enqueue_function[planar_matvec_kernel[tile, group, with_min, form]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x.ptr(),
         o,
@@ -400,11 +453,17 @@ def device_matvec_into(
 ) raises:
     """`out[at + r] = dot(row r of w, x)`, both sides already on the device.
 
-    The dispatch is over the two things the layout varies by, which are the
-    group size and whether there is a minimum plane, and there are three live
-    combinations rather than four: everything with a minimum groups by 32, and
-    the only type that groups by 16 is q6_k, which centres its quants and has no
-    minimum at all.
+    The dispatch is over the three things the layout varies by, which are how
+    wide a quant is, the group size, and whether there is a minimum plane.
+    Twelve combinations exist on paper and five exist in the type table:
+    everything with a minimum groups by 32, the only type that groups by 16 is
+    q6_k, which centres its quants and has no minimum at all, the two unsigned
+    nibble types both group by 32 and both carry a minimum, and the one signed
+    nibble type is q4_0, which centres and does not.
+
+    The check is written out in full rather than inferred from the form,
+    because a type added later that breaks one of those coincidences should
+    fail to launch and say so, not quietly read the wrong plane.
 
     `at` is where the rows go and it defaults to the front, which is what every
     caller wanted until there was a cache. A key and a value projection write
@@ -438,17 +497,25 @@ def device_matvec_into(
     else:
         var o = out.ptr_at(at)
         var g = group_size(w.kind)
-        if g == 32 and has_min(w.kind):
-            _launch[TILE, 32, True](ctx, w, x, o)
-        elif g == 32:
-            _launch[TILE, 32, False](ctx, w, x, o)
-        elif g == 16 and not has_min(w.kind):
-            _launch[TILE, 16, False](ctx, w, x, o)
+        var carries_min = has_min(w.kind)
+        var form = quant_form(w.kind)
+        if form == QUANT_U4 and g == 32 and carries_min:
+            _launch[TILE, 32, True, QUANT_U4](ctx, w, x, o)
+        elif form == QUANT_S4 and g == 32 and not carries_min:
+            _launch[TILE, 32, False, QUANT_S4](ctx, w, x, o)
+        elif form == QUANT_I8 and g == 32 and carries_min:
+            _launch[TILE, 32, True, QUANT_I8](ctx, w, x, o)
+        elif form == QUANT_I8 and g == 32:
+            _launch[TILE, 32, False, QUANT_I8](ctx, w, x, o)
+        elif form == QUANT_I8 and g == 16 and not carries_min:
+            _launch[TILE, 16, False, QUANT_I8](ctx, w, x, o)
         else:
             raise Error(
-                "no device matvec is compiled for a group of "
+                "no device matvec is compiled for quant form "
+                + String(form)
+                + " with a group of "
                 + String(g)
-                + " with a minimum plane"
+                + (" and a minimum plane" if carries_min else " and no minimum")
             )
 
 
