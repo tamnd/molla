@@ -179,6 +179,50 @@ It is exact. `i // 32` and `i >> 5` are the same number for every index this ker
 
 Two things this says beyond the fix. The first is that a compile time constant is not a compile time constant on every backend, and the only way to know which is to price it on each one. The second is that the CUDA reading in the section above stands but its scope does not: on CUDA the wall really is work per value, and on Metal the wall was one instruction that should never have been there. The remaining Metal variants say the rest of the ladder is there too, 740 with narrow indices and 199 for the loads alone, so Metal has another three times in it after this and it is the same three times CUDA has.
 
+## What was in the way, on both
+
+Deleting the divide left Metal at 899 microseconds on the 4096 by 4096 shape against a floor of 197, and CUDA where it already was at 29 against a floor of 11. Both are about three times off the loads, and the section above guessed that the remaining three times were the same on the two backends. They are, and the largest single piece of them is not the multiply. It is turning the quant into a float.
+
+`Float32(n)` for a small integer compiles to a convert. On NVIDIA a convert issues on the same unit as transcendentals, at a quarter of the rate of a multiply, so the four converts that a byte of two nibbles costs are worth sixteen multiplies before any multiplying has happened. The kernel does four multiplies per byte. That is the ratio the probe kept running into from three directions and never named.
+
+There is a way to do the conversion with no convert in it. A float32 whose exponent is 23 has a mantissa step of exactly one, so every representable number from `2^23` to `2^24` is an integer and its bit pattern is `0x4B000000 + n`. For `n` below `2^23` nothing carries out of the mantissa, so `0x4B000000 | n` is the same bits as `0x4B000000 + n` and the addition is an or. Subtract `2^23` back off and the result is `n` as a float. An integer or and a floating point subtract, both full rate on both vendors, in place of a convert.
+
+A centred type gets its sign extension free. `n ^ 8` is `n + 8` below eight and `n - 8` above it, so biasing the subtraction by eight turns the same or into `(n ^ 8) - 8`, which is the four bit two's complement value the repack wrote. A byte wide type is the same one bit wider, `u ^ 0x80` and a bias of 128. So one shape covers all three quant forms and the type only picks a constant.
+
+The probe, microseconds a launch, best of five batches of sixteen, against the shift kernel from the section above:
+
+| shape | M4 before | M4 after | 4090 before | 4090 after | M4 floor | 4090 floor |
+| --- | --- | --- | --- | --- | --- | --- |
+| q4_K 14336 by 4096 | 3029 | 1924 | 93 | 42 | 620 | 26 |
+| q4_K 4096 by 14336 | 2509 | 1377 | 93 | 35 | 578 | 21 |
+| q4_K 4096 by 4096 | 899 | 553 | 28 | 14 | 197 | 11 |
+| q8_0 1536 by 576 | 152 | 141 | 8 | 8 | | |
+| q8_0 49152 by 576 | 4119 | 4125 | 49 | 49 | | |
+
+The four bit shapes are 1.6 to 1.8 times on Metal and 2.0 to 2.7 times on CUDA. The byte wide shapes are neither, on either card, and that is the result worth having rather than the one worth hiding: a signed byte load already sign extends in the hardware, so the loop being replaced there is one convert where the nibble loop's is a mask, a shift, an xor, a subtract and a convert. Three instructions for one is a wash. Three instructions for five is not. The byte loop was changed anyway because it costs nothing and it keeps the two readers of a planar row the same shape, which is a thing `gpu_ops.mojo` already says it wants, and not because it buys anything.
+
+It is exact. There is no rounding anywhere in it: every value the trick sees is under the mantissa step, so the or is exact, and the subtraction of a nearby power of two from a number of the same exponent is exact. The whole logit corpus was run on Metal and on CUDA and the worst case in it is unchanged in every digit that was already written down, sum 5.1e-4, value 3.1e-2, log probability 9.6e-2. No tolerance moved.
+
+End to end, decode tokens per second, same binary either side:
+
+| model | backend | before | after |
+| --- | --- | --- | --- |
+| Llama 3.1 8B q4_K_M | CUDA 4090 | 72.9 | 99.7 |
+| SmolLM2 135M q8_0 | CUDA 4090 | 223.8 | 226.5 |
+| Llama 3.1 8B q4_K_M | Metal M4 | 2.0 | 2.9 |
+
+The 8B moves and the 135M does not, which is exactly what the probe said would happen, for the reason it said: one is four bit and the other is not. The Metal 8B was run twice alternating with the baseline and read 2.0, 2.9, 2.0, 2.9, which is the only reason a number off that machine is here at all, because its load average was above eleven throughout. SmolLM2 on Metal read within four per cent either way across four alternating runs on the same loaded machine, which resolves nothing the probe has not already resolved more cleanly at 152 against 141 and 4119 against 4125.
+
+### The other way, which was measured and is not being taken yet
+
+The probe also priced the thing #186 originally proposed, which is to quantize the activation vector as well and multiply weight by activation as integers, converting once per run of eight values instead of once per value. That is faster still on both cards, 1240 against 1924 on the Metal gate shape and 34 against 42 on the CUDA one, and it was implemented, and it is not what is landing.
+
+Two reasons. The first is arithmetic. Over a group, `sum((d * w + m) * x)` is `d * dx * sum(w * q) + m * dx * sum(q)`, which is fine, but `q` has to be wide enough. At a signed byte per activation with a group of 32 the Metal corpus failed twelve of thirteen cases, sampled values 0.041 to 0.069 against a tolerance of 8e-2 and log probabilities 0.21 to 0.58 against 2e-1. Shrinking the group to 8 still read 0.113 to 0.202 on the head, so what is wrong is the step size and not the group, and the fix is a signed short, which is 258 times finer and puts every case back under the tolerances that were already there. That works. It also means the activation plane is two bytes a value, so the thing being saved is entirely the converts and the scale reads and not the activation being small.
+
+The second reason is the launches, and it is the one that decides. Quantizing an activation is a kernel, and a layer reads three separate activation vectors with a matvec, so it is four more launches on a layer that has about fourteen. On the 8B that is invisible against the win, 74.4 to 97.6 on CUDA. On SmolLM2 135M it is the whole story, 269.5 to 212.3 on CUDA and 52.4 to 49.3 on Metal, because a 135M decode is launch bound and not bandwidth bound for the reason performance.md gives. SmolLM2 135M is what M2c's exit criteria are measured on.
+
+So the integer path is worth roughly a further 1.3 times on the four bit shapes on top of what is landing here, and it costs a regression on the smallest model that has to be paid off first. Three of its four launches per layer disappear if the norm and the activation function write the quantized form as they go, which is #168. That is the order: this change now, because it is free everywhere and costs nothing anywhere, then #168, then the integer path on top of it with the launches already gone. The branch is kept rather than deleted so that the second half of it does not have to be rediscovered.
+
 ## Order
 
 Pack the quant plane first and leave the scales at float32. That is 9574 MiB to 6475 MiB on the 8B, it is bit exact against the current layout because the integers written are the same integers, and it can be verified by running the corpus with the old cache and the new one and comparing logits with no tolerance at all.

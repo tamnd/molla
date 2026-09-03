@@ -20,7 +20,7 @@ Usage:
 from std.gpu import block_idx, thread_idx
 
 from max.gpu import barrier
-from std.memory import AddressSpace, stack_allocation
+from std.memory import AddressSpace, bitcast, stack_allocation
 from std.time import monotonic
 
 from max.gpu.host import DeviceContext
@@ -30,15 +30,19 @@ from molla.nn.repack import (
     QUANT_U4,
     planar_row_bytes,
 )
-from molla.nn.quant import Q_Q4_K
+from molla.nn.quant import Q_Q4_K, Q_Q8_0
 
 comptime TILE = 128
 
 # What each variant takes away, in the order they are printed.
-comptime V_SHIPPED = 0
-"""The kernel as it is in `molla.nn.gpu`, for a number to compare against."""
+comptime V_DIVIDE = 0
+"""The kernel as it was before #190, with the group index by a signed divide."""
 comptime V_SHIFT = 1
-"""Same, with the group index by a shift rather than a signed divide."""
+"""Same with the group index by a shift, which is what #190 made it.
+
+This is the baseline the rest are against. `V_MAGIC` below is what #186 made it
+after that, so the two of them together are the before and after of this file.
+"""
 comptime V_NARROW = 2
 """Same again, with the loop counter and the group index 32 bits wide."""
 comptime V_PER_GROUP = 3
@@ -47,6 +51,40 @@ comptime V_NO_SCALE = 4
 """The nibbles and the activations, with no scale plane read at all."""
 comptime V_NO_MATH = 5
 """The loads and nothing else, which is the floor this shape can reach."""
+comptime V_DOT4 = 6
+"""Four values a thread against an int8 activation, multiplied as integers."""
+comptime V_DOT8 = 7
+"""Eight, so the converts and the scale reads are halved again."""
+comptime V_DOT16 = 8
+"""Sixteen, which is half a group and as far as this can be taken."""
+comptime V_MAGIC = 10
+"""The shipped loop with the nibble to float conversion done by bit pattern.
+
+`Float32(n)` for a small integer is an `I2F`, which on NVIDIA issues on the same
+unit as transcendentals at a quarter of the rate of a multiply. Or the nibble
+into the mantissa of `2^23` instead and subtract `2^23` back off, and the whole
+thing is an integer or and a floating point subtract, both full rate. It is
+exact, it changes no layout and it adds no launch, which is everything the
+integer path is not."""
+comptime V_BYTE = 11
+"""The shipped loop for a byte wide type, which is a different loop entirely."""
+comptime V_BYTE_MAGIC = 12
+"""Same, with the byte to float conversion done by bit pattern.
+
+Worth asking separately from the nibble case rather than assumed from it. A
+signed byte load already sign extends in the hardware, so the loop it replaces
+is one convert where the nibble loop's is a mask, a shift, an xor, a subtract
+and a convert. The bit pattern version costs the same three instructions in
+both. So the nibble case has more to win and the byte case might have nothing,
+and q8_0 is the type the smallest model in the bench is in."""
+comptime V_DOT8_I16 = 9
+"""Eight, against an activation quantized to a signed short rather than a byte.
+
+The win the integer variants show is the converts and the scale reads going
+away, not the activation getting smaller, and an activation vector is a few
+kilobytes that every block in the launch reads. So this asks what the second
+byte costs, and the answer decides whether the accuracy this work spends has to
+be spent at all."""
 
 
 def probe_kernel[
@@ -77,7 +115,7 @@ def probe_kernel[
 
     var acc = Float32(0)
 
-    comptime if variant == V_SHIPPED:
+    comptime if variant == V_DIVIDE:
         var i = t * 2
         while i < cols:
             var gi = i // group
@@ -164,6 +202,50 @@ def probe_kernel[
                 acc += m * asum
             g += tile
 
+    elif variant == V_MAGIC:
+        var i = t * 2
+        while i < cols:
+            var gi = i >> shift
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            var lo = bitcast[DType.float32, 1](UInt32(0x4B000000) | (b & 0xF))
+            var hi = bitcast[DType.float32, 1](UInt32(0x4B000000) | (b >> 4))
+            var a0 = x[unsafe_offset=i]
+            var a1 = x[unsafe_offset=i + 1]
+            var d = scales[unsafe_offset=d_base + gi]
+            acc += d * (lo - Float32(8388608.0)) * a0
+            acc += d * (hi - Float32(8388608.0)) * a1
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                acc += m * a0
+                acc += m * a1
+            i += tile * 2
+
+    elif variant == V_BYTE:
+        var quants = w.unsafe_bitcast[Int8]()
+        var i = t
+        while i < cols:
+            var gi = i >> shift
+            var q = Float32(Int(quants[unsafe_offset=row + i]))
+            var a = x[unsafe_offset=i]
+            acc += scales[unsafe_offset=d_base + gi] * q * a
+            comptime if with_min:
+                acc += scales[unsafe_offset=m_base + gi] * a
+            i += tile
+
+    elif variant == V_BYTE_MAGIC:
+        var i = t
+        while i < cols:
+            var gi = i >> shift
+            var u = UInt32(packed[unsafe_offset=row + i]) ^ 0x80
+            var q = bitcast[DType.float32, 1](UInt32(0x4B000000) | u)
+            var a = x[unsafe_offset=i]
+            acc += (
+                scales[unsafe_offset=d_base + gi] * (q - Float32(8388736.0)) * a
+            )
+            comptime if with_min:
+                acc += scales[unsafe_offset=m_base + gi] * a
+            i += tile
+
     elif variant == V_NO_SCALE:
         var i = t * 2
         while i < cols:
@@ -174,12 +256,66 @@ def probe_kernel[
             acc += Float32((b >> 4) & 0xF) * a1
             i += tile * 2
 
-    else:
+    elif variant == V_NO_MATH:
         var i = t * 2
         while i < cols:
             acc += Float32(Int(packed[unsafe_offset=row + (i >> 1)]))
             acc += x[unsafe_offset=i]
             i += tile * 2
+
+    else:
+        # What #186 proposes. The activation vector arrives already quantized to
+        # a signed byte per value with a scale a group, so a weight and an
+        # activation are both small integers and their product is an integer.
+        # Two things go away. The four `Int32` to `Float32` converts a byte pair
+        # costs now become one per run, and on NVIDIA a convert is a quarter
+        # rate instruction where a multiply is full rate, so four of them are
+        # worth sixteen multiplies. And the group's scale is read once for the
+        # run rather than once for a pair.
+        #
+        # A run has to sit inside one group for that to work, which it does:
+        # every group here is 32 values and 4 and 8 both divide it.
+        #
+        # The minimum is the second integer sum. Over a group, sum of
+        # `(d * w + m) * x` is `d * dx * sum(w * q) + m * dx * sum(q)`, so a
+        # `with_min` type costs one more integer accumulator and one more
+        # convert per run rather than a multiply and an add per value.
+        comptime run = 4 if variant == V_DOT4 else (
+            16 if variant == V_DOT16 else 8
+        )
+        comptime wide = variant == V_DOT8_I16
+        var qx = x.unsafe_bitcast[Int8]()
+        var qw = x.unsafe_bitcast[Int16]()
+        var xd = x.unsafe_bitcast[Float32]()
+        var xd_base = cols  # the activation scales, a float a group
+        var i = t * run
+        while i < cols:
+            var gi = i >> shift
+            var at = row + (i >> 1)
+            var dot = Int32(0)
+            var qsum = Int32(0)
+            var k = 0
+            while k < run // 2:
+                var b = Int32(packed[unsafe_offset=at + k])
+                var lo = b & 0xF
+                var hi = (b >> 4) & 0xF
+                var q0: Int32
+                var q1: Int32
+                comptime if wide:
+                    q0 = Int32(qw[unsafe_offset=i + k * 2])
+                    q1 = Int32(qw[unsafe_offset=i + k * 2 + 1])
+                else:
+                    q0 = Int32(qx[unsafe_offset=i + k * 2])
+                    q1 = Int32(qx[unsafe_offset=i + k * 2 + 1])
+                dot += lo * q0 + hi * q1
+                comptime if with_min:
+                    qsum += q0 + q1
+                k += 1
+            var dx = xd[unsafe_offset=xd_base + gi]
+            acc += scales[unsafe_offset=d_base + gi] * dx * Float32(dot)
+            comptime if with_min:
+                acc += scales[unsafe_offset=m_base + gi] * dx * Float32(qsum)
+            i += tile * run
 
     var part = stack_allocation[
         tile, Float32, address_space=AddressSpace.SHARED
@@ -252,7 +388,13 @@ def _sweep[
     var stride = planar_row_bytes(kind, cols)
     var bytes = rows * stride
     var wbuf = ctx.enqueue_create_buffer[DType.uint8](bytes)
-    var xbuf = ctx.enqueue_create_buffer[DType.float32](cols)
+    # The float variants want `cols` floats. The integer ones read the same
+    # bytes as `cols` signed bytes and then want a float a group behind them, at
+    # float index `cols`, so the buffer carries both layouts at once and no
+    # variant reads past the end of it.
+    var xbuf = ctx.enqueue_create_buffer[DType.float32](
+        cols + cols // group + 4
+    )
     var obuf = ctx.enqueue_create_buffer[DType.float32](rows)
     ctx.synchronize()
     var w = Pointer[UInt8, MutAnyOrigin](
@@ -280,8 +422,8 @@ def _sweep[
         + " MiB"
     )
     _report(
-        "  shipped   ",
-        _time[group, with_min, form, V_SHIPPED](
+        "  divide    ",
+        _time[group, with_min, form, V_DIVIDE](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -327,6 +469,101 @@ def _sweep[
         values,
         read,
     )
+    _report(
+        "  magic cvt ",
+        _time[group, with_min, form, V_MAGIC](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  int dot 4 ",
+        _time[group, with_min, form, V_DOT4](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  int dot 8 ",
+        _time[group, with_min, form, V_DOT8](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  int16 dot8",
+        _time[group, with_min, form, V_DOT8_I16](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  int dot 16",
+        _time[group, with_min, form, V_DOT16](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+
+
+def _sweep_byte[
+    kind: Int, group: Int, with_min: Bool
+](ctx: DeviceContext, label: String, rows: Int, cols: Int) raises:
+    """The two byte wide variants, on their own, because they read differently.
+    """
+    comptime form = QUANT_I8
+    var stride = planar_row_bytes(kind, cols)
+    var bytes = rows * stride
+    var wbuf = ctx.enqueue_create_buffer[DType.uint8](bytes)
+    var xbuf = ctx.enqueue_create_buffer[DType.float32](
+        cols + cols // group + 4
+    )
+    var obuf = ctx.enqueue_create_buffer[DType.float32](rows)
+    ctx.synchronize()
+    var w = Pointer[UInt8, MutAnyOrigin](
+        unsafe_from_address=Int(wbuf.unsafe_ptr())
+    )
+    var x = Pointer[Float32, MutAnyOrigin](
+        unsafe_from_address=Int(xbuf.unsafe_ptr())
+    )
+    var o = Pointer[Float32, MutAnyOrigin](
+        unsafe_from_address=Int(obuf.unsafe_ptr())
+    )
+    var values = Float64(rows * cols)
+    var read = Float64(bytes)
+    print(
+        label
+        + "  "
+        + String(rows)
+        + " by "
+        + String(cols)
+        + ", row "
+        + String(stride)
+        + " bytes, "
+        + String(Int(read / 1048576.0))
+        + " MiB"
+    )
+    _report(
+        "  byte cvt  ",
+        _time[group, with_min, form, V_BYTE](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  byte magic",
+        _time[group, with_min, form, V_BYTE_MAGIC](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
 
 
 def main() raises:
@@ -340,3 +577,8 @@ def main() raises:
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k gate", 14336, 4096)
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k down", 4096, 14336)
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k attn", 4096, 4096)
+
+    # And the byte wide type, at the shape SmolLM2 135M spends its decode in,
+    # because that is the model the milestone is measured on and it is q8_0.
+    _sweep_byte[Q_Q8_0, 32, False](ctx, "q8_0 gate", 1536, 576)
+    _sweep_byte[Q_Q8_0, 32, False](ctx, "q8_0 head", 49152, 576)
