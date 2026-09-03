@@ -4,6 +4,32 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-04
+
+The first half of M2c, which is the memory half, plus one prediction that turned out to be wrong.
+
+A device run used to carry about three times the model file in host memory: a 1.3 GiB arena nothing asked for, both file mappings held open for the life of the process, and a planar weight layout that spent a byte on every weight whatever the file spent. All three are gone or smaller. The Llama 3.1 8B on a 4090 went from 11066 MiB of peak resident memory to 9769 with the arena, then to a bounded window over the file rather than the whole file, and its repack cache went from 9573 MiB to 6474 with the packing. On the reporting side, every Metal memory number published before this release was understated by roughly the size of the weights, and that is fixed rather than explained away.
+
+The prediction was that packing the weights would nearly double decode on that model. It did not, it cost four per cent, and the measurement that says why is the most useful thing in this release. The kernel was not waiting on memory, it was waiting on instructions, and #186 is the work that follows from it.
+
+### Added
+
+- [docs/validation/layout.md](docs/validation/layout.md), which is the research on what molla's weight layout costs and now also on what changing it was worth. One byte per weight makes a q4_K weight ten bits in molla against four and a half in the file, which is where the 8B's 9573 MiB cache came from. The page carries the prediction it made, the measurement that followed, and the correction, because a spec that quietly drops a prediction it got wrong is worth less than one that keeps it.
+- [docs/validation/max.md](docs/validation/max.md), answering the three questions performance.md ended on. Graph capture is reachable from Mojo and worth nothing here, there is no grid wide barrier but the pieces to build one exist, and a Metal launch costs four times a CUDA one. Two of those change the plan: fusing a whole layer down to five kernels still leaves launch cost at 115 per cent of the CUDA budget and 203 per cent of the Metal one, so a persistent kernel stops being the fallback and becomes the thing the rest is arranged around.
+- `scripts/mem_probe.mojo`, a standalone probe that reads a device buffer with the matvec's own one block per row access shape and reports what that shape is worth. It exists because the packed layout raised a question about the memory system that nothing in the repository could answer, and on a 4090 it answers it in a second: 945 GB/s a byte a thread at any row length from a kibibyte up, and less than that with wider loads.
+
+### Changed
+
+- The planar quant plane is packed at the type's own bit width. q4_0, q4_1 and q4_K store two values a byte, low nibble first, and the five, six and eight bit types keep their byte. `LAYOUT_VERSION` is 2, so every existing repack cache is rebuilt on next load. The Llama 3.1 8B cache is 6474 MiB against 9573, Qwen 2.5 0.5B is 663 against 688, and SmolLM2 q8_0 is unchanged, which is right for an eight bit type. The stored integers are the same integers, so this was checked with no tolerance at all: the whole logit corpus was run on Metal and on CUDA against a tree with the old layout and the logits were identical in every digit on both.
+- Decode on the 8B went from 77.6 tok/s to 74.2 with that change, which is the opposite of what [docs/validation/layout.md](docs/validation/layout.md) predicted and worth stating plainly. nsys puts all of it in the q4_K matvec, which was 8.45 ms a forward pass moving 8.12 GB and is now 8.97 ms moving 4.87 GB. That is 961 GB/s falling to 543 while the values a second stay where they were, so the kernel was never being paid by the byte. Four arrangements of the inner loop, three block widths, four rows to a block and a probe with the activation read deleted entirely all land within noise of each other. What separates molla from llama.cpp on this model is work per value rather than bytes per value, and #186 is that.
+
+### Fixed
+
+- The first `map_to_host` call in a process reserves 1313 MiB and never gives it back or reuses it. molla hit it while binding a model, once per layer for the norm weights and again for the rope tables, and paid for it on the first one. Those and the per token logit read go through `enqueue_copy` now, which is what the weight loader always did. Peak resident memory on a 4090 at 512 prompt tokens and 128 generated went from 1607 MiB to 296 on SmolLM2, 2168 to 862 on Qwen and 11066 to 9769 on the 8B.
+- A device load held the model file and the repack cache mapped for the whole run, so a process carried about twice the model file in pages nothing would read again. Both are closed before the first token, and the drain loop gives each matrix's pages back as it copies them, in a 64 MiB window, so peak is the window rather than the model. Giving pages back is an anonymous `PROT_NONE` mapping over the top and not `madvise`, because on macOS `MADV_DONTNEED`, `MADV_FREE` and `msync(MS_INVALIDATE)` all return success and all move the resident set by nothing.
+- That window was not a bound. The transfer workers touched pages as fast as they could claim tensors and nothing made them wait for the drain loop, so on a warm page cache they walked an eight gigabyte file in under a second and peak was the whole file again. It only looked fixed because every measurement had been taken on a cold cache, where the disk holds the workers in step by accident. Warm cache peak on the 8B was 9719 MiB, which is what it cost before any of this. The read stage now waits for the window.
+- The benchmark harness read `ru_maxrss` on macOS, which does not count the pages behind a Metal buffer, and on Apple silicon those pages are host memory. The 8B on the macbook reported 5347 MiB for a process that had just uploaded 9572 MiB of weights. Switching to `phys_footprint` alone would have been wrong in the other direction, because it excludes clean file backed pages and llama.cpp holds its weights in a mapping of the model file. The harness takes the larger of the two, which hides neither engine's weights. Linux is untouched and stays on `ru_maxrss`.
+
 ## [0.4.0] - 2026-09-03
 
 M2b closes. molla runs on a GPU, and now there is a number for how well.
