@@ -140,6 +140,20 @@ def run_generate_device(
             backend,
         )
 
+        # The weights are on the card and the norms are in device vectors, so
+        # nothing below reads either mapping again. Holding them to the end of
+        # the run cost about twice the model file size in resident memory for
+        # bytes nobody looks at, which on the 8B was 9.2 GiB. `eos`, `take` and
+        # the vocabulary were read out above and are integers.
+        #
+        # The matrices a kernel reads are device addresses out of the pool,
+        # which is what `_resident` asserts at bind time. If that were ever
+        # untrue this would not fault, because a device kernel handed a host
+        # address reads zeros, so what proves it is the logit corpus rather
+        # than the absence of a crash.
+        cache.close()
+        g.close()
+
         var prefill_started = monotonic_ms()
         decode.prefill(ids)
         var prefilled = monotonic_ms()
@@ -162,7 +176,5 @@ def run_generate_device(
             finished - prefilled,
             written,
         )
-        cache.close()
-        g.close()
         _ = decode^
         _ = weights^

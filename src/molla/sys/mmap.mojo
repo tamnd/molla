@@ -43,6 +43,24 @@ comptime MADV_WILLNEED = 3
 """Tell the kernel these pages are about to be read. Also the same number on
 both platforms, along with MADV_NORMAL, MADV_RANDOM and MADV_SEQUENTIAL."""
 
+comptime PROT_NONE = 0x00
+comptime MAP_FIXED = 0x10
+"""Also the same on both platforms. `MAP_FIXED` replaces whatever is already at
+the address instead of refusing, atomically, which is the whole trick behind
+`drop_pages`."""
+
+
+def _map_anon() -> Int:
+    comptime if CompilationTarget.is_macos():
+        return 0x1000
+    else:
+        return 0x20
+
+
+comptime MAP_ANONYMOUS = _map_anon()
+"""One of the few flags the two platforms disagree about. macOS spells it
+MAP_ANON and Linux MAP_ANONYMOUS, and the numbers are not the same."""
+
 
 def _sc_pagesize() -> Int:
     comptime if CompilationTarget.is_macos():
@@ -96,6 +114,64 @@ def will_need(address: Int, length: Int) -> Bool:
         )
     )
     return rc == 0
+
+
+def drop_pages(address: Int, length: Int) -> Bool:
+    """Give back the pages at this address, for good.
+
+    The other end of `will_need`, and the reason peak resident memory does not
+    have to scale with the size of a model. A load walks a mapping once, hands
+    each tensor to the card, and never looks at those bytes again, so without
+    this the whole file ends up resident and stays resident. See
+    [docs/validation/performance.md](../../../docs/validation/performance.md).
+
+    The obvious way to write this is `madvise(MADV_DONTNEED)`, which is what it
+    was first, and on macOS that does nothing at all. A clean page of a mapped
+    file stays charged to the process until there is memory pressure, and
+    MADV_DONTNEED, MADV_FREE and `msync(MS_INVALIDATE)` all return success and
+    move the resident set by nothing. Measured on a 468 MiB file: 485 MiB
+    resident before the call and 485 MiB after, for all three.
+
+    So the range is replaced instead. An anonymous `PROT_NONE` mapping over the
+    top with `MAP_FIXED` drops the file pages, on both platforms, and the same
+    468 MiB file went from 485 MiB resident to 16 MiB. `MAP_FIXED` does that
+    atomically, so there is no moment where the address is unmapped and some
+    other allocation could land in it.
+
+    `PROT_NONE` and not a readable mapping, and replaced rather than plain
+    `munmap`, for the same reason: it keeps the hole. A read of a dropped
+    address is a bug, and this way it is a fault at the address that caused it
+    rather than zeros, or worse, whatever the next `mmap` in the process
+    happened to put there. `Mapping.close()` still unmaps the whole original
+    range afterwards, which is fine over a range with replacements in it.
+
+    Narrowed to whole pages inside the range rather than widened to whole pages
+    covering it, which is the opposite of what `will_need` does and for the
+    opposite reason. A partial page at either end is shared with the tensor next
+    door, and taking away a page somebody else is about to read is no longer a
+    re-read, it is a crash. So the ends are left alone and a tensor smaller than
+    a page drops nothing.
+    """
+    if length <= 0:
+        return False
+    var page = page_size()
+    var begin = address + (page - 1)
+    begin = begin - (begin % page)
+    var end = address + length
+    end = end - (end % page)
+    if end <= begin:
+        return False
+    var got = Int(
+        external_call["mmap", Int](
+            begin,
+            end - begin,
+            c_int(PROT_NONE),
+            c_int(MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS),
+            c_int(-1),
+            Int64(0),
+        )
+    )
+    return got == begin
 
 
 struct Mapping(Movable):

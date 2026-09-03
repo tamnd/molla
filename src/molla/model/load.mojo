@@ -86,7 +86,7 @@ from molla.sys.atomic import AtomicBlock
 from molla.sys.clock import monotonic_ms
 from molla.sys.device import Device, default_device
 from molla.sys.mem import keep
-from molla.sys.mmap import RawPtr, page_size, will_need
+from molla.sys.mmap import RawPtr, drop_pages, page_size, will_need
 from molla.sys.queue import MpscQueue, round_up_pow2
 from molla.sys.thread import (
     Thread,
@@ -130,6 +130,16 @@ itself recommends as a working set."""
 comptime MAX_WORKERS = 8
 """More transfer threads than this stops helping. The limit is the device, and
 past a handful of readers the queue depth is deep enough to keep it busy."""
+
+comptime UPLOAD_WINDOW = 64 * MIB
+"""Uploaded bytes allowed to stay resident before they are waited for and
+dropped.
+
+The reason peak resident memory does not scale with the model. Big enough that
+the wait it forces happens a few dozen times over a whole load rather than once
+per tensor, so the transfer threads and the card keep overlapping, and small
+enough that it is the same number on an eight gigabyte model as on a hundred
+megabyte one. See docs/validation/performance.md."""
 
 
 def stage_name(stage: Int) -> String:
@@ -175,6 +185,24 @@ struct Placement(Copyable, ImplicitlyCopyable, Movable):
     var place: Int
     var slot: Int
     """Byte offset in the device pool, or -1 for a tensor that is not copied."""
+
+    var droppable: Bool
+    """Whether the host is finished with this tensor once the card has it.
+
+    True for a matrix and false for anything one dimensional, which is the same
+    test `device_refusal` makes and for the same reason. A kernel reads a matrix
+    out of the pool by its slot address and never looks at the file again. A
+    norm or a bias is read on the host, dequantized and uploaded as floats, and
+    that happens after the load returns, so its pages have to still be there.
+
+    It matters because `drop_pages` gives pages back for good. Getting this
+    wrong on a matrix costs resident memory. Getting it wrong on a norm is a
+    fault in `_gain`, which is what an eight billion parameter model did:
+    a 4096 wide gain is 16 KiB and holds whole pages, while the same gain in a
+    small model is under one page and so was never dropped and never noticed.
+
+    One dimensional tensors are a few hundred kilobytes of an eight gigabyte
+    file, so keeping them costs nothing worth measuring."""
 
 
 struct Plan(Movable):
@@ -389,6 +417,7 @@ def plan_load(
                 lengths[i],
                 place,
                 at,
+                g.tensors[i].n_dims > 1,
             )
         )
     return plan^
@@ -952,6 +981,17 @@ def load(
     var reported = -1
     var copy_ms = 0
     var copied = 0
+    # The uploaded pages waiting to be given back, and where they were.
+    # Bounded, which is the whole point: a copy is asynchronous, so the source
+    # pages have to stay valid until the stream has drained, and waiting after
+    # every tensor would serialise the load this file exists to keep parallel.
+    # So they accumulate to a window and then get waited for and dropped
+    # together, and peak resident memory is the window rather than the model.
+    #
+    # Only what `droppable` says, which is matrices. A norm is read on the host
+    # after this function returns.
+    var window = List[Int]()
+    var window_bytes = 0
     while drained < count:
         var index = 0
         if not job.ready.pop(index):
@@ -965,6 +1005,16 @@ def load(
                     out.pool.value().copy_in(one.slot, one.source, one.length)
                     out.report.resident += 1
                     copied += one.length
+                    if one.droppable:
+                        window.append(one.source)
+                        window.append(one.length)
+                        window_bytes += one.length
+                    if window_bytes >= UPLOAD_WINDOW:
+                        out.pool.value().wait()
+                        for w in range(0, len(window), 2):
+                            _ = drop_pages(window[w], window[w + 1])
+                        window.clear()
+                        window_bytes = 0
             copy_ms += monotonic_ms() - at
         drained += 1
         if stream:
@@ -1017,6 +1067,11 @@ def load(
         if out.pool:
             var at = monotonic_ms()
             out.pool.value().wait()
+            # Whatever the last window did not reach. The bookkeeping is not
+            # reset because nothing reads it again.
+            for w in range(0, len(window), 2):
+                _ = drop_pages(window[w], window[w + 1])
+            window.clear()
             copy_ms += monotonic_ms() - at
             # The plan said how many bytes would be on the card and this counts
             # what was put there. They are computed from the same placements a
