@@ -4,6 +4,19 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-09-04
+
+Three of the kernels a layer launches were doing one flop per element, and every one of them can be done by the kernel in front of it for free.
+
+A matvec thread block owns one output row and has that row in a register when its reduction finishes. Anything that reads only that row, and nothing else the same launch is still writing, is work the block can finish itself. That is exactly what the projection bias, the residual add and the gate half of a gated MLP are, so all three are epilogues now rather than launches. The residual add is the best of the three, because folding it in also deletes the scratch vector the projection was landing in and the round trip through device memory that went with it.
+
+A layer goes from fifteen launches to twelve on a model without qkv bias and from eighteen to twelve on one with it. It is exact, so the logit corpus is byte identical to the previous release on both backends and no tolerance moved.
+
+### Changed
+
+- The device matvec takes an epilogue argument and an auxiliary vector, and `device_mlp` and `device_attention` use it in place of the bias add, the residual add and the activation launches. Counted with nsys over five forward passes on an RTX 4090, SmolLM2 135M goes from 453 kernel launches a token to 363 and Qwen 2.5 0.5B goes from 435 to 291. Decode on the same card, eight interleaved repetitions: SmolLM2 135M q8_0 goes from 282.2 tokens per second to 310.8, Qwen 2.5 0.5B q4_K_M from 244.9 to 309.2, and Llama 3.1 8B q4_K_M from 99.8 to 101.4. The 8B barely moves because at 5.6 GiB a token its launches were already hidden behind its weight reads, which is the same split this project has been reporting from the byte side since 0.4.1.
+- [docs/validation/performance.md](docs/validation/performance.md) has the launch counts, the throughput, the three things that fit in a matvec epilogue and the four that do not. It also records a variant that was measured and rejected, making the activation a compile time parameter rather than a runtime branch to keep an `exp`'s registers out of kernels that never run it, which came out a wash on two models in opposite directions and is not worth three instantiations of the hottest kernel in the program.
+
 ## [0.4.3] - 2026-09-04
 
 The decode matvec spent more of its time turning integers into floats than multiplying them, and there is a way to do that with no conversion instruction in it.
