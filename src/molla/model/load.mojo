@@ -442,7 +442,33 @@ comptime SLOT_REPACK_ERR = 3
 because the answer to any of them is the same: abandon the cache and load
 without one, and say which errno it was."""
 
-comptime SLOT_COUNT = 4
+comptime SLOT_RELEASED = 4
+"""Bytes the drain loop has finished with, either given back by `drop_pages` or
+accounted for because they were never droppable.
+
+The other half of `SLOT_BYTES`, and the difference between the two is how much
+of the file is resident because of this load right now. A worker reads both
+before it touches anything, which is the only backpressure in the design."""
+
+comptime SLOT_COUNT = 5
+
+comptime READ_AHEAD = 256 * MIB
+"""How far the read stage may get ahead of the drain loop, in bytes touched but
+not yet given back.
+
+Without this the drop window is not a bound on anything. A worker claims a
+tensor, faults every page of it in, and claims the next one, and nothing stops
+it from doing that for the whole file while the drain loop is still on the
+second tensor. On a cold page cache that never showed up, because every touch
+blocks on the disk and the workers stay roughly in step by accident. On a warm
+one a touch is a minor fault and the workers run the length of the file in
+well under a second, so an eight gigabyte model was eight gigabytes resident
+and the window was doing nothing. Measured on the 8B on gpc: 1392 MiB with the
+page cache dropped and 9719 MiB without, from the same binary.
+
+Four times `UPLOAD_WINDOW` so the drain loop always has a queue in front of it
+and the threads keep overlapping, and small enough that it is the same number
+on any size of model, which is the whole point."""
 
 
 @fieldwise_init
@@ -487,6 +513,14 @@ struct LoadJob(Movable):
     var cursor: AtomicBlock
     var ready: MpscQueue
 
+    var bounded: Bool
+    """Whether the drain loop is giving pages back, and so whether a worker has
+    to wait for it.
+
+    Set by the one caller that drops, which is the device path. A host load
+    reads the tensors and leaves them where they are, so there is nothing to
+    wait for and waiting would be a deadlock rather than a delay."""
+
     var repack_fd: Int
     """The cache being written, or -1 when this load is not repacking."""
 
@@ -522,6 +556,7 @@ struct LoadJob(Movable):
             self.lengths.append(plan.placements[i].length)
         self.cursor = AtomicBlock(SLOT_COUNT)
         self.ready = MpscQueue(round_up_pow2(self.count + 2))
+        self.bounded = False
         if not self.cursor.is_valid() or not self.ready.is_valid():
             raise Error("could not allocate the transfer queue")
         self.repack_fd = -1
@@ -596,6 +631,7 @@ def _transfer(arg: Int) abi("C") -> Int:
     _ = set_thread_name("molla-load")
     var next = job[].cursor.slot(SLOT_NEXT)
     var warmed = job[].cursor.slot(SLOT_BYTES)
+    var released = job[].cursor.slot(SLOT_RELEASED)
     var failed = job[].cursor.slot(SLOT_REPACK_ERR)
     var page = job[].page
     var repacking = job[].repack_fd >= 0 and slot < len(job[].scratch)
@@ -606,6 +642,15 @@ def _transfer(arg: Int) abi("C") -> Int:
             break
         var start = job[].warm[i]
         var length = job[].lengths[i]
+        # Wait until the drain loop has room, when there is a drain loop giving
+        # pages back. Before `will_need` rather than after it, because a hint
+        # on a warm page cache is not a hint, it maps the range there and then.
+        #
+        # `bounded` is false for a host load, where nothing is ever dropped and
+        # a worker that waited for a release would wait forever.
+        if job[].bounded:
+            while warmed.load() - released.load() > READ_AHEAD:
+                _ = sleep_ms(1)
         _ = will_need(start, length)
         var p = RawPtr(unsafe_from_address=start)
         var at = 0
@@ -960,6 +1005,10 @@ def load(
                 out.pool = DevicePool(out.plan.device, pool_bytes, ctx.value())
             else:
                 out.pool = DevicePool(out.plan.device, pool_bytes)
+            # Set here rather than in the constructor because this is the only
+            # place that knows whether anything is going to be given back, and
+            # a worker that waits for a release nobody makes never returns.
+            job.bounded = True
 
     var read_started = monotonic_ms()
     var pool_threads = List[Thread]()
@@ -992,12 +1041,18 @@ def load(
     # after this function returns.
     var window = List[Int]()
     var window_bytes = 0
+    var released = job.cursor.slot(SLOT_RELEASED)
     while drained < count:
         var index = 0
         if not job.ready.pop(index):
             _ = sleep_ms(1)
             continue
         var one = out.plan.placements[index]
+        # Whether this tensor's bytes are waiting in the window rather than
+        # already accounted for. Everything that is not gets credited below the
+        # moment it is drained, so that the read stage's bound is about pages
+        # that are actually still resident and not about bookkeeping.
+        var held = False
         if one.place == WHERE_DEVICE:
             var at = monotonic_ms()
             comptime if has_accelerator():
@@ -1009,13 +1064,20 @@ def load(
                         window.append(one.source)
                         window.append(one.length)
                         window_bytes += one.length
+                        held = True
                     if window_bytes >= UPLOAD_WINDOW:
                         out.pool.value().wait()
                         for w in range(0, len(window), 2):
                             _ = drop_pages(window[w], window[w + 1])
+                        # Credited as part of the window, this tensor
+                        # included, so `held` stays true and it is not
+                        # counted a second time below.
+                        _ = released.add(window_bytes)
                         window.clear()
                         window_bytes = 0
             copy_ms += monotonic_ms() - at
+        if not held:
+            _ = released.add(one.length)
         drained += 1
         if stream:
             var tenth = drained * 10 // count
