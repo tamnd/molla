@@ -41,7 +41,7 @@ from max.gpu import barrier
 from max.gpu.host import DeviceContext
 
 from molla.nn.attention import AttnSpec
-from molla.nn.gpu import TILE, DeviceVec
+from molla.nn.gpu import TILE, DeviceVec, byte_float, nibble_float
 from molla.nn.repack import (
     LAYOUT_PLANAR,
     QUANT_I8,
@@ -329,7 +329,6 @@ def planar_row_kernel[
     """
     var cols = Int(cols_dev)
     var row = Int(row_dev) * Int(stride_dev)
-    var quants = w.unsafe_bitcast[Int8]()
     var packed = w
     var scales = w.unsafe_bitcast[Float32]()
     var groups = cols // group
@@ -348,15 +347,12 @@ def planar_row_kernel[
         var gi = i >> shift
         var q: Float32
         comptime if form == QUANT_I8:
-            q = Float32(Int(quants[unsafe_offset=row + i]))
+            q = byte_float(UInt32(packed[unsafe_offset=row + i]))
         else:
             # Arithmetic rather than a branch, for the reason `gpu.mojo` gives
             # where the same two lines are.
-            var b = Int(packed[unsafe_offset=row + (i >> 1)])
-            var n = (b >> ((i & 1) * 4)) & 0xF
-            comptime if form == QUANT_S4:
-                n = (n ^ 8) - 8
-            q = Float32(n)
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            q = nibble_float[form]((b >> UInt32((i & 1) * 4)) & 0xF)
         var v = scales[unsafe_offset=d_base + gi] * q
         comptime if with_min:
             v += scales[unsafe_offset=m_base + gi]

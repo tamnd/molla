@@ -20,7 +20,7 @@ Usage:
 from std.gpu import block_idx, thread_idx
 
 from max.gpu import barrier
-from std.memory import AddressSpace, stack_allocation
+from std.memory import AddressSpace, bitcast, stack_allocation
 from std.time import monotonic
 
 from max.gpu.host import DeviceContext
@@ -47,6 +47,29 @@ comptime V_NO_SCALE = 4
 """The nibbles and the activations, with no scale plane read at all."""
 comptime V_NO_MATH = 5
 """The loads and nothing else, which is the floor this shape can reach."""
+comptime V_DOT4 = 6
+"""Four values a thread against an int8 activation, multiplied as integers."""
+comptime V_DOT8 = 7
+"""Eight, so the converts and the scale reads are halved again."""
+comptime V_DOT16 = 8
+"""Sixteen, which is half a group and as far as this can be taken."""
+comptime V_MAGIC = 10
+"""The shipped loop with the nibble to float conversion done by bit pattern.
+
+`Float32(n)` for a small integer is an `I2F`, which on NVIDIA issues on the same
+unit as transcendentals at a quarter of the rate of a multiply. Or the nibble
+into the mantissa of `2^23` instead and subtract `2^23` back off, and the whole
+thing is an integer or and a floating point subtract, both full rate. It is
+exact, it changes no layout and it adds no launch, which is everything the
+integer path is not."""
+comptime V_DOT8_I16 = 9
+"""Eight, against an activation quantized to a signed short rather than a byte.
+
+The win the integer variants show is the converts and the scale reads going
+away, not the activation getting smaller, and an activation vector is a few
+kilobytes that every block in the launch reads. So this asks what the second
+byte costs, and the answer decides whether the accuracy this work spends has to
+be spent at all."""
 
 
 def probe_kernel[
@@ -164,6 +187,24 @@ def probe_kernel[
                 acc += m * asum
             g += tile
 
+    elif variant == V_MAGIC:
+        var i = t * 2
+        while i < cols:
+            var gi = i >> shift
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            var lo = bitcast[DType.float32, 1](UInt32(0x4B000000) | (b & 0xF))
+            var hi = bitcast[DType.float32, 1](UInt32(0x4B000000) | (b >> 4))
+            var a0 = x[unsafe_offset=i]
+            var a1 = x[unsafe_offset=i + 1]
+            var d = scales[unsafe_offset=d_base + gi]
+            acc += d * (lo - Float32(8388608.0)) * a0
+            acc += d * (hi - Float32(8388608.0)) * a1
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                acc += m * a0
+                acc += m * a1
+            i += tile * 2
+
     elif variant == V_NO_SCALE:
         var i = t * 2
         while i < cols:
@@ -174,12 +215,66 @@ def probe_kernel[
             acc += Float32((b >> 4) & 0xF) * a1
             i += tile * 2
 
-    else:
+    elif variant == V_NO_MATH:
         var i = t * 2
         while i < cols:
             acc += Float32(Int(packed[unsafe_offset=row + (i >> 1)]))
             acc += x[unsafe_offset=i]
             i += tile * 2
+
+    else:
+        # What #186 proposes. The activation vector arrives already quantized to
+        # a signed byte per value with a scale a group, so a weight and an
+        # activation are both small integers and their product is an integer.
+        # Two things go away. The four `Int32` to `Float32` converts a byte pair
+        # costs now become one per run, and on NVIDIA a convert is a quarter
+        # rate instruction where a multiply is full rate, so four of them are
+        # worth sixteen multiplies. And the group's scale is read once for the
+        # run rather than once for a pair.
+        #
+        # A run has to sit inside one group for that to work, which it does:
+        # every group here is 32 values and 4 and 8 both divide it.
+        #
+        # The minimum is the second integer sum. Over a group, sum of
+        # `(d * w + m) * x` is `d * dx * sum(w * q) + m * dx * sum(q)`, so a
+        # `with_min` type costs one more integer accumulator and one more
+        # convert per run rather than a multiply and an add per value.
+        comptime run = 4 if variant == V_DOT4 else (
+            16 if variant == V_DOT16 else 8
+        )
+        comptime wide = variant == V_DOT8_I16
+        var qx = x.unsafe_bitcast[Int8]()
+        var qw = x.unsafe_bitcast[Int16]()
+        var xd = x.unsafe_bitcast[Float32]()
+        var xd_base = cols  # the activation scales, a float a group
+        var i = t * run
+        while i < cols:
+            var gi = i >> shift
+            var at = row + (i >> 1)
+            var dot = Int32(0)
+            var qsum = Int32(0)
+            var k = 0
+            while k < run // 2:
+                var b = Int32(packed[unsafe_offset=at + k])
+                var lo = b & 0xF
+                var hi = (b >> 4) & 0xF
+                var q0: Int32
+                var q1: Int32
+                comptime if wide:
+                    q0 = Int32(qw[unsafe_offset=i + k * 2])
+                    q1 = Int32(qw[unsafe_offset=i + k * 2 + 1])
+                else:
+                    q0 = Int32(qx[unsafe_offset=i + k * 2])
+                    q1 = Int32(qx[unsafe_offset=i + k * 2 + 1])
+                dot += lo * q0 + hi * q1
+                comptime if with_min:
+                    qsum += q0 + q1
+                k += 1
+            var dx = xd[unsafe_offset=xd_base + gi]
+            acc += scales[unsafe_offset=d_base + gi] * dx * Float32(dot)
+            comptime if with_min:
+                acc += scales[unsafe_offset=m_base + gi] * dx * Float32(qsum)
+            i += tile * run
 
     var part = stack_allocation[
         tile, Float32, address_space=AddressSpace.SHARED
@@ -252,7 +347,13 @@ def _sweep[
     var stride = planar_row_bytes(kind, cols)
     var bytes = rows * stride
     var wbuf = ctx.enqueue_create_buffer[DType.uint8](bytes)
-    var xbuf = ctx.enqueue_create_buffer[DType.float32](cols)
+    # The float variants want `cols` floats. The integer ones read the same
+    # bytes as `cols` signed bytes and then want a float a group behind them, at
+    # float index `cols`, so the buffer carries both layouts at once and no
+    # variant reads past the end of it.
+    var xbuf = ctx.enqueue_create_buffer[DType.float32](
+        cols + cols // group + 4
+    )
     var obuf = ctx.enqueue_create_buffer[DType.float32](rows)
     ctx.synchronize()
     var w = Pointer[UInt8, MutAnyOrigin](
@@ -322,6 +423,46 @@ def _sweep[
     _report(
         "  loads only",
         _time[group, with_min, form, V_NO_MATH](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  magic cvt ",
+        _time[group, with_min, form, V_MAGIC](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  int dot 4 ",
+        _time[group, with_min, form, V_DOT4](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  int dot 8 ",
+        _time[group, with_min, form, V_DOT8](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  int16 dot8",
+        _time[group, with_min, form, V_DOT8_I16](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  int dot 16",
+        _time[group, with_min, form, V_DOT16](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,

@@ -47,7 +47,7 @@ called with device buffers could not be checked against the host at all.
 """
 
 from std.gpu import block_idx, thread_idx
-from std.memory import AddressSpace, stack_allocation
+from std.memory import AddressSpace, bitcast, stack_allocation
 from std.sys.info import has_accelerator
 
 from max.gpu import barrier
@@ -253,6 +253,54 @@ struct DeviceVec(Movable):
         return got
 
 
+comptime MAGIC = UInt32(0x4B000000)
+"""The bit pattern of `2^23` as a float32, which is where a small integer goes.
+
+A float32 with an exponent of 23 has a mantissa step of exactly one, so the
+representable numbers from `2^23` to `2^24` are the integers, and their bit
+patterns are `MAGIC + n`. Nothing carries out of the mantissa for `n` under
+`2^23`, so `MAGIC | n` and `MAGIC + n` are the same bits and the OR is what a
+quant costs. Subtracting `2^23` back is exact because the result is small.
+
+So an integer becomes a float in an OR and a subtract, both of which issue at
+the full rate on both vendors, instead of in a convert, which on NVIDIA issues
+on the transcendental unit at a quarter rate. Four converts a byte pair cost
+more than sixteen multiplies before any multiplying happens, and that is what
+`scripts/matvec_probe.mojo` was measuring when it found three quarters of this
+kernel going into arithmetic on values that had already arrived.
+
+The trick is only valid for a value that fits under the mantissa step and there
+is no rounding anywhere in it, so it is exact rather than close. See
+[docs/validation/layout.md](../../../docs/validation/layout.md).
+"""
+
+
+@always_inline
+def nibble_float[form: Int](n: UInt32) -> Float32:
+    """One four bit quant, as a float, without a convert.
+
+    For a centred type the sign extension comes free: `n ^ 8` is `n + 8` below
+    eight and `n - 8` above it, so biasing the subtraction by eight turns the
+    same OR into `(n ^ 8) - 8`, which is the four bit two's complement value the
+    repack wrote. An unsigned type subtracts the plain magic.
+    """
+    comptime if form == QUANT_S4:
+        return bitcast[DType.float32, 1](MAGIC | (n ^ 8)) - Float32(8388616.0)
+    else:
+        return bitcast[DType.float32, 1](MAGIC | n) - Float32(8388608.0)
+
+
+@always_inline
+def byte_float(u: UInt32) -> Float32:
+    """One signed byte quant, as a float, without a convert.
+
+    Same shape as `nibble_float`, one bit wider. The quant plane of a byte wide
+    type is signed two's complement, `u ^ 0x80` moves it to the unsigned range
+    the mantissa can hold, and the bias takes it back.
+    """
+    return bitcast[DType.float32, 1](MAGIC | (u ^ 0x80)) - Float32(8388736.0)
+
+
 def planar_matvec_kernel[
     tile: Int, group: Int, with_min: Bool, form: Int
 ](
@@ -280,17 +328,14 @@ def planar_matvec_kernel[
 
     var row = r * stride
     var groups = cols // group
-    # Three views of the same bytes rather than one view and a conversion. The
-    # byte wide quants are signed and are read through a signed pointer for
-    # that reason: converting a `UInt8` to an `Int8` after loading it is a value
-    # conversion and not a reinterpretation, and it turns every quant of 128 and
-    # up into something that is not the negative number the repack wrote. Four
-    # of the eight types centre their quants, so half the corpus is wrong and
-    # the other half is exact, which is a failure that looks like a type table
-    # bug rather than like a cast. The nibble wide ones are read unsigned and
-    # the sign extension is done in the open below, because there is no four
-    # bit type to reinterpret through.
-    var quants = w.unsafe_bitcast[Int8]()
+    # Two views of the same bytes rather than one view and a conversion. Every
+    # quant is read as an unsigned byte and turned into a float by
+    # `nibble_float` and `byte_float`, which carry the sign in the bias they
+    # subtract rather than in the type they load through. That is why there is
+    # no `Int8` view here any more: reading a signed byte only to convert it is
+    # the instruction this kernel is trying not to issue, and the sign
+    # extension a centred type needs is a constant in the subtraction either
+    # way.
     var packed = w
     var scales = w.unsafe_bitcast[Float32]()
     var quant_bytes = cols if form == QUANT_I8 else cols // 2
@@ -306,7 +351,7 @@ def planar_matvec_kernel[
         var i = t
         while i < cols:
             var gi = i >> shift
-            var q = Float32(Int(quants[unsafe_offset=row + i]))
+            var q = byte_float(UInt32(packed[unsafe_offset=row + i]))
             var a = x[unsafe_offset=i]
             acc += scales[unsafe_offset=d_base + gi] * q * a
             comptime if with_min:
@@ -316,10 +361,11 @@ def planar_matvec_kernel[
         # A byte to a thread and both of its values, so a warp reads thirty two
         # contiguous bytes and gets sixty four values out of them. Both values
         # of a byte sit in one group, because every group size here is even, so
-        # their scale and minimum are loaded once for the pair. `(n ^ 8) - 8` is
-        # the four bit two's complement sign extension, done with arithmetic
-        # because a branch on which nibble is which is one that every warp would
-        # take both sides of.
+        # their scale and minimum are loaded once for the pair. The masking is
+        # done with arithmetic rather than a branch on which nibble is which,
+        # because that is a branch every warp would take both sides of, and the
+        # high nibble needs no mask at all: the shift has already cleared
+        # everything above it.
         #
         # Three other arrangements of this loop were written and measured on an
         # RTX 4090 against an 8B: a value to a thread with two threads sharing a
@@ -332,22 +378,21 @@ def planar_matvec_kernel[
         # are arranged, which is #186, so the simplest of the four is the one
         # that is here. That was read as a statement about both backends for a
         # day and it is not one: on Metal the same loop was spending more than
-        # half its time on the group index, which is why that is a shift now.
+        # half its time on the group index, which is why that is a shift now,
+        # and the largest thing left after that was the conversion of the quant,
+        # which is why `nibble_float` exists.
         # See [docs/validation/layout.md](../../../docs/validation/layout.md).
         var i = t * 2
         while i < cols:
             var gi = i >> shift
-            var b = Int(packed[unsafe_offset=row + (i >> 1)])
-            var lo = b & 0xF
-            var hi = (b >> 4) & 0xF
-            comptime if form == QUANT_S4:
-                lo = (lo ^ 8) - 8
-                hi = (hi ^ 8) - 8
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            var lo = nibble_float[form](b & 0xF)
+            var hi = nibble_float[form](b >> 4)
             var a0 = x[unsafe_offset=i]
             var a1 = x[unsafe_offset=i + 1]
             var d = scales[unsafe_offset=d_base + gi]
-            acc += d * Float32(lo) * a0
-            acc += d * Float32(hi) * a1
+            acc += d * lo * a0
+            acc += d * hi * a1
             comptime if with_min:
                 var m = scales[unsafe_offset=m_base + gi]
                 acc += m * a0
