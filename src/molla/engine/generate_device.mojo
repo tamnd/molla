@@ -26,11 +26,9 @@ telling somebody to go and run a different command.
 
 from std.sys.info import has_accelerator
 
-from max.gpu.host import DeviceContext
-
 from molla.engine.backend import Backend
 from molla.engine.bind import bind
-from molla.engine.device import DeviceSession
+from molla.engine.device import DeviceSession, device_context, load_on_device
 from molla.engine.generate import (
     DEFAULT_CONTEXT,
     DEFAULT_LIMIT,
@@ -39,7 +37,6 @@ from molla.engine.generate import (
 )
 from molla.engine.sample import Sampler, SamplerConfig
 from molla.model.gguf import Gguf
-from molla.model.load import load, plan_load
 from molla.model.repack import model_key, open_cache
 from molla.model.spec import read_geometry
 from molla.sys.clock import monotonic_ms
@@ -84,42 +81,15 @@ def run_generate_device(
         var started = monotonic_ms()
         var g = Gguf(model_path)
 
-        # The repack first and on its own, because the planar bytes have to
-        # exist before the plan decides what to put on the card. A load that
-        # writes the cache on the way past writes it from the file it is
-        # reading, and the tensors this process already bound would still be
-        # the ggml ones, so the device would get the layout its kernels cannot
-        # read.
         var cache = open_cache(model_path, model_key(g))
-        if not cache.usable:
-            print("repack:    writing a planar cache first, " + cache.reason)
-            var warm = load(
-                g, plan_load(g, dev, 0, cache), 0, False, model_path
-            )
-            _ = warm^
-            cache.close()
-            cache = open_cache(model_path, model_key(g))
-            if not cache.usable:
-                raise Error(
-                    "the repack cache was written and still cannot be used: "
-                    + cache.reason
-                )
 
         # One context for the process, made here and handed down. A second one
         # on CUDA constructs and then hangs on the first allocation against it,
         # so the load takes this rather than making its own.
-        var ctx = DeviceContext(device_id=dev.index)
-        var plan = plan_load(g, dev, -1, cache)
-        if plan.left_behind > 0:
-            raise Error(
-                "the device forward pass needs every weight on the card and"
-                " this plan leaves "
-                + String(plan.left_behind)
-                + " of them in the mapping, which would be read as zeros. This"
-                " model does not fit on "
-                + dev.name
-            )
-        var weights = load(g, plan^, 0, False, "", ctx)
+        var ctx = device_context(dev.index)
+        var weights = load_on_device(
+            g, cache, model_path, dev, ctx, String("repack:   ")
+        )
         var loaded = monotonic_ms()
 
         # The same file bound twice. Once with the residency, which is what the

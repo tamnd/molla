@@ -55,12 +55,11 @@ from molla.engine.bind import Bound
 from molla.engine.cache import check_room, slot_of
 from molla.engine.sample import Sampler
 from molla.model.gguf import Gguf
-from molla.model.load import Weights, load, plan_load
+from molla.model.load import Weights, device_refusal, load, plan_load
 from molla.model.repack import RepackCache, model_key, open_cache
 from molla.nn.gpu import DeviceVec
 from molla.nn.gpu_block import DeviceModel, DeviceScratch, device_forward
 from molla.nn.model import frequency_factors
-from molla.nn.repack import repackable
 from molla.nn.tensor import Buffer
 from molla.sys.device import Device
 
@@ -319,45 +318,13 @@ def open_session(
     )
 
 
-def device_refusal(g: Gguf) raises -> String:
-    """Why the device kernels cannot read this file, or the empty string.
-
-    They read the planar form of a quantized weight and nothing else. A norm is
-    one dimensional and is uploaded as floats, so it does not count, but a
-    matrix in f16, bf16 or f32 is a weight a matvec would be handed and cannot
-    dequantize. Asked before anything is loaded, because the alternative is
-    finding out from the first kernel launch of the first token, by which point
-    a gigabyte has been copied to the card.
-    """
-    var stuck = 0
-    var kind = -1
-    for i in range(len(g.tensors)):
-        var t = g.tensors[i]
-        if t.n_dims < 2:
-            continue
-        if repackable(t.kind):
-            continue
-        stuck += 1
-        if kind < 0:
-            kind = Int(t.kind)
-    if stuck == 0:
-        return String("")
-    return (
-        String("the device kernels read quantized weights in the planar")
-        + " layout and this file has "
-        + String(stuck)
-        + " matrices of ggml type "
-        + String(kind)
-        + ", which has no planar form. An unquantized model runs on the host"
-    )
-
-
 def load_on_device(
     g: Gguf,
     mut cache: RepackCache,
     model_path: String,
     dev: Device,
     ctx: DeviceContext,
+    label: String = "  repack        ",
 ) raises -> Weights:
     """Put every weight of this model on the card, in the planar layout.
 
@@ -372,15 +339,17 @@ def load_on_device(
     writes the cache on the way past writes it from the file it is reading, so
     the bytes it copied to the card would be the ggml ones, which is the layout
     these kernels cannot read.
+
+    `label` is the column the repack line is printed under, because the three
+    callers report in three different shapes and the one thing this function
+    prints has to line up with the rest of whichever one is asking.
     """
     comptime if has_accelerator():
         var refusal = device_refusal(g)
         if refusal.byte_length() > 0:
             raise Error(refusal)
         if not cache.usable:
-            print(
-                "  repack         writing a planar cache first,", cache.reason
-            )
+            print(label + " writing a planar cache first, " + cache.reason)
             var warm = load(
                 g, plan_load(g, dev, 0, cache), 0, False, model_path
             )
