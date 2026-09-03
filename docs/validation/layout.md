@@ -165,12 +165,15 @@ The first variant deletes something nobody suspected. The kernel finds which gro
 
 More than half of the Metal matvec was a divide that the index can never need, because `i` counts up from a thread id and is never negative, and a signed divide has to handle a negative numerator whatever the divisor is. Metal keeps the correction, CUDA removes it.
 
-End to end on the M4, same binary either side of the one line change, 305 prompt tokens and 64 generated:
+End to end on the M4, same binary either side of the one line change, decode tokens per second:
 
 | model | before | after |
 | --- | --- | --- |
-| Qwen 2.5 0.5B q4_K_M | 9.9 tok/s | 19.0 tok/s |
-| SmolLM2 135M q8_0 | 24.7 tok/s | 31.2 tok/s |
+| Llama 3.1 8B q4_K_M | 0.8 | 2.1 |
+| Qwen 2.5 0.5B q4_K_M | 9.9 | 19.0 |
+| SmolLM2 135M q8_0 | 24.7 | 31.2 |
+
+The 8B moves most and the 135M least, which is the right shape: the larger the model the more of a token is the matvec, and the small one is launch bound for the reason performance.md gives. The 8B was measured at 78 prompt tokens and 32 generated because a 305 token prompt through a prefill that is 305 decodes is a minute and a half either side, and the other two at 305 and 64. The macbook's load average was between 1.9 and 3.1 across all of it, which is quiet for that machine but is still why these are ratios on one machine rather than numbers to publish.
 
 It is exact. `i // 32` and `i >> 5` are the same number for every index this kernel produces, and the whole logit corpus on Metal is identical in every digit either side of the change.
 
