@@ -47,6 +47,16 @@ Acceptance: `molla generate` produces the same greedy text on the host, the M4 G
 
 The bench table is not a gate here. Being faster than llama.cpp is an M7 gate with a number attached. What this milestone owes is knowing the distance, because a performance number first taken at the end is a number nobody can bisect.
 
+## M2c: two times the throughput at half the memory, 6 to 8 weeks
+
+M2b measured the distance and the distance turned out to be a shape problem. molla launches 453 kernels per token and a launch costs 4.9 microseconds on a 4090, so a token cannot go below 2.2 ms of pure launch cost and molla cannot exceed about 450 tokens per second on that card whatever the kernels do. llama.cpp is at 782.5, and the M7 gate is 1.5 times. There is no tuning that gets there from here.
+
+So the launch count per token stops being proportional to the layer count, prefill becomes a matmul over the prompt instead of one decode per prompt token, and the host stops holding a 1.3 GiB mapping arena and two copies of the weight file. The research behind each of those, with the measurement that produced it, is in `docs/validation/performance.md`.
+
+Acceptance: decode on SmolLM2 Q8_0 on the 4090 above two times llama.cpp at 512 prompt tokens and 128 generated, prefill on the same file above two times llama.cpp, peak host memory under half of llama.cpp's and not scaling with the model file size, and the same greedy text on host, Metal and CUDA with the logit corpus green on all three.
+
+Two times llama.cpp on single stream decode of an 8B is not in scope and is not possible. llama.cpp is already at 79 per cent of the card's memory bandwidth there, so two times its rate is above the hardware. The large model version of this goal is aggregate throughput and it arrives with continuous batching in M3.
+
 ## M3: serving properly, 8 to 10 weeks
 
 Paged KV cache, continuous batching, chunked prefill, prefix caching, admission control, runner lifecycle and keep alive, fit estimation, and eviction. Anthropic `/v1/messages` with the full event sequence. Embeddings.

@@ -85,7 +85,7 @@ Each of these has a full writeup with the alternatives we rejected and the evide
 
 See [docs/design.md](docs/design.md) for the reasoning and [docs/roadmap.md](docs/roadmap.md) for the plan.
 
-D6 says the engine is ours, and the reversal condition on it has a number in it, so molla is measured against llama.cpp and Ollama on the same file, the same prompt and the same card, one table per machine, in [docs/validation/bench.md](docs/validation/bench.md). Decode on CUDA is currently 2.4 to 3.3 times off llama.cpp, prefill is more than a hundred times off because molla has no batched prefill yet, and peak host memory is 2.2 to 3.6 times higher.
+D6 says the engine is ours, and the reversal condition on it has a number in it, so molla is measured against llama.cpp and Ollama on the same file, the same prompt and the same card, one table per machine, in [docs/validation/bench.md](docs/validation/bench.md). Decode on CUDA is currently 2.4 to 3.3 times off llama.cpp, prefill is more than a hundred times off because molla has no batched prefill yet, and peak host memory is 2.2 to 3.6 times higher. What causes each of those, and which parts of closing them are reachable and which are above the hardware, is in [docs/validation/performance.md](docs/validation/performance.md).
 
 ## Hardware
 
