@@ -17,8 +17,8 @@ that the thread beside it also needs. Planar is a value at a fixed width with
 the scales in planes at the end of the row, so thread `t` reads the byte at
 value `t`, the thread beside it reads the byte at value `t + 1`, and the
 hardware coalesces the row into as few transactions as it has lanes. At four
-bits those two threads read the same byte and take different halves of it,
-which is a cache hit and still one contiguous run per warp.
+bits a thread takes a whole byte and both of the values in it, so a warp still
+reads one contiguous run and gets twice as many values out of it.
 
 One block per output row, `TILE` threads in it, each walking the row with a
 stride of `TILE`, then a tree reduction in shared memory. That is the arrangement
@@ -308,21 +308,24 @@ def planar_matvec_kernel[
                 acc += scales[unsafe_offset=m_base + gi] * a
             i += tile
     else:
-        # A byte to a thread and both of its values, rather than a value to a
-        # thread with neighbouring threads sharing a byte. The sharing version
-        # was written first and measured 7 per cent slower than the byte wide
-        # layout it replaced while reading half the bytes, because a warp asking
-        # for sixteen contiguous bytes still pulls whole thirty two byte sectors
-        # and the other half of each sector is a different warp's problem. This
-        # way a warp asks for thirty two contiguous bytes and gets sixty four
-        # values out of them, so the sectors are read once and the number of
-        # load instructions halves as well.
+        # A byte to a thread and both of its values, so a warp reads thirty two
+        # contiguous bytes and gets sixty four values out of them. Both values
+        # of a byte sit in one group, because every group size here is even, so
+        # their scale and minimum are loaded once for the pair. `(n ^ 8) - 8` is
+        # the four bit two's complement sign extension, done with arithmetic
+        # because a branch on which nibble is which is one that every warp would
+        # take both sides of.
         #
-        # Both values of a byte sit in one group, because every group size here
-        # is even, so their scale and minimum are loaded once for the pair.
-        # `(n ^ 8) - 8` is the four bit two's complement sign extension, done
-        # with arithmetic because a branch on which nibble is which is one that
-        # every warp would take both sides of.
+        # Three other arrangements of this loop were written and measured on an
+        # RTX 4090 against an 8B: a value to a thread with two threads sharing a
+        # byte, four bytes to a thread through a `UInt32`, and that one again
+        # with the activations read four at a time into a SIMD accumulator. All
+        # four are within one per cent of each other, and all four leave the
+        # kernel reading 543 GB/s where `scripts/mem_probe.mojo` says this shape
+        # of access is worth 945. Whatever holds this kernel at three quarters
+        # of the byte wide layout's rate while it reads half the bytes is not in
+        # the inner loop, so the simplest of the four is the one that is here.
+        # See [docs/validation/layout.md](../../../docs/validation/layout.md).
         var i = t * 2
         while i < cols:
             var gi = i // group

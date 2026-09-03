@@ -108,6 +108,40 @@ Memory, which is arithmetic and not a guess. The 8B repack cache goes from 9573 
 
 Throughput, which is a prediction with a mechanism. If molla stays at 72 per cent of the card's bandwidth and reads 1.86 times fewer bytes, the 8B goes from 77.7 tok/s to about 145. llama.cpp is at 163.6. So this closes the 8B gap to about 12 per cent and does not by itself beat it, and it should not be sold as though it does. Two times llama.cpp on an 8B still needs either fewer bits per weight than llama.cpp reads or more than one sequence sharing the read, which is what performance.md already concluded and this does not change.
 
+The memory half of that prediction was right to a megabyte and the throughput half was wrong. What actually happened is the next section, and it is the more useful of the two.
+
+## What it was actually worth
+
+The quant plane was packed and measured on gpc, same model, same prompt, same three runs, with the byte wide build and the packed build alternating on one machine.
+
+| build | repack cache | decode tok/s | weight bytes read per token | achieved GB/s |
+| --- | --- | --- | --- | --- |
+| byte wide | 9573 MiB | 77.6 | 10.04 GB | 823 |
+| packed | 6474 MiB | 74.2 | 6.79 GB | 590 |
+
+Memory landed where the arithmetic said it would, 6474 MiB against a predicted 6475. Decode went the other way by four per cent.
+
+nsys puts the whole of that in the q4_K matvec, which is the only kernel the change touches. Per forward pass it was 8.45 ms moving 8.12 GB, and it is now 8.97 ms moving 4.87 GB. Read as bandwidth that is 961 GB/s falling to 543. Read as values it is 769 billion a second falling to 724, which is the same number twice. The kernel was never being paid by the byte.
+
+Four arrangements of the inner loop were written and measured, all within one per cent of each other: a value to a thread with two threads sharing a byte, a byte to a thread with both of its values, four bytes to a thread through a `UInt32`, and that last one again with the activations read four at a time into a SIMD accumulator. Larger thread blocks were tried, 256 made no difference and 512 was worse. Four rows to a block instead of one, which cuts the block count by four and reads the activation vector once for four rows, was ten per cent worse. Removing the activation read from the kernel entirely, which computes the wrong answer and exists only as a probe, changed nothing at all.
+
+`scripts/mem_probe.mojo` reads a 2 GiB buffer with the same one block per row shape the matvec uses and says what that shape is worth on this card.
+
+| row | one byte a thread | four bytes a thread |
+| --- | --- | --- |
+| 512 B | 611 GB/s | 423 GB/s |
+| 1 KiB | 939 GB/s | 609 GB/s |
+| 2 KiB | 938 GB/s | 704 GB/s |
+| 4 KiB | 945 GB/s | 704 GB/s |
+| 8 KiB | 947 GB/s | 702 GB/s |
+| 16 KiB | 947 GB/s | 706 GB/s |
+
+Two things fall out of that. Row length stops mattering above a kibibyte, so shortening the rows is not what cost the four per cent and the block reduction is not the problem the previous section guessed it might be. And the more arithmetic a kernel does per byte it reads, the fewer bytes a second it gets, which is what a kernel that is short of issue slots rather than short of bandwidth looks like.
+
+So the reading in "The measurement" above needs correcting. Both engines' achieved bandwidth figures are right. The conclusion drawn from them, that the bytes are what separates them, is not, because molla's kernel does not go faster when the bytes go away. What separates them is work per value: llama.cpp's CUDA decode quantizes the activation vector to eight bits and multiplies four values at a time with an integer dot product, and molla's does one value at a time in float. That is a four to one difference in instructions on the hot loop and it is the size of the gap.
+
+The packing still pays for itself. It is a third off device memory, a third off the cache on disk, it is the only reason #182 and #183 have anything to sit on, and it costs four per cent of a decode rate that the next change has to fix anyway.
+
 On the small models it is worth nothing at all, because q8_0 barely moves. Those need #168 and #170 and this page does not help them.
 
 The disk win is not nothing either. A repack cache that is 1.1 times the model instead of 2.04 times it is the difference between a cache people tolerate and one they turn off.

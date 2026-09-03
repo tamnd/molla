@@ -219,7 +219,9 @@ def test_geometry(mut suite: Suite) raises:
     suite.check(planar_groups(Q_Q8_0, 256) == 8, "256 q8_0 values is 8 groups")
     suite.check(planar_groups(Q_Q6_K, 256) == 16, "and 16 q6_k ones")
 
-    suite.check(quant_form(Q_Q4_0) == QUANT_S4, "q4_0 quants are signed nibbles")
+    suite.check(
+        quant_form(Q_Q4_0) == QUANT_S4, "q4_0 quants are signed nibbles"
+    )
     suite.check(
         quant_form(Q_Q4_1) == QUANT_U4, "q4_1 keeps its nibbles unsigned"
     )
