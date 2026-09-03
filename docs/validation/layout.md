@@ -53,7 +53,7 @@ On CUDA it was not visible at all, because the weights are on the card and host 
 
 Metal is where it shows, because the pool is unified memory and the weights are host bytes by construction. The 8B on the macbook, six token prompt, four generated:
 
-```
+```text
 repack:    226 tensors from cache, 9572 MiB
 maximum resident set size   5347 MiB
 peak memory footprint      10212 MiB
@@ -67,7 +67,7 @@ This also means every Metal peak molla has published, in bench.md and in the iss
 
 Bump `LAYOUT_VERSION` and change two things about a row.
 
-```
+```text
 row = [ quants at the type's native bit width ][ groups float16 dscale ][ groups float16 mscale ]
 ```
 
