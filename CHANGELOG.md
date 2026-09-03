@@ -4,6 +4,20 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-04
+
+The decode matvec spent more of its time turning integers into floats than multiplying them, and there is a way to do that with no conversion instruction in it.
+
+`Float32(n)` for a small integer compiles to a convert. On NVIDIA a convert issues on the same unit as transcendentals, at a quarter of the rate of a multiply, so the four of them that a byte of two four bit weights costs are worth sixteen multiplies before any multiplying has happened, and the kernel only does four. A float32 whose exponent is 23 has a mantissa step of exactly one, which means every representable number between `2^23` and `2^24` is an integer and its bit pattern is `0x4B000000` plus that integer. Nothing carries out of the mantissa for a small value, so the addition is an or. Or the weight in, subtract `2^23` back off, and the conversion is an integer or and a floating point subtract, both of which run at full rate on both vendors. A type whose weights are centred gets its sign extension out of the same or for free, because the bias moves into the constant being subtracted.
+
+It is exact rather than close, so the whole logit corpus is unchanged in every digit on both backends and no tolerance moved.
+
+### Changed
+
+- The device matvec and the device row dequantizer convert a weight to a float by bit pattern rather than by conversion instruction. Decode on Llama 3.1 8B q4_K_M goes from 72.9 tokens per second to 99.7 on an RTX 4090 and from 2.0 to 2.9 on an Apple M4, against llama.cpp's 163.7 on the same card and file. Microseconds a launch on the three shapes an 8B decode spends its matvec time in, Apple M4 before and after then RTX 4090 before and after: 3029 and 1924 then 93 and 42 on the 14336 by 4096 shape, 2509 and 1377 then 93 and 35 on the 4096 by 14336 one, 899 and 553 then 28 and 14 on the square one. The byte wide types are a wash on both cards and SmolLM2 135M q8_0 does not move, 223.8 to 226.5 on the 4090, because a signed byte load already sign extends in the hardware and there the change swaps one instruction for three rather than five for three. It was made in that loop anyway, because it costs nothing and it keeps the two readers of a planar row the same shape.
+- `scripts/matvec_probe.mojo` prices the byte wide path as well as the four bit one, which is the only reason the paragraph above can say the two behave differently rather than assume they do not. Its baseline variant is also relabelled: what it called shipped was the divide that 0.4.2 deleted.
+- [docs/validation/layout.md](docs/validation/layout.md) has the probe tables, the decode numbers and a section on the fix that is not landing yet. Multiplying weight by activation as integers is faster still, roughly a further 1.3 times, and it needs a 16 bit activation rather than the 8 bit one the research proposed, because at 8 bits the Metal corpus fails twelve of thirteen cases and narrowing the group does not rescue it. It also costs four kernel launches on a layer that has about fourteen, which is invisible on an 8B and takes SmolLM2 135M from 269.5 tokens per second to 212.3. That waits on the elementwise fusion work, which removes three of the four.
+
 ## [0.4.2] - 2026-09-04
 
 One line of the decode matvec, and Metal is about twice as fast as it was.
