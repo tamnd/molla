@@ -54,6 +54,7 @@ from molla.nn.gpu import (
     EPI_BIAS,
     EPI_GLU,
     EPI_NONE,
+    SPAN,
     DeviceVec,
     device_matmul_into,
     device_matvec_into,
@@ -397,12 +398,16 @@ struct DeviceScratch(Movable):
             raise Error("a model needs a vocabulary to write logits into")
         if chunk <= 0:
             raise Error("a pass has to carry at least one token")
-        self.norm = DeviceVec(ctx, chunk * spec.width)
-        self.q = DeviceVec(ctx, chunk * spec.q_width())
-        self.heads_out = DeviceVec(ctx, chunk * spec.q_width())
-        self.projected = DeviceVec(ctx, chunk * spec.width)
-        self.gate = DeviceVec(ctx, chunk * spec.hidden)
-        self.up = DeviceVec(ctx, chunk * spec.hidden)
+        # `SPAN` rows of slack on everything a matmul reads, because the dead
+        # lanes of a tail block read past the last token of the chunk rather
+        # than clamping onto it. See `planar_matmul_kernel`.
+        var wide = chunk + (SPAN if chunk > 1 else 0)
+        self.norm = DeviceVec(ctx, wide * spec.width)
+        self.q = DeviceVec(ctx, wide * spec.q_width())
+        self.heads_out = DeviceVec(ctx, wide * spec.q_width())
+        self.projected = DeviceVec(ctx, wide * spec.width)
+        self.gate = DeviceVec(ctx, wide * spec.hidden)
+        self.up = DeviceVec(ctx, wide * spec.hidden)
         self.scores = DeviceVec(ctx, chunk * spec.attn.heads * context)
         self.logits = DeviceVec(ctx, vocab)
         self.ids = DeviceVec(ctx, chunk)
@@ -727,12 +732,15 @@ def device_forward(
             + " tokens was given scratch sized for "
             + String(s.chunk)
         )
-    if x.elements() < run * m.width():
+    # A chunk wants `SPAN - 1` rows of slack past its last token, because the
+    # dead lanes of a tail matmul block read there. See `planar_matmul_kernel`.
+    var rows = run if run == 1 else run + SPAN - 1
+    if x.elements() < rows * m.width():
         raise Error(
             "the residual stream is "
             + String(x.elements())
             + " wide where the model wants "
-            + String(run * m.width())
+            + String(rows * m.width())
         )
     if s.tracing and run != 1:
         raise Error(

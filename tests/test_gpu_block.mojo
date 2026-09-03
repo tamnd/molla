@@ -35,7 +35,7 @@ from molla.model.spec import architecture_id
 from molla.nn.arch import arch_of
 from molla.nn.attention import AttnSpec
 from molla.nn.block import BlockSpec, LayerWeights, Scratch
-from molla.nn.gpu import DeviceVec
+from molla.nn.gpu import SPAN, DeviceVec
 from molla.nn.gpu_block import DeviceModel, DeviceScratch, device_forward
 from molla.nn.model import ModelWeights, forward
 from molla.nn.quant import Q_F32, Q_Q8_0
@@ -172,7 +172,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         # The norm gains stay on the host in both models. The device one
         # uploads them when it binds, which is what `DeviceLayer` is for.
         var gains = List[Float32]()
-        for m in range(LAYERS * 2 + 1):
+        for m in range(LAYERS * 2 + 3):
             _gains(gains, m)
         var gp = Int(gains.unsafe_ptr())
 
@@ -226,6 +226,13 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             var h = LayerWeights()
             h.attn_norm = gain_tensor(gp, l * 2)
             h.ffn_norm = gain_tensor(gp, l * 2 + 1)
+            # The first layer carries the two norms Gemma puts after a sublayer
+            # and the second does not, so one pass covers both shapes. The
+            # post norm path is the one that cannot ride a projection epilogue,
+            # and a chunk that is not a whole chunk is where it goes wrong.
+            if l == 0:
+                h.attn_post_norm = gain_tensor(gp, LAYERS * 2 + 1)
+                h.ffn_post_norm = gain_tensor(gp, LAYERS * 2 + 2)
             h.wq = host_tensor(host_at, offs, cols, rows, at)
             h.wk = host_tensor(host_at, offs, cols, rows, at + 1)
             h.wv = host_tensor(host_at, offs, cols, rows, at + 2)
@@ -349,13 +356,13 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
 
         # The prefill path, over the same tokens, into a cache of its own. This
         # is the claim #167 makes and it is not implied by anything above: the
-        # five decodes ran the matvec, the norms and the attention one token at
+        # decodes ran the matvec, the norms and the attention one token at
         # a time, and one pass over five tokens runs a different kernel for
         # every one of them. What has to survive that is the last token's
         # logits and both cache planes, because a chunk that gets the logits
         # right and the cache wrong answers the prompt and then drifts.
         var batch = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, len(tokens))
-        var bx = DeviceVec(ctx, len(tokens) * WIDTH)
+        var bx = DeviceVec(ctx, (len(tokens) + SPAN) * WIDTH)
         var bcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
         device_forward(
             ctx, model, batch, bx, tokens, 0, 0, bcache.keys, bcache.values
@@ -377,7 +384,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             else:
                 tail_run.append(tokens[i])
         var pair = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, len(tokens))
-        var px = DeviceVec(ctx, len(tokens) * WIDTH)
+        var px = DeviceVec(ctx, (len(tokens) + SPAN) * WIDTH)
         var pcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
         device_forward(
             ctx, model, pair, px, head_run, 0, 0, pcache.keys, pcache.values
@@ -497,7 +504,10 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         suite.group("device prefill against device decode")
         suite.check(
             batch_worst <= peak * Float32(2e-4),
-            "a chunk of five tokens leaves the last token's logits",
+            (
+                "a chunk leaves the last token's logits where the decodes left"
+                " them"
+            ),
         )
         suite.check(
             batch_top == want_last,

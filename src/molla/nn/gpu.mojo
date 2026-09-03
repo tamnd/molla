@@ -535,11 +535,12 @@ def planar_matmul_kernel[
     have to be co-resident for the L2 to serve that row once rather than once
     each, so the token index is the fast axis.
 
-    A chunk is not a multiple of `SPAN` in general, and the tail block clamps
-    its dead lanes onto the last live token rather than branching around them.
-    They compute a duplicate dot product that is never stored, which costs the
-    tail block alone a fraction of one launch and keeps every load in bounds
-    and every loop free of a test.
+    A chunk is not a multiple of `SPAN` in general, and the tail block runs its
+    dead lanes off the end of the chunk rather than branching around them. Every
+    scratch vector a chunk uses is allocated with `SPAN` rows of slack for
+    exactly this, so those lanes read real memory, compute a dot product of
+    whatever is in it, and never store it. It costs the tail block alone a
+    fraction of one launch and it keeps the inner loop free of a test.
 
     See [docs/validation/prefill.md](../../../docs/validation/prefill.md).
     """
@@ -567,14 +568,17 @@ def planar_matmul_kernel[
 
     # Every loop over `SPAN` below has a constant trip count so that the index
     # into `acc` is a constant after unrolling and the accumulators stay in
-    # registers. A runtime bound would put all eight of them in local memory and
-    # undo the whole change.
-    var at = InlineArray[Int, SPAN](fill=0)
-    for k in range(SPAN):
-        var tk = base + k
-        if tk >= tokens:
-            tk = tokens - 1
-        at[k] = tk * cols
+    # registers. A runtime bound would put all of them in local memory and undo
+    # the whole change.
+    #
+    # The dead lanes of a tail block read past the last token rather than
+    # clamping onto it, which is why every scratch vector a chunk uses is
+    # allocated with `SPAN` rows of slack. Clamping would need a token index per
+    # lane held in a register for the length of the accumulation, which is
+    # `SPAN` registers taken from the accumulators for arithmetic that is thrown
+    # away. Reading slack is an affine offset the address unit folds in for
+    # free, and what it computes is discarded by the `t < live` below.
+    var at0 = base * cols
 
     var acc = InlineArray[Float32, SPAN](fill=0)
     comptime if form == QUANT_I8:
@@ -586,11 +590,11 @@ def planar_matmul_kernel[
             comptime if with_min:
                 var m = scales[unsafe_offset=m_base + gi]
                 for k in range(SPAN):
-                    var a = x[unsafe_offset=at[k] + i]
+                    var a = x[unsafe_offset=at0 + k * cols + i]
                     acc[k] += d * a + m * a
             else:
                 for k in range(SPAN):
-                    acc[k] += d * x[unsafe_offset=at[k] + i]
+                    acc[k] += d * x[unsafe_offset=at0 + k * cols + i]
             i += tile
     else:
         var i = t * 2
@@ -603,13 +607,13 @@ def planar_matmul_kernel[
             comptime if with_min:
                 var m = scales[unsafe_offset=m_base + gi]
                 for k in range(SPAN):
-                    var a0 = x[unsafe_offset=at[k] + i]
-                    var a1 = x[unsafe_offset=at[k] + i + 1]
+                    var a0 = x[unsafe_offset=at0 + k * cols + i]
+                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
                     acc[k] += lo * a0 + hi * a1 + m * (a0 + a1)
             else:
                 for k in range(SPAN):
-                    var a0 = x[unsafe_offset=at[k] + i]
-                    var a1 = x[unsafe_offset=at[k] + i + 1]
+                    var a0 = x[unsafe_offset=at0 + k * cols + i]
+                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
                     acc[k] += lo * a0 + hi * a1
             i += tile * 2
 

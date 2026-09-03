@@ -806,12 +806,25 @@ def device_rms_norm_inplace(
     """
     if runs < 1:
         raise Error("a norm needs at least one run")
-    _check_norm(x.elements() // runs, gain.elements(), x.elements() // runs)
+    var n = gain.elements()
+    # The width comes from the gain rather than from dividing the vector by the
+    # run count, because a prefill chunk holds room for the largest chunk and a
+    # short one does not fill it, so that division is the wrong width whenever
+    # a prompt does not end on a chunk boundary.
+    if runs == 1:
+        _check_norm(x.elements(), n, x.elements())
+    elif x.elements() < runs * n:
+        raise Error(
+            "a norm over "
+            + String(runs)
+            + " runs of "
+            + String(n)
+            + " does not fit in a vector of "
+            + String(x.elements())
+        )
     _need_device()
     comptime if has_accelerator():
-        _norm_launch(
-            ctx, x.ptr(), gain.ptr(), x.ptr(), gain.elements(), eps, runs
-        )
+        _norm_launch(ctx, x.ptr(), gain.ptr(), x.ptr(), n, eps, runs)
 
 
 def device_rms_norm_run(
