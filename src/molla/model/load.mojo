@@ -1014,9 +1014,13 @@ def _mib(bytes: Int) -> String:
 def _small(bytes: Int) -> String:
     """Megabytes, or kilobytes when megabytes would round to nothing.
 
-    The norms of a small model come to a few hundred kilobytes, and a table
-    that reports them as `0 MiB` reads like they were not placed at all.
+    The norms of a small model come to a few hundred kilobytes, and the rope
+    frequencies to a few hundred bytes. A table that reports either as `0 MiB`
+    reads like they were not placed at all, which is the one thing this table
+    exists to say.
     """
+    if bytes < 1024:
+        return String(bytes) + " bytes"
     if bytes < MIB:
         return String(bytes // 1024) + " KiB"
     return _mib(bytes)
