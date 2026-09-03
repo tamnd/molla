@@ -33,6 +33,7 @@ from molla.sys.device import run_devices
 from molla.sys.mem import AllocCounter
 from molla.sys.poll import USES_KQUEUE
 from molla.tls.client import probe, run_tls
+from molla.tokenizer.tokenizer import run_tokenize
 
 
 def print_version():
@@ -127,6 +128,10 @@ def print_usage():
     print(
         "                  --host --port --ctx --device, and 127.0.0.1:8000"
         " when nothing says"
+    )
+    print(
+        "  tokenize <tokenizer.json> <prompt> [--ids]  print how many tokens a"
+        " prompt is"
     )
     print("  devices         list what this machine can put a tensor on")
     print("  config get [key] print a setting and where its value came from")
@@ -602,6 +607,19 @@ def main():
             )
         except e:
             print("molla serve:", e)
+            exit(1)
+    elif command == "tokenize":
+        # No model file, because encoding a prompt does not need one. The
+        # benchmark harness asks this to find out how much work it is about to
+        # hand three engines, and loading eight gigabytes to count 512 tokens
+        # would have made the measurement cost more than the thing measured.
+        if len(args) < 4:
+            print("molla tokenize: expected a tokenizer.json and a prompt")
+            exit(2)
+        try:
+            run_tokenize(args[2], args[3], len(args) > 4 and args[4] == "--ids")
+        except e:
+            print("molla tokenize:", e)
             exit(1)
     elif command == "devices":
         try:

@@ -20,6 +20,7 @@ from molla.json.reader import (
     EV_OBJECT_END,
     Reader,
 )
+from molla.sys.mem import AllocCounter
 from molla.sys.mmap import Mapping
 from molla.text.props import Unicode
 from molla.text.regex import Scratch
@@ -383,3 +384,30 @@ def _last_boundary(text: List[UInt8]) -> Int:
         at -= 1
         back += 1
     return len(text)
+
+
+def run_tokenize(tokenizer_path: String, prompt: String, ids: Bool) raises:
+    """Print how many tokens a prompt is, and the ids when asked.
+
+    The one thing a benchmark harness needs before it starts: three engines
+    have to be given the same amount of work, and a prompt built to a target
+    length is only that length once somebody has counted it. There is no model
+    file in this because encoding does not need one, so counting a 512 token
+    prompt costs the tokenizer file rather than eight gigabytes of weights.
+    """
+    var counter = AllocCounter()
+    var tokenizer = Tokenizer(tokenizer_path, counter.raw())
+    var session = Session()
+    var out = List[Int]()
+    tokenizer.encode(prompt, True, session, out)
+
+    if not ids:
+        print(len(out))
+        return
+    var line = String("")
+    for i in range(len(out)):
+        if i > 0:
+            line += " "
+        line += String(out[i])
+    print(len(out))
+    print(line)

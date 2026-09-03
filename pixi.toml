@@ -81,3 +81,8 @@ conformance-logits = "mojo run -I src scripts/logit_oracle.mojo scripts/logit_ca
 # skipped on a device because there is no planar form of an unquantized weight.
 conformance-logits-device = "mojo run -I src scripts/logit_oracle.mojo scripts/logit_cases.txt scripts/logits corpus/logits --device=auto"
 conformance-template-full = { cmd = "mojo run -I src scripts/template_oracle.mojo scripts/template_cases.txt scripts/templates.tsv corpus/templates full", env = { TZ = "UTC" } }
+# molla against llama.cpp and Ollama on one machine, same file, same prompt,
+# same token count. Takes a model and a tokenizer after the task name, plus any
+# of the flags the script documents. Not run by CI, because a shared runner
+# cannot produce a number worth writing down.
+bench = "python3 scripts/bench.py"

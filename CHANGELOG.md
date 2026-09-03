@@ -2,6 +2,13 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- molla is measured against llama.cpp and Ollama. `scripts/bench.py` puts the same GGUF file, byte for byte, with the same prompt and the same token count, through all three on one machine and prints one table of prefill tokens per second, decode tokens per second, time to first token and peak resident bytes. Every table records the machine, the backend, the digest of the model file, the build of each engine and the wall clock, so two numbers can be compared only when they are comparable. Results are in [docs/validation/bench.md](docs/validation/bench.md), one table per fleet machine, and `pixi run bench` is the task. Decode on a 4090 is 2.2 times off llama.cpp on SmolLM2 and 2.5 times off on Qwen, against the 1.5 times gate at M7. Prefill is eighty times off, because molla runs a prompt through the one token at a time path and llama.cpp prefills it as one matrix multiply.
+- `molla tokenize <tokenizer.json> "<prompt>" [--ids]` prints how many tokens a prompt is, and the ids when asked. No model file, because encoding does not need one. The benchmark harness builds a prompt to a target length and only knows the length once something has counted it, and doing that with `molla generate` cost a full prefill per attempt, which on an eight gigabyte model is minutes for an answer the tokenizer alone gives in milliseconds.
+
 ## [0.3.3] - 2026-09-03
 
 The same fourteen logit cases, on the host, on Metal and on CUDA.
