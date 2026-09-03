@@ -22,6 +22,14 @@ The device forward pass needs every weight on the card, so half fitting does not
 
 Planning costs a header parse and two directory reads, so `choose_backend` opens the file and the repack cache a second time purely to ask. That second open is a few hundred microseconds against a load that is measured in seconds, and it buys one decision in one place instead of a half loaded state threaded through two entry points that differ in every other respect.
 
+## A file the kernels cannot read is settled first
+
+The device matvecs read the planar form of a quantized weight and nothing else, so an f16 or bf16 model has nothing on the card for them to read however much room there is. `device_refusal` asks that off the tensor directory, before fitting, because it is the more basic answer and a bigger card does not change it. A matrix counts and a norm does not, since a norm is one dimensional and is uploaded as floats whatever type it has.
+
+It then splits the way every other question here splits. `auto` stays on the host and the reason is printed under the backend line, `--device=metal` is an error. Without it the failure arrives from inside the repack, as a cache that was written and still cannot be used, which is true and says nothing about the model that caused it.
+
+`molla load` opts out of this one question, and it is the only caller that does. Copying an f16 tensor to a card is a perfectly good thing to time and that command launches no kernels, so what the matvecs support is not its business.
+
 ## What each command does with it
 
 | Command | Default | What the flag does |

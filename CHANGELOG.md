@@ -2,6 +2,17 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The logit corpus runs on a device. `scripts/logit_oracle.mojo` takes `--device` with the same spellings every command takes, loads onto the card, traces the device forward pass and compares it against the same reference files the host run uses. One set of tolerances covers all three backends: the host, an M4 and a 4090 agree with llama.cpp to the digits printed, and the largest difference between any two of them on any case is 1.75e-5 against a tolerance of 2e-1. `pixi run conformance-logits-device` is the task. See [docs/validation/logits.md](docs/validation/logits.md).
+- An unquantized model on a device is refused before it is loaded, and the message says why. The device matvecs read the planar form of a quantized weight and an f16 file has no planar form, so `--device=metal` on one is an error, `--device=auto` on one is a host run with the reason printed under the backend line, and the logit corpus reports its f16 case as a stated skip. Before this the failure came out of the repack as a cache that was written and still cannot be used, which said nothing about the model that caused it. `molla load` is exempt, because copying an f16 tensor to a card is a real thing to time and that command launches no kernels.
+
+### Changed
+
+- `molla generate --device` loads through the same code the server and the logit oracle load through. It had its own copy of the context, the repack and the fit check from before `molla.engine.device` existed, which is how the refusal above initially reached two of the three callers and not the third.
+
 ## [0.3.2] - 2026-09-03
 
 A token goes in and a row of logits comes out without leaving the card.
