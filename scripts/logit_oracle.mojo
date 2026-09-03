@@ -44,12 +44,21 @@ Usage:
 from std.math import exp, log, sqrt
 from std.sys import argv, exit
 
-from molla.engine.bind import bind
+from max.gpu.host import DeviceContext
+
+from molla.engine.backend import Backend, parse_backend, pick
+from molla.engine.bind import Bound, bind
+from molla.engine.device import (
+    device_context,
+    device_refusal,
+    load_on_device,
+    open_session,
+)
 from molla.engine.session import Session as Decode
 from molla.model.gguf import Gguf
 from molla.model.load import load, plan_load
-from molla.model.repack import model_key, open_cache
-from molla.sys.device import default_device
+from molla.model.repack import RepackCache, model_key, open_cache
+from molla.sys.device import Device, devices, host_device
 from molla.sys.mmap import Mapping
 
 comptime SUM_TOL = Float64(2e-3)
@@ -290,7 +299,113 @@ def _found(spec: Case, token: Int) -> Float64:
     return -1e30
 
 
-def _check(spec: Case, model_dir: String) raises -> Int:
+struct Run(Movable):
+    """What one forward pass left behind, whichever backend ran it.
+
+    Copied out of the session rather than borrowed from it, because the two
+    sessions keep them in different places and neither outlives the load it was
+    made against. A trace is a few hundred kilobytes and this happens once per
+    case.
+    """
+
+    var trace: List[Float32]
+    var logits: List[Float32]
+
+    def __init__(out self):
+        self.trace = List[Float32]()
+        self.logits = List[Float32]()
+
+
+def _check_shape(b: Bound, spec: Case) raises:
+    """That the file on disk is the one the reference was taken against."""
+    if b.width() != spec.width:
+        raise Error(
+            "the file is "
+            + String(b.width())
+            + " wide and the reference says "
+            + String(spec.width)
+        )
+    if b.block_count() != spec.layers:
+        raise Error(
+            "the file has "
+            + String(b.block_count())
+            + " layers and the reference says "
+            + String(spec.layers)
+        )
+    if b.vocab() != spec.vocab:
+        raise Error(
+            "the file has a vocabulary of "
+            + String(b.vocab())
+            + " and the reference says "
+            + String(spec.vocab)
+        )
+
+
+def _run_host(g: Gguf, cache: RepackCache, spec: Case) raises -> Run:
+    """The prompt through the host kernels, tracing every layer."""
+    var weights = load(g, plan_load(g, host_device(), 0, cache), 0, False, "")
+    var b = bind(g, cache)
+    _check_shape(b, spec)
+
+    var d = Decode(b, len(spec.tokens) + 1)
+    d.scratch.tracing = True
+    d.prefill(b, spec.tokens)
+
+    var out = Run()
+    out.trace.reserve(len(d.scratch.trace))
+    for i in range(len(d.scratch.trace)):
+        out.trace.append(d.scratch.trace[i])
+    out.logits.reserve(spec.vocab)
+    for i in range(spec.vocab):
+        out.logits.append(d.logits.data[i])
+    _ = weights^
+    return out^
+
+
+def _run_device(
+    g: Gguf,
+    mut cache: RepackCache,
+    path: String,
+    dev: Device,
+    ctx: DeviceContext,
+    spec: Case,
+) raises -> Run:
+    """The same prompt through the device kernels, tracing the same layers.
+
+    The trace costs a synchronize and a download per layer, which is the thing
+    `molla.engine.device` exists to avoid, and it is the right trade here: a
+    trace that could only be taken by running a different code path would be
+    checking a different program.
+    """
+    var weights = load_on_device(g, cache, path, dev, ctx)
+    var host_b = bind(g, cache)
+    var b = bind(g, cache, weights.residency())
+    _check_shape(b, spec)
+
+    var held = open_session(ctx, host_b, b, len(spec.tokens) + 1)
+    var s = held.take()
+    s.scratch.tracing = True
+    s.prefill(spec.tokens)
+    s.fetch()
+
+    var out = Run()
+    out.trace.reserve(len(s.scratch.trace))
+    for i in range(len(s.scratch.trace)):
+        out.trace.append(s.scratch.trace[i])
+    out.logits.reserve(spec.vocab)
+    for i in range(spec.vocab):
+        out.logits.append(s.logits.data[i])
+    _ = s^
+    _ = weights^
+    return out^
+
+
+def _check(
+    spec: Case,
+    model_dir: String,
+    backend: Backend,
+    ctx: Optional[DeviceContext],
+) raises -> Int:
     """The number of complaints, or minus one when the model is not here.
 
     Prints one line per case, plus a detail line for each thing that
@@ -321,37 +436,28 @@ def _check(spec: Case, model_dir: String) raises -> Int:
 
     var g = Gguf(path)
     var cache = open_cache(path, model_key(g))
-    var weights = load(g, plan_load(g, default_device(), 0), 0, False, "")
-    var b = bind(g, cache)
-    if b.width() != spec.width:
-        raise Error(
-            "the file is "
-            + String(b.width())
-            + " wide and the reference says "
-            + String(spec.width)
-        )
-    if b.block_count() != spec.layers:
-        raise Error(
-            "the file has "
-            + String(b.block_count())
-            + " layers and the reference says "
-            + String(spec.layers)
-        )
-    if b.vocab() != spec.vocab:
-        raise Error(
-            "the file has a vocabulary of "
-            + String(b.vocab())
-            + " and the reference says "
-            + String(spec.vocab)
-        )
-
-    var d = Decode(b, len(spec.tokens) + 1)
-    d.scratch.tracing = True
-    d.prefill(b, spec.tokens)
+    var run: Run
+    if backend.on_device:
+        # A model the device kernels cannot read is a skip and not a failure,
+        # and it says which model and why rather than counting as a pass. The
+        # f16 case in this corpus is the one that hits it: there is no planar
+        # form of an unquantized weight, so there is nothing for a device matvec
+        # to read.
+        var refusal = device_refusal(g)
+        if refusal.byte_length() > 0:
+            print("  " + spec.name + "  skipped, " + refusal)
+            cache.close()
+            g.close()
+            return -1
+        run = _run_device(g, cache, path, backend.device, ctx.value(), spec)
+    else:
+        run = _run_host(g, cache, spec)
 
     var n = len(spec.tokens)
     var w = spec.width
-    var per = d.scratch.snapshots(w) // n
+    if len(run.trace) % w != 0:
+        raise Error("the trace is not a whole number of snapshots")
+    var per = (len(run.trace) // w) // n
     if per != spec.layers + 2:
         raise Error(
             "molla took "
@@ -378,7 +484,7 @@ def _check(spec: Case, model_dir: String) raises -> Int:
         for p in range(from_pos, n):
             var at = (p * per + k) * w
             for i in range(w):
-                var v = Float64(d.scratch.trace[at + i])
+                var v = Float64(run.trace[at + i])
                 total += v
                 mass += _abs(v)
                 if p == n - 1:
@@ -416,7 +522,7 @@ def _check(spec: Case, model_dir: String) raises -> Int:
         var last = ((n - 1) * per + k) * w
         var at_index = [0, 1, 2, w - 3, w - 2, w - 1]
         for j in range(6):
-            var got = Float64(d.scratch.trace[last + at_index[j]])
+            var got = Float64(run.trace[last + at_index[j]])
             var theirs = want.sampled[j]
             var off = _abs(got - theirs) / _max(_abs(theirs), scale)
             if off > worst_elem:
@@ -439,11 +545,7 @@ def _check(spec: Case, model_dir: String) raises -> Int:
         if complained and first < 0:
             first = k
 
-    var logits = List[Float32]()
-    logits.reserve(spec.vocab)
-    for i in range(spec.vocab):
-        logits.append(d.logits.data[i])
-    var lp = _log_softmax(logits)
+    var lp = _log_softmax(run.logits)
 
     var worst_top = Float64(0)
     var wrong_rank = 0
@@ -543,18 +645,59 @@ def _check(spec: Case, model_dir: String) raises -> Int:
 
     cache.close()
     g.close()
-    _ = weights^
     return bad
+
+
+def _resolve(value: String) raises -> Backend:
+    """Which backend the whole run uses, fixed before the first case.
+
+    Fixed for the run rather than chosen per case, and the fit list says yes to
+    everything on purpose. A model too big for the card has to fail loudly here,
+    because a corpus that quietly ran three of its fourteen cases on the host
+    would report agreement for a backend that never saw them.
+    """
+    var all = devices()
+    var fits = List[Bool]()
+    for _ in range(len(all)):
+        fits.append(True)
+    return pick(parse_backend(value), all, fits)
 
 
 def main() raises:
     var args = argv()
-    if len(args) != 4:
-        print("usage: logit_oracle <cases.txt> <reference-dir> <model-dir>")
+    if len(args) < 4 or len(args) > 5:
+        print(
+            "usage: logit_oracle <cases.txt> <reference-dir> <model-dir>"
+            " [--device=auto|cpu|metal|cuda]"
+        )
         exit(2)
     var cases = String(args[1])
     var ref_dir = String(args[2])
     var model_dir = String(args[3])
+    var want = String("cpu")
+    if len(args) == 5:
+        var arg = String(args[4])
+        if not arg.startswith("--device="):
+            print("the only flag is --device=")
+            exit(2)
+        want = String(arg[byte = 9 : arg.byte_length()])
+
+    var backend: Backend
+    try:
+        backend = _resolve(want)
+    except e:
+        print(String(e))
+        exit(2)
+        backend = Backend()
+    print("backend  " + backend.describe())
+
+    # One context for the whole run, made before any case and handed to every
+    # one of them. A CUDA process gets a single `DeviceContext` and hangs on the
+    # first allocation against a second, so fourteen cases cannot each make
+    # their own.
+    var ctx = Optional[DeviceContext](None)
+    if backend.on_device:
+        ctx = device_context(backend.device.index)
 
     var names = List[String]()
     var lines = _lines(_read(cases))
@@ -575,7 +718,7 @@ def main() raises:
             print("  " + names[i] + "  no reference, " + String(e))
             skipped += 1
             continue
-        var out = _check(spec, model_dir)
+        var out = _check(spec, model_dir, backend, ctx)
         if out < 0:
             skipped += 1
         else:
@@ -590,9 +733,15 @@ def main() raises:
         )
         exit(1)
     if bad > 0:
-        print(String(bad) + " disagreements with llama.cpp")
+        print(
+            String(bad)
+            + " disagreements with llama.cpp on "
+            + backend.describe()
+        )
         exit(1)
-    var line = String(ran) + " cases agree with llama.cpp"
+    var line = (
+        String(ran) + " cases agree with llama.cpp on " + backend.describe()
+    )
     if skipped > 0:
         line += ", " + String(skipped) + " skipped"
     print(line)
