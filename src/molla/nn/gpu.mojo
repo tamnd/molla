@@ -310,11 +310,16 @@ def planar_matvec_kernel[
             # would halve the loads and change which thread sums which term,
             # and that changes the last bits of every row. Not worth it for a
             # kernel that is waiting on DRAM either way.
+            #
+            # Which half of the byte, and the sign extension under it, are
+            # arithmetic and not branches. Neighbouring threads take opposite
+            # halves, so a branch here is one every warp takes both sides of,
+            # and the whole loop body runs twice for every warp in the grid.
+            # `(n ^ 8) - 8` is the four bit two's complement sign extension.
             var b = Int(packed[unsafe_offset=row + (i >> 1)])
-            var n = (b >> 4) if (i & 1) != 0 else (b & 0xF)
+            var n = (b >> ((i & 1) * 4)) & 0xF
             comptime if form == QUANT_S4:
-                if n >= 8:
-                    n -= 16
+                n = (n ^ 8) - 8
             q = Float32(n)
         var a = x[unsafe_offset=i]
         acc += scales[unsafe_offset=d_base + gi] * q * a

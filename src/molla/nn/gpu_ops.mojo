@@ -344,11 +344,12 @@ def planar_row_kernel[
         comptime if form == QUANT_I8:
             q = Float32(Int(quants[unsafe_offset=row + i]))
         else:
+            # Arithmetic rather than a branch, for the reason `gpu.mojo` gives
+            # where the same two lines are.
             var b = Int(packed[unsafe_offset=row + (i >> 1)])
-            var n = (b >> 4) if (i & 1) != 0 else (b & 0xF)
+            var n = (b >> ((i & 1) * 4)) & 0xF
             comptime if form == QUANT_S4:
-                if n >= 8:
-                    n -= 16
+                n = (n ^ 8) - 8
             q = Float32(n)
         var v = scales[unsafe_offset=d_base + gi] * q
         comptime if with_min:
