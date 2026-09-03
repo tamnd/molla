@@ -153,24 +153,27 @@ def capture(args: list[str], env: dict | None = None) -> tuple[str, int, int]:
     return out, code, peak_of(usage)
 
 
-def prompt_of(tokens: int, molla: str, model: str, tokenizer: str) -> tuple[str, int]:
+def prompt_of(tokens: int, molla: str, tokenizer: str) -> tuple[str, int]:
     """Filler repeated until molla counts at least `tokens`, and the count.
 
     The count comes back from the engine rather than from an estimate here
     because the whole table depends on the three engines having been given the
     same amount of work, and a tokenizer disagreement of five per cent is a
     prefill throughput disagreement of five per cent.
+
+    `molla tokenize` and not `molla generate`, because generate would have to
+    load the weights and prefill the prompt to reach the line with the count on
+    it, which on an eight gigabyte model is minutes per attempt for an answer
+    the tokenizer alone can give in milliseconds.
     """
     text = FILLER
     for _ in range(40):
-        out, code, _ = capture(
-            [molla, "generate", model, tokenizer, text, "1", "--device=cpu"]
-        )
+        out, code, _ = capture([molla, "tokenize", tokenizer, text])
         if code != 0:
             die("molla could not count the prompt:\n" + out[-800:])
-        m = re.search(r"prompt:\s+(\d+) tokens", out)
+        m = re.search(r"(\d+)", out)
         if m is None:
-            die("molla printed no prompt line:\n" + out[-800:])
+            die("molla printed no count:\n" + out[-800:])
         got = int(m.group(1))
         if got >= tokens:
             return text, got
@@ -474,7 +477,7 @@ def main() -> None:
         die(f"no molla binary at {molla}, build it first")
 
     print(f"building a prompt of at least {want_prompt} tokens", file=sys.stderr)
-    prompt, prompt_tokens = prompt_of(want_prompt, molla, str(model), tokenizer)
+    prompt, prompt_tokens = prompt_of(want_prompt, molla, tokenizer)
 
     # Resolved once, so every row says which card rather than saying auto.
     resolved = device
