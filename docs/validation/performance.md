@@ -72,15 +72,14 @@ The post projection norm that Gemma has sits between the projection and the resi
 
 Attention itself is not elementwise.
 
-So the count per layer, before and after:
+So the count, before and after. These are counted rather than derived: nsys over five forward passes on gpc, every kernel instance summed and divided by five.
 
-| model | before | after | what moved |
-| --- | --- | --- | --- |
-| Llama 3.1 8B q4_K_M | 15 | 12 | two residual adds and the swiglu |
-| SmolLM2 135M q8_0 | 15 | 12 | the same three |
-| Qwen 2.5 0.5B q4_K_M | 18 | 12 | those three and three qkv biases |
+| model | layers | a layer before | a layer after | a token before | a token after |
+| --- | --- | --- | --- | --- | --- |
+| SmolLM2 135M q8_0 | 30 | 15 | 12 | 453 | 363 |
+| Qwen 2.5 0.5B q4_K_M | 24 | 18 | 12 | 435 | 291 |
 
-Twenty per cent off a model without bias and a third off one with it. On SmolLM2 that is 453 launches a token down to 363, which by the budget in the section above is 1.78 ms of launch cost rather than 2.22.
+Twenty per cent off a model without bias and a third off one with it. On SmolLM2 that is 1.78 ms of launch cost by the budget in the section above rather than 2.22. The three launches over the layer total in both rows are the embedding, the final norm and the output head, and they do not move.
 
 It is exact and was checked as exact rather than argued to be. Every one of the three is the same arithmetic on the same values in the same order as the kernel it replaces, so the whole logit corpus is unchanged in every digit on both backends, and the layer by layer device against host comparison in `tests/test_gpu_block.mojo` holds at the tolerance it already had.
 
