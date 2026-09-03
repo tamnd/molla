@@ -2,7 +2,13 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.3.2] - 2026-09-03
+
+A token goes in and a row of logits comes out without leaving the card.
+
+Two issues, and together they are what M2b was for. The first is a whole forward pass in device memory rather than twenty one kernels that each have to come home, which on a 4090 is the difference between 5681 ms and 12 ms per token on an 8B. The second is being able to say which backend a run is on and to refuse the one that is not there, because the first is worth nothing to a benchmark that cannot tell which of the two it just measured.
+
+The default changed with it. `molla generate` and `molla serve` with no flag now run on an accelerator when the model fits on one, and `--device=cpu` is the way back.
 
 ### Added
 
