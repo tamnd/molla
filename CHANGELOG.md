@@ -4,6 +4,27 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-04
+
+One line of the decode matvec, and Metal is about twice as fast as it was.
+
+The group index into the scale plane was written `i // group`, with `group` a compile time constant of 32 or 16. NVVM turns that into a shift and the Metal compiler does not, and a signed divide has to correct for a negative numerator whatever the divisor is, so on Metal more than half of the hottest kernel in the program was the compiler being careful about a sign that index has never had. It is a shift now. The change is worth nothing on CUDA and it is worth 0.8 to 2.1 tokens per second on Llama 3.1 8B on an M4.
+
+The useful part is how it was found, which is a new probe rather than a profiler. Every performance number this project has published came off a 4090, and this one cost zero per cent there, so no amount of reading that profile would have turned it up.
+
+### Added
+
+- `scripts/matvec_probe.mojo`, which runs the decode matvec over a synthetic planar tensor of a real shape and prices six arrangements of its inner loop against each other. A question that was an hour of nsys against an 8B model is now a second against a tensor that does not have to be a model, and it runs on whichever backend the machine has, which is the point. Microseconds a launch on a 4096 by 4096 q4_K matvec, Apple M4 then RTX 4090: as shipped 1916 and 29, with the shift 867 and 29, with 32 bit loop indices 740 and 29, a thread to a group 639 and 64, with the scale plane read deleted 521 and 28, and with all the arithmetic deleted 199 and 10.
+
+### Changed
+
+- The device matvecs index the scale plane with a shift rather than a division. Decode on an M4 goes from 0.8 tokens per second to 2.1 on Llama 3.1 8B q4_K_M, 9.9 to 19.0 on Qwen 2.5 0.5B q4_K_M and 24.7 to 31.2 on SmolLM2 135M q8_0, and does not move on a 4090. The bigger the model the bigger the win, because the more of a token is that one kernel. It computes the same index, so it was checked with no tolerance: the whole logit corpus on Metal is identical in every digit to the same corpus from the commit before, and CUDA is green on all thirteen device cases. `group_shift` in `src/molla/nn/repack.mojo` is where the reasoning is, and `tests/test_repack.mojo` fails if a quant type is ever added whose group is not a power of two.
+- [docs/validation/layout.md](docs/validation/layout.md) has the probe table, the three model decode table and a correction. The conclusion 0.4.1 drew from the packing measurement, that molla's matvec is limited by work per value rather than by bytes, is a fact about a 4090 and had been written as though it were a fact about both backends. It was not one, and half of the Metal kernel was something else entirely.
+
+### Fixed
+
+- The test suite builds without warnings. Five files had an unused variable or a loop index nothing read, and one check folded five constant comparisons that the compiler could answer without running the test. That one now compares every pair at runtime, which is both what it was trying to say and something the compiler cannot fold away.
+
 ## [0.4.1] - 2026-09-04
 
 The first half of M2c, which is the memory half, plus one prediction that turned out to be wrong.
