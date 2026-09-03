@@ -2,7 +2,13 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.3] - 2026-09-03
+
+The same fourteen logit cases, on the host, on Metal and on CUDA.
+
+One issue, and what it produced is a number rather than a feature. The corpus that has been checking molla against llama.cpp since #30 now runs through the device kernels too, and all three backends land in the same place: one set of tolerances covers them, the worst case per target is identical to the digits printed, and the largest difference between any two of them on any case is 1.75e-5. Three implementations sharing no reduction order agreeing that closely is the strongest statement this repository can make about the device path being the same program.
+
+It also cost one confusing failure, which is now a clear one. An unquantized model has no planar form of its weights and the device matvecs read nothing else, so an f16 file on a card used to fail from inside the repack with a message about a cache. It is refused up front and by name.
 
 ### Added
 
