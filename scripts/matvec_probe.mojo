@@ -35,10 +35,14 @@ from molla.nn.quant import Q_Q4_K, Q_Q8_0
 comptime TILE = 128
 
 # What each variant takes away, in the order they are printed.
-comptime V_SHIPPED = 0
-"""The kernel as it is in `molla.nn.gpu`, for a number to compare against."""
+comptime V_DIVIDE = 0
+"""The kernel as it was before #190, with the group index by a signed divide."""
 comptime V_SHIFT = 1
-"""Same, with the group index by a shift rather than a signed divide."""
+"""Same with the group index by a shift, which is what #190 made it.
+
+This is the baseline the rest are against. `V_MAGIC` below is what #186 made it
+after that, so the two of them together are the before and after of this file.
+"""
 comptime V_NARROW = 2
 """Same again, with the loop counter and the group index 32 bits wide."""
 comptime V_PER_GROUP = 3
@@ -111,7 +115,7 @@ def probe_kernel[
 
     var acc = Float32(0)
 
-    comptime if variant == V_SHIPPED:
+    comptime if variant == V_DIVIDE:
         var i = t * 2
         while i < cols:
             var gi = i // group
@@ -418,8 +422,8 @@ def _sweep[
         + " MiB"
     )
     _report(
-        "  shipped   ",
-        _time[group, with_min, form, V_SHIPPED](
+        "  divide    ",
+        _time[group, with_min, form, V_DIVIDE](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
