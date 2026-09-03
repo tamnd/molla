@@ -49,7 +49,7 @@ from std.memory import AddressSpace, stack_allocation
 from std.sys.info import has_accelerator
 
 from max.gpu import barrier
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext
 
 from molla.nn.repack import LAYOUT_PLANAR, group_size, has_min
 from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
@@ -64,6 +64,101 @@ of work per thread. It is a parameter of the kernel rather than a constant
 inside it so that changing it is a launch site edit and not a rewrite, which is
 the form D7 asks divergence between targets to take.
 """
+
+
+struct DeviceVec(Movable):
+    """Float32 activations in device memory, owned.
+
+    The counterpart of `molla.nn.tensor.Buffer` and the thing that makes a
+    block run without leaving the device. Every operation in `molla.nn.gpu_ops`
+    takes these and returns nothing, so a norm feeding a matvec feeding a
+    residual add is three launches on one stream and no transfer between them.
+    A round trip to the host between two kernels costs more than either of them
+    at decode shapes, which is the whole argument for putting the small
+    operations on the device at all.
+
+    `upload` and `download` exist for the ends of a block and for tests. They
+    are not on the path a token takes once #143 lands, and every use of them
+    inside a sequence of kernels is a bug rather than a slow spot.
+
+    Not `ImplicitlyCopyable`, deliberately. Two vectors that name the same
+    device buffer is exactly the aliasing bug that produces a norm reading its
+    own half written output, and it is invisible in the numbers.
+    """
+
+    var buf: DeviceBuffer[DType.float32]
+    var n: Int
+
+    def __init__(out self, ctx: DeviceContext, n: Int) raises:
+        if n <= 0:
+            raise Error("a device vector needs a positive length")
+        self.buf = ctx.enqueue_create_buffer[DType.float32](n)
+        self.n = n
+
+    def elements(self) -> Int:
+        return self.n
+
+    def ptr(self) -> Pointer[Float32, MutAnyOrigin]:
+        """The device address, for a kernel argument.
+
+        A host load through this faults. `map_to_host` is the other end and it
+        is a different address for the same bytes, which is the finding in
+        `docs/validation/load.md`.
+        """
+        return Pointer[Float32, MutAnyOrigin](
+            unsafe_from_address=Int(self.buf.unsafe_ptr())
+        )
+
+    def upload(mut self, x: Buffer) raises:
+        if x.elements() != self.n:
+            raise Error(
+                "uploading "
+                + String(x.elements())
+                + " values into a device vector of "
+                + String(self.n)
+            )
+        with self.buf.map_to_host() as h:
+            for i in range(self.n):
+                h[i] = x.data[i]
+
+    def upload_run(mut self, x: List[Float32], at: Int, n: Int) raises:
+        """Part of a host list into the front of this vector.
+
+        A key cache is one long list per layer with a token's heads laid end to
+        end, so the thing an attention test wants to move is a run out of the
+        middle of one rather than a whole `Buffer`.
+        """
+        if at < 0 or n <= 0 or len(x) < at + n or n > self.n:
+            raise Error("a run to upload has to fit in both ends")
+        with self.buf.map_to_host() as h:
+            for i in range(n):
+                h[i] = x[at + i]
+
+    def download(self, mut out: Buffer) raises:
+        if out.elements() != self.n:
+            raise Error(
+                "downloading a device vector of "
+                + String(self.n)
+                + " into "
+                + String(out.elements())
+                + " values"
+            )
+        with self.buf.map_to_host() as h:
+            for i in range(self.n):
+                out.data[i] = h[i]
+
+    def at(self, index: Int) raises -> Float32:
+        """One value, for a test that wants a scalar out of a reduction.
+
+        A map and an unmap for one float, which is why nothing on a hot path
+        calls it.
+        """
+        if index < 0 or index >= self.n:
+            raise Error("index " + String(index) + " is outside this vector")
+        var got: Float32
+        with self.buf.map_to_host() as h:
+            got = h[index]
+        return got
 
 
 def planar_matvec_kernel[
@@ -158,6 +253,16 @@ def check_matvec(w: Tensor, x: Buffer, out_elements: Int) raises:
     reads zeros. Refusing here is the difference between a shape error and a
     model that runs at full speed and answers with noise.
     """
+    check_matvec_shapes(w, x.elements(), out_elements)
+
+
+def check_matvec_shapes(w: Tensor, in_elements: Int, out_elements: Int) raises:
+    """The same checks, counting elements rather than holding buffers.
+
+    Which is what the device to device path needs, since a `DeviceVec` is not
+    copyable and a check that took one would have to borrow it through a
+    signature that says nothing about why.
+    """
     if w.layout != LAYOUT_PLANAR:
         raise Error(
             "the device matvec reads the planar layout and this weight is"
@@ -173,12 +278,12 @@ def check_matvec(w: Tensor, x: Buffer, out_elements: Int) raises:
             " in host memory, which a device kernel reads as zeros rather than"
             " as an error"
         )
-    if x.elements() != w.cols:
+    if in_elements != w.cols:
         raise Error(
             "the device matvec wants an input of "
             + String(w.cols)
             + " but got "
-            + String(x.elements())
+            + String(in_elements)
         )
     if out_elements != w.rows:
         raise Error(
@@ -191,49 +296,35 @@ def check_matvec(w: Tensor, x: Buffer, out_elements: Int) raises:
 
 def _launch[
     tile: Int, group: Int, with_min: Bool
-](ctx: DeviceContext, w: Tensor, x: Buffer, mut out: Buffer) raises:
-    """One instantiation, and the transfers around it.
-
-    The input and output buffers are created per call, which is the wrong thing
-    to do in a decode loop and the right thing to do in a numerics check. #143
-    is where the residual stream stops making the trip.
-    """
-    var d_x = ctx.enqueue_create_buffer[DType.float32](w.cols)
-    var d_o = ctx.enqueue_create_buffer[DType.float32](w.rows)
-    with d_x.map_to_host() as h:
-        for i in range(w.cols):
-            h[i] = x.data[i]
+](ctx: DeviceContext, w: Tensor, x: DeviceVec, mut out: DeviceVec) raises:
+    """One instantiation, launched. No transfer either side of it."""
     ctx.enqueue_function[planar_matvec_kernel[tile, group, with_min]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
-        Pointer[Float32, MutAnyOrigin](
-            unsafe_from_address=Int(d_x.unsafe_ptr())
-        ),
-        Pointer[Float32, MutAnyOrigin](
-            unsafe_from_address=Int(d_o.unsafe_ptr())
-        ),
+        x.ptr(),
+        out.ptr(),
         Int32(w.cols),
         Int32(w.row_bytes()),
         grid_dim=(w.rows, 1, 1),
         block_dim=(tile, 1, 1),
     )
-    ctx.synchronize()
-    with d_o.map_to_host() as h:
-        for r in range(w.rows):
-            out.data[r] = h[r]
 
 
-def device_matvec(
-    ctx: DeviceContext, w: Tensor, x: Buffer, mut out: Buffer
+def device_matvec_into(
+    ctx: DeviceContext, w: Tensor, x: DeviceVec, mut out: DeviceVec
 ) raises:
-    """`out[r] = dot(row r of w, x)` on the accelerator `ctx` opened.
+    """`out[r] = dot(row r of w, x)`, both sides already on the device.
 
     The dispatch is over the two things the layout varies by, which are the
     group size and whether there is a minimum plane, and there are three live
     combinations rather than four: everything with a minimum groups by 32, and
     the only type that groups by 16 is q6_k, which centres its quants and has no
     minimum at all.
+
+    Queued and not synchronized. A block is a couple of dozen of these and
+    waiting after each one would put the cost this exists to remove back in a
+    different place, so the caller synchronizes once when it wants the answer.
     """
-    check_matvec(w, x, out.elements())
+    check_matvec_shapes(w, x.elements(), out.elements())
     comptime if not has_accelerator():
         raise Error(
             "this build has no device code in it, so there is no device matvec"
@@ -254,3 +345,31 @@ def device_matvec(
                 + String(g)
                 + " with a minimum plane"
             )
+
+
+def device_matvec(
+    ctx: DeviceContext, w: Tensor, x: Buffer, mut out: Buffer
+) raises:
+    """`out[r] = dot(row r of w, x)` with host activations either side.
+
+    What the oracle and the tests call, and what nothing on a token's path
+    should. Every call allocates two device buffers, uploads, launches,
+    synchronizes and downloads, and at decode shapes the transfers cost more
+    than the multiply does. It exists because a kernel that could only be
+    called with device buffers could not be checked against the host at all
+    until there was a block to run.
+    """
+    check_matvec(w, x, out.elements())
+    comptime if not has_accelerator():
+        raise Error(
+            "this build has no device code in it, so there is no device matvec"
+            " to run. Accelerator support is decided when molla is compiled,"
+            " not when it is run"
+        )
+    else:
+        var d_x = DeviceVec(ctx, w.cols)
+        var d_o = DeviceVec(ctx, w.rows)
+        d_x.upload(x)
+        device_matvec_into(ctx, w, d_x, d_o)
+        ctx.synchronize()
+        d_o.download(out)

@@ -14,6 +14,8 @@ same expression, but one does it in float64 and rounds and the other works in
 float32 throughout, so the last bit or two differ.
 """
 
+from std.math import cos
+
 from harness import Suite
 
 from molla.nn.rope import (
@@ -24,6 +26,7 @@ from molla.nn.rope import (
     rotate,
     rotate_heads,
     rotate_scaled,
+    step_table,
 )
 from molla.nn.tensor import Buffer
 
@@ -83,6 +86,7 @@ def run(mut suite: Suite) raises:
     test_yarn(suite)
     test_factors(suite)
     test_heads(suite)
+    test_steps(suite)
     test_errors(suite)
 
 
@@ -405,6 +409,51 @@ def test_heads(mut suite: Suite) raises:
     except:
         raised = True
     suite.check(raised, "and so is a rotary dimension wider than the head")
+
+
+def test_steps(mut suite: Suite) raises:
+    """The frequency step table a device kernel is handed instead of a base.
+
+    It has to be the same value `angle` uses and not merely close to it, which
+    is the whole reason it exists. `angle` folds the step into a cosine, so the
+    way to compare them without exporting a private is to rotate a pair whose
+    input makes the answer the step's own cosine and sine, at position one where
+    the angle is the step itself.
+    """
+    suite.group("rope frequency steps")
+
+    var spec = RopeSpec(64, 500000.0)
+    var steps = step_table(spec)
+    suite.check(len(steps) == 32, "there is one step per pair")
+    suite.check(steps[0] == 1.0, "and the first pair turns a whole radian")
+
+    var falls = True
+    for i in range(1, len(steps)):
+        if steps[i] >= steps[i - 1]:
+            falls = False
+    suite.check(falls, "and every pair after it turns more slowly")
+
+    var worst = Float32(0)
+    for pair in range(len(steps)):
+        var turn = angle(spec, 1, pair, 1.0)
+        var want_c = Float32(cos(Float64(steps[pair])))
+        var gap = turn[0] - want_c
+        if gap < 0:
+            gap = -gap
+        if gap > worst:
+            worst = gap
+    suite.check(
+        worst == 0,
+        "and the table holds exactly what angle works out for itself",
+    )
+
+    # The two Gemma 3 alternates, which is the case where a table cached against
+    # the wrong spec would be read for the wrong layer.
+    var local = step_table(RopeSpec(64, 10000.0))
+    var glob = step_table(RopeSpec(64, 1000000.0))
+    suite.check(
+        local[16] != glob[16], "and two bases give two different tables"
+    )
 
 
 def test_errors(mut suite: Suite) raises:

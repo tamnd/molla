@@ -21,6 +21,7 @@ import test_attention
 import test_block
 import test_engine
 import test_gpu
+import test_gpu_ops
 import test_kernel
 import test_nnmodel
 import test_repack
@@ -90,6 +91,10 @@ def main():
         test_gpu.run(suite)
     except e:
         suite.fail("test_gpu", String(e))
+    try:
+        test_gpu_ops.run(suite)
+    except e:
+        suite.fail("test_gpu_ops", String(e))
     try:
         test_cache.run(suite)
     except e:
