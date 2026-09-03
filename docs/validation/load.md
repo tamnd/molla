@@ -16,11 +16,13 @@ Every tensor gets one of three placements, and the choice is made once in `plan_
 
 | Placement | What it means | When |
 | --- | --- | --- |
-| `host` | The tensor is the mapping. No copy at all. | No accelerator, or the card ran out of budget. |
-| `unified` | The tensor is the mapping, on a machine whose accelerator shares the same physical memory. No copy at all. | Apple silicon. |
-| `device` | The tensor is copied into a slot in one device pool buffer. | A card with its own memory and room for it. |
+| `host` | The tensor is the mapping. No copy at all. | No accelerator, or the device ran out of budget. |
+| `unified` | The tensor is the mapping, on a machine whose accelerator draws from the same physical memory. No copy at all. | Apple silicon, when the kernels are going to run on the host. |
+| `device` | The tensor is copied into a slot in one device pool buffer. | Any accelerator with room for it, unified or not. |
 
-`unified` is not `host` with a different name. They do the same amount of work, which is none, and the difference is what that none is worth. A host placement on a machine with a card means the card is not being used for those bytes. A unified placement means the bytes are already in the memory the accelerator draws from, so the pool the plan asked for costs nothing to satisfy. That is a fact about the budget rather than about any address, which is a correction: see the section at the end on what a unified weight cannot do.
+`unified` is not `host` with a different name. They do the same amount of work, which is none, and the difference is what that none is worth. A host placement on a machine with an accelerator means the accelerator is not being used for those bytes. A unified placement means the bytes are already in the memory the accelerator draws from, so a pool the plan asks for costs nothing to fill from anywhere else. That is a fact about the budget and not about any address, which is the correction the last section of this document goes into.
+
+What decides between `unified` and `device` on a machine that could do either is where the kernels are going to read from, and not what kind of memory the machine has. That is the one thing about this table that changed after the first device kernel ran. Sharing physical memory does not share an address space, so a weight a device kernel is going to read has to be in a pool on an M4 exactly as it does on a 4090.
 
 ## A weight knows which memory it is in
 
@@ -59,7 +61,7 @@ Both runs are the same file, `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`, 492073923
 | Copy | nothing to copy | 473 ms, 9904 MiB/s |
 | Total | 3746 ms | 499 ms |
 
-The M4 run:
+The M4 run, which is a host placement and is what `molla load --host` prints today. The wording of the second line has changed since this was taken, because the claim it made about a device reading the mapping turned out to be false, and the numbers have not.
 
 ```console
 plan   292 tensors, 4685 MiB, metal Apple M4
@@ -121,7 +123,7 @@ done   292 tensors in 954 ms
 
 The two plan lines are the point. The first counts the file, which has not changed, and the second counts what is going to be read. The difference between 4685 and 9573 is the planar layout the repack wrote. Before this the planner knew only the first number, so the read stage faulted in the model file while the binder pointed the kernels at the cache beside it, and all 4685 MiB of that was work nobody used.
 
-On the M4 the second number costs nothing to satisfy: 9573 MiB of weights ended up in the memory the GPU draws from with no allocation and no copy anywhere in the run. That is the saving unified names and it is the part that held up. What did not hold up is the sentence that used to follow it here, about a Metal kernel reading those bytes where they lie, and the last section is what replaced it. On the 4090 it costs a 9573 MiB pool, and the plan line, the copy line and the resident line are three separate counts of the same quantity, arrived at from the placements at three different points in the load, which the loader compares before it will report success.
+On the M4 the second number costs nothing to satisfy: 9573 MiB of weights ended up in the memory the GPU draws from with no allocation and no copy anywhere in the run. That is the saving unified names and it is the part that held up. What did not hold up is the sentence that used to follow it here, about a Metal kernel reading those bytes where they lie, and the last section is what replaced it and what a device load on the M4 costs instead. On the 4090 it costs a 9573 MiB pool, and the plan line, the copy line and the resident line are three separate counts of the same quantity, arrived at from the placements at three different points in the load, which the loader compares before it will report success.
 
 The cold half of the gpc run is worth recording too, because the table above is a warm page cache and says so. The same 8B read for the first time after landing on the disk took 3551 ms at 1319 MiB/s, and the copy behind it took 695 ms. That 1319 MiB/s is the storage number for that box and the 9639 MiB/s in the table is not.
 
@@ -137,11 +139,11 @@ The cold half of the gpc run is worth recording too, because the table above is 
 
 ## What the tests can and cannot check
 
-`tests/test_load.mojo` is 42 checks over a six tensor fixture. Placement is arithmetic and it is tested against made up devices, because the interesting cases are a card that is too small and a card that is unified, and no machine in the fleet is both. A `Device` is a plain struct with public fields, so a 2 GB discrete card and a 24 GB one are two lines of setup rather than two machines.
+`tests/test_load.mojo` is 58 checks over a six tensor fixture. Placement is arithmetic and it is tested against made up devices, because the interesting cases are a card that is too small and one that is unified, and no machine in the fleet is both. A `Device` is a plain struct with public fields, so a 2 GB discrete card and a 24 GB one are two lines of setup rather than two machines.
 
 The transfer pool runs against a real file on real threads and what it checks is conservation. Every tensor comes back exactly once, the bytes the workers faulted in add up to the bytes the plan said were there, and one worker loads the same thing as four. A load that drops a tensor or claims one twice fails there rather than in a kernel that gets the wrong weights and still produces plausible words.
 
-There is no device copy in the suite. The copy needs an accelerator and three of the five machines do not have one, so the numbers above are what proves that half.
+The device copy is checked on the two machines that have somewhere to copy to. `tests/test_gpu.mojo` allocates a real `DevicePool`, puts two tensors in it at the slots the plan would have chosen, and reads both back with a kernel, so the pool arithmetic and the asynchronous copy meet the same way they do in a load. Two tensors and not one, because a pool holding a single tensor cannot tell a correct base address from a correct offset. On the three machines with no accelerator the group reports a skip, since a build made there has no device code in it at all.
 
 ## The repack rides along on this pool
 
@@ -157,13 +159,18 @@ That is why there is a fourth stage in `stage_name` and a `repack` line in the r
 pixi run build
 ./build/molla devices
 ./build/molla load ~/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+./build/molla load ~/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --host
 ```
 
-`molla load` takes an optional worker count as a second argument. The default is half the cores capped at eight, which is a floor to keep a four thread box from spawning two threads and a ceiling because past eight the transfer pool is waiting on the storage device rather than on itself.
+`molla load` takes an optional worker count as an argument. The default is half the cores capped at eight, which is a floor to keep a four thread box from spawning two threads and a ceiling because past eight the transfer pool is waiting on the storage device rather than on itself.
+
+`--host` leaves every weight in the mapping and asks for no pool, which is what a load for host kernels costs. Without it the accelerator gets whatever fits, which is what a load for device kernels costs. On a machine with no accelerator the two are the same run.
 
 ## What a unified weight cannot do
 
 The paragraph that used to be at the top of this document said that a unified weight passes both `base` and `device_address`, and that a device kernel reads the mapping where it lies with no copy between. The first device kernel, in [#141](https://github.com/tamnd/molla/issues/141), found that the second half of that is false, so this section replaces it and the tracking issue is [#152](https://github.com/tamnd/molla/issues/152).
+
+It is at the end rather than the top because it is a correction and the record of what it cost to correct, and burying the measurements above it under it would be putting the apology before the work.
 
 Probed on the M4 through max-core 26.5.0.
 
@@ -173,6 +180,33 @@ The other half of the probe explains why. A device buffer's `unsafe_ptr()` is a 
 
 Nothing in the measured part of this document changes. A unified plan still allocates nothing and copies nothing, the M4 still loads 9573 MiB with no transfer, and every number in the tables above was taken before this was known and is unaffected by it, because none of them ever dereferenced anything.
 
-What changes is what the placement promises. `unified` now means that the weights are in the memory the accelerator draws from, which is a statement about what the pool cost rather than about what a kernel can be handed, and `Tensor.device_address` refuses a unified weight rather than returning a host address a kernel would read as zeros. Refusing is the right direction to be wrong in. A host kernel following a device address crashes on the spot; a device kernel following a host address produces a model that runs at full speed and answers with noise, and there is no test short of comparing logits that would catch it.
+What changes is what the placement promises. `unified` means that the weights are in the memory the accelerator draws from, which is a statement about what a pool would cost rather than about what a kernel can be handed, and `Tensor.device_address` refuses a unified weight rather than returning a host address a kernel would read as zeros. Refusing is the right direction to be wrong in. A host kernel following a device address crashes on the spot; a device kernel following a host address produces a model that runs at full speed and answers with noise, and there is no test short of comparing logits that would catch it.
 
-Making unified mean something to a kernel again is the second half of #152: the load reads into the host mapping of a device buffer, so there is still exactly one copy of the bytes and still no transfer, and the tensor carries the device address instead of the mapping address. The number this document reports for a unified load has to stay the same afterwards, which is what makes it a change with a measurement attached rather than a rename.
+### So a unified machine gets a pool too
+
+The second half of #152 was going to be a way of making `unified` mean something to a kernel again, by reading the weights into the host mapping of a device buffer so that one set of bytes had both addresses. What was measured instead says not to bother. Four things were probed on the M4, and the fourth is the one that decided it.
+
+A pool of 1024 MiB allocates in under a millisecond, because the allocation is lazy and the pages arrive on first touch. Its host mapping is a real address that eight threads write into concurrently at 17964 MiB/s. Those writes are still there after the mapping is released, all 262144 pages of them, and a kernel reads them back correctly. So the two address scheme would have worked.
+
+And the ordinary asynchronous `enqueue_copy` that the discrete path has used all along works on a unified pool as well, giving a kernel result identical to the mapped one, to the bit. There was no reason to write a second copy path. What a unified machine was missing was not a mechanism, it was permission: `device_budget` returned zero for it and `plan_load` skipped it when handing out slots, both on the assumption that a pool there was a copy bought for nothing. Deleting those two conditions is the whole change.
+
+The reserve is the one number that had to differ. A tenth of a card is holding back memory nothing else wants, and a tenth of a unified machine is holding back memory the operating system, the page cache and every other process are drawing from. A unified device keeps a quarter of the machine back instead, which on a 16 GiB M4 leaves a budget of 12288 MiB and lands close to what Metal itself recommends as a working set.
+
+### What the device address costs on the M4
+
+Both runs are the same warm cache 8B, back to back on the same machine, and the only difference is the flag.
+
+| | `molla load --host` | `molla load` |
+| --- | --- | --- |
+| Placement | 9573 MiB unified | 9573 MiB to the device pool |
+| Budget | none asked for | 12288 MiB |
+| Workers | 5 | 5 |
+| Read | 4156 ms, 2303 MiB/s | 5287 ms, 1810 MiB/s |
+| Copy | nothing to copy | 3851 ms, 2485 MiB/s |
+| Total | 4157 ms | 5289 ms |
+
+A device address on this machine costs 1132 ms on a 4157 ms load, which is 27 per cent. That is not the copy. The copy is 3851 ms and it is hidden almost entirely, exactly as it is on the 4090: the total is 5289 ms against a read of 5287 ms, so the drain thread never once waited for the transfer to catch up. What the copy costs is the read it slows down, 2303 MiB/s falling to 1810, because on a unified machine the read and the copy are competing for one memory bus rather than for a bus each. That is the honest shape of the number and it is the reason the two runs are printed side by side rather than the device one alone.
+
+Neither run is the fallback of the other. `--host` is what the engine does today and is the right load when the kernels are going to run on the host, where a pool would be 9573 MiB of memory and 1132 ms bought for nothing. The default is the right load when they are going to run on the device, where the alternative is not a cheaper load but a model that answers with noise. Choosing between them from the backend rather than from a flag is [#144](https://github.com/tamnd/molla/issues/144).
+
+These timings are from a laptop that is shared and usually busy, so they are worth reading as a ratio and not as a record. The pair was taken back to back for that reason.

@@ -17,16 +17,22 @@ are not the same:
 Host. The tensor stays in the mapping. There is no copy and no allocation, the
 kernel reads the file's own pages, and the only work is faulting them in.
 
-Unified. The same thing, except the accelerator can read those pages too. On
-Apple silicon there is no host and device split, so a mapped file already is the
-device visible buffer and copying it into one would be work done for nothing.
-This is a placement, not a special case: the plan says every tensor is unified
-and the copy stage has nothing to do.
+Unified. The same thing, on a machine whose accelerator draws from the same
+physical memory. There is no copy and no allocation, and what that buys is a
+budget rather than an address: the bytes are already in the memory the device
+uses, but not at a number a device kernel can follow. This is the placement for
+a load whose kernels are going to run on the host anyway.
 
 Device. The tensor is copied into a slot in one large device buffer. One buffer
 rather than one per tensor, because a few hundred separate allocations on a card
 fragment the address space and cost a driver round trip each, and because the
-engine wants one base pointer and a table of offsets.
+engine wants one base pointer and a table of offsets. A unified machine takes
+this path too when its kernels are going to run on the device. That is not what
+this file used to do, and the reason it does now is #152: a Metal kernel handed
+a host address reads zeros rather than faulting, so sharing a pool of memory is
+not sharing an address space, and a weight a device is going to read has to be
+in a pool wherever it runs. The copy itself is the same `enqueue_copy` on both,
+which was measured rather than assumed.
 
 The repack rides along on the same threads. A worker that has just faulted a
 tensor's pages in is holding the warmest copy of those bytes that will ever
@@ -110,6 +116,15 @@ one tensor staying on the host."""
 comptime RESERVE_SHARE = 10
 """And at least a tenth of the card, because ten per cent of 24 GB and ten per
 cent of 8 GB are different amounts of the same thing."""
+
+comptime UNIFIED_RESERVE_SHARE = 4
+"""A quarter of a unified machine instead of a tenth.
+
+The reserve on a card is holding back memory nothing else wants. The reserve on
+a unified machine is holding back memory the operating system, the page cache
+and every other process on the box are drawing from, and a tenth of sixteen
+gigabytes is not enough left to run in. A quarter lands close to what Metal
+itself recommends as a working set."""
 
 comptime MAX_WORKERS = 8
 """More transfer threads than this stops helping. The limit is the device, and
@@ -206,10 +221,19 @@ def device_budget(dev: Device) -> Int:
     it would be sizing it from a constant that happens to look like a
     measurement. The total is wrong in a knowable direction and the reserve
     covers it.
+
+    A unified device gets an answer here and used to get zero. Zero was written
+    when a mapped file was believed to be a device visible buffer, which made a
+    pool on a unified machine a copy bought for nothing. It is not one. A device
+    kernel cannot read the mapping, which is what #152 found, so a weight a
+    Metal kernel is going to read needs a pool exactly as much as a weight a
+    CUDA kernel is going to read. What differs between them is the reserve and
+    not the shape of the answer.
     """
-    if not dev.accelerator() or dev.unified():
+    if not dev.accelerator():
         return 0
-    var reserve = dev.total // RESERVE_SHARE
+    var share = UNIFIED_RESERVE_SHARE if dev.unified() else RESERVE_SHARE
+    var reserve = dev.total // share
     if reserve < MIN_RESERVE:
         reserve = MIN_RESERVE
     if dev.total <= reserve:
@@ -291,7 +315,11 @@ def plan_load(
     # Two passes so the tensors that are read every token get the device first,
     # and the embedding gets whatever is left. Within a pass it is directory
     # order, which is file order, which is the order the reads will happen in.
-    if dev.accelerator() and not dev.unified() and plan.budget > 0:
+    # Unified devices go through here too. They did not, on the grounds that an
+    # accelerator sharing the memory could read the mapping where it lies, and
+    # #152 found that it cannot. A pool is how a weight gets an address a kernel
+    # can follow, and that is as true on an M4 as on a 4090.
+    if dev.accelerator() and plan.budget > 0:
         var used = 0
         for pass_id in range(2):
             for i in range(count):
@@ -555,6 +583,16 @@ struct DevicePool(Copyable, ImplicitlyCopyable, Movable):
     """
 
     var ctx: DeviceContext
+    """The context the pool allocates and copies against.
+
+    There are two constructors because there are two callers and only one of
+    them has a context already. A CUDA process gets one `DeviceContext` and
+    hangs on the first allocation against a second, with the GPU idle and every
+    thread asleep on a futex, so a caller that owns one has to be able to hand
+    it over rather than watch a second appear. `load` still makes its own, which
+    holds while a load is the only thing in the process talking to the device,
+    and #143 is where the engine starts owning one and passes it in."""
+
     var pool: DeviceBuffer[DType.uint8]
     var bytes: Int
 
@@ -565,6 +603,15 @@ struct DevicePool(Copyable, ImplicitlyCopyable, Movable):
 
     def __init__(out self, device: Device, bytes: Int) raises:
         self.ctx = DeviceContext(device_id=device.index)
+        self.pool = self.ctx.enqueue_create_buffer[DType.uint8](bytes)
+        self.bytes = bytes
+        self.device = device
+
+    def __init__(
+        out self, device: Device, bytes: Int, ctx: DeviceContext
+    ) raises:
+        """The same pool, against a context somebody else already owns."""
+        self.ctx = ctx
         self.pool = self.ctx.enqueue_create_buffer[DType.uint8](bytes)
         self.bytes = bytes
         self.device = device
@@ -682,9 +729,9 @@ struct Weights(Movable):
     """A loaded model: the plan that placed it and the pool that holds it.
 
     The pool is optional because most of the fleet has nowhere to put one, and
-    because a unified device wants the mapping rather than a copy of it. A
-    `Weights` with no pool is not a failed load, it is a model that lives in the
-    file's own pages.
+    because a load whose kernels run on the host does not want one on any
+    machine. A `Weights` with no pool is not a failed load, it is a model that
+    lives in the file's own pages.
     """
 
     var plan: Plan
@@ -964,14 +1011,7 @@ def _report_plan(plan: Plan, pool_bytes: Int):
         + " "
         + plan.device.name
     )
-    if plan.device.unified() and plan.device.accelerator():
-        print(
-            stage_name(STAGE_PLAN)
-            + "   "
-            + _mib(plan.host_bytes)
-            + " unified, which the device reads from the mapping"
-        )
-    elif pool_bytes > 0:
+    if pool_bytes > 0:
         print(
             stage_name(STAGE_PLAN)
             + "   "
@@ -980,6 +1020,14 @@ def _report_plan(plan: Plan, pool_bytes: Int):
             + _mib(plan.host_bytes)
             + " left on the host, budget "
             + _mib(plan.budget)
+        )
+    elif plan.device.unified() and plan.device.accelerator():
+        print(
+            stage_name(STAGE_PLAN)
+            + "   "
+            + _mib(plan.host_bytes)
+            + " unified, in the memory the device draws from but not at an"
+            " address it can read"
         )
     else:
         print(
@@ -1075,13 +1123,25 @@ def _report_done(report: LoadReport):
     )
 
 
-def run_load(path: StringSpan, workers: Int = 0, repack: Bool = True) raises:
+def run_load(
+    path: StringSpan,
+    workers: Int = 0,
+    repack: Bool = True,
+    host_only: Bool = False,
+) raises:
     """Entry point for `molla load` on a GGUF file.
 
     Reports a hit or a miss either way. A load that already has a cache says so
     and does not write one, and a load that does not says why, so the question
     of whether the repack is being redone every time has an answer on the
     screen rather than in a stopwatch.
+
+    `host_only` is what `--host` sets and it is there because a machine with an
+    accelerator has two loads worth timing, not one. The default fills the
+    device, which is what a load for device kernels costs. `--host` leaves
+    everything in the mapping, which is what the engine does today and what a
+    load for host kernels costs. Neither is the fallback of the other and the
+    difference between the two numbers is the price of a device address.
     """
     var g = Gguf(path)
     var dev = default_device()
@@ -1091,7 +1151,7 @@ def run_load(path: StringSpan, workers: Int = 0, repack: Bool = True) raises:
     # afterwards is a cache the plan could not use.
     var want = String("")
     var cache = open_cache(path, model_key(g))
-    var plan = plan_load(g, dev, -1, cache)
+    var plan = plan_load(g, dev, 0 if host_only else -1, cache)
     if cache.usable:
         print(
             stage_name(STAGE_REPACK)

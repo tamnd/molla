@@ -95,7 +95,10 @@ def print_usage():
         "  spec <path>     print what a model is and what this build can do"
         " with it"
     )
-    print("  load <path>     load a model's weights and report each stage")
+    print(
+        "  load <path> [n] [--host]  load a model's weights and report each"
+        " stage"
+    )
     print(
         "  generate <model> <tokenizer.json> <prompt> [n] [ctx]  generate text"
     )
@@ -446,10 +449,14 @@ def main():
             print("molla load: expected a gguf file")
             exit(2)
         var workers = 0
+        var host_only = False
         try:
-            if len(args) > 3:
-                workers = atol(args[3])
-            run_load(args[2], workers)
+            for i in range(3, len(args)):
+                if args[i] == "--host":
+                    host_only = True
+                else:
+                    workers = atol(args[i])
+            run_load(args[2], workers, True, host_only)
         except e:
             print("molla load:", e)
             exit(1)
