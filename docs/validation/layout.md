@@ -146,6 +146,39 @@ On the small models it is worth nothing at all, because q8_0 barely moves. Those
 
 The disk win is not nothing either. A repack cache that is 1.1 times the model instead of 2.04 times it is the difference between a cache people tolerate and one they turn off.
 
+## What was in the way, on Metal
+
+The section above is a CUDA answer that was allowed to stand as a general one for a day. `scripts/matvec_probe.mojo` was written because nsys on an 8B is an hour a question: it runs the same kernel over a synthetic planar tensor of a real shape, and it runs five variants of it that each delete one piece of the work so that the piece can be priced.
+
+The first variant deletes something nobody suspected. The kernel finds which group a value belongs to with `i // group`, and `group` is a compile time constant. On CUDA that is free, because NVVM turns it into a shift. On Metal it is not, and it is not close.
+
+4096 by 4096, q4_K, on the M4, microseconds a launch:
+
+| variant | Apple M4 | RTX 4090 |
+| --- | --- | --- |
+| shipped | 1916 | 29 |
+| the same with `i >> 5` | 867 | 29 |
+| and with 32 bit loop indices | 740 | 29 |
+| a thread to a group | 639 | 64 |
+| no scale plane read at all | 521 | 28 |
+| the loads and no arithmetic | 199 | 10 |
+
+More than half of the Metal matvec was a divide that the index can never need, because `i` counts up from a thread id and is never negative, and a signed divide has to handle a negative numerator whatever the divisor is. Metal keeps the correction, CUDA removes it.
+
+End to end on the M4, same binary either side of the one line change, decode tokens per second:
+
+| model | before | after |
+| --- | --- | --- |
+| Llama 3.1 8B q4_K_M | 0.8 | 2.1 |
+| Qwen 2.5 0.5B q4_K_M | 9.9 | 19.0 |
+| SmolLM2 135M q8_0 | 24.7 | 31.2 |
+
+The 8B moves most and the 135M least, which is the right shape: the larger the model the more of a token is the matvec, and the small one is launch bound for the reason performance.md gives. The 8B was measured at 78 prompt tokens and 32 generated because a 305 token prompt through a prefill that is 305 decodes is a minute and a half either side, and the other two at 305 and 64. The macbook's load average was between 1.9 and 3.1 across all of it, which is quiet for that machine but is still why these are ratios on one machine rather than numbers to publish.
+
+It is exact. `i // 32` and `i >> 5` are the same number for every index this kernel produces, and the whole logit corpus on Metal is identical in every digit either side of the change.
+
+Two things this says beyond the fix. The first is that a compile time constant is not a compile time constant on every backend, and the only way to know which is to price it on each one. The second is that the CUDA reading in the section above stands but its scope does not: on CUDA the wall really is work per value, and on Metal the wall was one instruction that should never have been there. The remaining Metal variants say the rest of the ladder is there too, 740 with narrow indices and 199 for the loads alone, so Metal has another three times in it after this and it is the same three times CUDA has.
+
 ## Order
 
 Pack the quant plane first and leave the scales at float32. That is 9574 MiB to 6475 MiB on the 8B, it is bit exact against the current layout because the integers written are the same integers, and it can be verified by running the corpus with the old cache and the new one and comparing logits with no tolerance at all.

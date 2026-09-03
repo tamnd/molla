@@ -58,6 +58,7 @@ from molla.nn.repack import (
     QUANT_I8,
     QUANT_S4,
     QUANT_U4,
+    group_shift,
     group_size,
     has_min,
     quant_form,
@@ -296,11 +297,15 @@ def planar_matvec_kernel[
     var d_base = (row + quant_bytes) // 4
     var m_base = d_base + groups
 
+    # A shift and not `i // group`, which is a signed divide and which Metal
+    # keeps. See `group_shift` for what it costs there.
+    comptime shift = group_shift(group)
+
     var acc = Float32(0)
     comptime if form == QUANT_I8:
         var i = t
         while i < cols:
-            var gi = i // group
+            var gi = i >> shift
             var q = Float32(Int(quants[unsafe_offset=row + i]))
             var a = x[unsafe_offset=i]
             acc += scales[unsafe_offset=d_base + gi] * q * a
@@ -322,13 +327,16 @@ def planar_matvec_kernel[
         # with the activations read four at a time into a SIMD accumulator. All
         # four are within one per cent of each other, and all four leave the
         # kernel reading 543 GB/s where `scripts/mem_probe.mojo` says this shape
-        # of access is worth 945. Whatever holds this kernel at three quarters
-        # of the byte wide layout's rate while it reads half the bytes is not in
-        # the inner loop, so the simplest of the four is the one that is here.
+        # of access is worth 945. What holds it there on that card is the number
+        # of instructions a value costs rather than anything about how the bytes
+        # are arranged, which is #186, so the simplest of the four is the one
+        # that is here. That was read as a statement about both backends for a
+        # day and it is not one: on Metal the same loop was spending more than
+        # half its time on the group index, which is why that is a shift now.
         # See [docs/validation/layout.md](../../../docs/validation/layout.md).
         var i = t * 2
         while i < cols:
-            var gi = i // group
+            var gi = i >> shift
             var b = Int(packed[unsafe_offset=row + (i >> 1)])
             var lo = b & 0xF
             var hi = (b >> 4) & 0xF

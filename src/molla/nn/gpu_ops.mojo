@@ -47,6 +47,7 @@ from molla.nn.repack import (
     QUANT_I8,
     QUANT_S4,
     QUANT_U4,
+    group_shift,
     group_size,
     has_min,
     quant_form,
@@ -336,10 +337,15 @@ def planar_row_kernel[
     var d_base = (row + quant_bytes) // 4
     var m_base = d_base + groups
 
+    # A shift and not a divide, for the reason `group_shift` gives. This one is
+    # a row a token rather than the hot loop, and it is here so that the two
+    # readers of a planar row stay line for line the same.
+    comptime shift = group_shift(group)
+
     var i = Int(block_idx.x * block_dim.x + thread_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     while i < cols:
-        var gi = i // group
+        var gi = i >> shift
         var q: Float32
         comptime if form == QUANT_I8:
             q = Float32(Int(quants[unsafe_offset=row + i]))
