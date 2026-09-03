@@ -33,8 +33,11 @@ Not every number is available from every engine, and a dash in the table is a
 dash rather than a zero.
 
 molla reports prefill and decode separately and this reads them off `molla
-generate`. Peak resident bytes come from `wait4`, so they are the real maximum
-of the process this script started.
+generate`. Peak memory comes from `wait4` on Linux, and on macOS from the
+larger of `wait4` and `/usr/bin/time -l`, so it is the real maximum of the
+process this script started rather than a figure the engine reports about
+itself. The two platforms are asked different questions on purpose and `TIMED`
+says why.
 
 llama.cpp is measured with `llama-bench`, which runs prefill and decode as
 separate passes and reports tokens per second for each. It does not report
@@ -150,12 +153,70 @@ def peak_of(rusage: object) -> int:
     return value * 1024
 
 
+TIMED = ["/usr/bin/time", "-l"] if sys.platform == "darwin" else []
+"""What a child is wrapped in on macOS, and nothing anywhere else.
+
+macOS has two answers to how much memory a process used and neither one is
+right on its own, so the table takes the larger of the two and this says why.
+
+`ru_maxrss`, which is what `wait4` returns, does not count the pages behind a
+Metal buffer, and on Apple silicon those pages are host memory because the GPU
+pool is the same RAM the process is in. A run of the 8B reported 5347 MiB for a
+process that had just uploaded 9572 MiB of weights and 512 MiB of key value
+cache.
+
+`phys_footprint`, which `/usr/bin/time -l` prints as "peak memory footprint",
+does count them. It reported 10212 MiB for that same run, which is the weights
+plus the cache plus about 130 MiB of everything else, so it reconciles with
+what the engine says it did. But it excludes clean file backed pages, on the
+grounds that they are reclaimable, and llama.cpp holds its weights in a mapping
+of the model file. On SmolLM2 llama.cpp is 236 MiB of resident set and 105 MiB
+of footprint, and the 138 MiB between them is the model, which is really there
+and really occupying RAM.
+
+So one number hides molla's weights and the other hides llama.cpp's, and the
+larger of the two is a lower bound that hides neither. That is not a perfect
+measure of what a process cost the machine, and there is no perfect one, but it
+is the only choice here that does not favour one engine's way of holding a
+model over the other's.
+
+Linux needs none of this. CUDA weights genuinely are not host memory, so the
+resident set is the right number and the only number.
+"""
+
+TIME_L_HEAD = re.compile(r"^\s*[\d.]+ real\s", re.M)
+TIME_L_PEAK = re.compile(r"^\s*(\d+)\s+peak memory footprint\s*$", re.M)
+
+
+def split_timing(out: str) -> tuple[int, str]:
+    """Peel `/usr/bin/time -l`'s report off the end of a child's output.
+
+    The child's stdout and stderr are merged, and `time` writes its report to
+    stderr after the child has exited, so the report is the tail of the merged
+    text and nothing of the child's follows it. The last line matching "N real"
+    is where it starts, last rather than first in case an engine printed
+    something that looks like one.
+
+    Returns zero and the text unchanged when there is no report, which is every
+    platform that is not macOS and also a child that could not be started.
+    """
+    start = -1
+    for m in TIME_L_HEAD.finditer(out):
+        start = m.start()
+    if start < 0:
+        return 0, out
+    found = TIME_L_PEAK.search(out, start)
+    return (int(found.group(1)) if found else 0), out[:start]
+
+
 def capture(args: list[str], env: dict | None = None) -> tuple[str, int, int]:
     """Run to completion and return its output, exit code and peak bytes.
 
     `wait4` rather than `getrusage`, because the process wide child maximum
     never goes back down and would report the largest engine of the run for
-    every engine after it.
+    every engine after it. On macOS `wait4` gives one of two incomplete answers
+    and the child is wrapped to get the other, then the larger is taken.
+    `TIMED` says why.
 
     Windows has no `wait4` and no rusage, so the peak comes back as zero there
     and the memory column is empty for the whole run. Reading it out of the job
@@ -164,18 +225,19 @@ def capture(args: list[str], env: dict | None = None) -> tuple[str, int, int]:
     report is worse in a comparison table than no number.
     """
     proc = subprocess.Popen(
-        args,
+        [*TIMED, *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         env=env,
     )
-    out = proc.stdout.read() if proc.stdout else ""
+    raw = proc.stdout.read() if proc.stdout else ""
+    footprint, out = split_timing(raw)
     if not hasattr(os, "wait4"):
-        return out, proc.wait(), 0
+        return out, proc.wait(), footprint
     _, status, usage = os.wait4(proc.pid, 0)
     code = status >> 8 if status >= 256 else status
-    return out, code, peak_of(usage)
+    return out, code, max(footprint, peak_of(usage))
 
 
 def prompt_of(tokens: int, molla: str, tokenizer: str) -> tuple[str, int]:
