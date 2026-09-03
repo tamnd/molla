@@ -48,6 +48,59 @@ Or write the token as one kernel that keeps the whole model resident in the grid
 
 The recommendation is the second, with the first as the fallback if grid wide sync turns out to be unavailable, and with fusion inside the layer done first either way because it is useful under both and it is the part that is certain to work. The order matters: fusion is a two times improvement that can be measured next week, and the launch collapse is the part that reaches the goal.
 
+## What fusion actually reached
+
+The section above budgets fifteen launches a layer down to four and calls that not enough. Four was a guess. This is what the elementwise chain is actually worth once it is folded in, and it is three launches a layer rather than eleven.
+
+The unit that can absorb elementwise work is the matvec, because it already owns one output row per thread block and it already has that row in a register when it finishes. Anything that reads only that row, and nothing else that the same launch is still writing, can be done by one thread of that block for free. That is a real constraint and it decides the list.
+
+Three things fit it.
+
+The projection bias is `o[r] = dot + bias[r]`, which reads one element of one plane at the row the block already owns. Three of them a layer on a model with qkv bias, and they were three whole launches doing one flop per element.
+
+The residual add is `x[r] = x[r] + dot`, same shape, and it is better than the other two because it also deletes the scratch vector the projection was landing in and the round trip through device memory that went with it. Two a layer.
+
+The gate half of a gated MLP is `o[r] = act(dot) * up[r]`, and it fits because `up` was written by the projection before it, so by the time the gate projection runs its epilogue the element it needs is final. One a layer.
+
+Four things do not fit it, and it is worth saying why, because they are most of what is left.
+
+A norm cannot go in a matvec epilogue in either direction. As a prologue it is a reduction over the whole input vector, so every block would recompute it, and there are three blocks per input on the qkv side. As an epilogue it is a reduction over the whole output vector, which the block that owns one row of it cannot see. That is two launches a layer that stay.
+
+Rope cannot, because it rotates element `i` against element `i + head_dim / 2`, and those are two different blocks of the same launch. Two a layer that stay, and they could become one launch by taking the query and the key together, which is a launch merge rather than a fusion.
+
+The post projection norm that Gemma has sits between the projection and the residual add, so on that architecture neither the add nor the scratch vector can go. Both paths are still there and it is the only reason `s.projected` still exists.
+
+Attention itself is not elementwise.
+
+So the count, before and after. These are counted rather than derived: nsys over five forward passes on gpc, every kernel instance summed and divided by five.
+
+| model | layers | a layer before | a layer after | a token before | a token after |
+| --- | --- | --- | --- | --- | --- |
+| SmolLM2 135M q8_0 | 30 | 15 | 12 | 453 | 363 |
+| Qwen 2.5 0.5B q4_K_M | 24 | 18 | 12 | 435 | 291 |
+
+Twenty per cent off a model without bias and a third off one with it. The three launches over the layer total in both rows are the embedding, the final norm and the output head, and they do not move.
+
+What that is worth in tokens per second, on the same card, decode only, eight repetitions of the three models interleaved so that a drift in the machine moves both sides of a row together.
+
+| model | before | after | ratio |
+| --- | --- | --- | --- |
+| SmolLM2 135M q8_0 | 282.2 | 310.8 | 1.11 |
+| Qwen 2.5 0.5B q4_K_M | 244.9 | 309.2 | 1.26 |
+| Llama 3.1 8B q4_K_M | 99.8 | 101.4 | 1.02 |
+
+The two small models are the ones the launch budget said were launch bound, and they are the two that moved. The 8B did not, which is the same answer from the other direction: at 5.6 GiB a token it is bandwidth bound, the launches are hidden behind the weight reads, and deleting a launch that was overlapped anyway buys nothing.
+
+The two small rows do not reach what the budget above predicts. Ninety launches off SmolLM2 at 4.9 microseconds each is 0.44 ms off a 3.5 ms token, which would be 1.14, and the measurement is 1.11. On Qwen the same arithmetic gives 1.21 against a measured 1.26. Close enough on both to say the budget is roughly the right model of where the time goes, and not close enough to trust the fourth digit of it.
+
+One thing was tried and rejected on the way, and it is worth recording because it looked obvious. The gate epilogue contains an `exp`, and register allocation is per thread and uniform across a kernel, so a runtime branch on the activation allocates that `exp`'s registers in every thread of every block of every matvec including the output head that never runs it. Making the activation a compile time parameter instead, three instantiations where there was one, measured as a wash: it was 2.4 per cent slower than the runtime branch on SmolLM2 and 2 per cent faster on Qwen, both inside the run to run spread on this machine. So the parameter is not there and the branch is.
+
+It is exact and was checked as exact rather than argued to be. Every one of the three is the same arithmetic on the same values in the same order as the kernel it replaces, so the whole logit corpus is unchanged in every digit on both backends, and the layer by layer device against host comparison in `tests/test_gpu_block.mojo` holds at the tolerance it already had.
+
+The epilogue is a runtime argument to the matvec and not a compile time parameter. That is deliberate. One thread of a block runs it, once, after everything else the block does, so making it a parameter would multiply five instantiations of the hottest kernel in the program by four to save one correctly predicted branch per block.
+
+What this leaves is the two norms, the two ropes, attention and six matvecs. Of those, the qkv triple reads one input and the up and gate pair reads one input, so five of the six matvecs are two launches worth of work in a launch geometry that has not been written yet, and that is a launch merge rather than a fusion. It belongs with the launch collapse below, and it would take a layer from twelve to nine. The section above is still right that none of this reaches the target: nine launches a layer on a thirty layer model is 270 a token, and the budget is twenty.
+
 ## Why prefill is slow
 
 molla has no prefill. It has a decode loop that the prompt is also fed through one token at a time, which is why molla's prefill rate and its decode rate are within a few per cent of each other on every row of every table in bench.md. A 514 token prompt is 514 forward passes, so it is 232000 kernel launches, and 1933 ms of time to first token against llama.cpp's 18 ms.
