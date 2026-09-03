@@ -2,6 +2,18 @@
 
 Notable changes per release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- A unified machine can put weights where a device kernel can read them. `device_budget` gives a unified device a budget and `plan_load` gives it slots, both of which used to be skipped on the belief that an accelerator sharing the memory could read the mapping where it lies. It cannot, so a weight a Metal kernel is going to read needs a pool as much as one a CUDA kernel is going to read. The copy is the same asynchronous `enqueue_copy` the discrete path already used, which was measured on an M4 rather than assumed, so there is no second copy path. The reserve is a quarter of the machine rather than a tenth, because on a unified box the memory held back is memory the operating system is also drawing from.
+- `molla load --host`, which leaves every weight in the mapping and asks for no pool. A machine with an accelerator has two loads worth timing and neither is the fallback of the other. On the M4 the same warm cache 8B is 4157 ms with `--host` and 5289 ms without, so a device address costs 27 per cent there, and almost none of that is the copy itself, which hides behind the read exactly as it does on a 4090. See [docs/validation/load.md](docs/validation/load.md).
+- The device pool is checked by the test suite on the machines that have a device. `tests/test_gpu.mojo` fills a real `DevicePool` at the slots a plan would have chosen and reads both tensors back with a kernel, so the slot arithmetic and the asynchronous copy meet the way they do in a load. Two tensors rather than one, because a pool holding a single tensor cannot tell a correct base address from a correct offset.
+
+### Fixed
+
+- `DevicePool` can be handed a device context instead of always making one. A CUDA process gets one context and hangs on the first allocation against a second, so a pool that insists on its own is a hang waiting for the first caller that already has one.
+
 ## [0.3.0] - 2026-09-03
 
 M2 closes and the GPU stops being a plan.

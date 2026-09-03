@@ -44,8 +44,12 @@ cannot. Sharing a pool is not sharing an address space here: a device buffer's
 own pointer segfaults when read from the host, `map_to_host` returns a different
 address for the same bytes with no copy between them, and a Metal kernel given a
 host allocation reads zeros without faulting rather than reporting anything.
-This place is host memory with a note about what it did not cost, and issue #152
-is where it earns a device address."""
+
+So this is host memory with a note about what it did not cost, and that is all
+it will ever be. A unified weight a device kernel is going to read goes into a
+pool and comes back `WHERE_DEVICE`, the same as one on a card, which is what
+#152 settled. The place says which address this is, and a machine having one
+pool of physical memory does not change how many addresses there are."""
 
 comptime WHERE_DEVICE = 2
 """In a device pool. A host kernel cannot follow this address."""
@@ -175,9 +179,10 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
         that turned out to be false on the machine it was written for: a device
         buffer's own pointer segfaults when read from the host, `map_to_host`
         hands back a different address for the same bytes, and a kernel given
-        the host one reads zeros. Making a unified weight carry an address a
-        device can use is issue #152, and until then the honest answer is that
-        it has not got one.
+        the host one reads zeros. The way a weight on a unified machine gets an
+        address a device can follow is to be loaded into a device pool, which is
+        what `molla.model.load` does there now, and then it is `WHERE_DEVICE`
+        and comes through here. A weight that is still unified has not got one.
         """
         if self.place != WHERE_DEVICE:
             raise Error(

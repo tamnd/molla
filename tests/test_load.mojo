@@ -14,8 +14,9 @@ here rather than in a kernel that gets the wrong weights and still produces
 words.
 
 There is no device copy in these tests. The copy needs an accelerator and three
-of the five machines do not have one, so what proves that half is a real model
-on a real card, which is written down in `docs/validation/load.md`.
+of the five machines do not have one, so what proves that half is the pool group
+in `tests/test_gpu.mojo`, which runs where there is a device, and a real model on
+a real card, which is written down in `docs/validation/load.md`.
 """
 
 from std.ffi import c_int, external_call
@@ -168,9 +169,20 @@ def _check_budget(mut suite: Suite) raises:
         device_budget(_fake(DEV_CPU, String("cpu"), 0)) == 0,
         "the host has no device budget",
     )
+    # A unified device gets a budget, and used to get zero on the grounds that
+    # an accelerator sharing the memory could read the mapping. It cannot, which
+    # is #152, so a pool is how a weight there gets a readable address too. The
+    # reserve is a quarter rather than a tenth because the total is the whole
+    # machine's memory.
+    var shared = _fake(DEV_UNIFIED, String("metal"), 16 * GIB)
     suite.check(
-        device_budget(_fake(DEV_UNIFIED, String("metal"), 16 * GIB)) == 0,
-        "and neither does a unified device, which needs no pool",
+        device_budget(shared) == 16 * GIB - (16 * GIB) // 4,
+        "a unified device keeps a quarter of the machine back",
+    )
+    suite.check(
+        device_budget(shared)
+        < device_budget(_fake(DEV_DISCRETE, String("cuda"), 16 * GIB)),
+        "which is more than a card of the same size holds back",
     )
 
     # A tenth of 24 GB is more than the floor, so the fraction is what applies.
@@ -216,16 +228,34 @@ def _check_plan(mut suite: Suite, path: String) raises:
             all_host = False
     suite.check(all_host, "and every placement says host")
 
-    var unified = plan_load(
-        g, _fake(DEV_UNIFIED, String("metal"), 16 * GIB), -1
-    )
-    var all_unified = True
+    # A unified device with room takes the pool, the same as a card does. The
+    # placement follows where the kernels are going to read from and not what
+    # kind of memory the machine has, because #152 found that an accelerator
+    # sharing the memory still cannot follow a host address.
+    var metal = _fake(DEV_UNIFIED, String("metal"), 16 * GIB)
+    var unified = plan_load(g, metal, -1)
+    var all_device = True
     for i in range(unified.count()):
-        if unified.placements[i].place != WHERE_UNIFIED:
-            all_unified = False
-    suite.check(all_unified, "on a unified device every placement says unified")
+        if unified.placements[i].place != WHERE_DEVICE:
+            all_device = False
+    suite.check(all_device, "a unified device with room takes every tensor")
     suite.check(
-        unified.device_bytes == 0,
+        unified.device_bytes == _total(),
+        "and the bytes go to a pool rather than staying in the mapping",
+    )
+
+    # And a budget of nothing is how a load for host kernels is asked for, which
+    # is the placement unified still names.
+    var shared = plan_load(g, metal, 0)
+    var all_unified = True
+    for i in range(shared.count()):
+        if shared.placements[i].place != WHERE_UNIFIED:
+            all_unified = False
+    suite.check(
+        all_unified, "with no budget every placement on it says unified"
+    )
+    suite.check(
+        shared.device_bytes == 0,
         "which is a placement and not a copy, so the pool stays empty",
     )
 
@@ -377,10 +407,12 @@ def _check_residency(mut suite: Suite, path: String) raises:
     suite.check(all_host, "and a host load says host for each of them")
     suite.check(no_address, "and hands out no device addresses")
 
-    # A unified plan is the interesting one on this laptop and on nothing else
-    # in the fleet. Nothing is copied and nothing is allocated, and the weights
-    # still come back marked so a device kernel knows it may read the mapping.
-    var shared = plan_load(g, _fake(DEV_UNIFIED, String("metal"), 16 * GIB), -1)
+    # A unified plan with no budget, which is the load the engine does today and
+    # what `molla load --host` reports. Nothing is copied and nothing is
+    # allocated, and that saving is what unified names. It is not an address: a
+    # weight placed this way has none a device kernel can follow, which is why
+    # the pool exists on this machine too.
+    var shared = plan_load(g, _fake(DEV_UNIFIED, String("metal"), 16 * GIB), 0)
     var on_metal = load(g, shared^, 1, False)
     suite.check(
         not on_metal.pool, "a unified load allocates nothing on the device"
@@ -395,7 +427,7 @@ def _check_residency(mut suite: Suite, path: String) raises:
     suite.check(all_unified, "and every weight comes back unified")
     suite.check(
         no_address,
-        "with no address of its own, because the mapping already is one",
+        "with no address of its own, which is the thing a pool would give it",
     )
 
     g.close()
