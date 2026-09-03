@@ -128,6 +128,20 @@ def digest(path: pathlib.Path) -> str:
     return h.hexdigest()[:12]
 
 
+def load_now() -> str:
+    """The one minute load average, or a word saying it is not available.
+
+    Every machine in this fleet is shared with something, and a run taken next
+    to somebody else's build is not a measurement. The number belongs in the
+    header beside the date, because a table that does not say what else was
+    running is a table nobody can defend a year later.
+    """
+    try:
+        return f"{os.getloadavg()[0]:.1f}"
+    except (OSError, AttributeError):
+        return "unavailable"
+
+
 def peak_of(rusage: object) -> int:
     """Maximum resident bytes, from a unit that is not the same on both."""
     value = int(getattr(rusage, "ru_maxrss", 0))
@@ -521,6 +535,10 @@ def main() -> None:
     print(f"building a prompt of at least {want_prompt} tokens", file=sys.stderr)
     prompt, prompt_tokens = prompt_of(want_prompt, molla, tokenizer)
 
+    # Before the run rather than after it, because after it is molla's own
+    # load and not the load molla was competing with.
+    before = load_now()
+
     # Resolved once, so every row says which card rather than saying auto.
     resolved = device
     if device == "auto":
@@ -559,6 +577,7 @@ def main() -> None:
     print(f"prompt    {prompt_tokens} tokens, {decode} generated, {runs} runs")
     print(f"builds    molla {molla_build(molla)}, llama.cpp {llama_build()},"
           f" ollama {ollama_build()}")
+    print(f"load      {before} before the run, on {cores} logical cores")
     print(f"when      {stamp}")
     print()
     print(table(results, markdown))
