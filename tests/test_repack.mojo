@@ -55,6 +55,7 @@ from molla.nn.repack import (
     quant_bits,
     quant_form,
     repack_row,
+    group_shift,
     repackable,
     unpack_run,
 )
@@ -218,6 +219,21 @@ def test_geometry(mut suite: Suite) raises:
 
     suite.check(planar_groups(Q_Q8_0, 256) == 8, "256 q8_0 values is 8 groups")
     suite.check(planar_groups(Q_Q6_K, 256) == 16, "and 16 q6_k ones")
+
+    # Every group in the table has to be a power of two, because the device
+    # kernels index their scale plane with a shift and not a divide. A type
+    # added with a group of 24 fails here rather than reading whichever scale
+    # `i >> 4` happens to land on.
+    for i in range(len(kinds)):
+        var g = group_size(kinds[i])
+        var s = group_shift(g)
+        suite.check(
+            s >= 0 and (1 << s) == g,
+            "a " + _label(kinds[i]) + " group is a power of two",
+        )
+    suite.check(group_shift(32) == 5, "a group of 32 is a shift of 5")
+    suite.check(group_shift(16) == 4, "and a group of 16 is a shift of 4")
+    suite.check(group_shift(24) == -1, "a group that is not one has no shift")
 
     suite.check(
         quant_form(Q_Q4_0) == QUANT_S4, "q4_0 quants are signed nibbles"

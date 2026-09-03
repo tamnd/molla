@@ -145,6 +145,34 @@ def group_size(kind: Int) -> Int:
     return 32
 
 
+def group_shift(group: Int) -> Int:
+    """The right shift that divides by `group`, or -1 if it is not a power of
+    two.
+
+    Both group sizes in the type table are powers of two, so a group index is a
+    shift rather than a division, and the difference is worth having. `i //
+    group` with `group` a compile time constant is a signed divide, and a signed
+    divide has to correct for a negative numerator whatever the divisor is.
+    NVVM strength reduces the whole thing away and Metal does not: measured with
+    `scripts/matvec_probe.mojo` on an M4, a 4096 by 4096 q4_k matvec is 1916
+    microseconds with the divide and 867 with the shift, so more than half of
+    that kernel was the compiler being careful about a sign the index never has.
+
+    -1 rather than a raise because the callers are device kernels, which cannot
+    raise and evaluate this at compile time. `test_repack` checks that every
+    kind in the table gives a shift that is really a shift, so a type added with
+    a group of 24 fails there rather than reading the wrong scale.
+    """
+    var n = group
+    var shift = 0
+    while n > 1:
+        if n & 1 != 0:
+            return -1
+        n >>= 1
+        shift += 1
+    return shift if n == 1 else -1
+
+
 def has_min(kind: Int) -> Bool:
     """Whether the row carries an mscale plane.
 
