@@ -139,6 +139,12 @@ def capture(args: list[str], env: dict | None = None) -> tuple[str, int, int]:
     `wait4` rather than `getrusage`, because the process wide child maximum
     never goes back down and would report the largest engine of the run for
     every engine after it.
+
+    Windows has no `wait4` and no rusage, so the peak comes back as zero there
+    and the memory column is empty for the whole run. Reading it out of the job
+    object would mean a package this script does not have, and a number that
+    means something slightly different from the one the other two machines
+    report is worse in a comparison table than no number.
     """
     proc = subprocess.Popen(
         args,
@@ -148,6 +154,8 @@ def capture(args: list[str], env: dict | None = None) -> tuple[str, int, int]:
         env=env,
     )
     out = proc.stdout.read() if proc.stdout else ""
+    if not hasattr(os, "wait4"):
+        return out, proc.wait(), 0
     _, status, usage = os.wait4(proc.pid, 0)
     code = status >> 8 if status >= 256 else status
     return out, code, peak_of(usage)
@@ -504,7 +512,14 @@ def main() -> None:
 
     stamp = time.strftime("%Y-%m-%d %H:%M %Z")
     print()
-    print(f"machine   {platform.node()} {platform.system()} {platform.machine()}")
+    # No host name. What matters about the machine for a number is the
+    # operating system, the instruction set and how many cores it has, and the
+    # name it answers to on this network is not any of that.
+    cores = os.cpu_count() or 0
+    print(
+        f"machine   {platform.system()} {platform.machine()},"
+        f" {cores} logical cores"
+    )
     print(f"backend   {resolved}")
     print(f"model     {model.name} {digest(model)}")
     print(f"prompt    {prompt_tokens} tokens, {decode} generated, {runs} runs")
