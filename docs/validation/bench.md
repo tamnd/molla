@@ -26,25 +26,33 @@ Ollama is asked through `/api/generate` with `stream` off and `raw` on, which re
 
 An RTX 4090 with 24564 MiB, reached through WSL2 on a Windows machine, which is why the harness reports Linux x86_64 with 32 logical cores. It is a WSL2 CUDA result and not a Linux CUDA result, for the reason in [toolchain.md](toolchain.md): the only NVIDIA card in the fleet is in a Windows box. This is the quietest machine in the set and the one where a number is a measurement.
 
-molla 0.3.3, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-03. All three on `--device=cuda`, 134 prompt tokens, 32 generated, 3 runs, median.
+molla 0.3.3, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-03. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, median, and the load average was between 0.1 and 0.6 before each run. These are the lengths M7 takes its gate at.
 
 llama.cpp reports itself as build 1 on this machine because it was built there from a clone with no tags, and the build number comes from `git describe`. The commit is the identity that matters and it is in the line above.
 
-SmolLM2 135M Instruct Q8_0, digest 5a1395716f79.
+SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 514 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | peak MiB |
 | --- | --- | --- | --- | --- |
-| molla | 315.3 | 372.1 | 425 | 1611 |
-| llama.cpp | 25737.8 | 809.9 | 5 | 445 |
-| ollama | 43379.7 | 685.3 | 3 | - |
+| molla | 265.9 | 254.5 | 1933 | 1607 |
+| llama.cpp | 29020.2 | 782.5 | 18 | 443 |
+| ollama | 37824.7 | 651.9 | 14 | - |
 
-Qwen 2.5 0.5B Instruct q4_K_M, digest 74a4da8c9fdb.
+Qwen 2.5 0.5B Instruct q4_K_M, digest 74a4da8c9fdb, 514 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | peak MiB |
 | --- | --- | --- | --- | --- |
-| molla | 339.2 | 301.9 | 395 | 2174 |
-| llama.cpp | 25497.0 | 767.2 | 5 | 807 |
-| ollama | 32651.1 | 505.0 | 4 | - |
+| molla | 244.4 | 227.0 | 2103 | 2168 |
+| llama.cpp | 42670.8 | 756.7 | 12 | 807 |
+| ollama | 43229.6 | 517.4 | 12 | - |
+
+Llama 3.1 8B Instruct q4_K_M, digest 7b064f5842bf, 515 prompt tokens, 3 runs.
+
+| engine | prefill tok/s | decode tok/s | ttft ms | peak MiB |
+| --- | --- | --- | --- | --- |
+| molla | 75.6 | 66.5 | 6809 | 11066 |
+| llama.cpp | 10609.9 | 161.2 | 49 | 5034 |
+| ollama | 5578.9 | 144.1 | 92 | - |
 
 ## macbook, the M4
 
@@ -86,13 +94,15 @@ llama.cpp and Ollama are reported as not on PATH, which is what a machine withou
 
 ## What the numbers say
 
-Four things, and only the first is about the gate.
+Five things, and only the first is about the gate.
 
-Decode on CUDA is 2.2 times off llama.cpp on SmolLM2 and 2.5 times off on Qwen. The M7 gate is 1.5 times, so the distance is real but it is one change rather than an order of magnitude. Ollama sits between molla and llama.cpp on decode, which is what you would expect from the same engine underneath with a server in front of it.
+Decode on CUDA is 3.1 times off llama.cpp on SmolLM2, 3.3 times off on Qwen and 2.4 times off on the 8B. The M7 gate is 1.5 times, so the distance is a factor of two beyond the gate rather than a rounding error.
 
-Prefill is not two times off, it is eighty times off, and the reason is in the shape of molla's own numbers rather than in a comparison. On every row of every table molla's prefill rate and its decode rate are within a few per cent of each other. molla has no batched prefill: it runs the prompt through the same one token at a time path the decode uses, so a 134 token prompt costs 134 decodes. llama.cpp prefills the whole prompt as one matrix multiply and gets 25000 tokens per second out of the same card. That is what puts 425 ms of time to first token against 5 ms, and it is the single largest gap on this page.
+The gap shrinks as the model grows, and that is the most useful line on this page. A cost that is a smaller fraction of a bigger model is a fixed cost per layer, not a slow kernel: a slow kernel would stay slow in proportion. molla launches about fifteen kernels per layer and 453 per token on SmolLM2, and an empty kernel on this machine costs 4.9 microseconds to launch, so 453 of them are 2.2 ms before any arithmetic happens at all, against the 3.9 ms a token actually takes. The 8B does more work per launch, so the same fixed cost buys a better ratio.
 
-Peak resident bytes on CUDA are 1611 MiB for a 138 MiB model, against llama.cpp's 445 MiB. The host side of a device run holds the mapping and the planar repack cache and the staging for the upload, and none of that is freed once the weights are on the card.
+Prefill is not two times off, it is between 109 and 175 times off, and the reason is in the shape of molla's own numbers rather than in a comparison. On every row of every table molla's prefill rate and its decode rate are within a few per cent of each other. molla has no batched prefill: it runs the prompt through the same one token at a time path the decode uses, so a 514 token prompt costs 514 decodes. llama.cpp prefills the whole prompt as one matrix multiply. That is what puts 1933 ms of time to first token against 18 ms, and it is the single largest gap on this page.
+
+Peak resident bytes on CUDA are 1607 MiB for a 138 MiB model, against llama.cpp's 443 MiB, and 11066 MiB for a 4.6 GiB model against 5034 MiB. The measurements fit `1312 MiB + 2.14x the model file size`, so there are two costs in there and only one of them is about the model. The host side of a device run holds the GGUF mapping and the planar repack cache mapping while the card holds a third copy, and none of it is freed once the weights are up.
 
 The Metal path is much further behind than the CUDA path, and the laptop's load average means this page cannot say how much. Thirteen times off llama.cpp on a machine that is doing other work is not a number worth acting on. Getting a quiet Apple machine into the fleet is the way to make that one real.
 
@@ -108,9 +118,7 @@ CI does not run it. A shared runner cannot produce a number worth writing down, 
 
 ## What this does not cover
 
-Not a long prompt and not a long generation. The tables above are 134 tokens in and 32 out, which is short enough that molla's unbatched prefill does not turn a run into a coffee break. The numbers to take at M7 are the 512 and 128 the harness defaults to, on a machine where molla's prefill is not the reason the run is slow.
-
-Not the 8B model. Llama 3.1 8B q4_K_M is in the fleet and in the logit corpus, and at molla's current prefill rate a 512 token prompt against it is eight minutes before the first token. It goes in this page when batched prefill lands.
+Not a long prompt on the machines that are not gpc. The gpc tables are the 512 and 128 the harness defaults to and are the ones to hold M7 against. The macbook and server1 tables are 134 and 32, because at those machines' rates the default lengths are a coffee break rather than a measurement.
 
 Not concurrency. Every engine here is answering one sequence, and Ollama and llama.cpp both do more than that. molla refuses a second sequence with a 503, so there is nothing to compare yet.
 
