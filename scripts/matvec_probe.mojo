@@ -30,7 +30,7 @@ from molla.nn.repack import (
     QUANT_U4,
     planar_row_bytes,
 )
-from molla.nn.quant import Q_Q4_K
+from molla.nn.quant import Q_Q4_K, Q_Q8_0
 
 comptime TILE = 128
 
@@ -62,6 +62,17 @@ into the mantissa of `2^23` instead and subtract `2^23` back off, and the whole
 thing is an integer or and a floating point subtract, both full rate. It is
 exact, it changes no layout and it adds no launch, which is everything the
 integer path is not."""
+comptime V_BYTE = 11
+"""The shipped loop for a byte wide type, which is a different loop entirely."""
+comptime V_BYTE_MAGIC = 12
+"""Same, with the byte to float conversion done by bit pattern.
+
+Worth asking separately from the nibble case rather than assumed from it. A
+signed byte load already sign extends in the hardware, so the loop it replaces
+is one convert where the nibble loop's is a mask, a shift, an xor, a subtract
+and a convert. The bit pattern version costs the same three instructions in
+both. So the nibble case has more to win and the byte case might have nothing,
+and q8_0 is the type the smallest model in the bench is in."""
 comptime V_DOT8_I16 = 9
 """Eight, against an activation quantized to a signed short rather than a byte.
 
@@ -204,6 +215,32 @@ def probe_kernel[
                 acc += m * a0
                 acc += m * a1
             i += tile * 2
+
+    elif variant == V_BYTE:
+        var quants = w.unsafe_bitcast[Int8]()
+        var i = t
+        while i < cols:
+            var gi = i >> shift
+            var q = Float32(Int(quants[unsafe_offset=row + i]))
+            var a = x[unsafe_offset=i]
+            acc += scales[unsafe_offset=d_base + gi] * q * a
+            comptime if with_min:
+                acc += scales[unsafe_offset=m_base + gi] * a
+            i += tile
+
+    elif variant == V_BYTE_MAGIC:
+        var i = t
+        while i < cols:
+            var gi = i >> shift
+            var u = UInt32(packed[unsafe_offset=row + i]) ^ 0x80
+            var q = bitcast[DType.float32, 1](UInt32(0x4B000000) | u)
+            var a = x[unsafe_offset=i]
+            acc += scales[unsafe_offset=d_base + gi] * (
+                q - Float32(8388736.0)
+            ) * a
+            comptime if with_min:
+                acc += scales[unsafe_offset=m_base + gi] * a
+            i += tile
 
     elif variant == V_NO_SCALE:
         var i = t * 2
@@ -470,6 +507,61 @@ def _sweep[
     )
 
 
+def _sweep_byte[
+    kind: Int, group: Int, with_min: Bool
+](ctx: DeviceContext, label: String, rows: Int, cols: Int) raises:
+    """The two byte wide variants, on their own, because they read differently.
+    """
+    comptime form = QUANT_I8
+    var stride = planar_row_bytes(kind, cols)
+    var bytes = rows * stride
+    var wbuf = ctx.enqueue_create_buffer[DType.uint8](bytes)
+    var xbuf = ctx.enqueue_create_buffer[DType.float32](
+        cols + cols // group + 4
+    )
+    var obuf = ctx.enqueue_create_buffer[DType.float32](rows)
+    ctx.synchronize()
+    var w = Pointer[UInt8, MutAnyOrigin](
+        unsafe_from_address=Int(wbuf.unsafe_ptr())
+    )
+    var x = Pointer[Float32, MutAnyOrigin](
+        unsafe_from_address=Int(xbuf.unsafe_ptr())
+    )
+    var o = Pointer[Float32, MutAnyOrigin](
+        unsafe_from_address=Int(obuf.unsafe_ptr())
+    )
+    var values = Float64(rows * cols)
+    var read = Float64(bytes)
+    print(
+        label
+        + "  "
+        + String(rows)
+        + " by "
+        + String(cols)
+        + ", row "
+        + String(stride)
+        + " bytes, "
+        + String(Int(read / 1048576.0))
+        + " MiB"
+    )
+    _report(
+        "  byte cvt  ",
+        _time[group, with_min, form, V_BYTE](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  byte magic",
+        _time[group, with_min, form, V_BYTE_MAGIC](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+
+
 def main() raises:
     var ctx = DeviceContext()
     print("device  " + String(ctx.name()))
@@ -481,3 +573,8 @@ def main() raises:
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k gate", 14336, 4096)
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k down", 4096, 14336)
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k attn", 4096, 4096)
+
+    # And the byte wide type, at the shape SmolLM2 135M spends its decode in,
+    # because that is the model the milestone is measured on and it is q8_0.
+    _sweep_byte[Q_Q8_0, 32, False](ctx, "q8_0 gate", 1536, 576)
+    _sweep_byte[Q_Q8_0, 32, False](ctx, "q8_0 head", 49152, 576)
