@@ -109,6 +109,30 @@ struct DeviceVec(Movable):
             unsafe_from_address=Int(self.buf.unsafe_ptr())
         )
 
+    def ptr_at(self, at: Int) raises -> Pointer[Float32, MutAnyOrigin]:
+        """The device address of element `at`, for a kernel argument.
+
+        Every kernel here writes from element zero of whatever pointer it was
+        handed, so writing into the middle of something is done by moving the
+        pointer rather than by giving each kernel an offset it would have to
+        apply and a bound it would have to be told. A key projection lands at
+        `slot * kv_width` in a layer's cache, a bias covers one run of a query,
+        and both are this call and the kernel unchanged.
+
+        Four bytes an element, which is what a float32 device vector is by
+        construction, so the arithmetic is the same on both vendors.
+        """
+        if at < 0 or at > self.n:
+            raise Error(
+                "offset "
+                + String(at)
+                + " is outside a device vector of "
+                + String(self.n)
+            )
+        return Pointer[Float32, MutAnyOrigin](
+            unsafe_from_address=Int(self.buf.unsafe_ptr()) + at * 4
+        )
+
     def upload(mut self, x: Buffer) raises:
         if x.elements() != self.n:
             raise Error(
@@ -296,12 +320,17 @@ def check_matvec_shapes(w: Tensor, in_elements: Int, out_elements: Int) raises:
 
 def _launch[
     tile: Int, group: Int, with_min: Bool
-](ctx: DeviceContext, w: Tensor, x: DeviceVec, mut out: DeviceVec) raises:
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    o: Pointer[Float32, MutAnyOrigin],
+) raises:
     """One instantiation, launched. No transfer either side of it."""
     ctx.enqueue_function[planar_matvec_kernel[tile, group, with_min]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x.ptr(),
-        out.ptr(),
+        o,
         Int32(w.cols),
         Int32(w.row_bytes()),
         grid_dim=(w.rows, 1, 1),
@@ -310,9 +339,9 @@ def _launch[
 
 
 def device_matvec_into(
-    ctx: DeviceContext, w: Tensor, x: DeviceVec, mut out: DeviceVec
+    ctx: DeviceContext, w: Tensor, x: DeviceVec, mut out: DeviceVec, at: Int = 0
 ) raises:
-    """`out[r] = dot(row r of w, x)`, both sides already on the device.
+    """`out[at + r] = dot(row r of w, x)`, both sides already on the device.
 
     The dispatch is over the two things the layout varies by, which are the
     group size and whether there is a minimum plane, and there are three live
@@ -320,11 +349,29 @@ def device_matvec_into(
     the only type that groups by 16 is q6_k, which centres its quants and has no
     minimum at all.
 
+    `at` is where the rows go and it defaults to the front, which is what every
+    caller wanted until there was a cache. A key and a value projection write
+    into the layer's cache at the slot this position occupies, and doing that
+    here rather than into scratch and then copying is the same choice the host
+    made for the same reason: the cache is where they are needed and this is the
+    only place they are written.
+
     Queued and not synchronized. A block is a couple of dozen of these and
     waiting after each one would put the cost this exists to remove back in a
     different place, so the caller synchronizes once when it wants the answer.
     """
-    check_matvec_shapes(w, x.elements(), out.elements())
+    if at < 0:
+        raise Error("a matvec cannot write at a negative offset")
+    if out.elements() < at + w.rows:
+        raise Error(
+            "the device matvec writes "
+            + String(w.rows)
+            + " rows at offset "
+            + String(at)
+            + " and the output ends at "
+            + String(out.elements())
+        )
+    check_matvec_shapes(w, x.elements(), w.rows)
     comptime if not has_accelerator():
         raise Error(
             "this build has no device code in it, so there is no device matvec"
@@ -332,13 +379,14 @@ def device_matvec_into(
             " not when it is run"
         )
     else:
+        var o = out.ptr_at(at)
         var g = group_size(w.kind)
         if g == 32 and has_min(w.kind):
-            _launch[TILE, 32, True](ctx, w, x, out)
+            _launch[TILE, 32, True](ctx, w, x, o)
         elif g == 32:
-            _launch[TILE, 32, False](ctx, w, x, out)
+            _launch[TILE, 32, False](ctx, w, x, o)
         elif g == 16 and not has_min(w.kind):
-            _launch[TILE, 16, False](ctx, w, x, out)
+            _launch[TILE, 16, False](ctx, w, x, o)
         else:
             raise Error(
                 "no device matvec is compiled for a group of "

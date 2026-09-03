@@ -9,6 +9,7 @@ from std.sys import argv, exit
 
 from molla.build_info import MOJO_PIN, VERSION
 from molla.engine.generate import run_generate
+from molla.engine.generate_device import run_generate_device
 from molla.engine.sample import SamplerConfig
 from molla.engine.serve import run_serve
 from molla.host import detect
@@ -110,6 +111,7 @@ def print_usage():
         " --presence-penalty"
     )
     print("                  --repeat-last-n --seed, and no flags means greedy")
+    print("                  --device runs the whole forward pass on the GPU")
     print(
         "  serve <model> <tokenizer.json>  answer OpenAI requests against a"
         " model"
@@ -470,6 +472,10 @@ def main():
         var limit = 0
         var context = 0
         var sampling = SamplerConfig()
+        # Provisional, and a flag rather than a choice of backend, because
+        # choosing one properly is #144. What it means today is the whole
+        # forward pass on the default accelerator or none of it on the host.
+        var on_device = False
         try:
             # The two numbers stay positional and the sampling settings are
             # named, in either order. Nobody is going to remember a ninth
@@ -477,6 +483,9 @@ def main():
             var positional = 0
             for i in range(5, len(args)):
                 if sampling_flag(sampling, args[i]):
+                    continue
+                if args[i] == "--device":
+                    on_device = True
                     continue
                 if args[i].startswith("--"):
                     raise Error(
@@ -493,7 +502,14 @@ def main():
                         + "' is one argument more than this takes"
                     )
                 positional += 1
-            run_generate(args[2], args[3], args[4], limit, context, sampling)
+            if on_device:
+                run_generate_device(
+                    args[2], args[3], args[4], limit, context, sampling
+                )
+            else:
+                run_generate(
+                    args[2], args[3], args[4], limit, context, sampling
+                )
         except e:
             print("molla generate:", e)
             exit(1)

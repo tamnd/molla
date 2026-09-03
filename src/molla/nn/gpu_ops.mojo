@@ -42,7 +42,9 @@ from max.gpu.host import DeviceContext
 
 from molla.nn.attention import AttnSpec
 from molla.nn.gpu import TILE, DeviceVec
+from molla.nn.repack import LAYOUT_PLANAR, group_size, has_min
 from molla.nn.rope import RopeSpec, corr_range, step_table
+from molla.nn.tensor import WHERE_DEVICE, Tensor
 
 comptime NEG_INF = Float32(-3.4028234663852886e38)
 """What a masked key scores.
@@ -250,6 +252,89 @@ def add_into_kernel(
     var stride = Int(grid_dim.x * block_dim.x)
     while i < n:
         acc[unsafe_offset=i] = acc[unsafe_offset=i] + x[unsafe_offset=i]
+        i += stride
+
+
+def add_run_kernel(
+    acc: Pointer[Float32, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    n_dev: Int32,
+):
+    """The same add, over a run rather than a whole vector.
+
+    Identical to `add_into_kernel` and separate from it because the thing it is
+    for is different: this one is a bias being added to one projection, and the
+    run it covers is picked by the pointer the launcher hands over. Keeping one
+    kernel and calling it twice would be the same instructions and a name that
+    lies about which of the two the caller meant.
+    """
+    var n = Int(n_dev)
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    while i < n:
+        acc[unsafe_offset=i] = acc[unsafe_offset=i] + x[unsafe_offset=i]
+        i += stride
+
+
+def softcap_kernel(
+    x: Pointer[Float32, MutAnyOrigin], n_dev: Int32, cap: Float32
+):
+    """`x = cap * tanh(x / cap)`, which is what Gemma 2 does to its logits.
+
+    In place over a vocabulary, so this is the one elementwise kernel here that
+    covers a couple of hundred thousand values rather than a few thousand. It is
+    still one launch, because the grid loop means the block count is a cap and
+    not a shape.
+    """
+    var n = Int(n_dev)
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    while i < n:
+        x[unsafe_offset=i] = cap * _tanh(x[unsafe_offset=i] / cap)
+        i += stride
+
+
+def planar_row_kernel[
+    group: Int, with_min: Bool
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+    row_dev: Int32,
+):
+    """One planar row of a weight, dequantized into a float32 vector.
+
+    This is the embedding lookup and nothing else uses it. Every other weight in
+    a forward pass is read by the matvec, which never materialises a row, and
+    the embedding is the one place where the multiply a training framework does
+    against a one hot vector is a row copy here.
+
+    The decoding is the matvec's, line for line: one signed byte per value, a
+    scale per group in a plane after the quants, and a minimum plane after that
+    for the two types that carry one. It is duplicated rather than shared
+    because the matvec's version is inside an accumulation loop that also reads
+    the input vector, and a shared helper would be a function call per element
+    in the hottest loop in the program to save six lines here.
+    """
+    var cols = Int(cols_dev)
+    var row = Int(row_dev) * Int(stride_dev)
+    var quants = w.bitcast[Int8]()
+    var scales = w.bitcast[Float32]()
+    var groups = cols // group
+    var d_base = (row + cols) // 4
+    var m_base = d_base + groups
+
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    while i < cols:
+        var gi = i // group
+        var v = scales[unsafe_offset=d_base + gi] * Float32(
+            Int(quants[unsafe_offset=row + i])
+        )
+        comptime if with_min:
+            v += scales[unsafe_offset=m_base + gi]
+        o[unsafe_offset=i] = v
         i += stride
 
 
@@ -641,6 +726,37 @@ def device_rms_norm_inplace(
         _norm_launch(ctx, x.ptr(), gain.ptr(), x.ptr(), x.elements(), eps)
 
 
+def device_rms_norm_run(
+    ctx: DeviceContext,
+    mut x: DeviceVec,
+    at: Int,
+    n: Int,
+    gain: DeviceVec,
+    eps: Float32,
+) raises:
+    """The same norm again, in place over `n` values starting at `at`.
+
+    Qwen 3 normalises each head of a query and of a key before rotating it, and
+    a key at that point is already lying in the cache at the slot this position
+    occupies. So the run this covers is not the front of anything, which is the
+    whole reason there is a third entry point rather than two.
+    """
+    if at < 0 or n <= 0 or x.elements() < at + n:
+        raise Error(
+            "a norm over "
+            + String(n)
+            + " values from offset "
+            + String(at)
+            + " does not fit in a vector of "
+            + String(x.elements())
+        )
+    _check_norm(n, gain.elements(), n)
+    _need_device()
+    comptime if has_accelerator():
+        var p = x.ptr_at(at)
+        _norm_launch(ctx, p, gain.ptr(), p, n, eps)
+
+
 def _check_norm(n: Int, gain: Int, written: Int) raises:
     if gain != n:
         raise Error(
@@ -765,6 +881,141 @@ def device_add_into(
             grid_dim=(_grid(n), 1, 1),
             block_dim=(TILE, 1, 1),
         )
+
+
+def device_add_run(
+    ctx: DeviceContext, mut acc: DeviceVec, at: Int, x: DeviceVec, n: Int
+) raises:
+    """`acc[at + i] += x[i]` for `n` values, which is a bias on a projection."""
+    if at < 0 or n <= 0 or acc.elements() < at + n:
+        raise Error(
+            "adding "
+            + String(n)
+            + " values at offset "
+            + String(at)
+            + " does not fit in a vector of "
+            + String(acc.elements())
+        )
+    if x.elements() < n:
+        raise Error(
+            "adding "
+            + String(n)
+            + " values out of a vector of "
+            + String(x.elements())
+        )
+    _need_device()
+    comptime if has_accelerator():
+        ctx.enqueue_function[add_run_kernel](
+            acc.ptr_at(at),
+            x.ptr(),
+            Int32(n),
+            grid_dim=(_grid(n), 1, 1),
+            block_dim=(TILE, 1, 1),
+        )
+
+
+def device_softcap(
+    ctx: DeviceContext, mut x: DeviceVec, cap: Float32, n: Int
+) raises:
+    """`x = cap * tanh(x / cap)` over the first `n` values."""
+    if cap <= 0:
+        raise Error("a softcap has to be positive to divide by")
+    if n <= 0 or n > x.elements():
+        raise Error(
+            "a softcap over "
+            + String(n)
+            + " does not fit in a vector of "
+            + String(x.elements())
+        )
+    _need_device()
+    comptime if has_accelerator():
+        ctx.enqueue_function[softcap_kernel](
+            x.ptr(),
+            Int32(n),
+            cap,
+            grid_dim=(_grid(n), 1, 1),
+            block_dim=(TILE, 1, 1),
+        )
+
+
+def device_unpack_row(
+    ctx: DeviceContext, w: Tensor, row: Int, mut out: DeviceVec, at: Int = 0
+) raises:
+    """One row of a planar weight into `out[at ..]`, dequantized.
+
+    The embedding lookup, and the one read of a weight in a forward pass that is
+    not a matvec. It refuses the same three things the matvec refuses, and for
+    the third one the reason is the same and worth repeating: a device kernel
+    handed a host address reads zeros rather than faulting, so a model whose
+    embedding was left in the mapping would start every token from a residual
+    stream of zeros and answer with whatever the layers make of that.
+    """
+    if w.layout != LAYOUT_PLANAR:
+        raise Error(
+            "the device embedding lookup reads the planar layout and this"
+            " weight is still in ggml blocks, so it has to be repacked first"
+        )
+    if group_size(w.kind) == 0:
+        raise Error(
+            "ggml type " + String(w.kind) + " has no planar form to read"
+        )
+    if w.place != WHERE_DEVICE:
+        raise Error(
+            "the device embedding lookup wants a weight in a device pool and"
+            " this one is in host memory, which a device kernel reads as zeros"
+            " rather than as an error"
+        )
+    if row < 0 or row >= w.rows:
+        raise Error(
+            "row "
+            + String(row)
+            + " is out of range for a weight with "
+            + String(w.rows)
+            + " rows"
+        )
+    if at < 0 or out.elements() < at + w.cols:
+        raise Error(
+            "a row of "
+            + String(w.cols)
+            + " at offset "
+            + String(at)
+            + " does not fit in a vector of "
+            + String(out.elements())
+        )
+    _need_device()
+    comptime if has_accelerator():
+        var g = group_size(w.kind)
+        if g == 32 and has_min(w.kind):
+            _unpack[32, True](ctx, w, out.ptr_at(at), row)
+        elif g == 32:
+            _unpack[32, False](ctx, w, out.ptr_at(at), row)
+        elif g == 16 and not has_min(w.kind):
+            _unpack[16, False](ctx, w, out.ptr_at(at), row)
+        else:
+            raise Error(
+                "no device row read is compiled for a group of "
+                + String(g)
+                + " with a minimum plane"
+            )
+
+
+def _unpack[
+    group: Int, with_min: Bool
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    o: Pointer[Float32, MutAnyOrigin],
+    row: Int,
+) raises:
+    ctx.enqueue_function[planar_row_kernel[group, with_min]](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
+        o,
+        Int32(w.cols),
+        Int32(w.row_bytes()),
+        Int32(row),
+        grid_dim=(_grid(w.cols), 1, 1),
+        block_dim=(TILE, 1, 1),
+    )
 
 
 def device_scale_into(ctx: DeviceContext, mut x: DeviceVec, by: Float32) raises:

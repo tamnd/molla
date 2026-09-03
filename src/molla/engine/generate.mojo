@@ -19,12 +19,12 @@ errand of the decode loop is how a tokenizer ends up with no oracle behind it.
 `molla.tokenizer` already has one, and it takes a path.
 """
 
-from molla.engine.bind import bind
+from molla.engine.bind import Bound, bind
 from molla.engine.sample import Sampler, SamplerConfig
 from molla.engine.session import Session as Decode
 from molla.model.gguf import Gguf
 from molla.model.load import load, plan_load
-from molla.model.repack import model_key, open_cache
+from molla.model.repack import RepackCache, model_key, open_cache
 from molla.model.spec import read_geometry
 from molla.sys.clock import monotonic_ms
 from molla.sys.device import default_device
@@ -66,6 +66,70 @@ def describe(c: SamplerConfig) -> String:
     return out
 
 
+def report_header(
+    g: Gguf,
+    b: Bound,
+    want: Int,
+    cache_bytes: Int,
+    prompt_tokens: Int,
+    sampling: SamplerConfig,
+    load_ms: Int,
+    cache: RepackCache,
+    backend: String,
+) raises:
+    """What was loaded and how it was asked to run, before any text.
+
+    Shared with the device path rather than written twice. A run that reads
+    oddly is the first thing anybody argues about and the argument is shorter
+    when the settings are in the same output as the text, which is an argument
+    that does not get weaker when the arithmetic moves to a card.
+    """
+    print(
+        "model:    ",
+        g.architecture(),
+        b.block_count(),
+        "layers,",
+        b.width(),
+        "wide",
+    )
+    print("backend:  ", backend)
+    print(
+        "context:  ",
+        want,
+        "positions,",
+        cache_bytes // (1 << 20),
+        "MiB of cache",
+    )
+    print("prompt:   ", prompt_tokens, "tokens")
+    print("sampling: ", describe(sampling))
+    print("load:     ", load_ms, "ms")
+    if cache.usable:
+        print(
+            "repack:   ",
+            cache.count(),
+            "tensors from cache,",
+            cache.bytes() // (1 << 20),
+            "MiB",
+        )
+    else:
+        print("repack:   ", cache.reason)
+    print()
+
+
+def report_timing(
+    prefill_ms: Int, prompt_tokens: Int, decode_ms: Int, written: Int
+):
+    """What it cost, in the same shape on both backends so they compare."""
+    print()
+    print("prefill:  ", prefill_ms, "ms for", prompt_tokens, "tokens")
+    print("decode:   ", decode_ms, "ms for", written, "tokens")
+    if written > 0:
+        # Milliseconds per token rather than tokens per second, because a
+        # scalar decode of an 8B is five seconds a token and a rate in whole
+        # tokens per second prints zero.
+        print("rate:     ", decode_ms // written, "ms/token")
+
+
 def run_generate(
     model_path: String,
     tokenizer_path: String,
@@ -99,8 +163,9 @@ def run_generate(
     # Everything stays in the mapping. The kernels are host kernels, so a
     # tensor copied to a card is a tensor they cannot read, and a budget of
     # zero says so rather than leaving it to a placement heuristic that has no
-    # way to know what will read the result. The budget stops being zero when
-    # there is a device forward pass to read the result, which is #143.
+    # way to know what will read the result. It stays zero now that there is a
+    # device forward pass, because that pass is `molla.engine.generate_device`
+    # and this is the run somebody asked to have on the host.
     #
     # A hit binds to the repacked weights and a miss binds to the file and
     # writes the repack on the way past, so the first run against a model is
@@ -142,35 +207,17 @@ def run_generate(
     var sampler = Sampler(sampling, b.vocab())
     for i in range(len(ids)):
         sampler.observe(ids[i])
-    print(
-        "model:    ",
-        g.architecture(),
-        b.block_count(),
-        "layers,",
-        b.width(),
-        "wide",
-    )
-    print(
-        "context:  ",
+    report_header(
+        g,
+        b,
         want,
-        "positions,",
-        decode.cache.bytes() // (1 << 20),
-        "MiB of cache",
+        decode.cache.bytes(),
+        len(ids),
+        sampling,
+        loaded - started,
+        cache,
+        String("host"),
     )
-    print("prompt:   ", len(ids), "tokens")
-    print("sampling: ", describe(sampling))
-    print("load:     ", loaded - started, "ms")
-    if cache.usable:
-        print(
-            "repack:   ",
-            cache.count(),
-            "tensors from cache,",
-            cache.bytes() // (1 << 20),
-            "MiB",
-        )
-    else:
-        print("repack:   ", cache.reason)
-    print()
 
     var prefill_started = monotonic_ms()
     decode.prefill(b, ids)
@@ -188,16 +235,9 @@ def run_generate(
     print()
     var finished = monotonic_ms()
 
-    print()
-    print(
-        "prefill:  ", prefilled - prefill_started, "ms for", len(ids), "tokens"
+    report_timing(
+        prefilled - prefill_started, len(ids), finished - prefilled, written
     )
-    print("decode:   ", finished - prefilled, "ms for", written, "tokens")
-    if written > 0:
-        # Milliseconds per token rather than tokens per second, because a
-        # scalar decode of an 8B is five seconds a token and a rate in whole
-        # tokens per second prints zero.
-        print("rate:     ", (finished - prefilled) // written, "ms/token")
     cache.close()
     g.close()
     _ = weights^
