@@ -94,10 +94,16 @@ def _values(t: Tensor, n: Int) raises -> List[Float32]:
 
 
 def _gain(ctx: DeviceContext, t: Tensor, n: Int) raises -> DeviceVec:
-    """One small host weight, uploaded once and kept for the model's life."""
+    """One small host weight, copied up once and kept for the model's life.
+
+    `copy_in` rather than `upload_run`, because the mapping route costs 1.3 GiB
+    on the first call in a process and a thirty layer model calls this sixty
+    times. That was most of the resident set of a device run and it is the whole
+    of docs/validation/performance.md's memory section.
+    """
     var values = _values(t, n)
     var out = DeviceVec(ctx, n)
-    out.upload_run(values, 0, n)
+    out.copy_in(values)
     return out^
 
 

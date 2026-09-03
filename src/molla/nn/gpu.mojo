@@ -77,9 +77,16 @@ struct DeviceVec(Movable):
     at decode shapes, which is the whole argument for putting the small
     operations on the device at all.
 
-    `upload` and `download` exist for the ends of a block and for tests. They
-    are not on the path a token takes once #143 lands, and every use of them
-    inside a sequence of kernels is a bug rather than a slow spot.
+    `copy_in` and `copy_out` are how bytes cross the boundary. `upload`,
+    `upload_run`, `download` and `at` do the same job through a host mapping and
+    are for tests and for a trace, because the first `map_to_host` call in a
+    process reserves 1.3 GiB that it never gives back and never reuses. On a 138
+    MiB model that was most of the resident set. The copy path never pays it.
+    See [docs/validation/performance.md](../../../docs/validation/performance.md).
+
+    Either way, a transfer is for the ends of a block. It is not on the path a
+    token takes, and every use of one inside a sequence of kernels is a bug
+    rather than a slow spot.
 
     Not `ImplicitlyCopyable`, deliberately. Two vectors that name the same
     device buffer is exactly the aliasing bug that produces a norm reading its
@@ -132,6 +139,56 @@ struct DeviceVec(Movable):
         return Pointer[Float32, MutAnyOrigin](
             unsafe_from_address=Int(self.buf.unsafe_ptr()) + at * 4
         )
+
+    def copy_in(mut self, x: List[Float32]) raises:
+        """Fill this vector from the front of a host list, without a mapping.
+
+        Synchronous on purpose. The card reads `x` directly and `x` is usually a
+        local that dies when the caller returns, so handing the copy to the
+        stream and going home would leave the card reading a freed list.
+        Everything that calls this calls it once per weight when a model binds,
+        so the wait costs nothing anybody can measure.
+        """
+        if len(x) < self.n:
+            raise Error(
+                "copying "
+                + String(len(x))
+                + " values into a device vector of "
+                + String(self.n)
+            )
+        var ctx = self.buf.context()
+        ctx.enqueue_copy(
+            self.buf,
+            Pointer[Float32, MutAnyOrigin](
+                unsafe_from_address=Int(x.unsafe_ptr())
+            ),
+        )
+        ctx.synchronize()
+
+    def copy_out(self, mut out: Buffer) raises:
+        """This vector back into a host buffer, without a mapping.
+
+        Synchronous for the ordinary reason rather than the lifetime one:
+        whatever queued the kernels that wrote this vector has not necessarily
+        finished, and reading before the stream drains reads whichever of them
+        happened to land.
+        """
+        if out.elements() != self.n:
+            raise Error(
+                "copying a device vector of "
+                + String(self.n)
+                + " into "
+                + String(out.elements())
+                + " values"
+            )
+        var ctx = self.buf.context()
+        ctx.enqueue_copy(
+            Pointer[Float32, MutAnyOrigin](
+                unsafe_from_address=Int(out.data.unsafe_ptr())
+            ),
+            self.buf,
+        )
+        ctx.synchronize()
 
     def upload(mut self, x: Buffer) raises:
         if x.elements() != self.n:
