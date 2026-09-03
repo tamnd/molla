@@ -58,7 +58,12 @@ from molla.model.gguf import Gguf
 from molla.model.load import Weights, device_refusal, load, plan_load
 from molla.model.repack import RepackCache, model_key, open_cache
 from molla.nn.gpu import DeviceVec
-from molla.nn.gpu_block import DeviceModel, DeviceScratch, device_forward
+from molla.nn.gpu_block import (
+    PREFILL_CHUNK,
+    DeviceModel,
+    DeviceScratch,
+    device_forward,
+)
 from molla.nn.model import frequency_factors
 from molla.nn.tensor import Buffer
 from molla.sys.device import Device
@@ -151,6 +156,17 @@ struct DeviceSession(Movable):
     var cache: DeviceKvCache
     var scratch: DeviceScratch
 
+    var batch: DeviceScratch
+    """The same scratch again, sized for a prefill chunk.
+
+    A second one rather than one sized for the chunk and used for both, because
+    the attention scratch scales with the chunk and the context together and a
+    decode would then be holding a hundred times the scores it reads.
+    """
+
+    var wide: DeviceVec
+    """The residual stream for a prefill chunk, one row a token."""
+
     var x: DeviceVec
     """The residual stream, one token wide, device side from the embedding
     lookup to the final norm."""
@@ -162,6 +178,15 @@ struct DeviceSession(Movable):
     var pos: Int
     """How many positions this sequence has consumed. The next token is at
     `pos`, and the cache's `filled` agrees with it until something evicts."""
+
+    var batched: Bool
+    """Whether the last pass was a chunk, so `fetch` knows which logits are the
+    live ones.
+
+    The two scratches each own a logits vector and a pass writes exactly one of
+    them, so reading the other gives whatever the last decode left there. That
+    is a silent wrong answer rather than an error, because the buffer is the
+    right shape and full of real numbers from an earlier token."""
 
     def __init__(
         out self, ctx: DeviceContext, host: Bound, dev: Bound, context: Int
@@ -199,9 +224,17 @@ struct DeviceSession(Movable):
             ctx, dev.block_count(), context, dev.kv_width()
         )
         self.scratch = DeviceScratch(ctx, dev.specs[0], context, dev.vocab())
+        var chunk = PREFILL_CHUNK
+        if chunk > context:
+            chunk = context
+        self.batch = DeviceScratch(
+            ctx, dev.specs[0], context, dev.vocab(), chunk
+        )
+        self.wide = DeviceVec(ctx, chunk * dev.width())
         self.x = DeviceVec(ctx, dev.width())
         self.logits = Buffer(dev.vocab())
         self.pos = 0
+        self.batched = False
 
     def context(self) -> Int:
         return self.cache.context
@@ -210,6 +243,36 @@ struct DeviceSession(Movable):
         """Start a new sequence in the same memory."""
         self.cache.reset()
         self.pos = 0
+        self.batched = False
+
+    def run(mut self, tokens: List[Int]) raises:
+        """A run of tokens through the stack in one pass, waited for once.
+
+        The wait is here rather than in `fetch` because a prefill that never
+        waits hands the driver every launch of every chunk at once, and the
+        point of the design is one synchronize a pass and not none.
+        """
+        var n = len(tokens)
+        if n == 0:
+            raise Error("a forward pass needs at least one token")
+        self.cache.reserve(n)
+        var slot = self.cache.slot_for(self.pos)
+        device_forward(
+            self.ctx,
+            self.model,
+            self.batch if n > 1 else self.scratch,
+            self.wide if n > 1 else self.x,
+            tokens,
+            self.pos,
+            slot,
+            self.cache.keys,
+            self.cache.values,
+        )
+        self.ctx.synchronize()
+        self.batched = n > 1
+        self.pos += n
+        for _ in range(n):
+            self.cache.advance()
 
     def step(mut self, token: Int) raises:
         """One token through the whole stack, leaving its logits on the card.
@@ -220,22 +283,8 @@ struct DeviceSession(Movable):
         them, and the point of the design is one synchronize per token and not
         none.
         """
-        self.cache.reserve(1)
-        var slot = self.cache.slot_for(self.pos)
-        device_forward(
-            self.ctx,
-            self.model,
-            self.scratch,
-            self.x,
-            token,
-            self.pos,
-            slot,
-            self.cache.keys,
-            self.cache.values,
-        )
-        self.ctx.synchronize()
-        self.pos += 1
-        self.cache.advance()
+        var one: List[Int] = [token]
+        self.run(one)
 
     def fetch(mut self) raises:
         """Bring the last step's logits back to the host.
@@ -246,15 +295,42 @@ struct DeviceSession(Movable):
         """
         if self.pos == 0:
             raise Error("there are no logits until a token has been run")
-        self.scratch.logits.copy_out(self.logits)
+        if self.batched:
+            self.batch.logits.copy_out(self.logits)
+        else:
+            self.scratch.logits.copy_out(self.logits)
 
     def prefill(mut self, tokens: List[Int]) raises:
-        """The prompt. Only the last token's logits are worth anything."""
+        """The prompt, in chunks. Only the last token's logits are worth reading.
+
+        A chunk is a matmul with the chunk length as its free dimension rather
+        than that many matvecs, so a prompt costs the launches of one token per
+        chunk instead of the launches of one token per token. The chunk size is
+        what bounds the attention scratch, which is the only thing here that
+        grows with both the chunk and the context.
+
+        A trace records one residual stream a layer, so a session that is
+        tracing goes back to a token at a time. That path is what the logit
+        corpus compares against the host and it has to stay the one the corpus
+        was written for.
+        """
         if len(tokens) == 0:
             raise Error("a prompt with no tokens has nothing to continue")
         self.cache.reserve(len(tokens))
-        for i in range(len(tokens)):
-            self.step(tokens[i])
+        if self.scratch.tracing or self.batch.chunk == 1:
+            for i in range(len(tokens)):
+                self.step(tokens[i])
+            return
+        var at = 0
+        while at < len(tokens):
+            var take = len(tokens) - at
+            if take > self.batch.chunk:
+                take = self.batch.chunk
+            var run = List[Int]()
+            for i in range(take):
+                run.append(tokens[at + i])
+            self.run(run)
+            at += take
 
     def pick(mut self, mut sampler: Sampler) raises -> Int:
         """One token, from the logits the last step left on the card."""

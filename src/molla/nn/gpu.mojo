@@ -494,6 +494,165 @@ def planar_matvec_kernel[
             o[unsafe_offset=r] = v
 
 
+comptime MM_TILE = 32
+"""Threads in a batched matmul block, which need not be the matvec's tile."""
+
+comptime SPAN = 16
+"""How many tokens one matmul block carries at once.
+
+The number that decides whether prefill is bandwidth bound or compute bound. A
+block reads and dequantizes a weight value once and multiplies it into `SPAN`
+accumulators, so the weight traffic and the conversion work for a chunk of `T`
+tokens are `ceil(T / SPAN)` passes over the matrix rather than `T` of them. It
+costs `SPAN * tile` floats of shared memory, which at the shipped tile is 8 KiB
+a block.
+"""
+
+
+def planar_matmul_kernel[
+    tile: Int, group: Int, with_min: Bool, form: Int
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+    epi_dev: Int32,
+    rows_dev: Int32,
+    tokens_dev: Int32,
+):
+    """`o[t][r] = dot(row r of w, x[t])` for `SPAN` tokens at a time.
+
+    The same inner loop as `planar_matvec_kernel` with the accumulator widened
+    from one float to `SPAN` of them. That is the entire difference and it is
+    the entire point: the expensive part of a decode matvec is reading a weight
+    byte and turning it into a float, and both of those happen once here for
+    `SPAN` multiplies rather than once for one.
+
+    The grid is `(ceil(tokens / SPAN), rows)` and the order is deliberate.
+    Blocks that share an output row differ only in the token index, and they
+    have to be co-resident for the L2 to serve that row once rather than once
+    each, so the token index is the fast axis.
+
+    A chunk is not a multiple of `SPAN` in general, and the tail block clamps
+    its dead lanes onto the last live token rather than branching around them.
+    They compute a duplicate dot product that is never stored, which costs the
+    tail block alone a fraction of one launch and keeps every load in bounds
+    and every loop free of a test.
+
+    See [docs/validation/prefill.md](../../../docs/validation/prefill.md).
+    """
+    var cols = Int(cols_dev)
+    var stride = Int(stride_dev)
+    var rows = Int(rows_dev)
+    var tokens = Int(tokens_dev)
+    var r = Int(block_idx.y)
+    var base = Int(block_idx.x) * SPAN
+    var t = Int(thread_idx.x)
+
+    var row = r * stride
+    var groups = cols // group
+    var packed = w
+    var scales = w.unsafe_bitcast[Float32]()
+    var quant_bytes = cols if form == QUANT_I8 else cols // 2
+    var d_base = (row + quant_bytes) // 4
+    var m_base = d_base + groups
+
+    comptime shift = group_shift(group)
+
+    var live = tokens - base
+    if live > SPAN:
+        live = SPAN
+
+    # Every loop over `SPAN` below has a constant trip count so that the index
+    # into `acc` is a constant after unrolling and the accumulators stay in
+    # registers. A runtime bound would put all eight of them in local memory and
+    # undo the whole change.
+    var at = InlineArray[Int, SPAN](fill=0)
+    for k in range(SPAN):
+        var tk = base + k
+        if tk >= tokens:
+            tk = tokens - 1
+        at[k] = tk * cols
+
+    var acc = InlineArray[Float32, SPAN](fill=0)
+    comptime if form == QUANT_I8:
+        var i = t
+        while i < cols:
+            var gi = i >> shift
+            var q = byte_float(UInt32(packed[unsafe_offset=row + i]))
+            var d = scales[unsafe_offset=d_base + gi] * q
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                for k in range(SPAN):
+                    var a = x[unsafe_offset=at[k] + i]
+                    acc[k] += d * a + m * a
+            else:
+                for k in range(SPAN):
+                    acc[k] += d * x[unsafe_offset=at[k] + i]
+            i += tile
+    else:
+        var i = t * 2
+        while i < cols:
+            var gi = i >> shift
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            var d = scales[unsafe_offset=d_base + gi]
+            var lo = d * nibble_float[form](b & 0xF)
+            var hi = d * nibble_float[form](b >> 4)
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                for k in range(SPAN):
+                    var a0 = x[unsafe_offset=at[k] + i]
+                    var a1 = x[unsafe_offset=at[k] + i + 1]
+                    acc[k] += lo * a0 + hi * a1 + m * (a0 + a1)
+            else:
+                for k in range(SPAN):
+                    var a0 = x[unsafe_offset=at[k] + i]
+                    var a1 = x[unsafe_offset=at[k] + i + 1]
+                    acc[k] += lo * a0 + hi * a1
+            i += tile * 2
+
+    # Laid out `[SPAN][tile]` so that a step of the tree reads what consecutive
+    # threads wrote, which is the access the single accumulator version already
+    # had, done `SPAN` times over rather than as `SPAN` tree walks in a row.
+    var part = stack_allocation[
+        tile * SPAN, Float32, address_space=AddressSpace.SHARED
+    ]()
+    for k in range(SPAN):
+        part[unsafe_offset=k * tile + t] = acc[k]
+    barrier()
+    var step = tile // 2
+    while step > 0:
+        if t < step:
+            for k in range(SPAN):
+                part[unsafe_offset=k * tile + t] = (
+                    part[unsafe_offset=k * tile + t]
+                    + part[unsafe_offset=k * tile + t + step]
+                )
+        barrier()
+        step //= 2
+
+    # One thread a token rather than one thread for the whole block, so the
+    # tail is `SPAN` threads doing one epilogue each.
+    if t < live:
+        var v = part[unsafe_offset=t * tile]
+        var epi = Int(epi_dev)
+        var out_at = (base + t) * rows + r
+        if epi & EPI_BIAS != 0:
+            v += aux[unsafe_offset=r]
+        elif epi & EPI_GLU != 0:
+            var g = aux[unsafe_offset=out_at]
+            if epi & ACT_BIT != 0:
+                v = activate[ACT_GELU](v) * g
+            else:
+                v = activate[ACT_SILU](v) * g
+        if epi & EPI_ADD != 0:
+            o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + v
+        else:
+            o[unsafe_offset=out_at] = v
+
+
 def device_ready() -> Bool:
     """Whether this build has device code in it at all.
 
@@ -539,7 +698,13 @@ def check_matvec_shapes(w: Tensor, in_elements: Int, out_elements: Int) raises:
             " in host memory, which a device kernel reads as zeros rather than"
             " as an error"
         )
-    if in_elements != w.cols:
+    # A matvec reads one row from the front of its input, and since prefill a
+    # scratch vector is a chunk of rows rather than one, so the width it has to
+    # hold is a whole number of rows and at least one. Exact equality would
+    # refuse the output head reading the last row of a prefill chunk, and a
+    # width that is not a multiple of the row is still the wiring mistake this
+    # check exists to catch.
+    if in_elements < w.cols or in_elements % w.cols != 0:
         raise Error(
             "the device matvec wants an input of "
             + String(w.cols)
@@ -653,6 +818,121 @@ def device_matvec_into(
         else:
             raise Error(
                 "no device matvec is compiled for quant form "
+                + String(form)
+                + " with a group of "
+                + String(g)
+                + (" and a minimum plane" if carries_min else " and no minimum")
+            )
+
+
+def _launch_mm[
+    tile: Int, group: Int, with_min: Bool, form: Int
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+    tokens: Int,
+) raises:
+    """One instantiation of the batched form, launched."""
+    ctx.enqueue_function[planar_matmul_kernel[tile, group, with_min, form]](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
+        x,
+        o,
+        aux,
+        Int32(w.cols),
+        Int32(w.row_bytes()),
+        Int32(epi),
+        Int32(w.rows),
+        Int32(tokens),
+        grid_dim=((tokens + SPAN - 1) // SPAN, w.rows, 1),
+        block_dim=(tile, 1, 1),
+    )
+
+
+def device_matmul_into(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    mut out: DeviceVec,
+    tokens: Int,
+    at: Int = 0,
+    epi: Int = EPI_NONE,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
+) raises:
+    """`out[at + t * w.rows + r] = dot(row r of w, x[t])`, for `tokens` of them.
+
+    The batched form of `device_matvec_into`, with the same dispatch over the
+    same five instantiations and the same epilogue. `x` holds `tokens` rows of
+    `w.cols` laid out one after another and `out` holds `tokens` rows of
+    `w.rows` the same way, which is what makes a key projection write a run of
+    cache slots with no copy: the slots are contiguous and so are the rows.
+
+    Queued and not synchronized, for the reason the single token form gives.
+    """
+    if tokens <= 0:
+        raise Error("a batched matmul needs at least one token")
+    if at < 0:
+        raise Error("a matmul cannot write at a negative offset")
+    if x.elements() < tokens * w.cols:
+        raise Error(
+            "the device matmul wants "
+            + String(tokens)
+            + " rows of "
+            + String(w.cols)
+            + " and the input holds "
+            + String(x.elements())
+        )
+    if out.elements() < at + tokens * w.rows:
+        raise Error(
+            "the device matmul writes "
+            + String(tokens)
+            + " rows of "
+            + String(w.rows)
+            + " at offset "
+            + String(at)
+            + " and the output ends at "
+            + String(out.elements())
+        )
+    check_matvec_shapes(w, w.cols, w.rows)
+    comptime if not has_accelerator():
+        raise Error(
+            "this build has no device code in it, so there is no device matmul"
+            " to run. Accelerator support is decided when molla is compiled,"
+            " not when it is run"
+        )
+    else:
+        var o = out.ptr_at(at)
+        var a = aux.value() if aux and epi != EPI_NONE else o
+        var p = x.ptr()
+        var g = group_size(w.kind)
+        var carries_min = has_min(w.kind)
+        var form = quant_form(w.kind)
+        if form == QUANT_U4 and g == 32 and carries_min:
+            _launch_mm[MM_TILE, 32, True, QUANT_U4](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_S4 and g == 32 and not carries_min:
+            _launch_mm[MM_TILE, 32, False, QUANT_S4](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_I8 and g == 32 and carries_min:
+            _launch_mm[MM_TILE, 32, True, QUANT_I8](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_I8 and g == 32:
+            _launch_mm[MM_TILE, 32, False, QUANT_I8](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_I8 and g == 16 and not carries_min:
+            _launch_mm[MM_TILE, 16, False, QUANT_I8](
+                ctx, w, p, o, a, epi, tokens
+            )
+        else:
+            raise Error(
+                "no device matmul is compiled for quant form "
                 + String(form)
                 + " with a group of "
                 + String(g)

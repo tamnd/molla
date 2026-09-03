@@ -53,7 +53,7 @@ comptime KV_HEADS = 2
 comptime HEAD_DIM = 16
 comptime LAYERS = 2
 comptime VOCAB = 96
-comptime CONTEXT = 8
+comptime CONTEXT = 24
 
 comptime MATRICES = 2 + LAYERS * 7
 """The embedding, the head, and seven per layer, in the order `_shapes` lists
@@ -281,12 +281,17 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         var cache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
         var got = Buffer(VOCAB)
 
+        # Twenty of them rather than a handful, because a prefill block carries
+        # `SPAN` tokens and a run shorter than one block would never exercise a
+        # second block, a tail block, or the clamp the tail lanes ride on.
         var tokens = List[Int]()
         tokens.append(3)
         tokens.append(41)
         tokens.append(0)
         tokens.append(VOCAB - 1)
         tokens.append(17)
+        for i in range(15):
+            tokens.append((i * 13 + 5) % VOCAB)
 
         var worst = Float32(0)
         var peak = Float32(0)
@@ -307,12 +312,13 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                 factors,
                 logits,
             )
+            var one: List[Int] = [tokens[step]]
             device_forward(
                 ctx,
                 model,
                 dscratch,
                 dx,
-                tokens[step],
+                one,
                 step,
                 step,
                 cache.keys,
@@ -340,6 +346,103 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                     worst = gap
             if want_top == got_top:
                 picks += 1
+
+        # The prefill path, over the same tokens, into a cache of its own. This
+        # is the claim #167 makes and it is not implied by anything above: the
+        # five decodes ran the matvec, the norms and the attention one token at
+        # a time, and one pass over five tokens runs a different kernel for
+        # every one of them. What has to survive that is the last token's
+        # logits and both cache planes, because a chunk that gets the logits
+        # right and the cache wrong answers the prompt and then drifts.
+        var batch = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, len(tokens))
+        var bx = DeviceVec(ctx, len(tokens) * WIDTH)
+        var bcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+        device_forward(
+            ctx, model, batch, bx, tokens, 0, 0, bcache.keys, bcache.values
+        )
+        ctx.synchronize()
+        var batched = Buffer(VOCAB)
+        batch.logits.download(batched)
+
+        # And again in two chunks, because a prompt longer than the scratch is
+        # the ordinary case and the second chunk is the one that has to find
+        # the first chunk's keys where it left them. The split is not on a
+        # `SPAN` boundary on purpose.
+        var split = 13
+        var head_run = List[Int]()
+        var tail_run = List[Int]()
+        for i in range(len(tokens)):
+            if i < split:
+                head_run.append(tokens[i])
+            else:
+                tail_run.append(tokens[i])
+        var pair = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, len(tokens))
+        var px = DeviceVec(ctx, len(tokens) * WIDTH)
+        var pcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+        device_forward(
+            ctx, model, pair, px, head_run, 0, 0, pcache.keys, pcache.values
+        )
+        device_forward(
+            ctx,
+            model,
+            pair,
+            px,
+            tail_run,
+            split,
+            split,
+            pcache.keys,
+            pcache.values,
+        )
+        ctx.synchronize()
+        var split_out = Buffer(VOCAB)
+        pair.logits.download(split_out)
+        var split_worst = Float32(0)
+        for i in range(VOCAB):
+            var gap = split_out.data[i] - logits.data[i]
+            if gap < 0:
+                gap = -gap
+            if gap > split_worst:
+                split_worst = gap
+
+        var batch_worst = Float32(0)
+        var batch_top = 0
+        var want_last = 0
+        for i in range(VOCAB):
+            if batched.data[i] > batched.data[batch_top]:
+                batch_top = i
+            if logits.data[i] > logits.data[want_last]:
+                want_last = i
+            var gap = batched.data[i] - logits.data[i]
+            if gap < 0:
+                gap = -gap
+            if gap > batch_worst:
+                batch_worst = gap
+
+        var span = CONTEXT * KV_HEADS * HEAD_DIM
+        var live = len(tokens) * KV_HEADS * HEAD_DIM
+        var mine = Buffer(span)
+        var theirs = Buffer(span)
+        var cache_worst = Float32(0)
+        var cache_peak = Float32(0)
+        for l in range(LAYERS):
+            for half in range(2):
+                if half == 0:
+                    cache.keys[l].download(mine)
+                    bcache.keys[l].download(theirs)
+                else:
+                    cache.values[l].download(mine)
+                    bcache.values[l].download(theirs)
+                for i in range(live):
+                    var m = mine.data[i]
+                    if m < 0:
+                        m = -m
+                    if m > cache_peak:
+                        cache_peak = m
+                    var gap = theirs.data[i] - mine.data[i]
+                    if gap < 0:
+                        gap = -gap
+                    if gap > cache_worst:
+                        cache_worst = gap
 
         keep(pool)
         keep(blob)
@@ -389,4 +492,23 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                 "and the residual stream agrees layer by layer, not only at"
                 " the end"
             ),
+        )
+
+        suite.group("device prefill against device decode")
+        suite.check(
+            batch_worst <= peak * Float32(2e-4),
+            "a chunk of five tokens leaves the last token's logits",
+        )
+        suite.check(
+            batch_top == want_last,
+            "and greedy picks the same token off them",
+        )
+        suite.check(cache_peak > 0, "the cache the decodes left is not zeros")
+        suite.check(
+            cache_worst <= cache_peak * Float32(2e-4),
+            "and the chunk leaves the same keys and values in it",
+        )
+        suite.check(
+            split_worst <= peak * Float32(2e-4),
+            "and a prompt split across two chunks reaches the same logits",
         )
