@@ -179,6 +179,15 @@ def fits_on(g: Gguf, cache: RepackCache, dev: Device) raises -> Bool:
     return plan_load(g, dev, -1, cache).left_behind == 0
 
 
+def _yes(all: List[Device]) -> List[Bool]:
+    """A fit list that says yes to everything, for the questions fit does not
+    enter into."""
+    var out = List[Bool]()
+    for _ in range(len(all)):
+        out.append(True)
+    return out^
+
+
 def _api_list(all: List[Device]) -> String:
     """The apis this machine has, for a message about one it does not."""
     var out = String("")
@@ -267,10 +276,14 @@ def pick(want: Request, all: List[Device], fits: List[Bool]) raises -> Backend:
     if best >= 0:
         return Backend(all[best], True, String(""))
 
-    var note = String("no accelerator on this machine")
-    if not build_targets_gpu():
-        note = String("this build has no device code in it")
-    elif accelerators > 0:
+    # Most specific reason first. A card in the list is a card whatever the
+    # build can talk to, so "does not fit" outranks both of the others, and
+    # "no accelerator on this machine" is only honest on a build that would
+    # have been able to see one.
+    var note = String("this build has no device code in it")
+    if build_targets_gpu():
+        note = String("no accelerator on this machine")
+    if accelerators > 0:
         note = (
             String("the model does not fit on ")
             + all[biggest].name
@@ -293,9 +306,17 @@ def choose_backend(model_path: String, want: Request) raises -> Backend:
     if want.mode == WANT_CPU:
         return Backend(host_device(), False, String(""))
 
+    var all = devices()
+    if want.mode == WANT_API:
+        # Everything about a named backend except whether the model fits is
+        # answerable without the file, and asking now means `--device=cuda` on
+        # a machine with no CUDA says so rather than reporting whatever is
+        # wrong with the path first. Nothing can come back from this call but a
+        # refusal, because every entry is marked as fitting.
+        _ = pick(want, all, _yes(all))
+
     var g = Gguf(model_path)
     var cache = open_cache(model_path, model_key(g))
-    var all = devices()
     var fits = List[Bool]()
     for i in range(len(all)):
         fits.append(fits_on(g, cache, all[i]))
