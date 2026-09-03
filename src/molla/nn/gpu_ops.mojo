@@ -33,7 +33,7 @@ of these on one stream and the caller waits once at the end.
 """
 
 from std.gpu import block_dim, block_idx, grid_dim, thread_idx
-from std.math import cos, exp, sin, sqrt, tanh
+from std.math import cos, exp, sin, sqrt
 from std.memory import AddressSpace, stack_allocation
 from std.sys.info import has_accelerator
 
@@ -390,8 +390,9 @@ def rope_kernel[
         if ext_factor != 0:
             var mix = _ramp(low, high, pair) * ext_factor
             theta = interp * (Float32(1.0) - mix) + extrap * mix
-        var c = cos(theta) * attn_factor
-        var s = sin(theta) * attn_factor
+        var turn = _reduce_angle(theta)
+        var c = cos(turn) * attn_factor
+        var s = sin(turn) * attn_factor
 
         var lo = at + pair
         var hi = at + pair + pairs
@@ -404,6 +405,71 @@ def rope_kernel[
         x[unsafe_offset=lo] = a * c - b * s
         x[unsafe_offset=hi] = a * s + b * c
         pair += Int(block_dim.x)
+
+
+comptime TWO_PI_HI = Float32(6.28125)
+"""Two pi, truncated to eight significant bits.
+
+Eight because the rest of the split below only works if `k * TWO_PI_HI` is exact
+in float32, and a float32 has 24 bits of mantissa, so eight here leaves sixteen
+for `k`. That covers an angle of up to 65536 turns, which is a position of about
+411000 at the fastest pair, and no context is near that.
+"""
+
+comptime TWO_PI_MID = Float32(0.0019353072)
+"""What is left of two pi after the first term."""
+
+comptime TWO_PI_LO = Float32(1.0253132e-11)
+"""And after the second. Three terms reproduce two pi to about 1e-18, which is
+far past float32 and is the point: the error in the reduction has to come from
+the multiplications rather than from the constant."""
+
+comptime INV_TWO_PI = Float32(0.15915494)
+
+
+def _reduce_angle(theta: Float32) -> Float32:
+    """Bring an angle into one turn before it reaches `cos` and `sin`.
+
+    This is here because the two GPUs disagreed and only one of them was wrong.
+    A rope angle is the position times a frequency, so at the fastest pair it is
+    the position itself, and by position 4096 that is 652 whole turns. Metal
+    takes a float32 `cos` of that and lands within 1e-7 of the float64 answer.
+    CUDA does not: it reduced the argument in a way that costs about 4e-4 there,
+    growing with the position, which is the shape of a bug that looks fine in
+    every short test and degrades a long context.
+
+    Doing the reduction here rather than trusting either one is what makes the
+    two targets agree, and it is cheap. Cody and Waite's method, with two pi
+    split into three terms so that the first product is exact and the other two
+    carry the bits it dropped.
+
+    The angle is never negative, so this does not handle that. `pos` is a
+    position, `step` is positive by construction and the YaRN blend is between
+    two positive numbers, so there is no path to one.
+    """
+    var k = Float32(Int(theta * INV_TWO_PI + Float32(0.5)))
+    var r = theta - k * TWO_PI_HI
+    r = r - k * TWO_PI_MID
+    return r - k * TWO_PI_LO
+
+
+def _tanh(x: Float32) -> Float32:
+    """`tanh` through one exponential rather than the target's own.
+
+    Same reason as `_reduce_angle` and found the same way. The host softcaps a
+    score in float64 and multiplies the result by the cap, which is 50 on a
+    Gemma 2, so an error in the tanh arrives at the softmax fifty times larger.
+    The float32 `tanh` CUDA provides is far enough from the float64 one for that
+    to show, and the float32 `exp` both targets provide is not.
+
+    Written on the negative side so the exponential is of a non positive number
+    and lands in `(0, 1]`. The other arrangement overflows for a score a few
+    times the cap, which is not rare.
+    """
+    var v = x if x >= 0 else -x
+    var e = exp(Float32(-2.0) * v)
+    var r = (Float32(1.0) - e) / (Float32(1.0) + e)
+    return r if x >= 0 else -r
 
 
 def _ramp(low: Float32, high: Float32, pair: Int) -> Float32:
@@ -485,7 +551,7 @@ def attend_kernel[
                 acc += q[unsafe_offset=qa + d] * keys[unsafe_offset=ka + d]
             s = acc * scale
             if softcap > 0:
-                s = softcap * tanh(s / softcap)
+                s = softcap * _tanh(s / softcap)
         scores[unsafe_offset=sa + j] = s
         if s > mine:
             mine = s
