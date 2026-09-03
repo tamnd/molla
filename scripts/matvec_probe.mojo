@@ -239,9 +239,9 @@ def probe_kernel[
             var u = UInt32(packed[unsafe_offset=row + i]) ^ 0x80
             var q = bitcast[DType.float32, 1](UInt32(0x4B000000) | u)
             var a = x[unsafe_offset=i]
-            acc += scales[unsafe_offset=d_base + gi] * (
-                q - Float32(8388736.0)
-            ) * a
+            acc += (
+                scales[unsafe_offset=d_base + gi] * (q - Float32(8388736.0)) * a
+            )
             comptime if with_min:
                 acc += scales[unsafe_offset=m_base + gi] * a
             i += tile
