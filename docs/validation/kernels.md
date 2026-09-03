@@ -342,6 +342,18 @@ The third was found by the oracle rather than by the second machine, and it is t
 
 The general point is that a tolerance that has to grow with an input is not a tolerance, it is an unfixed bug with a number in front of it.
 
+### A CUDA process gets one device context
+
+Found by running the suite on the 4090, and it is the reason the fleet earns its keep on something other than numerics.
+
+The suite hung. Not failed, hung: the GPU at nought per cent, 141 seconds of CPU over 74 minutes, and all 35 threads asleep on a futex. It stopped at the first device norm, which reads exactly like a kernel that will not finish, and it is not one.
+
+`tests/test_gpu.mojo` made a `DeviceContext` for the matvec and `tests/test_gpu_ops.mojo` made another for the block. On CUDA the second one is constructed without complaint and then hangs on the first buffer allocated against it, even though the first context went out of scope before it. Each module passes on its own, which is what made this slow to see. Metal does not mind at all, so the M4 ran two contexts in one process for as long as there were two modules to run them.
+
+The fix is that `tests/main.mojo` makes the one context and lends it to both modules, and no test module makes its own. That is also the shape the engine wants, since a process that made a context per layer would hang on the second layer, and #143 binds against one context for the same reason.
+
+What is worth carrying forward is the failure mode rather than the rule. A hang with an idle GPU looks like a kernel bug and is not one, and nothing in it names a context.
+
 ### The fleet
 
 Per D8.
