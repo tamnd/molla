@@ -273,7 +273,7 @@ def run(mut suite: Suite) raises:
     # A header longer than the file it is in. The prefix is the only thing that
     # says how long the header is, so it has to be checked against the mapping.
     var short = _st_bytes(PAIR, 0)
-    for i in range(20):
+    for _ in range(20):
         _ = short.pop()
     _write(huge_path, short)
     suite.check(not _opens(huge_path), "a header that runs past the end")

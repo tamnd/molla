@@ -496,7 +496,7 @@ def _check_log_pump(mut suite: Suite) raises:
     var pump = LogPump(Int(Pointer(to=sink)))
     pump.start()
     var log = sink.logger(0)
-    for i in range(16):
+    for _ in range(16):
         _ = log.info("pumped")
     var deadline = monotonic_ms() + WAIT_MS
     while sink.pending() > 0 and monotonic_ms() < deadline:
