@@ -20,11 +20,11 @@ molla reports prefill and decode separately and the harness reads them off `moll
 
 llama.cpp is measured with `llama-bench`, which runs prefill and decode as separate passes and reports tokens per second for each. It does not report time to first token, so that column is the prompt divided by the prefill rate, which is the same quantity arrived at a different way rather than a second measurement.
 
-Ollama is asked through `/api/generate` with `stream` off and `raw` on, which returns the counts and the durations of both halves. Its prefill is the first run and no other, because the server keeps the keys and values of the last prompt it saw and the harness sends the same prompt every time. Before that was fixed the second run reported the full token count against almost no time and Ollama came out three times faster at prefill than the same engine underneath llama.cpp. Decode is not cached and keeps its median. Peak resident bytes belong to a server the harness did not start, which also holds other models, so that column is empty rather than wrong.
+Ollama is asked through `/api/generate` with `stream` off and `raw` on, which returns the counts and the durations of both halves. Its prefill is the first run and no other, because the server keeps the keys and values of the last prompt it saw and the harness sends the same prompt every time. Before that was fixed the second run reported the full token count against almost no time and Ollama came out three times faster at prefill than the same engine underneath llama.cpp. Decode is not cached and keeps its median. Peak resident bytes belong to a server the harness did not start, which also holds other models, so that cell is a dash rather than a number about the wrong process.
 
-## The CUDA machine
+## gpc, the RTX 4090
 
-An RTX 4090 with 24564 MiB, reached through WSL2 on a Windows machine, which is why the harness reports Linux x86_64 with 32 logical cores. It is a WSL2 CUDA result and not a Linux CUDA result, for the reason in the README: the only NVIDIA card in the fleet is in a Windows box. This is the quietest machine in the set and the one where a number is a measurement.
+An RTX 4090 with 24564 MiB, reached through WSL2 on a Windows machine, which is why the harness reports Linux x86_64 with 32 logical cores. It is a WSL2 CUDA result and not a Linux CUDA result, for the reason in [toolchain.md](toolchain.md): the only NVIDIA card in the fleet is in a Windows box. This is the quietest machine in the set and the one where a number is a measurement.
 
 molla 0.3.3, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-03. All three on `--device=cuda`, 134 prompt tokens, 32 generated, 3 runs, median.
 
@@ -46,9 +46,9 @@ Qwen 2.5 0.5B Instruct q4_K_M, digest 74a4da8c9fdb.
 | llama.cpp | 25497.0 | 767.2 | 5 | 807 |
 | ollama | 32651.1 | 505.0 | 4 | - |
 
-## The laptop
+## macbook, the M4
 
-An M4, and a shared working machine whose load average is regularly above sixty. These are indicative numbers and not measurements. They are here because they are the only Metal numbers in the set, and Metal is half of what M2b built.
+An M4 with 10 cores, and a shared working machine whose load average is regularly above sixty. These are indicative numbers and not measurements. They are here because they are the only Metal numbers in the set, and Metal is half of what M2b built.
 
 molla 0.3.3, llama.cpp b10621 c1d0e7a00, Ollama not installed, on 2026-09-03. SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 134 prompt tokens, 32 generated, 3 runs, median.
 
@@ -68,9 +68,9 @@ On `--device=cpu`, the same machine and the same file.
 | llama.cpp | 927.5 | 287.0 | 144 | 371 |
 | ollama | - | - | - | - |
 
-## The Linux host with no accelerator
+## server1, no accelerator
 
-Four cores, x86_64, no GPU, and neither rival installed. It is in the set to prove the harness reports an absent engine as absent rather than dropping the row, and to give the host path a second machine.
+An AMD EPYC with four threads, no GPU, and neither rival installed. It is in the set to prove the harness reports an absent engine as absent rather than dropping the row, and to give the host path a second machine.
 
 molla 0.3.3, on 2026-09-03. SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 134 prompt tokens, 32 generated, 3 runs, median, on `--device=cpu`.
 
@@ -82,7 +82,7 @@ molla 0.3.3, on 2026-09-03. SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 134
 
 llama.cpp and Ollama are reported as not on PATH, which is what a machine without them should produce.
 
-1.7 tokens per second on four cores is the slowest host figure in the set, and the laptop's 7.7 is too noisy to divide by it and get anything meaningful. What the row is worth is a floor. Anybody running molla on a small cloud instance today gets roughly a token per second on a 135M model, and that is the number to hold this page against once the host path is worked on.
+1.7 tokens per second on four threads is the slowest host figure in the set, and the laptop's 7.7 is too noisy to divide by it and get anything meaningful. What the row is worth is a floor. Anybody running molla on a small cloud instance today gets roughly a token per second on a 135M model, and that is the number to hold this page against once the host path is worked on.
 
 ## What the numbers say
 
