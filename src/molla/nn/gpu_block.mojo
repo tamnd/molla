@@ -48,7 +48,12 @@ from max.gpu.host import DeviceContext
 
 from molla.nn.arch import Arch
 from molla.nn.block import ACT_SILU, BlockSpec, LayerWeights
-from molla.nn.gpu import DeviceVec, device_matvec_into
+from molla.nn.gpu import (
+    DeviceQuantVec,
+    DeviceVec,
+    device_matvec_q8_into,
+    device_quantize,
+)
 from molla.nn.gpu_ops import (
     RopeTables,
     device_add_into,
@@ -348,6 +353,19 @@ struct DeviceScratch(Movable):
     var scores: DeviceVec
     var logits: DeviceVec
 
+    var qnorm: DeviceQuantVec
+    var qheads: DeviceQuantVec
+    var qhidden: DeviceQuantVec
+    """The three activation vectors a matvec reads, quantized to a byte a value.
+
+    Every matvec on a token's path reads one of these. The attention norm feeds
+    the query, key and value projections and the final norm feeds the head, the
+    attention output feeds the output projection, and the gate or the up
+    projection feeds the down projection. Sized once here for the same reason
+    everything else in this struct is, which is that a decode step touches no
+    allocator.
+    """
+
     var tracing: Bool
     """Whether `device_forward` records the residual stream as it goes. Off.
 
@@ -374,6 +392,9 @@ struct DeviceScratch(Movable):
         self.up = DeviceVec(ctx, spec.hidden)
         self.scores = DeviceVec(ctx, spec.attn.heads * context)
         self.logits = DeviceVec(ctx, vocab)
+        self.qnorm = DeviceQuantVec(ctx, spec.width)
+        self.qheads = DeviceQuantVec(ctx, spec.q_width())
+        self.qhidden = DeviceQuantVec(ctx, spec.hidden)
         self.tracing = False
         self.trace = List[Float32]()
 
@@ -447,13 +468,14 @@ def device_attention(
         )
 
     device_rms_norm(ctx, x, w.attn_norm, s.norm, spec.eps)
-    device_matvec_into(ctx, w.wq, s.norm, s.q)
+    device_quantize(ctx, s.norm, s.qnorm)
+    device_matvec_q8_into(ctx, w.wq, s.qnorm, s.q)
 
     # Straight into the cache rather than into scratch and then a copy, which is
     # what the offset on the matvec is for. The cache is where they are needed
     # and this is the only place they are written.
-    device_matvec_into(ctx, w.wk, s.norm, keys, at)
-    device_matvec_into(ctx, w.wv, s.norm, values, at)
+    device_matvec_q8_into(ctx, w.wk, s.qnorm, keys, at)
+    device_matvec_q8_into(ctx, w.wv, s.qnorm, values, at)
 
     if w.has_bias:
         device_add_run(ctx, s.q, 0, w.q_bias, spec.q_width())
@@ -503,7 +525,8 @@ def device_attention(
         s.heads_out,
         s.scores,
     )
-    device_matvec_into(ctx, w.wo, s.heads_out, s.projected)
+    device_quantize(ctx, s.heads_out, s.qheads)
+    device_matvec_q8_into(ctx, w.wo, s.qheads, s.projected)
 
     if w.has_attn_post:
         device_rms_norm_inplace(ctx, s.projected, w.attn_post_norm, spec.eps)
@@ -527,21 +550,23 @@ def device_mlp(
         )
 
     device_rms_norm(ctx, x, w.ffn_norm, s.norm, spec.eps)
-    device_matvec_into(ctx, w.up, s.norm, s.up)
+    device_quantize(ctx, s.norm, s.qnorm)
+    device_matvec_q8_into(ctx, w.up, s.qnorm, s.up)
 
     if w.has_gate:
-        device_matvec_into(ctx, w.gate, s.norm, s.gate)
+        device_matvec_q8_into(ctx, w.gate, s.qnorm, s.gate)
         if spec.act == ACT_SILU:
             device_swiglu(ctx, s.gate, s.up)
         else:
             device_geglu(ctx, s.gate, s.up)
-        device_matvec_into(ctx, w.down, s.gate, s.projected)
+        device_quantize(ctx, s.gate, s.qhidden)
     else:
         if spec.act == ACT_SILU:
             device_silu(ctx, s.up)
         else:
             device_gelu(ctx, s.up)
-        device_matvec_into(ctx, w.down, s.up, s.projected)
+        device_quantize(ctx, s.up, s.qhidden)
+    device_matvec_q8_into(ctx, w.down, s.qhidden, s.projected)
 
     if w.has_ffn_post:
         device_rms_norm_inplace(ctx, s.projected, w.ffn_post_norm, spec.eps)
@@ -619,7 +644,8 @@ def device_forward(
         s.record(ctx, x)
 
     device_rms_norm(ctx, x, m.output_norm, s.norm, m.specs[0].eps)
-    device_matvec_into(ctx, m.head, s.norm, s.logits)
+    device_quantize(ctx, s.norm, s.qnorm)
+    device_matvec_q8_into(ctx, m.head, s.qnorm, s.logits)
     if m.arch.final_softcap > 0:
         device_softcap(ctx, s.logits, m.arch.final_softcap, m.vocab())
     if s.tracing:

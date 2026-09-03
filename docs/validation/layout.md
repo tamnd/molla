@@ -179,6 +179,68 @@ It is exact. `i // 32` and `i >> 5` are the same number for every index this ker
 
 Two things this says beyond the fix. The first is that a compile time constant is not a compile time constant on every backend, and the only way to know which is to price it on each one. The second is that the CUDA reading in the section above stands but its scope does not: on CUDA the wall really is work per value, and on Metal the wall was one instruction that should never have been there. The remaining Metal variants say the rest of the ladder is there too, 740 with narrow indices and 199 for the loads alone, so Metal has another three times in it after this and it is the same three times CUDA has.
 
+## The activation side, which is what is left
+
+Issue #186. After the shift both backends sit in the same place relative to their own floor: on a 4096 by 4096 q4_K matvec the M4 is 868 microseconds against 192 for the loads with no arithmetic at all, and the 4090 is 29 against 10. So on either card roughly three quarters of the kernel is arithmetic on values that have already arrived, and no rearrangement of the bytes touches it. That is what this section is a spec for.
+
+The arithmetic is one shape repeated. Per pair of weights the kernel loads a byte, splits it into two nibbles, converts both to `Float32`, loads two activations, loads a scale and a minimum, and does eight floating point operations. The conversions are the part worth naming: on NVIDIA an integer to float convert issues on the same unit as transcendentals at a quarter of the rate of a multiply, so the four converts a byte pair costs are worth sixteen multiplies on their own.
+
+llama.cpp does not do any of that. It quantizes the activation vector to a signed byte per value with one scale per 32 values, and then a weight and an activation are both small integers whose product is an integer. A run of them accumulates in an `Int32` and the whole run is converted and scaled once.
+
+### What it is worth, measured before it was written
+
+`scripts/matvec_probe.mojo` prices it against the shipped loop. The integer variants read a real int8 activation plane and a real scale, so they do the work rather than skipping it, and they differ from the shipped kernel only in how the multiplying is arranged. Microseconds a launch, best of five batches of sixteen:
+
+| variant | M4 4096 by 4096 | 4090 4096 by 4096 | M4 4096 by 14336 | 4090 4096 by 14336 |
+| --- | --- | --- | --- | --- |
+| shipped | 868 | 29 | 2509 | 93 |
+| four values a thread | 498 | 15 | 1217 | 37 |
+| eight values a thread | 415 | 12 | 921 | 28 |
+| sixteen values a thread | 376 | 14 | 779 | 36 |
+| the loads and no arithmetic | 192 | 10 | 577 | 21 |
+
+Two point one times on Metal and two point four times on CUDA at eight values a thread, on the square shape, and two point seven and three point three on the long one. That is the first arrangement of this kernel that has moved a 4090 at all, and it lands within a third of the loads only floor on both cards.
+
+Eight is the width to ship. Sixteen is nine per cent better on Metal and seventeen per cent worse on CUDA, because at sixteen a warp reads 256 contiguous bytes an iteration and the wide access `scripts/mem_probe.mojo` measured is worth less than a narrow one. Eight is the width where neither card is giving anything up, and the case for making the width a per target parameter can be made later against a number rather than now against a guess.
+
+### The layout
+
+An activation vector becomes a plane of `n` signed bytes, padded to a multiple of four, followed by one `Float32` scale per 32 values. That is the planar weight layout with the plane count reduced to two, and it is read the same way, so the kernel gains a second base offset and no new shape of access.
+
+32 and not the weight's own group size, because a q4_K_M model has q4_K weights at a group of 32 and q6_K weights at a group of 16 and both read the same activation vector. The kernel takes two shifts rather than one, `i >> weight_shift` for the weight scale and `i >> 5` for the activation scale, and both are constant across a run of eight because 8 divides 16 and 32. The activation group is not required to match the weight group and pinning it to the smaller of the two would cost accuracy on the type that does not need it.
+
+The scale is symmetric absolute maximum, `q = round(x * 127 / absmax)` with the scale `absmax / 127`, and a group whose values are all zero gets a scale of zero and quants of zero. Symmetric rather than affine because the weight side already carries the minimum where the type has one, and adding a second offset would put a cross term in every dot product.
+
+### The minimum, which is where the algebra is
+
+For a type with a minimum the value is `d * w + m` and the sum over a group is `sum((d * w + m) * x)`. With `x = dx * q` that is `d * dx * sum(w * q) + m * dx * sum(q)`. So a run needs two integer accumulators rather than one, the dot and the plain sum of the activation quants, and it converts and scales twice at the end of the run instead of doing a multiply and an add per value. A type with no minimum drops the second accumulator entirely at compile time, the way `with_min` already works.
+
+The accumulators cannot overflow. The widest case is a run of eight unsigned nibbles at 15 against activation quants at 127, which is 15240, and a signed byte weight against the same is 129032. Both are far inside `Int32` and would still be inside it at a run of a whole group.
+
+### Where the quantizing happens
+
+A separate kernel over the activation vector, launched before the matvecs that read it. Per layer that is four: the attention norm feeds the query, key and value projections, the attention output feeds the output projection, the feed forward norm feeds up and gate, and the gate feeds down. Plus one for the final norm before the head.
+
+Four launches a layer is not free and on a small model it may not pay. molla launches about fourteen kernels a layer, so this is a 28 per cent rise in the launch count, and [performance.md](performance.md) says a q8_0 model at this size is launch bound rather than kernel bound. The expectation is that the two large models gain most of the two times above and that SmolLM2 gains less or nothing, and the measurement has to report all three rather than the two that look good.
+
+Fusing the quantizing into the kernels that produce the activation removes three of the four, because the norm already reduces over the whole vector and the activation function already walks it. That is #168 and it is not in this change, so that this one can be measured on its own.
+
+### The error budget
+
+This is the first change to the device path that is not bit exact, so it needs a number before it needs code.
+
+A signed byte over a group of 32 with a symmetric scale carries an absolute error of at most half a step, which is `absmax / 254`, on each activation. Relative to the group's own largest value that is 0.4 per cent worst case and about 0.23 per cent root mean square for values spread across the range. A dot product of 4096 sums 4096 of those errors against weights of mixed sign, so they add in quadrature rather than linearly and the error on the result grows as the square root of the length rather than as the length: 64 times 0.23 per cent of a single term, against a result that is itself about 64 times a single term, so the relative error on the output stays near a quarter of a per cent rather than growing with the row.
+
+That is per matvec and a token is 32 layers of them, so the question the corpus has to answer is whether it compounds. The residual stream is an addition of things this error is a fraction of, and the norms rescale, so the expectation is that it does not, and the expectation is not evidence. The rule for this change is that the tolerance in the corpus is raised once, to a number written down here with the measurement that justified it, and that the greedy text of every case is unchanged. A change of greedy token is a failure of this work and not a tolerance to widen.
+
+The current corpus runs at a tolerance of 2e-1 with a worst case of 1.75e-5 across the host, an M4 and a 4090, so there is room in the existing tolerance for a much larger error than this predicts. Room in the tolerance is not permission to use it: the worst case per target is printed, and if it lands three orders of magnitude above where it is now then that is the number this section has to explain.
+
+### What this does not decide
+
+Whether the host matvec follows. The host path is the reference the device path is checked against and it is not on anyone's critical path, so the first version leaves it in float and accepts that `scripts/kernel_oracle.mojo` is comparing two different arithmetics rather than two implementations of one. If that comparison stops being useful then the host gains the same path, as a second reference rather than as a replacement.
+
+Whether the four values in a run should be assembled into one 32 bit integer and multiplied with a single instruction. CUDA has `dp4a` and Metal does not, so a portable version of this is four multiplies and three adds, which is what the measurement above ran. `dp4a` would take the CUDA column further and is a target specific instruction behind a target specific spelling, which D7 allows and which should be a separate change with its own number.
+
 ## Order
 
 Pack the quant plane first and leave the scales at float32. That is 9574 MiB to 6475 MiB on the 8B, it is bit exact against the current layout because the integers written are the same integers, and it can be verified by running the corpus with the old cache and the new one and comparing logits with no tolerance at all.
