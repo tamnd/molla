@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-03
+
+M2b closes. molla runs on a GPU, and now there is a number for how well.
+
+Every kernel a token needs is on the device, the KV cache lives there, the backend is chosen and printed rather than assumed, and the same fourteen logit cases agree with llama.cpp on the host, on an M4 and on a 4090 within one set of tolerances. That was the milestone. The last issue in it was the one that asked how fast any of this is, and the answer decides what happens next.
+
+It is 2.4 to 3.3 times slower than llama.cpp on decode, more than a hundred times slower on prefill, and uses 2.2 to 3.6 times the host memory. M2b said up front that being faster was an M7 gate and that what this milestone owed was knowing the distance. It owes that now, and the distance turned out not to be a tuning problem. molla launches 453 kernels for one token and an empty kernel costs 4.9 microseconds to launch on a 4090, so a token cannot go below 2.2 ms of launch cost whatever the kernels do, which caps molla at about 450 tokens per second on that card against llama.cpp's 782.5. There is no version of the current architecture that reaches the 1.5 times gate, which is why M2c exists and why it is a milestone rather than a patch.
+
 ### Added
 
 - molla is measured against llama.cpp and Ollama. `scripts/bench.py` puts the same GGUF file, byte for byte, with the same prompt and the same token count, through all three on one machine and prints one table of prefill tokens per second, decode tokens per second, time to first token and peak resident bytes. Every table records the machine, the backend, the digest of the model file, the build of each engine and the wall clock, so two numbers can be compared only when they are comparable. Results are in [docs/validation/bench.md](docs/validation/bench.md), one table per fleet machine, and `pixi run bench` is the task. Decode on a 4090 is 3.1 times off llama.cpp on SmolLM2, 3.3 times off on Qwen and 2.4 times off on Llama 3.1 8B, against the 1.5 times gate at M7. Prefill is between 109 and 175 times off, because molla runs a prompt through the one token at a time path and llama.cpp prefills it as one matrix multiply.
