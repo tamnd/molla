@@ -31,12 +31,20 @@ The device forward pass wants every weight on the card, so a model that half
 fits does not count as fitting. That is stricter than what `molla load` allows,
 and it is the rule the kernels actually impose: a device kernel handed a host
 address reads zeros without faulting.
+
+## A file the kernels cannot read is not a fitting question
+
+The device matvecs read the planar form of a quantized weight and nothing else,
+so an f16 or bf16 model has nothing for them to read however much room the card
+has. That is asked here, off the tensor list, rather than found out from the
+first kernel launch, and it goes the same way every other question goes: `auto`
+stays on the host and says so, a named backend is an error.
 """
 
 from std.sys.info import has_accelerator
 
 from molla.model.gguf import Gguf
-from molla.model.load import plan_load
+from molla.model.load import device_refusal, plan_load
 from molla.model.repack import RepackCache, model_key, open_cache
 from molla.sys.device import Device, build_targets_gpu, devices, host_device
 
@@ -294,7 +302,9 @@ def pick(want: Request, all: List[Device], fits: List[Bool]) raises -> Backend:
     return Backend(all[0], False, note^)
 
 
-def choose_backend(model_path: String, want: Request) raises -> Backend:
+def choose_backend(
+    model_path: String, want: Request, for_kernels: Bool = True
+) raises -> Backend:
     """Resolve a request against this machine and this model.
 
     Opens the file and the repack cache for as long as it takes to plan against
@@ -302,6 +312,12 @@ def choose_backend(model_path: String, want: Request) raises -> Backend:
     open of both, since the run that follows opens them again, and that is worth
     it to keep the decision in one place instead of threading a half loaded
     state through two entry points that already differ in every other respect.
+
+    `for_kernels` is false for the one caller that puts weights on a card
+    without computing anything with them, which is `molla load`. Copying an f16
+    tensor to a device is a perfectly good thing to time, and it is only the
+    matvec that cannot read one, so the question of what the kernels support
+    should not be asked on behalf of a command that launches none.
     """
     if want.mode == WANT_CPU:
         return Backend(host_device(), False, String(""))
@@ -317,9 +333,21 @@ def choose_backend(model_path: String, want: Request) raises -> Backend:
 
     var g = Gguf(model_path)
     var cache = open_cache(model_path, model_key(g))
+
+    # A file the device kernels cannot read at all is settled before fitting is
+    # asked, because it is the more basic answer and a bigger card does not
+    # change it. An unquantized model has no planar form, so `auto` treats it as
+    # a reason to stay on the host and a named backend treats it as an error,
+    # which is the same split every other question here gets.
+    var refusal = device_refusal(g) if for_kernels else String("")
     var fits = List[Bool]()
     for i in range(len(all)):
         fits.append(fits_on(g, cache, all[i]))
     cache.close()
     g.close()
+
+    if refusal.byte_length() > 0:
+        if want.mode == WANT_API:
+            raise Error(refusal)
+        return Backend(all[0], False, refusal^)
     return pick(want, all, fits)

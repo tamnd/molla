@@ -32,6 +32,7 @@ from molla.model.load import (
     WHERE_UNIFIED,
     Residency,
     device_budget,
+    device_refusal,
     load,
     place_name,
     plan_load,
@@ -158,7 +159,104 @@ def run(mut suite: Suite) raises:
     _check_load(suite, path)
     _check_residency(suite, path)
     _check_names(suite)
+    _check_refusal(suite)
 
+    _remove(path)
+
+
+def _two_matrices(kind: Int, bytes: Int) -> List[UInt8]:
+    """A file with a norm, a q8_0 matrix, and a second matrix of `kind`.
+
+    Three tensors is enough because the question is per tensor. The norm is
+    there to be ignored, since it is one dimensional and is uploaded as floats
+    whatever type it has, and the q8_0 matrix is there so that a file which gets
+    refused is refused for the tensor that deserves it rather than for having no
+    quantized weights at all.
+    """
+    var names = [
+        String("output_norm.weight"),
+        String("blk.0.attn_q.weight"),
+        String("blk.0.ffn_up.weight"),
+    ]
+    var dims = [1, 2, 2]
+    var kinds = [0, 8, kind]
+    var sizes = [256, 136, bytes]
+
+    var b = Builder()
+    b.raw("GGUF")
+    b.u32(3)
+    b.u64(UInt64(len(names)))
+    b.u64(1)
+
+    b.kv_header("general.architecture", 8)
+    b.gstring("llama")
+
+    var at = 0
+    for i in range(len(names)):
+        b.gstring(names[i])
+        b.u32(UInt64(dims[i]))
+        b.u64(64)
+        if dims[i] == 2:
+            b.u64(2)
+        b.u32(UInt64(kinds[i]))
+        b.u64(UInt64(at))
+        at += sizes[i]
+        at += (32 - (at % 32)) % 32
+
+    b.pad_to(32)
+    for i in range(at):
+        b.u8(UInt8(i & 0xFF))
+    while len(b.bytes) % 32 != 0:
+        b.u8(0)
+    return b^.finish()
+
+
+def _check_refusal(mut suite: Suite) raises:
+    """Whether the device kernels can read a file at all, off the directory.
+
+    This is what keeps an f16 model off a card. It is asked before anything is
+    loaded because the alternative is a matvec being handed weights it cannot
+    dequantize, and the failure that produces is a wrong number rather than an
+    error.
+    """
+    suite.group("device refusal")
+
+    var path = _temp_path() + ".refusal"
+
+    _remove(path)
+    _write(path, _two_matrices(8, 136))
+    var quantized = Gguf(path)
+    suite.check(
+        device_refusal(quantized).byte_length() == 0,
+        "a file whose matrices are all quantized is readable",
+    )
+    quantized.close()
+    _remove(path)
+
+    _write(path, _two_matrices(0, 512))
+    var floats = Gguf(path)
+    var why = device_refusal(floats)
+    suite.check(why.byte_length() > 0, "one f32 matrix is enough to refuse")
+    suite.check(
+        why.find("1 matrices") >= 0,
+        "and the count is the matrices that are stuck, not every tensor",
+    )
+    suite.check(
+        why.find("ggml type 0") >= 0, "and it names the type that has no planar"
+    )
+    suite.check(
+        why.find("runs on the host") >= 0, "and says where the model does run"
+    )
+    floats.close()
+    _remove(path)
+
+    _write(path, _two_matrices(1, 256))
+    var halves = Gguf(path)
+    suite.check(
+        device_refusal(halves).find("ggml type 1") >= 0,
+        "f16 is refused for the same reason f32 is",
+    )
+    halves.close()
     _remove(path)
 
 

@@ -45,13 +45,14 @@ which is correct, and it is why the streaming loop asks for a delta rather than
 assuming one token is one chunk.
 """
 
-from std.sys.info import has_accelerator
-
-from max.gpu.host import DeviceContext
-
 from molla.engine.backend import Backend
 from molla.engine.bind import Bound, bind
-from molla.engine.device import DeviceSession
+from molla.engine.device import (
+    DeviceSession,
+    device_context,
+    load_on_device,
+    open_session,
+)
 from molla.engine.sample import Sampler, SamplerConfig
 from molla.engine.session import Session as Decode
 from molla.jinja.template import Template
@@ -91,99 +92,6 @@ def runner_at(address: Int) -> RunnerPtr:
 
 def address_of(ref runner: Runner) -> Int:
     return Int(Pointer(to=runner))
-
-
-def _device_context(index: Int) raises -> DeviceContext:
-    """The one context this process is going to use, or a refusal.
-
-    One, and made here rather than wherever it is first wanted. A CUDA process
-    gets a single `DeviceContext`: a second one constructs and then hangs on the
-    first allocation against it, with the card idle and every thread asleep on a
-    futex. So the load and the session are handed the same one, and this is the
-    only place it comes from.
-
-    Behind a `comptime if` because `max-core` resolves the device architecture
-    at compile time, so constructing one at all is what would stop molla
-    building on the machines that have no GPU.
-    """
-    comptime if has_accelerator():
-        return DeviceContext(device_id=index)
-    raise Error(
-        "this build has no device code in it, so there is no device context to"
-        " make. Accelerator support is decided when molla is compiled, not when"
-        " it is run"
-    )
-
-
-def _device_session(
-    ctx: DeviceContext, host: Bound, dev: Bound, context: Int
-) raises -> Optional[DeviceSession]:
-    """The session, built behind the same guard for the same reason."""
-    comptime if has_accelerator():
-        return DeviceSession(ctx, host, dev, context)
-    raise Error(
-        "this build has no device code in it, so there is no device session to"
-        " run a sequence in"
-    )
-
-
-def _load_device(
-    g: Gguf,
-    mut cache: RepackCache,
-    model_path: String,
-    dev: Device,
-    ctx: DeviceContext,
-) raises -> Weights:
-    """Put every weight of this model on the card, in the planar layout.
-
-    Every weight, and it refuses rather than placing what fits. A device kernel
-    handed a host address reads zeros without faulting, so a model that half
-    fits is a server that answers fluently out of layers that saw nothing, and
-    nothing in the answer says so. The refusal is checked against the plan
-    before any bytes move, so a model that will not fit says so in a second
-    rather than after a minute of copying.
-
-    The repack runs first and on its own when there is no cache. A load that
-    writes the cache on the way past writes it from the file it is reading, so
-    the bytes it copied to the card would be the ggml ones, which is the layout
-    these kernels cannot read.
-    """
-    comptime if has_accelerator():
-        if not cache.usable:
-            print(
-                "  repack         writing a planar cache first,", cache.reason
-            )
-            var warm = load(
-                g, plan_load(g, dev, 0, cache), 0, False, model_path
-            )
-            _ = warm^
-            cache.close()
-            cache = open_cache(model_path, model_key(g))
-            if not cache.usable:
-                raise Error(
-                    "the repack cache was written and still cannot be used: "
-                    + cache.reason
-                )
-
-        var plan = plan_load(g, dev, -1, cache)
-        if plan.left_behind > 0:
-            raise Error(
-                "the device forward pass needs every weight on the card and"
-                " this plan leaves "
-                + String(plan.left_behind)
-                + " of them in the mapping, which would be read as zeros. This"
-                " model does not fit on "
-                + dev.name
-            )
-        return load(g, plan^, 0, False, "", ctx)
-
-    # Only reachable on a build with no device code, where the block above is
-    # not compiled at all. The caller has already refused for the same reason,
-    # so this is the compiler being told what a function with a return type owes
-    # rather than a second check.
-    raise Error(
-        "this build has no device code in it, so there is nothing to load onto"
-    )
 
 
 struct Runner(Movable):
@@ -270,15 +178,15 @@ struct Runner(Movable):
         self.device = None
 
         if backend.on_device:
-            var ctx = _device_context(dev.index)
-            weights = _load_device(g, cache, model_path, dev, ctx)
+            var ctx = device_context(dev.index)
+            weights = load_on_device(g, cache, model_path, dev, ctx)
             # The same file bound twice. Once against the residency, which is
             # what the kernels read, and once without it, which is where the
             # norm gains are readable so they can be uploaded. A `Bound` owns no
             # bytes, so the second is a list of addresses and not a second copy
             # of anything.
             b = bind(g, cache, weights.residency())
-            self.device = _device_session(ctx, bind(g, cache), b, want)
+            self.device = open_session(ctx, bind(g, cache), b, want)
         else:
             # Everything stays in the mapping, because host kernels cannot read
             # a tensor on a card.

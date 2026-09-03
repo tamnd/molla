@@ -75,6 +75,7 @@ from molla.model.repack import (
     write_head,
 )
 from molla.model.spec import tensor_bytes
+from molla.nn.repack import repackable
 from molla.nn.tensor import (
     WHERE_DEVICE,
     WHERE_HOST,
@@ -250,6 +251,39 @@ def _lookup_only(name: String) -> Bool:
     thing to leave behind, which is what llama.cpp does too.
     """
     return name.startswith("token_embd") or name.startswith("tok_embeddings")
+
+
+def device_refusal(g: Gguf) raises -> String:
+    """Why the device kernels cannot read this file, or the empty string.
+
+    They read the planar form of a quantized weight and nothing else. A norm is
+    one dimensional and is uploaded as floats, so it does not count, but a
+    matrix in f16, bf16 or f32 is a weight a matvec would be handed and cannot
+    dequantize. Asked before anything is loaded, because the alternative is
+    finding out from the first kernel launch of the first token, by which point
+    a gigabyte has been copied to the card.
+    """
+    var stuck = 0
+    var kind = -1
+    for i in range(len(g.tensors)):
+        var t = g.tensors[i]
+        if t.n_dims < 2:
+            continue
+        if repackable(t.kind):
+            continue
+        stuck += 1
+        if kind < 0:
+            kind = Int(t.kind)
+    if stuck == 0:
+        return String("")
+    return (
+        String("the device kernels read quantized weights in the planar")
+        + " layout and this file has "
+        + String(stuck)
+        + " matrices of ggml type "
+        + String(kind)
+        + ", which has no planar form. An unquantized model runs on the host"
+    )
 
 
 def plan_load(g: Gguf, dev: Device, budget: Int) raises -> Plan:

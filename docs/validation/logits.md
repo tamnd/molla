@@ -69,7 +69,7 @@ Rank swaps inside the top sixty four are counted and printed and do not fail a c
 
 ## What the corpus measures
 
-Worst disagreement per case, from the run that set the tolerances. `sum` and `value` are the snapshot comparisons, `head` and `tail` are the two halves of the distribution.
+Worst disagreement per case on the host, from the run that set the tolerances. `sum` and `value` are the snapshot comparisons, `head` and `tail` are the two halves of the distribution. The next section has the same numbers per backend.
 
 | Case | sum | value | head | tail | swaps |
 | --- | --- | --- | --- | --- | --- |
@@ -90,6 +90,29 @@ Worst disagreement per case, from the run that set the tolerances. `sum` and `va
 
 The tolerances are 2e-3 on the sum, 8e-2 on a value and 2e-1 on a log probability, each written down in `scripts/logit_oracle.mojo` next to the number it was set from. They have between two and four times the headroom over the worst case in the corpus, and a composition bug is not a factor of three, it is a factor of ten or a hundred. A wrong rope base moves the sum comparison by tens of per cent.
 
+## The same corpus on three backends
+
+One set of tolerances covers all three, which was not a given and is the main thing this section reports. Worst case over the whole corpus per target, against the same reference files.
+
+| Comparison | tolerance | host | metal | cuda |
+| --- | --- | --- | --- | --- |
+| sum | 2e-3 | 5.15e-4 | 5.15e-4 | 5.15e-4 |
+| value | 8e-2 | 3.06e-2 | 3.06e-2 | 3.06e-2 |
+| head | 2e-1 | 9.60e-2 | 9.60e-2 | 9.60e-2 |
+| tail | 2e-1 | 8.40e-2 | 8.40e-2 | 8.40e-2 |
+
+The host column is the M4 and the numbers on server1 are the same to the digits printed. Metal is the M4 and cuda is a 4090.
+
+Those columns are not merely close, they agree to every digit shown, and the reason to say so is that they came from three different pieces of arithmetic. The host path is scalar float32 in one thread order, the Metal path is a threadgroup reduction, and the CUDA path is a warp reduction over a different block size. The largest difference between any two of the three, on any case and any of the four comparisons, is 1.75e-5, which is four orders of magnitude below the loosest tolerance and a hundred times below the smallest number in the table above.
+
+So the three backends disagree with each other by far less than any of them disagrees with llama.cpp, and the gap in the next section is a property of the reference rather than of a backend. It also means a per target tolerance would be three copies of one number, which is why there is not one.
+
+## What a device run skips
+
+`smollm2-f16-capital` does not run on a device and is reported as a skip with the reason, not as a pass. The device matvecs read the planar form of a quantized weight and there is no planar form of an f16 one, so an unquantized model has nothing on the card for them to read. That is checked off the tensor directory before anything is loaded, by `device_refusal`, which is the same check that makes `--device=metal` on an f16 model an error and `--device=auto` on one a host run with the reason printed under it.
+
+Thirteen of the fourteen cases run on a device and the fourteenth is the only unquantized file in the corpus. It is worth keeping, because the host path does run it and an f16 model is the case where a dequantization bug cannot hide.
+
 ## The gap that is not explained
 
 The eleven SmolLM2 cases agree with llama.cpp about twenty times more closely than the three cases on the two larger models do, and that is not understood.
@@ -98,21 +121,28 @@ It is not the quantization. SmolLM2 at four bits lands at 7.6e-4 on the sampled 
 
 The likely explanation is precision inside llama.cpp rather than inside molla. Its Metal backend takes a different matrix multiply path once a tensor is large enough, and that path holds its tiles in float16, which loses a thousandth of relative precision per multiply on a model where SmolLM2 stays on the path that does not. That is a guess with no measurement behind it and it is written here as a guess.
 
+Issue #145 was expected to settle it and did not, which is worth recording because the result is informative in the other direction. Running the corpus through molla's own Metal and CUDA kernels moved the gap by nothing at all: three implementations that share no reduction order land within 1.75e-5 of each other and all three sit the same twenty times away from llama.cpp on the two larger models. So whatever this is, it is not one backend of molla's being imprecise, and it is not a threadgroup or warp reduction losing what a scalar loop keeps. It is either llama.cpp's side or something all three of molla's paths do the same way, which for a matvec is accumulating the whole row in float32.
+
 Two things make it liveable in the meantime. The greedy token matches on every case in the corpus, once the near tie on Llama 3.1 is set aside. And the tolerances are still tight enough to be worth having: three hundredths of a stream is far below what any composition error produces.
 
 ## What this does not cover
 
-Issue #30 asks for four things and this is two of them.
+Issue #30 asks for four things and this is three of them.
 
 **Safetensors against transformers is not here.** `bind` takes a `Gguf` and the engine has no path that loads a model from safetensors, so there is nothing to compare. `molla.model.safetensors` reads the files and stops at the directory. That half needs the engine to accept a second file format first and is its own piece of work.
 
-**CPU against Metal against CUDA is not here either.** molla has host kernels and nothing else. There is one backend to compare, so the comparison across three of them is a sentence about a program that does not exist yet. When a device backend lands, this corpus is what it gets run against, and the reference files do not change.
+**CPU against Metal against CUDA is here as of #145**, in the section above, and it did not cost the corpus a single reference file. The oracle grew a `--device` flag and a second run path that loads onto the card and traces the device forward pass, and everything downstream of that, the snapshot numbering, the three comparisons and the tolerances, is the same code reading the same files.
+
+**Only one of the three runs on every machine.** The host column can be produced anywhere. The metal and cuda columns need a machine with that card and the models on its disk, which is two of the five boxes here, so those two columns are pasted from a run rather than checked by anything automatic.
 
 ## Running it
 
 ```sh
 pixi run conformance-logits
+pixi run conformance-logits-device
 ```
+
+The second one asks for `auto`, so it runs on whatever card the machine has. Every line of the output names the backend that produced it, which is what stops a run on a machine with no accelerator from being read as a device result. `--device=cuda:1` and the rest of the spellings work here as they do everywhere else, so a box with two cards can be asked about each of them.
 
 Writing the references again, which needs llama.cpp on PATH and the source models in `~/models`:
 

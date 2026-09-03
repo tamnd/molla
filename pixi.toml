@@ -73,4 +73,11 @@ conformance-block = "mojo run -I src scripts/block_oracle.mojo"
 # whose model is not in `corpus/logits` is skipped. See
 # docs/validation/logits.md.
 conformance-logits = "mojo run -I src scripts/logit_oracle.mojo scripts/logit_cases.txt scripts/logits corpus/logits"
+# The same corpus through the device kernels, against the same reference. Not
+# run by CI for the same reason `conformance-kernels` is not. It asks for auto
+# so it runs on whatever card the machine has, and every line of the output
+# names the backend that produced it, so a machine with no accelerator reports
+# a host run rather than passing this off as a device one. The f16 case is
+# skipped on a device because there is no planar form of an unquantized weight.
+conformance-logits-device = "mojo run -I src scripts/logit_oracle.mojo scripts/logit_cases.txt scripts/logits corpus/logits --device=auto"
 conformance-template-full = { cmd = "mojo run -I src scripts/template_oracle.mojo scripts/template_cases.txt scripts/templates.tsv corpus/templates full", env = { TZ = "UTC" } }

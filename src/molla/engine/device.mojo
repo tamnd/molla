@@ -31,17 +31,37 @@ forward pass once per prompt token and throws away every logit but the last, so
 downloading each one would be a transfer per token for a number nobody reads.
 `pick` fetches, which means the sampler always sees the last step's answer and
 the prompt costs no transfers at all.
+
+## Opening one, from three callers
+
+`device_context`, `load_on_device` and `open_session` are here rather than in
+whichever caller wanted a session first, because there are three of them now:
+the server, `molla generate`, and the logit oracle. Each of the three has to
+make the one context, refuse a model that does not entirely fit, and write a
+planar cache when there is none, and three copies of that is three chances to
+get the refusal wrong in the direction that reads zeros and answers anyway.
+
+Each of them is behind a `comptime if` because `max-core` resolves the device
+architecture when molla is compiled, so a call that is not guarded is what stops
+the build on a machine with no GPU. Three of the five boxes we test on have
+none.
 """
+
+from std.sys.info import has_accelerator
 
 from max.gpu.host import DeviceContext
 
 from molla.engine.bind import Bound
 from molla.engine.cache import check_room, slot_of
 from molla.engine.sample import Sampler
+from molla.model.gguf import Gguf
+from molla.model.load import Weights, device_refusal, load, plan_load
+from molla.model.repack import RepackCache, model_key, open_cache
 from molla.nn.gpu import DeviceVec
 from molla.nn.gpu_block import DeviceModel, DeviceScratch, device_forward
 from molla.nn.model import frequency_factors
 from molla.nn.tensor import Buffer
+from molla.sys.device import Device
 
 
 struct DeviceKvCache(Movable):
@@ -262,3 +282,102 @@ struct DeviceSession(Movable):
             out.append(next)
             self.step(next)
         return out^
+
+
+def device_context(index: Int) raises -> DeviceContext:
+    """The one context this process is going to use, or a refusal.
+
+    One, and made here rather than wherever it is first wanted. A CUDA process
+    gets a single `DeviceContext`: a second one constructs and then hangs on the
+    first allocation against it, with the card idle and every thread asleep on a
+    futex. So the load and the session are handed the same one, and this is the
+    only place it comes from.
+    """
+    comptime if has_accelerator():
+        return DeviceContext(device_id=index)
+    raise Error(
+        "this build has no device code in it, so there is no device context to"
+        " make. Accelerator support is decided when molla is compiled, not when"
+        " it is run"
+    )
+
+
+def open_session(
+    ctx: DeviceContext, host: Bound, dev: Bound, context: Int
+) raises -> Optional[DeviceSession]:
+    """The session, behind the same guard for the same reason.
+
+    Optional because the caller holds one of these or a host session and never
+    both, and a `None` on the other side is what says which.
+    """
+    comptime if has_accelerator():
+        return DeviceSession(ctx, host, dev, context)
+    raise Error(
+        "this build has no device code in it, so there is no device session to"
+        " run a sequence in"
+    )
+
+
+def load_on_device(
+    g: Gguf,
+    mut cache: RepackCache,
+    model_path: String,
+    dev: Device,
+    ctx: DeviceContext,
+    label: String = "  repack        ",
+) raises -> Weights:
+    """Put every weight of this model on the card, in the planar layout.
+
+    Every weight, and it refuses rather than placing what fits. A device kernel
+    handed a host address reads zeros without faulting, so a model that half
+    fits is a server that answers fluently out of layers that saw nothing, and
+    nothing in the answer says so. The refusal is checked against the plan
+    before any bytes move, so a model that will not fit says so in a second
+    rather than after a minute of copying.
+
+    The repack runs first and on its own when there is no cache. A load that
+    writes the cache on the way past writes it from the file it is reading, so
+    the bytes it copied to the card would be the ggml ones, which is the layout
+    these kernels cannot read.
+
+    `label` is the column the repack line is printed under, because the three
+    callers report in three different shapes and the one thing this function
+    prints has to line up with the rest of whichever one is asking.
+    """
+    comptime if has_accelerator():
+        var refusal = device_refusal(g)
+        if refusal.byte_length() > 0:
+            raise Error(refusal)
+        if not cache.usable:
+            print(label + " writing a planar cache first, " + cache.reason)
+            var warm = load(
+                g, plan_load(g, dev, 0, cache), 0, False, model_path
+            )
+            _ = warm^
+            cache.close()
+            cache = open_cache(model_path, model_key(g))
+            if not cache.usable:
+                raise Error(
+                    "the repack cache was written and still cannot be used: "
+                    + cache.reason
+                )
+
+        var plan = plan_load(g, dev, -1, cache)
+        if plan.left_behind > 0:
+            raise Error(
+                "the device forward pass needs every weight on the card and"
+                " this plan leaves "
+                + String(plan.left_behind)
+                + " of them in the mapping, which would be read as zeros. This"
+                " model does not fit on "
+                + dev.name
+            )
+        return load(g, plan^, 0, False, "", ctx)
+
+    # Only reachable on a build with no device code, where the block above is
+    # not compiled at all. Every caller has already refused for the same reason,
+    # so this is the compiler being told what a function with a return type owes
+    # rather than a second check.
+    raise Error(
+        "this build has no device code in it, so there is nothing to load onto"
+    )

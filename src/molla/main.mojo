@@ -485,7 +485,7 @@ def main():
             # `--host` is the older spelling of `--device=cpu` and it still
             # wins, so a script written before there was a flag keeps timing
             # the load it was timing.
-            var picked = choose_backend(args[2], load_want)
+            var picked = choose_backend(args[2], load_want, False)
             if not picked.on_device:
                 host_only = True
             run_load(args[2], workers, True, host_only, picked.device)
