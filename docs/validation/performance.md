@@ -79,7 +79,21 @@ So the count, before and after. These are counted rather than derived: nsys over
 | SmolLM2 135M q8_0 | 30 | 15 | 12 | 453 | 363 |
 | Qwen 2.5 0.5B q4_K_M | 24 | 18 | 12 | 435 | 291 |
 
-Twenty per cent off a model without bias and a third off one with it. On SmolLM2 that is 1.78 ms of launch cost by the budget in the section above rather than 2.22. The three launches over the layer total in both rows are the embedding, the final norm and the output head, and they do not move.
+Twenty per cent off a model without bias and a third off one with it. The three launches over the layer total in both rows are the embedding, the final norm and the output head, and they do not move.
+
+What that is worth in tokens per second, on the same card, decode only, eight repetitions of the three models interleaved so that a drift in the machine moves both sides of a row together.
+
+| model | before | after | ratio |
+| --- | --- | --- | --- |
+| SmolLM2 135M q8_0 | 282.2 | 310.8 | 1.11 |
+| Qwen 2.5 0.5B q4_K_M | 244.9 | 309.2 | 1.26 |
+| Llama 3.1 8B q4_K_M | 99.8 | 101.4 | 1.02 |
+
+The two small models are the ones the launch budget said were launch bound, and they are the two that moved. The 8B did not, which is the same answer from the other direction: at 5.6 GiB a token it is bandwidth bound, the launches are hidden behind the weight reads, and deleting a launch that was overlapped anyway buys nothing.
+
+The two small rows do not reach what the budget above predicts. Ninety launches off SmolLM2 at 4.9 microseconds each is 0.44 ms off a 3.5 ms token, which would be 1.14, and the measurement is 1.11. On Qwen the same arithmetic gives 1.21 against a measured 1.26. Close enough on both to say the budget is roughly the right model of where the time goes, and not close enough to trust the fourth digit of it.
+
+One thing was tried and rejected on the way, and it is worth recording because it looked obvious. The gate epilogue contains an `exp`, and register allocation is per thread and uniform across a kernel, so a runtime branch on the activation allocates that `exp`'s registers in every thread of every block of every matvec including the output head that never runs it. Making the activation a compile time parameter instead, three instantiations where there was one, measured as a wash: it was 2.4 per cent slower than the runtime branch on SmolLM2 and 2 per cent faster on Qwen, both inside the run to run spread on this machine. So the parameter is not there and the branch is.
 
 It is exact and was checked as exact rather than argued to be. Every one of the three is the same arithmetic on the same values in the same order as the kernel it replaces, so the whole logit corpus is unchanged in every digit on both backends, and the layer by layer device against host comparison in `tests/test_gpu_block.mojo` holds at the tolerance it already had.
 
