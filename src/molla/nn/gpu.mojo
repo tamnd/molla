@@ -47,12 +47,14 @@ called with device buffers could not be checked against the host at all.
 """
 
 from std.gpu import block_idx, thread_idx
+from std.math import exp
 from std.memory import AddressSpace, bitcast, stack_allocation
 from std.sys.info import has_accelerator
 
 from max.gpu import barrier
 from max.gpu.host import DeviceBuffer, DeviceContext
 
+from molla.nn.block import ACT_GELU, ACT_SILU
 from molla.nn.repack import (
     LAYOUT_PLANAR,
     QUANT_I8,
@@ -253,6 +255,56 @@ struct DeviceVec(Movable):
         return got
 
 
+comptime EPI_NONE = 0
+"""The matvec writes its row and nothing else, which is what it always did."""
+comptime EPI_BIAS = 1
+"""`o[r] = dot + aux[r]`, the projection bias folded into the row it belongs to.
+"""
+comptime EPI_ADD = 2
+"""`o[r] = o[r] + dot`, the residual add folded into the projection.
+
+The residual add is a whole kernel launch to do one flop per element on a vector
+that the matvec that produced it had in a register a moment earlier. Folding it
+in removes the launch, removes the round trip through device memory, and removes
+the scratch vector it was going through. It is the same addition in the same
+order, so it is exact.
+"""
+comptime EPI_GLU = 4
+"""`o[r] = act(dot) * aux[r]`, the gate half of a gated MLP.
+
+Only valid on the matvec that produces the gate, and only when the up projection
+has already been written, which is the order `device_mlp` was already in.
+"""
+
+comptime ACT_BIT = 8
+"""Set alongside `EPI_GLU` when the activation is gelu rather than silu."""
+
+
+@always_inline
+def activate[kind: Int](v: Float32) -> Float32:
+    """The gate function, chosen at compile time.
+
+    A parameter rather than a branch because it is the same value for every
+    element of every layer of a model, so a runtime test would be a predictable
+    branch executed fourteen thousand times per layer to reach the same side.
+
+    It lives here rather than beside the elementwise kernels because the matvec
+    epilogue applies it too and `gpu_ops` imports this file, not the other way
+    round.
+    """
+    comptime if kind == ACT_SILU:
+        return v / (Float32(1.0) + exp(-v))
+    else:
+        # The tanh approximation, which is the one the weights were trained
+        # with. The exact form through the error function is a different
+        # function by about a thousandth, and a model trained against one and
+        # run against the other is a small consistent bias nobody ever finds.
+        var c = Float32(0.7978845608028654)
+        var inner = c * (v + Float32(0.044715) * v * v * v)
+        var e = Float32(2.0) / (Float32(1.0) + exp(Float32(-2.0) * inner))
+        return Float32(0.5) * v * (Float32(1.0) + (e - Float32(1.0)))
+
+
 comptime MAGIC = UInt32(0x4B000000)
 """The bit pattern of `2^23` as a float32, which is where a small integer goes.
 
@@ -307,8 +359,10 @@ def planar_matvec_kernel[
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
     o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
     cols_dev: Int32,
     stride_dev: Int32,
+    epi_dev: Int32,
 ):
     """`o[r] = dot(planar row r of w, x)`, one thread block per row.
 
@@ -317,6 +371,14 @@ def planar_matvec_kernel[
     construction and so is its quant plane at either width, so the scale planes
     are four byte aligned in every row of every tensor, and a device buffer
     starts at an alignment far larger than that.
+
+    `epi` says what happens to the row once it is reduced, and `aux` is the one
+    other vector that needs, which is a bias plane or the up projection. It is a
+    runtime argument and not a parameter on purpose. One thread of the block
+    runs it, once, after everything else the block does, so making it a
+    parameter would multiply five instantiations of the whole kernel by four to
+    save one predicted branch executed once per block. `aux` is the output
+    pointer when nothing reads it, so there is no null to check for.
 
     Shapes arrive as `Int32` because a kernel argument has to be device
     passable and `Int` is not. Nothing here is near two billion.
@@ -417,7 +479,19 @@ def planar_matvec_kernel[
         barrier()
         step //= 2
     if t == 0:
-        o[unsafe_offset=r] = part[unsafe_offset=0]
+        var v = part[unsafe_offset=0]
+        var epi = Int(epi_dev)
+        if epi & EPI_BIAS != 0:
+            v += aux[unsafe_offset=r]
+        elif epi & EPI_GLU != 0:
+            if epi & ACT_BIT != 0:
+                v = activate[ACT_GELU](v) * aux[unsafe_offset=r]
+            else:
+                v = activate[ACT_SILU](v) * aux[unsafe_offset=r]
+        if epi & EPI_ADD != 0:
+            o[unsafe_offset=r] = o[unsafe_offset=r] + v
+        else:
+            o[unsafe_offset=r] = v
 
 
 def device_ready() -> Bool:
@@ -488,21 +562,31 @@ def _launch[
     w: Tensor,
     x: DeviceVec,
     o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
 ) raises:
     """One instantiation, launched. No transfer either side of it."""
     ctx.enqueue_function[planar_matvec_kernel[tile, group, with_min, form]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x.ptr(),
         o,
+        aux,
         Int32(w.cols),
         Int32(w.row_bytes()),
+        Int32(epi),
         grid_dim=(w.rows, 1, 1),
         block_dim=(tile, 1, 1),
     )
 
 
 def device_matvec_into(
-    ctx: DeviceContext, w: Tensor, x: DeviceVec, mut out: DeviceVec, at: Int = 0
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    mut out: DeviceVec,
+    at: Int = 0,
+    epi: Int = EPI_NONE,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
 ) raises:
     """`out[at + r] = dot(row r of w, x)`, both sides already on the device.
 
@@ -549,19 +633,23 @@ def device_matvec_into(
         )
     else:
         var o = out.ptr_at(at)
+        # No null to check for inside the kernel, so a caller that asked for
+        # nothing gets the output pointer and a kernel that reads it is one that
+        # was asked to.
+        var a = aux.value() if aux and epi != EPI_NONE else o
         var g = group_size(w.kind)
         var carries_min = has_min(w.kind)
         var form = quant_form(w.kind)
         if form == QUANT_U4 and g == 32 and carries_min:
-            _launch[TILE, 32, True, QUANT_U4](ctx, w, x, o)
+            _launch[TILE, 32, True, QUANT_U4](ctx, w, x, o, a, epi)
         elif form == QUANT_S4 and g == 32 and not carries_min:
-            _launch[TILE, 32, False, QUANT_S4](ctx, w, x, o)
+            _launch[TILE, 32, False, QUANT_S4](ctx, w, x, o, a, epi)
         elif form == QUANT_I8 and g == 32 and carries_min:
-            _launch[TILE, 32, True, QUANT_I8](ctx, w, x, o)
+            _launch[TILE, 32, True, QUANT_I8](ctx, w, x, o, a, epi)
         elif form == QUANT_I8 and g == 32:
-            _launch[TILE, 32, False, QUANT_I8](ctx, w, x, o)
+            _launch[TILE, 32, False, QUANT_I8](ctx, w, x, o, a, epi)
         elif form == QUANT_I8 and g == 16 and not carries_min:
-            _launch[TILE, 16, False, QUANT_I8](ctx, w, x, o)
+            _launch[TILE, 16, False, QUANT_I8](ctx, w, x, o, a, epi)
         else:
             raise Error(
                 "no device matvec is compiled for quant form "

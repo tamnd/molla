@@ -47,14 +47,20 @@ from std.math import sqrt
 from max.gpu.host import DeviceContext
 
 from molla.nn.arch import Arch
-from molla.nn.block import ACT_SILU, BlockSpec, LayerWeights
-from molla.nn.gpu import DeviceVec, device_matvec_into
+from molla.nn.block import ACT_GELU, ACT_SILU, BlockSpec, LayerWeights
+from molla.nn.gpu import (
+    ACT_BIT,
+    EPI_ADD,
+    EPI_BIAS,
+    EPI_GLU,
+    EPI_NONE,
+    DeviceVec,
+    device_matvec_into,
+)
 from molla.nn.gpu_ops import (
     RopeTables,
     device_add_into,
-    device_add_run,
     device_attend,
-    device_geglu,
     device_gelu,
     device_rms_norm,
     device_rms_norm_inplace,
@@ -63,7 +69,6 @@ from molla.nn.gpu_ops import (
     device_scale_into,
     device_silu,
     device_softcap,
-    device_swiglu,
     device_unpack_row,
 )
 from molla.nn.model import ModelWeights
@@ -447,18 +452,19 @@ def device_attention(
         )
 
     device_rms_norm(ctx, x, w.attn_norm, s.norm, spec.eps)
-    device_matvec_into(ctx, w.wq, s.norm, s.q)
 
+    # The bias goes on in the projection's own epilogue rather than in three
+    # kernels behind it. One thread of each block adds one float to the row it
+    # just reduced, which is the same addition to the same number, and the three
+    # launches and their three round trips through device memory are gone.
+    #
     # Straight into the cache rather than into scratch and then a copy, which is
     # what the offset on the matvec is for. The cache is where they are needed
     # and this is the only place they are written.
-    device_matvec_into(ctx, w.wk, s.norm, keys, at)
-    device_matvec_into(ctx, w.wv, s.norm, values, at)
-
-    if w.has_bias:
-        device_add_run(ctx, s.q, 0, w.q_bias, spec.q_width())
-        device_add_run(ctx, keys, at, w.k_bias, kv_width)
-        device_add_run(ctx, values, at, w.v_bias, kv_width)
+    var bias_epi = EPI_BIAS if w.has_bias else EPI_NONE
+    device_matvec_into(ctx, w.wq, s.norm, s.q, 0, bias_epi, w.q_bias.ptr())
+    device_matvec_into(ctx, w.wk, s.norm, keys, at, bias_epi, w.k_bias.ptr())
+    device_matvec_into(ctx, w.wv, s.norm, values, at, bias_epi, w.v_bias.ptr())
 
     if w.has_qk_norm:
         var head_dim = spec.attn.head_dim
@@ -503,11 +509,16 @@ def device_attention(
         s.heads_out,
         s.scores,
     )
-    device_matvec_into(ctx, w.wo, s.heads_out, s.projected)
-
+    # The residual add rides the output projection's epilogue, so `s.projected`
+    # is only used by the models that put a norm between the two. Those still
+    # pay for the scratch vector and the two launches, because a norm over the
+    # whole projection cannot be computed by a block that owns one row of it.
     if w.has_attn_post:
+        device_matvec_into(ctx, w.wo, s.heads_out, s.projected)
         device_rms_norm_inplace(ctx, s.projected, w.attn_post_norm, spec.eps)
-    device_add_into(ctx, x, s.projected)
+        device_add_into(ctx, x, s.projected)
+    else:
+        device_matvec_into(ctx, w.wo, s.heads_out, x, 0, EPI_ADD)
 
 
 def device_mlp(
@@ -529,23 +540,31 @@ def device_mlp(
     device_rms_norm(ctx, x, w.ffn_norm, s.norm, spec.eps)
     device_matvec_into(ctx, w.up, s.norm, s.up)
 
+    # The gate half of a gated MLP is `act(gate) * up` and the up projection has
+    # already been written by the line above, so the gate projection's own
+    # epilogue can finish the element rather than a kernel behind it reading
+    # both halves back. The ungated form has nothing to pair with, so its
+    # activation is still its own launch over `s.up`.
     if w.has_gate:
-        device_matvec_into(ctx, w.gate, s.norm, s.gate)
-        if spec.act == ACT_SILU:
-            device_swiglu(ctx, s.gate, s.up)
+        var glu = EPI_GLU | (0 if spec.act == ACT_SILU else ACT_BIT)
+        device_matvec_into(ctx, w.gate, s.norm, s.gate, 0, glu, s.up.ptr())
+        if w.has_ffn_post:
+            device_matvec_into(ctx, w.down, s.gate, s.projected)
+            device_rms_norm_inplace(ctx, s.projected, w.ffn_post_norm, spec.eps)
+            device_add_into(ctx, x, s.projected)
         else:
-            device_geglu(ctx, s.gate, s.up)
-        device_matvec_into(ctx, w.down, s.gate, s.projected)
+            device_matvec_into(ctx, w.down, s.gate, x, 0, EPI_ADD)
     else:
         if spec.act == ACT_SILU:
             device_silu(ctx, s.up)
         else:
             device_gelu(ctx, s.up)
-        device_matvec_into(ctx, w.down, s.up, s.projected)
-
-    if w.has_ffn_post:
-        device_rms_norm_inplace(ctx, s.projected, w.ffn_post_norm, spec.eps)
-    device_add_into(ctx, x, s.projected)
+        if w.has_ffn_post:
+            device_matvec_into(ctx, w.down, s.up, s.projected)
+            device_rms_norm_inplace(ctx, s.projected, w.ffn_post_norm, spec.eps)
+            device_add_into(ctx, x, s.projected)
+        else:
+            device_matvec_into(ctx, w.down, s.up, x, 0, EPI_ADD)
 
 
 def device_layer(

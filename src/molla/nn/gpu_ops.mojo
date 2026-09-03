@@ -41,7 +41,15 @@ from max.gpu import barrier
 from max.gpu.host import DeviceContext
 
 from molla.nn.attention import AttnSpec
-from molla.nn.gpu import TILE, DeviceVec, byte_float, nibble_float
+from molla.nn.gpu import (
+    ACT_GELU,
+    ACT_SILU,
+    TILE,
+    DeviceVec,
+    activate,
+    byte_float,
+    nibble_float,
+)
 from molla.nn.repack import (
     LAYOUT_PLANAR,
     QUANT_I8,
@@ -192,30 +200,6 @@ def softmax_kernel[tile: Int](x: Pointer[Float32, MutAnyOrigin], n_dev: Int32):
         i += tile
 
 
-comptime ACT_SILU = 0
-comptime ACT_GELU = 1
-
-
-def _activate[kind: Int](v: Float32) -> Float32:
-    """The gate function, chosen at compile time.
-
-    A parameter rather than a branch because it is the same value for every
-    element of every layer of a model, so a runtime test would be a predictable
-    branch executed fourteen thousand times per layer to reach the same side.
-    """
-    comptime if kind == ACT_SILU:
-        return v / (Float32(1.0) + exp(-v))
-    else:
-        # The tanh approximation, which is the one the weights were trained
-        # with. The exact form through the error function is a different
-        # function by about a thousandth, and a model trained against one and
-        # run against the other is a small consistent bias nobody ever finds.
-        var c = Float32(0.7978845608028654)
-        var inner = c * (v + Float32(0.044715) * v * v * v)
-        var e = Float32(2.0) / (Float32(1.0) + exp(Float32(-2.0) * inner))
-        return Float32(0.5) * v * (Float32(1.0) + (e - Float32(1.0)))
-
-
 def swiglu_kernel[
     kind: Int
 ](
@@ -235,7 +219,7 @@ def swiglu_kernel[
     var stride = Int(grid_dim.x * block_dim.x)
     while i < n:
         gate[unsafe_offset=i] = (
-            _activate[kind](gate[unsafe_offset=i]) * up[unsafe_offset=i]
+            activate[kind](gate[unsafe_offset=i]) * up[unsafe_offset=i]
         )
         i += stride
 
@@ -246,7 +230,7 @@ def act_kernel[kind: Int](x: Pointer[Float32, MutAnyOrigin], n_dev: Int32):
     var i = Int(block_idx.x * block_dim.x + thread_idx.x)
     var stride = Int(grid_dim.x * block_dim.x)
     while i < n:
-        x[unsafe_offset=i] = _activate[kind](x[unsafe_offset=i])
+        x[unsafe_offset=i] = activate[kind](x[unsafe_offset=i])
         i += stride
 
 
