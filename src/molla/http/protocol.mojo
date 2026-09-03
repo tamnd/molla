@@ -1098,6 +1098,15 @@ struct HttpProtocol(Movable, Protocol):
             _ = self.states[slot].scratch.append_str(VERSION)
             _ = self.states[slot].scratch.append_str("\nmojo ")
             _ = self.states[slot].scratch.append_str(MOJO_PIN)
+            # Which backend answers, when there is a model behind this server.
+            # A server that fell back to the host looks exactly like a slow
+            # card from the outside, and this is the one place a client can ask
+            # without waiting for a completion to come back.
+            if self.engine != 0:
+                _ = self.states[slot].scratch.append_str("\nbackend ")
+                _ = self.states[slot].scratch.append_str(
+                    runner_at(self.engine)[].running_on()
+                )
             _ = self.states[slot].scratch.append_str("\n")
         else:
             # The exposition format wants this exact content type, down to the

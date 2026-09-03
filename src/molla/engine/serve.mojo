@@ -33,6 +33,7 @@ nothing holding that address outlives the thing it points at. `keep` at the end
 is what stops Mojo from deciding otherwise.
 """
 
+from molla.engine.backend import Backend
 from molla.engine.runner import Runner, address_of
 from molla.http.protocol import HttpProtocol
 from molla.net.context import ServerContext
@@ -71,14 +72,18 @@ def run_serve(
     host: String,
     port: UInt16,
     context: Int,
+    backend: Backend = Backend(),
 ) raises -> Int:
     """Load a model and answer OpenAI requests against it until a signal."""
     _ = ignore_sigpipe()
 
     var started = monotonic_ms()
     print("loading", model_path)
-    var runner = Runner(model_path, tokenizer_path, model_path, context)
+    var runner = Runner(
+        model_path, tokenizer_path, model_path, context, backend
+    )
     print("  model         ", runner.describe())
+    print("  backend       ", runner.running_on())
     print("  tokenizer     ", tokenizer_path)
     print("  repack        ", runner.repack())
     print(

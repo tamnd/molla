@@ -19,6 +19,7 @@ errand of the decode loop is how a tokenizer ends up with no oracle behind it.
 `molla.tokenizer` already has one, and it takes a path.
 """
 
+from molla.engine.backend import Backend
 from molla.engine.bind import Bound, bind
 from molla.engine.sample import Sampler, SamplerConfig
 from molla.engine.session import Session as Decode
@@ -27,7 +28,6 @@ from molla.model.load import load, plan_load
 from molla.model.repack import RepackCache, model_key, open_cache
 from molla.model.spec import read_geometry
 from molla.sys.clock import monotonic_ms
-from molla.sys.device import default_device
 from molla.sys.mem import AllocCounter
 from molla.tokenizer.tokenizer import DecodeStream, Session, Tokenizer
 
@@ -75,7 +75,7 @@ def report_header(
     sampling: SamplerConfig,
     load_ms: Int,
     cache: RepackCache,
-    backend: String,
+    backend: Backend,
 ) raises:
     """What was loaded and how it was asked to run, before any text.
 
@@ -83,6 +83,10 @@ def report_header(
     oddly is the first thing anybody argues about and the argument is shorter
     when the settings are in the same output as the text, which is an argument
     that does not get weaker when the arithmetic moves to a card.
+
+    The backend is on its own line and its reason is on the line under it when
+    there is one, because `auto` staying on the host is the single most likely
+    explanation for a run that is slower than somebody expected.
     """
     print(
         "model:    ",
@@ -92,7 +96,9 @@ def report_header(
         b.width(),
         "wide",
     )
-    print("backend:  ", backend)
+    print("backend:  ", backend.describe())
+    if backend.note.byte_length() > 0:
+        print("          ", backend.note)
     print(
         "context:  ",
         want,
@@ -137,6 +143,7 @@ def run_generate(
     limit: Int,
     context: Int,
     sampling: SamplerConfig = SamplerConfig(),
+    backend: Backend = Backend(),
 ) raises:
     """Load, prefill, decode, and print as it goes.
 
@@ -158,7 +165,7 @@ def run_generate(
 
     var started = monotonic_ms()
     var g = Gguf(model_path)
-    var dev = default_device()
+    var dev = backend.device
 
     # Everything stays in the mapping. The kernels are host kernels, so a
     # tensor copied to a card is a tensor they cannot read, and a budget of
@@ -216,7 +223,7 @@ def run_generate(
         sampling,
         loaded - started,
         cache,
-        String("host"),
+        backend,
     )
 
     var prefill_started = monotonic_ms()

@@ -13,6 +13,7 @@ from harness import Suite, finish
 
 import test_allocs
 import test_api
+import test_backend
 import test_cache
 import test_client
 import test_concurrency
@@ -143,6 +144,10 @@ def main():
         test_arch.run(suite)
     except e:
         suite.fail("test_arch", String(e))
+    try:
+        test_backend.run(suite)
+    except e:
+        suite.fail("test_backend", String(e))
     try:
         test_block.run(suite)
     except e:
