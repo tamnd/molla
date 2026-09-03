@@ -43,7 +43,10 @@ prefill rate, which is the same quantity measured a different way rather than a
 second measurement.
 
 Ollama is asked through `/api/generate` with `stream` off, which returns the
-counts and the durations of both halves. The work happens inside a server this
+counts and the durations of both halves. Its prefill is the first run and no
+other, because the server keeps the keys and values of the last prompt it saw
+and this sends the same prompt every time, which turns the second run into a
+cache hit reported as a throughput. The work happens inside a server this
 script did not start, so peak resident bytes are not attributable and are left
 empty. Running one is not a substitute: the server holds other models and the
 number would be about the server rather than about the run.
@@ -362,10 +365,35 @@ def run_ollama(
         }
     ).encode()
 
-    prefills: list[float] = []
+    # One throwaway generation on a different prompt, so the model is resident
+    # and the clocks are up before the run that counts, and so the prompt that
+    # counts is not already in the server's cache when it is first asked.
+    warm = json.dumps(
+        {
+            "model": name,
+            "prompt": "warm",
+            "stream": False,
+            "raw": True,
+            "options": {"num_predict": 1, "temperature": 0, "seed": 0},
+        }
+    ).encode()
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"http://{OLLAMA_HOST}/api/generate",
+                data=warm,
+                headers={"content-type": "application/json"},
+            ),
+            timeout=600,
+        ).read()
+    except Exception as e:
+        out.note = str(e)
+        return out
+
     decodes: list[float] = []
-    ttfts: list[float] = []
-    for _ in range(runs):
+    prefill = None
+    ttft = None
+    for i in range(runs):
         request = urllib.request.Request(
             f"http://{OLLAMA_HOST}/api/generate",
             data=body,
@@ -380,18 +408,24 @@ def run_ollama(
         p_ns = int(answer.get("prompt_eval_duration", 0))
         d_n = int(answer.get("eval_count", 0))
         d_ns = int(answer.get("eval_duration", 0))
-        if p_ns > 0:
-            prefills.append(p_n * 1e9 / p_ns)
-            ttfts.append(p_ns / 1e6)
+        # Prefill from the first run and no other. The server keeps the keys and
+        # values of the last prompt it saw, and this sends the same prompt every
+        # time, so the second run reports the full token count against almost no
+        # time and comes out three or four times faster than the same engine
+        # underneath llama.cpp. Decode is not cached and keeps its median.
+        if i == 0 and p_ns > 0:
+            prefill = p_n * 1e9 / p_ns
+            ttft = p_ns / 1e6
         if d_ns > 0:
             decodes.append(d_n * 1e9 / d_ns)
-    if prefills:
-        out.prefill_tps = statistics.median(prefills)
+    out.prefill_tps = prefill
+    out.ttft_ms = ttft
     if decodes:
         out.decode_tps = statistics.median(decodes)
-    if ttfts:
-        out.ttft_ms = statistics.median(ttfts)
-    out.note = "peak resident bytes belong to the ollama server, not to the run"
+    out.note = (
+        "prefill is the first run only, because the server caches the last"
+        " prompt. Peak resident bytes belong to the server, not to the run"
+    )
     return out
 
 
