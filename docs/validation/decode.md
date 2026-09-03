@@ -32,7 +32,7 @@ A prefill here is still one position at a time. Attention takes a single query a
 
 So it binds by name against `tensor_names` in the architecture table, a name the table asks for and the file does not have is an error rather than a `none`, and every shape goes through `LayerWeights.check` before a token is computed. A load that takes half a minute and then fails on a shape at token one has spent that half minute for nothing, and the check is a few hundred integer comparisons.
 
-Everything binds to the mapping. The kernels are host kernels, so a tensor copied to a card is one they cannot read, and `molla generate` plans the load with a device budget of zero rather than leaving the placement to a heuristic that has no way to know what will read the result. Device placement becomes useful when there are device kernels, which is M3.
+Everything binds to the mapping on this path. The kernels are host kernels, so a tensor copied to a card is one they cannot read, and `molla generate` plans the load with a device budget of zero rather than leaving the placement to a heuristic that has no way to know what will read the result. The other answer is a second binding against a residency, which is what `molla generate --device` does, and it is [device-decode.md](device-decode.md).
 
 ## What was run
 
