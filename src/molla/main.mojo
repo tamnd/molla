@@ -8,6 +8,7 @@ binary thinks it is running on. The real command surface arrives with M2.
 from std.sys import argv, exit
 
 from molla.build_info import MOJO_PIN, VERSION
+from molla.engine.backend import Backend, Request, choose_backend, parse_backend
 from molla.engine.generate import run_generate
 from molla.engine.generate_device import run_generate_device
 from molla.engine.sample import SamplerConfig
@@ -97,8 +98,8 @@ def print_usage():
         " with it"
     )
     print(
-        "  load <path> [n] [--host]  load a model's weights and report each"
-        " stage"
+        "  load <path> [n] [--host] [--device=..]  load a model's weights and"
+        " report each stage"
     )
     print(
         "  generate <model> <tokenizer.json> <prompt> [n] [ctx]  generate text"
@@ -111,14 +112,21 @@ def print_usage():
         " --presence-penalty"
     )
     print("                  --repeat-last-n --seed, and no flags means greedy")
-    print("                  --device runs the whole forward pass on the GPU")
+    print(
+        "                  --device=auto|cpu|metal|cuda picks the backend, and"
+        " auto is"
+    )
+    print(
+        "                  the default. An api may be followed by a colon and"
+        " an index."
+    )
     print(
         "  serve <model> <tokenizer.json>  answer OpenAI requests against a"
         " model"
     )
     print(
-        "                  --host --port --ctx, and 127.0.0.1:8000 when"
-        " nothing says"
+        "                  --host --port --ctx --device, and 127.0.0.1:8000"
+        " when nothing says"
     )
     print("  devices         list what this machine can put a tensor on")
     print("  config get [key] print a setting and where its value came from")
@@ -199,6 +207,19 @@ def _flag_int(key: String, text: String) raises -> Int:
         return atol(text)
     except:
         raise Error("--" + key + " wants a whole number and got '" + text + "'")
+
+
+def _flag_value(arg: String) -> String:
+    """Everything after the first equals sign of a `--name=value` flag.
+
+    Empty when there is nothing after it, which every caller treats the same as
+    the flag's own default rather than as an error, because `--device=` with
+    nothing on the end reads as somebody who changed their mind mid command.
+    """
+    var eq = arg.find("=")
+    if eq < 0:
+        return String("")
+    return String(arg[byte = eq + 1 : arg.byte_length()].strip())
 
 
 def sampling_flag(mut config: SamplerConfig, arg: String) raises -> Bool:
@@ -452,13 +473,22 @@ def main():
             exit(2)
         var workers = 0
         var host_only = False
+        var load_want = Request()
         try:
             for i in range(3, len(args)):
                 if args[i] == "--host":
                     host_only = True
+                elif args[i].startswith("--device="):
+                    load_want = parse_backend(_flag_value(args[i]))
                 else:
                     workers = atol(args[i])
-            run_load(args[2], workers, True, host_only)
+            # `--host` is the older spelling of `--device=cpu` and it still
+            # wins, so a script written before there was a flag keeps timing
+            # the load it was timing.
+            var picked = choose_backend(args[2], load_want)
+            if not picked.on_device:
+                host_only = True
+            run_load(args[2], workers, True, host_only, picked.device)
         except e:
             print("molla load:", e)
             exit(1)
@@ -472,10 +502,11 @@ def main():
         var limit = 0
         var context = 0
         var sampling = SamplerConfig()
-        # Provisional, and a flag rather than a choice of backend, because
-        # choosing one properly is #144. What it means today is the whole
-        # forward pass on the default accelerator or none of it on the host.
-        var on_device = False
+        # `--device` on its own means auto, which is what it meant when it was
+        # a bare flag in #143 on a machine with one card. Everything else comes
+        # through `molla.engine.backend`, which is also what decides whether an
+        # unspelled run ends up on a card at all.
+        var want = Request()
         try:
             # The two numbers stay positional and the sampling settings are
             # named, in either order. Nobody is going to remember a ninth
@@ -485,7 +516,10 @@ def main():
                 if sampling_flag(sampling, args[i]):
                     continue
                 if args[i] == "--device":
-                    on_device = True
+                    want = Request()
+                    continue
+                if args[i].startswith("--device="):
+                    want = parse_backend(_flag_value(args[i]))
                     continue
                 if args[i].startswith("--"):
                     raise Error(
@@ -502,13 +536,14 @@ def main():
                         + "' is one argument more than this takes"
                     )
                 positional += 1
-            if on_device:
+            var picked = choose_backend(args[2], want)
+            if picked.on_device:
                 run_generate_device(
-                    args[2], args[3], args[4], limit, context, sampling
+                    args[2], args[3], args[4], limit, context, sampling, picked
                 )
             else:
                 run_generate(
-                    args[2], args[3], args[4], limit, context, sampling
+                    args[2], args[3], args[4], limit, context, sampling, picked
                 )
         except e:
             print("molla generate:", e)
@@ -520,6 +555,7 @@ def main():
         var serve_host = String("127.0.0.1")
         var serve_port: UInt16 = 8000
         var serve_context = 0
+        var serve_want = Request()
         try:
             # Named flags rather than positions, because a host and a port and
             # a context length are three numbers nobody is going to remember
@@ -548,6 +584,8 @@ def main():
                     serve_port = UInt16(_flag_int(key, val))
                 elif key == "ctx":
                     serve_context = _flag_int(key, val)
+                elif key == "device":
+                    serve_want = parse_backend(val)
                 else:
                     raise Error(
                         String("'") + arg + "' is not a flag this takes"
@@ -559,6 +597,7 @@ def main():
                     serve_host,
                     serve_port,
                     serve_context,
+                    choose_backend(args[2], serve_want),
                 )
             )
         except e:

@@ -34,7 +34,7 @@ So `DeviceSession` owns the one context and hands it down. `load` takes it as an
 
 ## What was run
 
-`molla generate <model.gguf> <tokenizer.json> "<prompt>" [n] [ctx] [--device]`, greedy, the same prompt on every row, on an M4 and on a 4090.
+`molla generate <model.gguf> <tokenizer.json> "<prompt>" [n] [ctx] [--device]`, greedy, the same prompt on every row, on an M4 and on a 4090. The flag took no value at the time, and the same runs today are `--device=auto` against `--device=cpu`.
 
 | Model | Machine | Host | Device |
 | --- | --- | --- | --- |
@@ -58,6 +58,6 @@ The host column is a scalar decode with no threading in it, so it is a floor rat
 
 Not batched. A prefill is still one position at a time, because attention takes a single query and a run of keys by construction, so a batched prefill is a different kernel rather than a different loop.
 
-Not a backend that anything chooses. `--device` is a flag on `molla generate` and nothing else uses it, which is deliberate: choosing a backend properly, and making the server able to use one, is #144.
+Backend selection came after this, in #144, and is written up in [backend.md](backend.md). While this issue was open `--device` was a bare flag on `molla generate` and nothing else read it.
 
 Not the fastest arrangement of these kernels. A token is one synchronize and several hundred launches, and the launches are small. Fusing them, keeping the residual stream in registers across a sublayer, and giving the matvec more than one row per block are all real work and all measurable, and none of it is worth doing before there is a number from a rival to aim at.

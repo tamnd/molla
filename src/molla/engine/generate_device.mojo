@@ -28,6 +28,7 @@ from std.sys.info import has_accelerator
 
 from max.gpu.host import DeviceContext
 
+from molla.engine.backend import Backend
 from molla.engine.bind import bind
 from molla.engine.device import DeviceSession
 from molla.engine.generate import (
@@ -42,7 +43,6 @@ from molla.model.load import load, plan_load
 from molla.model.repack import model_key, open_cache
 from molla.model.spec import read_geometry
 from molla.sys.clock import monotonic_ms
-from molla.sys.device import default_device
 from molla.sys.mem import AllocCounter
 from molla.tokenizer.tokenizer import DecodeStream, Session, Tokenizer
 
@@ -54,6 +54,7 @@ def run_generate_device(
     limit: Int,
     context: Int,
     sampling: SamplerConfig = SamplerConfig(),
+    backend: Backend = Backend(),
 ) raises:
     """Load onto the device, prefill, decode, and print as it goes.
 
@@ -73,7 +74,7 @@ def run_generate_device(
         )
 
     comptime if has_accelerator():
-        var dev = default_device()
+        var dev = backend.device
         if not dev.accelerator():
             raise Error(
                 "this build has device code and this machine has no"
@@ -166,7 +167,7 @@ def run_generate_device(
             sampling,
             loaded - started,
             cache,
-            dev.name,
+            backend,
         )
 
         var prefill_started = monotonic_ms()

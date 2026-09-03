@@ -839,6 +839,7 @@ def load(
 
     if stream:
         _report_plan(plan, pool_bytes)
+        _report_placement(g, plan)
 
     var threads = worker_count(workers)
     if threads > count:
@@ -1010,6 +1011,21 @@ def _mib(bytes: Int) -> String:
     return String(bytes // MIB) + " MiB"
 
 
+def _small(bytes: Int) -> String:
+    """Megabytes, or kilobytes when megabytes would round to nothing.
+
+    The norms of a small model come to a few hundred kilobytes, and the rope
+    frequencies to a few hundred bytes. A table that reports either as `0 MiB`
+    reads like they were not placed at all, which is the one thing this table
+    exists to say.
+    """
+    if bytes < 1024:
+        return String(bytes) + " bytes"
+    if bytes < MIB:
+        return String(bytes // 1024) + " KiB"
+    return _mib(bytes)
+
+
 def _report_plan(plan: Plan, pool_bytes: Int):
     print(
         stage_name(STAGE_PLAN)
@@ -1054,6 +1070,101 @@ def _report_plan(plan: Plan, pool_bytes: Int):
             + String(plan.left_behind)
             + " tensors did not fit the budget and stay on the host"
         )
+
+
+comptime CLASS_EMBEDDING = 0
+comptime CLASS_ATTENTION = 1
+comptime CLASS_FEEDFORWARD = 2
+comptime CLASS_NORM = 3
+comptime CLASS_OUTPUT = 4
+comptime CLASS_OTHER = 5
+comptime CLASS_COUNT = 6
+
+
+def class_name(id: Int) -> String:
+    if id == CLASS_EMBEDDING:
+        return String("embedding")
+    if id == CLASS_ATTENTION:
+        return String("attention")
+    if id == CLASS_FEEDFORWARD:
+        return String("feed forward")
+    if id == CLASS_NORM:
+        return String("norms")
+    if id == CLASS_OUTPUT:
+        return String("output head")
+    return String("other")
+
+
+def class_of(name: String) -> Int:
+    """Which group of weights a tensor belongs to, by its name.
+
+    Coarse on purpose. The question this answers is which part of the model
+    landed where, and the parts that can land in different places are the
+    embedding, the per layer matrices, and the output head. Splitting the
+    attention block into four would make the table longer without making any
+    placement decision visible that is not visible already.
+
+    Names rather than shapes, because the shapes of a key projection and a value
+    projection are the same in most architectures and the names never are. The
+    two embedding spellings are the two the architecture table already knows
+    about.
+    """
+    if name.startswith("token_embd") or name.startswith("tok_embeddings"):
+        return CLASS_EMBEDDING
+    if name.find("attn") >= 0 or name.find("attention") >= 0:
+        return CLASS_NORM if name.find("norm") >= 0 else CLASS_ATTENTION
+    if name.find("ffn") >= 0 or name.find("feed_forward") >= 0:
+        return CLASS_NORM if name.find("norm") >= 0 else CLASS_FEEDFORWARD
+    if name.find("norm") >= 0:
+        return CLASS_NORM
+    if name.startswith("output") or name.startswith("lm_head"):
+        return CLASS_OUTPUT
+    return CLASS_OTHER
+
+
+def _report_placement(g: Gguf, plan: Plan) raises:
+    """Where each class of weight ended up, in tensors and megabytes.
+
+    Printed because a model that quietly landed on the host is visible in
+    nothing else. The total bytes are the same either way, the load finishes
+    either way, and the only symptom is a token rate somebody has to already
+    know the right value of. A load that put the attention matrices on the card
+    and left the feed forward ones behind is the interesting case and it is one
+    line here.
+    """
+    var host_n = List[Int]()
+    var host_b = List[Int]()
+    var dev_n = List[Int]()
+    var dev_b = List[Int]()
+    for _ in range(CLASS_COUNT):
+        host_n.append(0)
+        host_b.append(0)
+        dev_n.append(0)
+        dev_b.append(0)
+
+    for i in range(plan.count()):
+        var one = plan.placements[i]
+        var id = class_of(g.text(g.tensors[one.index].name))
+        if one.place == WHERE_DEVICE:
+            dev_n[id] += 1
+            dev_b[id] += one.length
+        else:
+            host_n[id] += 1
+            host_b[id] += one.length
+
+    for id in range(CLASS_COUNT):
+        if host_n[id] == 0 and dev_n[id] == 0:
+            continue
+        var line = stage_name(STAGE_PLAN) + "   " + class_name(id)
+        while line.byte_length() < 22:
+            line += " "
+        if dev_n[id] > 0:
+            line += String(dev_n[id]) + " on the device, " + _small(dev_b[id])
+            if host_n[id] > 0:
+                line += ", "
+        if host_n[id] > 0:
+            line += String(host_n[id]) + " on the host, " + _small(host_b[id])
+        print(line)
 
 
 def _report_tick(tenth: Int, bytes: Int, started: Int):
@@ -1139,6 +1250,7 @@ def run_load(
     workers: Int = 0,
     repack: Bool = True,
     host_only: Bool = False,
+    place: Optional[Device] = None,
 ) raises:
     """Entry point for `molla load` on a GGUF file.
 
@@ -1153,9 +1265,15 @@ def run_load(
     everything in the mapping, which is what the engine does today and what a
     load for host kernels costs. Neither is the fallback of the other and the
     difference between the two numbers is the price of a device address.
+
+    `place` is what `--device=` resolved to. Nothing means the first
+    accelerator, which is what this command did before there was a way to say.
+    It arrives as a `Device` rather than as the flag itself because resolving a
+    flag needs the model file and the fit, and asking that question from in here
+    would make this module import the engine that imports it.
     """
     var g = Gguf(path)
-    var dev = default_device()
+    var dev = place.value() if place else default_device()
 
     # The cache is opened before the plan and not after it, because the plan is
     # what decides which copy of each weight gets read and a cache that turns up

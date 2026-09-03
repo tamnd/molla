@@ -21,6 +21,20 @@ request goes back to the event loop between tokens and another connection can be
 serviced in the gap. A request that is not streaming holds the worker for its
 whole generation, which is the same statement said less politely.
 
+## Two sessions, one of them present
+
+The sequence lives in a host session or in a device session and never in both,
+so both are optionals and exactly one is filled. A variant would be tidier and
+Mojo has no shape for one that does not cost more than this does. What it buys
+is that a server started on the host does not allocate a device cache and a
+server started on a card does not allocate a host one, and a kv cache at four
+bytes an element is not a thing to allocate twice for the sake of a field.
+
+Which one it is was decided before the file was opened, by
+`molla.engine.backend`, and it is printed at startup and served on
+`/molla/version` for the same reason `molla generate` prints it: a server that
+quietly fell back to the host looks exactly like a slow card.
+
 ## Stop strings are held, not searched afterwards
 
 A stop string can straddle two tokens, and it can be half emitted before it is
@@ -31,7 +45,13 @@ which is correct, and it is why the streaming loop asks for a delta rather than
 assuming one token is one chunk.
 """
 
+from std.sys.info import has_accelerator
+
+from max.gpu.host import DeviceContext
+
+from molla.engine.backend import Backend
 from molla.engine.bind import Bound, bind
+from molla.engine.device import DeviceSession
 from molla.engine.sample import Sampler, SamplerConfig
 from molla.engine.session import Session as Decode
 from molla.jinja.template import Template
@@ -40,7 +60,7 @@ from molla.model.load import Weights, load, plan_load
 from molla.model.repack import RepackCache, model_key, open_cache
 from molla.model.spec import read_geometry
 from molla.sys.clock import unix_time
-from molla.sys.device import default_device
+from molla.sys.device import Device
 from molla.sys.mem import AllocCounter
 from molla.tokenizer.tokenizer import DecodeStream, Session, Tokenizer
 
@@ -73,6 +93,99 @@ def address_of(ref runner: Runner) -> Int:
     return Int(Pointer(to=runner))
 
 
+def _device_context(index: Int) raises -> DeviceContext:
+    """The one context this process is going to use, or a refusal.
+
+    One, and made here rather than wherever it is first wanted. A CUDA process
+    gets a single `DeviceContext`: a second one constructs and then hangs on the
+    first allocation against it, with the card idle and every thread asleep on a
+    futex. So the load and the session are handed the same one, and this is the
+    only place it comes from.
+
+    Behind a `comptime if` because `max-core` resolves the device architecture
+    at compile time, so constructing one at all is what would stop molla
+    building on the machines that have no GPU.
+    """
+    comptime if has_accelerator():
+        return DeviceContext(device_id=index)
+    raise Error(
+        "this build has no device code in it, so there is no device context to"
+        " make. Accelerator support is decided when molla is compiled, not when"
+        " it is run"
+    )
+
+
+def _device_session(
+    ctx: DeviceContext, host: Bound, dev: Bound, context: Int
+) raises -> Optional[DeviceSession]:
+    """The session, built behind the same guard for the same reason."""
+    comptime if has_accelerator():
+        return DeviceSession(ctx, host, dev, context)
+    raise Error(
+        "this build has no device code in it, so there is no device session to"
+        " run a sequence in"
+    )
+
+
+def _load_device(
+    g: Gguf,
+    mut cache: RepackCache,
+    model_path: String,
+    dev: Device,
+    ctx: DeviceContext,
+) raises -> Weights:
+    """Put every weight of this model on the card, in the planar layout.
+
+    Every weight, and it refuses rather than placing what fits. A device kernel
+    handed a host address reads zeros without faulting, so a model that half
+    fits is a server that answers fluently out of layers that saw nothing, and
+    nothing in the answer says so. The refusal is checked against the plan
+    before any bytes move, so a model that will not fit says so in a second
+    rather than after a minute of copying.
+
+    The repack runs first and on its own when there is no cache. A load that
+    writes the cache on the way past writes it from the file it is reading, so
+    the bytes it copied to the card would be the ggml ones, which is the layout
+    these kernels cannot read.
+    """
+    comptime if has_accelerator():
+        if not cache.usable:
+            print(
+                "  repack         writing a planar cache first,", cache.reason
+            )
+            var warm = load(
+                g, plan_load(g, dev, 0, cache), 0, False, model_path
+            )
+            _ = warm^
+            cache.close()
+            cache = open_cache(model_path, model_key(g))
+            if not cache.usable:
+                raise Error(
+                    "the repack cache was written and still cannot be used: "
+                    + cache.reason
+                )
+
+        var plan = plan_load(g, dev, -1, cache)
+        if plan.left_behind > 0:
+            raise Error(
+                "the device forward pass needs every weight on the card and"
+                " this plan leaves "
+                + String(plan.left_behind)
+                + " of them in the mapping, which would be read as zeros. This"
+                " model does not fit on "
+                + dev.name
+            )
+        return load(g, plan^, 0, False, "", ctx)
+
+    # Only reachable on a build with no device code, where the block above is
+    # not compiled at all. The caller has already refused for the same reason,
+    # so this is the compiler being told what a function with a return type owes
+    # rather than a second check.
+    raise Error(
+        "this build has no device code in it, so there is nothing to load onto"
+    )
+
+
 struct Runner(Movable):
     """A model file, ready to answer, plus whatever it is in the middle of."""
 
@@ -93,7 +206,15 @@ struct Runner(Movable):
     """Whether the file carried a chat template. Without one the completions
     route still works and the chat route says why it does not."""
 
-    var session: Decode
+    var session: Optional[Decode]
+    var device: Optional[DeviceSession]
+    """The sequence, in host memory or on the card. Exactly one of them is
+    filled and `backend.on_device` says which."""
+
+    var backend: Backend
+    """Where this server computes, and why. Reported at startup and on
+    `/molla/version`, because it is not visible in an answer."""
+
     var sampler: Sampler
     var decoder: DecodeStream
 
@@ -130,29 +251,47 @@ struct Runner(Movable):
         tokenizer_path: String,
         id: String,
         context: Int,
+        backend: Backend = Backend(),
     ) raises:
         var g = Gguf(model_path)
-        var dev = default_device()
-
-        # Everything stays in the mapping, for the reason `molla generate`
-        # gives: the kernels are host kernels, so a tensor on a card is one
-        # they cannot read.
-        #
-        # A miss repacks while it loads and a hit does not, so the first start
-        # against a model pays once and every start after it binds straight to
-        # the cache. This run binds to whatever was there when it opened, which
-        # on a miss is the file, so the repack a miss writes is for the next
-        # start and not for this one. Either way the plan is told about the
-        # cache too, so the read stage warms the copy of each weight that this
-        # process is going to read.
-        var cache = open_cache(model_path, model_key(g))
-        var repack_for = String("") if cache.usable else model_path
-        var weights = load(g, plan_load(g, dev, 0, cache), 0, False, repack_for)
-        var b = bind(g, cache)
+        var dev = backend.device
         var geometry = read_geometry(g)
         var want = context if context > 0 else DEFAULT_CONTEXT
         if geometry.context_length > 0 and want > geometry.context_length:
             want = geometry.context_length
+
+        # The cache is opened before either plan, because the plan is what
+        # decides which copy of each weight the read stage warms, and a cache
+        # that turns up afterwards is one the plan could not use.
+        var cache = open_cache(model_path, model_key(g))
+        var weights: Weights
+        var b: Bound
+        self.session = None
+        self.device = None
+
+        if backend.on_device:
+            var ctx = _device_context(dev.index)
+            weights = _load_device(g, cache, model_path, dev, ctx)
+            # The same file bound twice. Once against the residency, which is
+            # what the kernels read, and once without it, which is where the
+            # norm gains are readable so they can be uploaded. A `Bound` owns no
+            # bytes, so the second is a list of addresses and not a second copy
+            # of anything.
+            b = bind(g, cache, weights.residency())
+            self.device = _device_session(ctx, bind(g, cache), b, want)
+        else:
+            # Everything stays in the mapping, because host kernels cannot read
+            # a tensor on a card.
+            #
+            # A miss repacks while it loads and a hit does not, so the first
+            # start against a model pays once and every start after it binds
+            # straight to the cache. This run binds to whatever was there when
+            # it opened, which on a miss is the file, so the repack a miss
+            # writes is for the next start and not for this one.
+            var repack_for = String("") if cache.usable else model_path
+            weights = load(g, plan_load(g, dev, 0, cache), 0, False, repack_for)
+            b = bind(g, cache)
+            self.session = Decode(b, want)
 
         var counter = AllocCounter()
         var tokenizer = Tokenizer(tokenizer_path, counter.raw())
@@ -165,7 +304,7 @@ struct Runner(Movable):
         self.bos_text = _token_text(tokenizer, bos)
         self.eos_text = _token_text(tokenizer, self.eos)
 
-        self.session = Decode(b, want)
+        self.backend = backend
         self.sampler = Sampler(SamplerConfig(), b.vocab())
         self.decoder = DecodeStream(True)
         self.context = want
@@ -218,6 +357,19 @@ struct Runner(Movable):
                 + " MiB"
             )
         return self.cache.reason
+
+    def running_on(self) -> String:
+        """Which backend answers, in one line, with the reason when there is
+        one.
+
+        The reason is only ever there after `auto` stayed on the host, which is
+        the case somebody looking at a slow server needs told rather than left
+        to work out from a token rate.
+        """
+        var out = self.backend.describe()
+        if self.backend.note.byte_length() > 0:
+            out += ", " + self.backend.note
+        return out^
 
     def answers_to(self, name: String) -> Bool:
         """Whether a request's `model` field names this model.
@@ -323,7 +475,7 @@ struct Runner(Movable):
         if take > self.context - len(prompt):
             take = self.context - len(prompt)
 
-        self.session.reset()
+        self._reset()
         self.sampler = Sampler(config, self.b.vocab())
         for i in range(len(bias_ids)):
             self.sampler.bias(bias_ids[i], bias_vals[i])
@@ -338,7 +490,31 @@ struct Runner(Movable):
         self.reason = REASON_LENGTH if take == 0 else REASON_STOP
         self.left = take
         self.busy = True
-        self.session.prefill(self.b, prompt)
+        self._prefill(prompt)
+
+    def _reset(mut self) raises:
+        """Put the sequence back to position zero, wherever it lives."""
+        if self.session:
+            self.session.value().reset()
+        if self.device:
+            self.device.value().reset()
+
+    def _prefill(mut self, prompt: List[Int]) raises:
+        if self.session:
+            self.session.value().prefill(self.b, prompt)
+        elif self.device:
+            self.device.value().prefill(prompt)
+
+    def _pick(mut self) raises -> Int:
+        if self.session:
+            return self.session.value().pick(self.sampler)
+        return self.device.value().pick(self.sampler)
+
+    def _step(mut self, token: Int) raises:
+        if self.session:
+            self.session.value().step(self.b, token)
+        elif self.device:
+            self.device.value().step(token)
 
     def advance(mut self) raises -> Bool:
         """One more token, or False because there are no more.
@@ -349,7 +525,7 @@ struct Runner(Movable):
         if self.left <= 0:
             self.reason = REASON_LENGTH
             return False
-        var next = self.session.pick(self.sampler)
+        var next = self._pick()
         if next == self.eos:
             self.reason = REASON_STOP
             return False
@@ -364,7 +540,7 @@ struct Runner(Movable):
                 self.emitted = cut
             self.reason = REASON_STOP
             return False
-        self.session.step(self.b, next)
+        self._step(next)
         return True
 
     def finish(mut self):
