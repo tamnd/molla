@@ -48,6 +48,14 @@ comptime MAX_STEPS = 400
 that is two seconds, far longer than loopback needs and short enough that a
 hang reads as a failed check rather than a hung job."""
 
+comptime FILL_ROUNDS = 8000
+"""Passes to spend filling the output ring before calling it a failure.
+
+Much larger than `MAX_STEPS` because this one is not waiting for an event, it
+is moving bytes, and it moves at most one read buffer of them per pass. A
+kernel that holds a few megabytes before it pushes back needs a few hundred
+passes to get through them, and none of those passes waits on anything."""
+
 comptime WAIT_MS = 4000
 """How long the threaded tests wait for a server that is running on its own
 threads. Generous, because CI runners are shared and a scheduling delay is not
@@ -259,13 +267,14 @@ def _check_reactor(mut suite: Suite) raises:
 def _check_backpressure(mut suite: Suite) raises:
     suite.group("net.reactor backpressure")
 
-    # Half a megabyte, against sockets whose buffers are pinned small at both
-    # ends. Left to itself the kernel decides how much it will hold, that number
-    # differs by platform and grows over the life of a connection, and a test
-    # that pushes bytes until it happens to fill either passes by accident or
-    # tests nothing. An accepted socket inherits the listener's buffer sizes, so
-    # setting it there covers the connection the reactor ends up with.
-    var total = 512 * 1024
+    # A ceiling rather than an amount. The sockets have their buffers pinned
+    # small at both ends, and an accepted socket inherits the listener's sizes,
+    # so on a kernel that honours that the path fills after a few hundred
+    # kilobytes. WSL2 does not honour it, takes the whole write into a buffer of
+    # its own choosing, and left the ring nearly empty at half a megabyte, which
+    # is #87. So this is the point at which the test gives up and says the ring
+    # never filled, and not the number of bytes it means to send.
+    var ceiling = 16 * 1024 * 1024
     var listener = open_listener(ListenAddress(UInt16(0)), False)
     set_buffer_size(listener, SO_SNDBUF, 8192)
     var port = bound_port(listener)
@@ -280,18 +289,23 @@ def _check_backpressure(mut suite: Suite) raises:
     # Push without reading until the whole path is full: the client's send
     # buffer, the reactor's read buffer, its output ring, the server's send
     # buffer and the client's receive buffer. Feeding bytes in step with the
-    # reads would never stall anything and would test nothing. Socket buffer
-    # sizes differ by platform and auto tune, so this stops on the condition it
-    # is looking for rather than after a fixed number of bytes.
+    # reads would never stall anything and would test nothing.
+    #
+    # The condition to stop on is the ring being full and not the socket write
+    # going short. The socket goes short the moment the kernel buffer is full,
+    # which is the beginning of backpressure rather than the thing being
+    # tested, and on a kernel with a large buffer the ring is still nearly
+    # empty at that point. The ring is 64 kB of molla's own memory, so a client
+    # that keeps sending and never reads fills it on any kernel eventually. How
+    # many bytes eventually is differs by platform, so this waits for the
+    # condition rather than guessing the number.
     var sent = 0
     var rounds = 0
     while (
-        sent < total
-        and reactor.conns[0].short_writes == 0
-        and rounds < MAX_STEPS
+        sent < ceiling and reactor.proto.stalled == 0 and rounds < FILL_ROUNDS
     ):
-        while sent < total:
-            var want = min(8192, total - sent)
+        while sent < ceiling:
+            var want = min(8192, ceiling - sent)
             var wrote = _send_pattern(client, 0, want)
             sent += wrote
             if wrote < want:
@@ -307,12 +321,17 @@ def _check_backpressure(mut suite: Suite) raises:
         reactor.conns[0].pending() > 0, "with a response still queued behind it"
     )
 
+    # Another half megabyte on top of whatever it took to fill the path, sent
+    # while the ring is draining. Draining an untouched ring would show that
+    # the bytes come back and not that the reactor goes on taking new ones
+    # while it is behind, which is the state a server is actually in.
+    var target = sent + 512 * 1024
     var read_back = 0
     var buf = stack_allocation[8192, UInt8]()
     var steps = 0
-    while read_back < total and steps < 200000:
-        if sent < total:
-            var want = min(8192, total - sent)
+    while read_back < target and steps < 200000:
+        if sent < target:
+            var want = min(8192, target - sent)
             sent += _send_pattern(client, 0, want)
         _ = reactor.poll_once(1)
         while True:
@@ -322,8 +341,10 @@ def _check_backpressure(mut suite: Suite) raises:
             read_back += n
         steps += 1
 
-    suite.check(sent == total, "the client sent half a megabyte")
-    suite.check(read_back == total, "and got every byte of it back")
+    suite.check(
+        sent == target, "the client kept sending while the ring drained"
+    )
+    suite.check(read_back == target, "and got every byte of it back")
     suite.check(steps < 200000, "without spinning")
 
     _ = close(client)
