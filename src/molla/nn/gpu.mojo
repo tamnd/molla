@@ -49,7 +49,7 @@ called with device buffers could not be checked against the host at all.
 from std.gpu import block_idx, thread_idx
 from std.math import exp
 from std.memory import AddressSpace, bitcast, stack_allocation
-from std.sys.info import has_accelerator
+from std.sys.info import CompilationTarget, has_accelerator
 
 from max.gpu import barrier
 from max.gpu.host import DeviceBuffer, DeviceContext
@@ -495,17 +495,32 @@ def planar_matvec_kernel[
 
 
 comptime MM_TILE = 32
-"""Threads in a batched matmul block, which need not be the matvec's tile."""
+"""Threads in a batched matmul block, which is not the matvec's tile.
 
-comptime SPAN = 16
+A quarter of it, measured. A matmul block reduces `SPAN` accumulators rather
+than one, so the tree at the end of it costs `SPAN` times what the matvec's
+does, and past a certain width the reduction is more work than the dot product
+that fed it. Thirty two threads is the best of every width from sixteen to five
+hundred and twelve on both backends and on all three models, and the losses
+either side of it are large: on a 4090 a 514 token prompt through SmolLM2 runs
+at 2734 tokens a second here, 2089 at 128 threads and 1034 at 512.
+"""
+
+comptime SPAN = 16 if CompilationTarget.is_macos() else 8
 """How many tokens one matmul block carries at once.
 
 The number that decides whether prefill is bandwidth bound or compute bound. A
 block reads and dequantizes a weight value once and multiplies it into `SPAN`
 accumulators, so the weight traffic and the conversion work for a chunk of `T`
 tokens are `ceil(T / SPAN)` passes over the matrix rather than `T` of them. It
-costs `SPAN * tile` floats of shared memory, which at the shipped tile is 8 KiB
-a block.
+costs `SPAN * MM_TILE` floats of shared memory and `SPAN` registers of
+accumulator, and the second one is what stops it growing.
+
+The two backends want different numbers and the difference is measured and
+consistent rather than noise. Metal is 11 per cent faster at sixteen than at
+eight and CUDA is 19 per cent faster at eight than at sixteen, on both models
+that fit in cache. A macOS build targets Metal and a build anywhere else
+targets CUDA, which is why the operating system is the thing asked here.
 """
 
 
