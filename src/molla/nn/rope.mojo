@@ -227,6 +227,29 @@ def _ramp(low: Float32, high: Float32, pair: Int) -> Float32:
     return 1.0 - at
 
 
+def step_table(spec: RopeSpec) -> List[Float32]:
+    """The frequency step for every pair, which does not depend on position.
+
+    `angle` works this out per pair per head per token, and on a host that is
+    fine, because it is one power next to a `cos` and a `sin` and nobody can
+    measure it.
+
+    A device kernel wants it as a table instead, and the reason is accuracy
+    rather than speed. The step here goes through a float64 `log` and `exp`, and
+    a kernel forming the same value from a float32 `exp` lands about 1e-7 away
+    in relative terms. That would be the end of it except that the angle is the
+    step times the position, so the absolute gap grows as a sequence gets
+    longer: nothing at position 10, the fourth digit of a rotated value by
+    position 4096. Handing the kernel the same float32 steps this computed
+    removes the difference instead of bounding it, and it costs `dim / 2` floats
+    per rope spec, of which a model has one or two.
+    """
+    var table = List[Float32]()
+    for pair in range(spec.dim // 2):
+        table.append(_powf(spec.base, -2.0 * Float32(pair) / Float32(spec.dim)))
+    return table^
+
+
 def angle(
     spec: RopeSpec, pos: Int, pair: Int, freq: Float32
 ) raises -> Tuple[Float32, Float32]:

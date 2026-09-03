@@ -5,6 +5,10 @@ Modules that can raise should be wrapped in try and except, reporting through
 an unreachable except, so only wrap the ones that actually raise.
 """
 
+from std.sys.info import has_accelerator
+
+from max.gpu.host import DeviceContext
+
 from harness import Suite, finish
 
 import test_allocs
@@ -21,6 +25,7 @@ import test_attention
 import test_block
 import test_engine
 import test_gpu
+import test_gpu_ops
 import test_kernel
 import test_nnmodel
 import test_repack
@@ -45,6 +50,27 @@ import test_sys
 import test_text
 import test_tls
 import test_tokenizer
+
+
+def run_on_device(mut suite: Suite):
+    """Every test that launches a kernel, sharing one context between them.
+
+    The context is here rather than in the modules because a CUDA process gets
+    one of them. Making a second, even after the first has gone out of scope,
+    hangs on the first allocation against it with the GPU idle and every thread
+    asleep on a futex, which reads exactly like a kernel that will not finish
+    and is not one. Metal does not mind, so a suite that made one per module
+    passed on the M4 for a while and hung on the 4090.
+    """
+    comptime if not has_accelerator():
+        return
+    else:
+        try:
+            var ctx = DeviceContext()
+            test_gpu.run_on_device(suite, ctx)
+            test_gpu_ops.run_on_device(suite, ctx)
+        except e:
+            suite.fail("device tests", String(e))
 
 
 def main():
@@ -90,6 +116,11 @@ def main():
         test_gpu.run(suite)
     except e:
         suite.fail("test_gpu", String(e))
+    try:
+        test_gpu_ops.run(suite)
+    except e:
+        suite.fail("test_gpu_ops", String(e))
+    run_on_device(suite)
     try:
         test_cache.run(suite)
     except e:

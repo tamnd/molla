@@ -59,6 +59,12 @@ conformance-quant = "mojo run -I src scripts/quant_oracle.mojo corpus/quant"
 # into docs/validation/kernels.md. It exits 2 rather than 1 on a build with no
 # device code, so a machine without an accelerator is a skip and not a failure.
 conformance-kernels = "mojo run -I src scripts/kernel_oracle.mojo corpus/quant"
+# The rest of a block on the device against the host functions it mirrors. Same
+# arrangement as `conformance-kernels` and the same exit codes, and it needs no
+# fixtures at all, because everything it compares is float32 arithmetic over
+# numbers it makes up. So a machine with a GPU can run this straight after a
+# clone, which is not true of any other conformance task here.
+conformance-block = "mojo run -I src scripts/block_oracle.mojo"
 # The logit conformance corpus. The reference files are committed because they
 # are a few hundred kilobytes and writing them needs llama.cpp on PATH, which
 # no machine in the fleet but the laptop has. The models they were taken
