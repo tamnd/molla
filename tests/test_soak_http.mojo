@@ -142,13 +142,21 @@ def _check_wire(mut suite: Suite):
         ),
     )
 
-    suite.check(
-        ROLE_KEEPALIVE != ROLE_STREAM
-        and ROLE_STREAM != ROLE_SLOW
-        and ROLE_SLOW != ROLE_ABRUPT
-        and ROLE_ABRUPT != ROLE_OVERSIZED,
-        "the five client kinds are five different numbers",
-    )
+    # Every pair rather than the four consecutive ones, which is both the whole
+    # claim and a runtime comparison, so the compiler does not fold it away.
+    var roles: List[Int] = [
+        ROLE_KEEPALIVE,
+        ROLE_STREAM,
+        ROLE_SLOW,
+        ROLE_ABRUPT,
+        ROLE_OVERSIZED,
+    ]
+    var distinct = True
+    for i in range(len(roles)):
+        for j in range(i + 1, len(roles)):
+            if roles[i] == roles[j]:
+                distinct = False
+    suite.check(distinct, "the five client kinds are five different numbers")
 
 
 def _check_latency(mut suite: Suite):

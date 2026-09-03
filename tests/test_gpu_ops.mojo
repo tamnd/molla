@@ -404,7 +404,6 @@ def test_rope(mut suite: Suite, ctx: DeviceContext) raises:
 
     var heads = 4
     var head_dim = 64
-    var n = heads * head_dim
 
     # Llama 3, which is neox pairing on a base of 500000.
     var spec = RopeSpec(head_dim, Float32(500000.0))

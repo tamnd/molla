@@ -678,11 +678,9 @@ def _fails(
     """
     _load(buf, text)
     reader.begin(buf.bytes())
-    var saw = EV_END
-    while True:
+    var saw = reader.next()
+    while saw != EV_ERROR and saw != EV_END:
         saw = reader.next()
-        if saw == EV_ERROR or saw == EV_END:
-            break
     if saw != EV_ERROR:
         suite.check(False, name + " (parsed instead of failing)")
         return
