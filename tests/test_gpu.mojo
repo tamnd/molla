@@ -37,8 +37,21 @@ from molla.sys.mmap import RawPtr
 
 
 def run(mut suite: Suite) raises:
+    """Everything that needs no device, which is the refusals and the skip.
+
+    The launches are in `run_on_device`, which `main` calls with the one
+    context the process owns. A CUDA process gets one `DeviceContext` and hangs
+    on the first allocation against a second, so no test module may make its
+    own.
+    """
     test_refusals(suite)
-    test_matvec(suite)
+    comptime if not has_accelerator():
+        suite.group("device matvec")
+        suite.check(True, "skipped, this build has no device code in it")
+
+
+def run_on_device(mut suite: Suite, ctx: DeviceContext) raises:
+    test_matvec(suite, ctx)
 
 
 def _planar(cols: Int, rows: Int) -> Tensor:
@@ -125,7 +138,7 @@ def test_refusals(mut suite: Suite) raises:
     )
 
 
-def test_matvec(mut suite: Suite) raises:
+def test_matvec(mut suite: Suite, ctx: DeviceContext) raises:
     """One matvec on whatever GPU this machine has.
 
     q8_0 shaped because its planar form has one scale plane and no minimum,
@@ -135,8 +148,9 @@ def test_matvec(mut suite: Suite) raises:
     """
     suite.group("device matvec")
 
+    # A machine with no device never reaches this, `run` having reported the
+    # skip, and the branch is what keeps the body out of that build.
     comptime if not has_accelerator():
-        suite.check(True, "skipped, this build has no device code in it")
         return
     else:
         var cols = 64
@@ -148,7 +162,6 @@ def test_matvec(mut suite: Suite) raises:
         for i in range(cols):
             x.data[i] = (Float32((i * 11) % 29) - 14.0) / 7.0
 
-        var ctx = DeviceContext()
         var pool = ctx.enqueue_create_buffer[DType.uint8](total)
         var want = Buffer(rows)
         # The weight is written straight into the pool's host mapping and the

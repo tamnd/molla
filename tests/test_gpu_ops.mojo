@@ -71,12 +71,21 @@ from molla.nn.tensor import Buffer, Tensor
 
 
 def run(mut suite: Suite) raises:
+    """Nothing here runs without a device, so this is the skip and no more.
+
+    The tests are in `run_on_device`, which `main` calls with the one context
+    the process owns. A CUDA process gets one `DeviceContext` and hangs on the
+    first allocation against a second, so no test module may make its own.
+    """
     comptime if not has_accelerator():
         suite.group("gpu ops")
         suite.check(True, "skipped, this build has no device code in it")
+
+
+def run_on_device(mut suite: Suite, ctx: DeviceContext) raises:
+    comptime if not has_accelerator():
         return
     else:
-        var ctx = DeviceContext()
         test_norm(suite, ctx)
         test_softmax(suite, ctx)
         test_activations(suite, ctx)
