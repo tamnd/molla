@@ -121,6 +121,8 @@ It is not the quantization. SmolLM2 at four bits lands at 7.6e-4 on the sampled 
 
 The likely explanation is precision inside llama.cpp rather than inside molla. Its Metal backend takes a different matrix multiply path once a tensor is large enough, and that path holds its tiles in float16, which loses a thousandth of relative precision per multiply on a model where SmolLM2 stays on the path that does not. That is a guess with no measurement behind it and it is written here as a guess.
 
+#145 was expected to settle it and did not, which is worth recording because the result is informative in the other direction. Running the corpus through molla's own Metal and CUDA kernels moved the gap by nothing at all: three implementations that share no reduction order land within 1.75e-5 of each other and all three sit the same twenty times away from llama.cpp on the two larger models. So whatever this is, it is not one backend of molla's being imprecise, and it is not a threadgroup or warp reduction losing what a scalar loop keeps. It is either llama.cpp's side or something all three of molla's paths do the same way, which for a matvec is accumulating the whole row in float32.
+
 Two things make it liveable in the meantime. The greedy token matches on every case in the corpus, once the near tie on Llama 3.1 is set aside. And the tolerances are still tight enough to be worth having: three hundredths of a stream is far below what any composition error produces.
 
 ## What this does not cover
