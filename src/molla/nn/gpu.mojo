@@ -112,16 +112,24 @@ arithmetic, is 206, 669 and 322 microseconds. So at 32 the two q4_K shapes are
 at the floor and at 128 they are twice off it, and the head, which is the shape
 a small model spends a fifth of its decode in, is three and a half times faster.
 
-Two things cost at 128 and both get worse as the row gets narrower. The
-reduction is a tree over the whole block, so its cost is the block width and not
-the work, and a 576 column row at eight values a thread is 72 threads of work,
-so 56 of the 128 arrive at that reduction with nothing in them. Neither shows up
-on a 4096 column row, which is why this was invisible on the 8B.
+Of the two things that could cost at 128, only one does. A 576 column row at
+eight values a thread is 72 threads of work, so 56 of the 128 arrive with
+nothing in them, and neither that nor anything else here shows up on a 4096
+column row, which is why this was invisible on the 8B. It is not the reduction:
+a shuffle reduction under the narrower block was written and measured and is a
+wash on both small models, so the width was never paying for the tree, it was
+paying for the empty threads. See
+[docs/validation/layout.md](../../../docs/validation/layout.md).
 
-CUDA keeps 128 until the same sweep runs on a 4090. A block there is four warps
-and a warp is 32, so the arrangement that wins on Metal is one warp a row, and
-whether that starves the scheduler is a different question on a card with 128
-resident blocks a multiprocessor. See #228.
+CUDA keeps 128, and that is now a measurement rather than a deferral. The same
+sweep on a 4090 at load 0.06 finds the same pattern: the head is 1.85 times
+faster at 32, the wide control prefers 128 by a quarter, and q4_K does not care.
+End to end it is worth about one per cent, because a token there is 2.1 ms and
+the head is 48 us of it. So 32 is very slightly better on both vendors and the
+honest version of this constant keys off the row width rather than the target,
+which is not worth writing without end to end evidence to write it from. The
+reason there is none is #170: on a 4090 a SmolLM2 token is 2.13 ms and 1.80 ms
+of it is launch cost.
 """
 
 

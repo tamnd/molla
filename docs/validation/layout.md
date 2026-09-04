@@ -338,6 +338,26 @@ It also says the matvec is close to done as a place to look. The three models fi
 
 Decode on the small models is launch bound. That is why the shuffle did nothing, and it is why the remaining distance to a rival is not in this kernel. It is in how many times a token crosses the driver, which is #170 stage two.
 
+## The same two answers on CUDA
+
+Both of the above were checked on a 4090 at a load average of 0.06, which is the quietest machine in the fleet rather than this laptop.
+
+The block width sweep finds the same pattern it found on Metal. The head, 49152 rows of 576, is 26 us at 32 threads a row against 48 at 128. The wide control, 4096 by 14336, is 48 against 38 and so prefers the wider block. q4_K is inside a microsecond either way at both of its shapes. So the width was never a Metal fact and it was never about the arithmetic: a 576 column row wants a narrow block on either vendor, for the same reason, which is that most of a wide block arrives at a short row with nothing to do.
+
+End to end it is worth about one per cent there, three alternating runs of each binary reading 275, 268, 270 ms at 128 against 269, 269, 267 at 32. That is the probe being right rather than the probe being wrong. A token on that card is 2.1 ms and the head is 48 us of it, so halving the head is one per cent of a token however real the halving is. CUDA keeps 128 on those grounds, and #228 is closed on them.
+
+The fit is the same shape as the Metal one and much cleaner, because the machine is quiet:
+
+| model | per token | bytes |
+| --- | --- | --- |
+| SmolLM2 135M q8_0 | 2.13 ms | 136 MiB |
+| Qwen 2.5 0.5B q4_K_M | 2.70 ms | about 400 MiB |
+| Llama 3.1 8B q4_K_M | 12.97 ms | 4.6 GiB |
+
+2.43 ms a GiB, which is 412 GB/s against a card that does about 1000, and an intercept of 1.80 ms a token that does not move with the model. At the 453 launches a token M2c was opened on that is 3.97 us a launch, against the 4.9 us measured directly in #171. The two agree, so on CUDA the intercept is the launches and nothing else. On Metal the same fit gives 13.6 ms against 450 launches at 19.6 us, which is 8.8 ms, so there the launches are most of the intercept but not all of it.
+
+The intercept is 85 per cent of a SmolLM2 token on a 4090 and 14 per cent of the 8B's. That is the whole picture in one number. Kernel work is finished as a way to move a small model and it is still most of what an 8B is doing, and the two facts point at different issues.
+
 ## Order
 
 Pack the quant plane first and leave the scales at float32. That is 9574 MiB to 6475 MiB on the 8B, it is bit exact against the current layout because the integers written are the same integers, and it can be verified by running the corpus with the old cache and the new one and comparing logits with no tolerance at all.
