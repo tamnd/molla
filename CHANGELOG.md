@@ -4,6 +4,15 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Changed
+
+- The decode matvec takes eight values a thread on Metal instead of two, and eight instead of one on the byte wide path. Nothing about the arithmetic changed. On an M4 at 512 prompt and 128 decode, with the version before it measured from the same clone on the same afternoon, decode goes 31.1 to 36.5 on SmolLM2 135M q8_0, 18.1 to 23.9 on Qwen 2.5 0.5B, and 2.7 to 5.1 on Llama 3.1 8B q4_K_M. The gain grows with the model because a wider step only pays on rows long enough to have a loop. CUDA keeps the step widths it had, because there a wider one is neutral on the four bit path and a tenth slower on the byte path, and both backends were rechecked on the hardware rather than assumed.
+- [docs/validation/bench.md](docs/validation/bench.md) gains a Metal table for Llama 3.1 8B, which is the model M7 takes its gate on and was missing from that half of the page. All three Metal tables were retaken together and each carries a before row. The CUDA tables are unchanged and the page now says why, with the runs that checked it.
+
+### Fixed
+
+- #203 is answered rather than implemented. It asked for the nibble masks from the Metal q4_K matvec in llama.cpp, which read four values out of a `uint16` and correct the factors of sixteen and two hundred and fifty six in the scale so that no shift is issued. `scripts/matvec_probe.mojo` gains that variant and a control that changes the step width and nothing else, and against the control the masks are worth nothing on Metal and between nothing and a fifth on CUDA depending on the shape. The shifts were never what the loop was paying for.
+
 ## [0.4.6] - 2026-09-04
 
 Prefill on Metal was multiplying one number at a time and the GPU has an instruction that multiplies an eight by eight matrix. Using it takes a 514 token prompt through SmolLM2 from 472 tokens a second to 2142, and through Qwen 2.5 0.5B from 169 to 613.
