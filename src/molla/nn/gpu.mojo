@@ -65,11 +65,16 @@ from molla.nn.repack import (
     LAYOUT_PLANAR,
     QUANT_I8,
     QUANT_S4,
+    QUANT_S5,
+    QUANT_S6,
     QUANT_U4,
+    QUANT_U5,
     group_shift,
     group_size,
     has_min,
+    quant_bias,
     quant_form,
+    quant_high_bits,
 )
 from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
 
@@ -360,6 +365,45 @@ def byte_float(u: UInt32) -> Float32:
 
 
 @always_inline
+def wide_float[form: Int](u: UInt32) -> Float32:
+    """One five or six bit quant, already joined from its two planes, as a float.
+
+    The same trick again with a different constant. A five or six bit value is
+    stored unsigned, 0 to 31 or 0 to 63, and the offset that makes it signed
+    comes off in the subtraction the magic number needed anyway, so a q5_0 value
+    costs exactly what a q4_1 value costs once the bits are in hand and the only
+    extra work the wider types do is joining the planes.
+    """
+    comptime bias = Float32(8388608.0) + Float32(quant_bias(form))
+    return bitcast[DType.float32, 1](MAGIC | u) - bias
+
+
+@always_inline
+def high_shift[form: Int]() -> Int:
+    """`log2` of how many values one byte of the second plane covers.
+
+    A shift and not the count, because every use of it is a divide or a modulo
+    by that count and both of those are signed operations on an `Int` that the
+    Metal compiler keeps unless the constant is a power of two it can see. It is
+    three at five bits and two at six.
+    """
+    return 3 if quant_high_bits(form) == 1 else 2
+
+
+@always_inline
+def planar_quant_stride[form: Int](cols: Int) -> Int:
+    """Bytes both quant planes of one row take, which is where the scales start.
+
+    Eight bits is a byte a value, four is half of that, five adds an eighth on
+    top of the half and six adds a quarter. Written as eighths of a byte so
+    there is one expression rather than a table, and exact for every row width
+    molla accepts, since a row is a whole number of 32 or 256 value blocks.
+    """
+    comptime eighths = 8 if form == QUANT_I8 else 4 + quant_high_bits(form)
+    return (cols * eighths) // 8
+
+
+@always_inline
 def write_epilogue(
     o: Pointer[Float32, MutAnyOrigin],
     aux: Pointer[Float32, MutAnyOrigin],
@@ -442,8 +486,7 @@ def planar_matvec_kernel[
     # way.
     var packed = w
     var scales = w.unsafe_bitcast[Float32]()
-    var quant_bytes = cols if form == QUANT_I8 else cols // 2
-    var d_base = (row + quant_bytes) // 4
+    var d_base = (row + planar_quant_stride[form](cols)) // 4
     var m_base = d_base + groups
 
     # A shift and not `i // group`, which is a signed divide and which Metal
@@ -467,7 +510,7 @@ def planar_matvec_kernel[
                 comptime if with_min:
                     acc += m * a
             i += tile * MATVEC_BYTES
-    else:
+    elif quant_high_bits(form) == 0:
         # A byte to a thread and both of its values, so a warp reads thirty two
         # contiguous bytes and gets sixty four values out of them. Both values
         # of a byte sit in one group, because every group size here is even, so
@@ -512,6 +555,59 @@ def planar_matvec_kernel[
                 var a1 = x[unsafe_offset=i + k * 2 + 1]
                 acc += d * lo * a0
                 acc += d * hi * a1
+                comptime if with_min:
+                    acc += m * a0
+                    acc += m * a1
+            i += tile * MATVEC_STEP
+    else:
+        # Five and six bit types, whose low four bits are the plane above and
+        # whose remaining one or two are in a second plane after it. One byte of
+        # that plane covers eight values at five bits and four at six, so the
+        # step is at least that many and the byte is read once for all of them.
+        # A step wider than one high byte reads several, which is what q6_K does
+        # on Metal, where the step that pays is eight and a high byte is four
+        # values.
+        #
+        # Nothing here converts. The two planes are joined with shifts and
+        # masks into the unsigned value the repack wrote, and `wide_float` turns
+        # that into a float and takes the type's offset off in the subtraction
+        # the magic number was already doing. So a five bit value costs one
+        # extra load per eight values and a handful of integer operations
+        # against the four bit loop, and reads five eighths of the bytes the
+        # byte wide fallback it replaces read.
+        comptime hbits = quant_high_bits(form)
+        comptime hshift = high_shift[form]()
+        comptime hper = 1 << hshift
+        comptime hmask = UInt32((1 << hbits) - 1)
+        var high = row + (cols >> 1)
+        var i = t * MATVEC_STEP
+        while i < cols:
+            var gi = i >> shift
+            var at = row + (i >> 1)
+            var d = scales[unsafe_offset=d_base + gi]
+            var m = Float32(0)
+            comptime if with_min:
+                m = scales[unsafe_offset=m_base + gi]
+            comptime for k in range(MATVEC_STEP // 2):
+                var b = UInt32(packed[unsafe_offset=at + k])
+                # `i` is a multiple of the step, so when the step covers a whole
+                # high byte or more these two are constants after unrolling and
+                # the load is hoisted out of the `k` loop for nothing. When it
+                # covers less they are the index and the shift a narrower pass
+                # needs. One loop rather than two shapes of it.
+                var hi_at = (i + k * 2) >> hshift
+                var s0 = UInt32(((i + k * 2) & (hper - 1)) * hbits)
+                var h = UInt32(packed[unsafe_offset=high + hi_at])
+                var lo = wide_float[form](
+                    (b & 0xF) | (((h >> s0) & hmask) << 4)
+                )
+                var hv = wide_float[form](
+                    (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
+                )
+                var a0 = x[unsafe_offset=i + k * 2]
+                var a1 = x[unsafe_offset=i + k * 2 + 1]
+                acc += d * lo * a0
+                acc += d * hv * a1
                 comptime if with_min:
                     acc += m * a0
                     acc += m * a1
@@ -717,8 +813,7 @@ def planar_matmul_kernel[
     var groups = cols // group
     var packed = w
     var scales = w.unsafe_bitcast[Float32]()
-    var quant_bytes = cols if form == QUANT_I8 else cols // 2
-    var d_base = (row + quant_bytes) // 4
+    var d_base = (row + planar_quant_stride[form](cols)) // 4
     var m_base = d_base + groups
 
     comptime shift = group_shift(group)
@@ -765,7 +860,7 @@ def planar_matmul_kernel[
                 for k in range(SPAN):
                     acc[k] += d * x[unsafe_offset=at0 + k * cols + i]
             i += tile
-    else:
+    elif quant_high_bits(form) == 0:
         var i = t * 2
         while i < cols:
             var gi = i >> shift
@@ -784,6 +879,41 @@ def planar_matmul_kernel[
                     var a0 = x[unsafe_offset=at0 + k * cols + i]
                     var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
                     acc[k] += lo * a0 + hi * a1
+            i += tile * 2
+    else:
+        # The five and six bit forms, joined the same way the matvec joins them.
+        # A step of one high byte and no more, because the accumulators here are
+        # `SPAN` deep and a wider step would hold more of the row in registers
+        # at the cost of the occupancy that keeps `SPAN` tokens in flight.
+        comptime hbits = quant_high_bits(form)
+        comptime hshift = high_shift[form]()
+        comptime hper = 1 << hshift
+        comptime hmask = UInt32((1 << hbits) - 1)
+        var high = row + (cols >> 1)
+        var i = t * 2
+        while i < cols:
+            var gi = i >> shift
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            var h = UInt32(packed[unsafe_offset=high + (i >> hshift)])
+            var s0 = UInt32((i & (hper - 1)) * hbits)
+            var d = scales[unsafe_offset=d_base + gi]
+            var lo = d * wide_float[form](
+                (b & 0xF) | (((h >> s0) & hmask) << 4)
+            )
+            var hv = d * wide_float[form](
+                (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
+            )
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                for k in range(SPAN):
+                    var a0 = x[unsafe_offset=at0 + k * cols + i]
+                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
+                    acc[k] += lo * a0 + hv * a1 + m * (a0 + a1)
+            else:
+                for k in range(SPAN):
+                    var a0 = x[unsafe_offset=at0 + k * cols + i]
+                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
+                    acc[k] += lo * a0 + hv * a1
             i += tile * 2
 
     # A lane group reduction and not a tree through shared memory. A group is a
@@ -963,12 +1093,14 @@ def device_matvec_into(
             _launch[TILE, 32, True, QUANT_U4](ctx, w, x, o, a, epi)
         elif form == QUANT_S4 and g == 32 and not carries_min:
             _launch[TILE, 32, False, QUANT_S4](ctx, w, x, o, a, epi)
-        elif form == QUANT_I8 and g == 32 and carries_min:
-            _launch[TILE, 32, True, QUANT_I8](ctx, w, x, o, a, epi)
-        elif form == QUANT_I8 and g == 32:
+        elif form == QUANT_U5 and g == 32 and carries_min:
+            _launch[TILE, 32, True, QUANT_U5](ctx, w, x, o, a, epi)
+        elif form == QUANT_S5 and g == 32 and not carries_min:
+            _launch[TILE, 32, False, QUANT_S5](ctx, w, x, o, a, epi)
+        elif form == QUANT_S6 and g == 16 and not carries_min:
+            _launch[TILE, 16, False, QUANT_S6](ctx, w, x, o, a, epi)
+        elif form == QUANT_I8 and g == 32 and not carries_min:
             _launch[TILE, 32, False, QUANT_I8](ctx, w, x, o, a, epi)
-        elif form == QUANT_I8 and g == 16 and not carries_min:
-            _launch[TILE, 16, False, QUANT_I8](ctx, w, x, o, a, epi)
         else:
             raise Error(
                 "no device matvec is compiled for quant form "
@@ -1123,8 +1255,7 @@ def planar_mma_kernel[
     var row = (r0 + wr) * stride if live_row else 0
     var groups = cols // group
     var scales = w.unsafe_bitcast[Float32]()
-    var quant_bytes = cols if form == QUANT_I8 else cols // 2
-    var d_base = (row + quant_bytes) // 4
+    var d_base = (row + planar_quant_stride[form](cols)) // 4
     var m_base = d_base + groups
     comptime shift = group_shift(group)
 
@@ -1158,7 +1289,7 @@ def planar_mma_kernel[
                 w_tile[unsafe_offset=(wk + j) * MMA_ROWS + wr] = (
                     d * byte_float(UInt32(q[j])) + m
                 )
-        else:
+        elif quant_high_bits(form) == 0:
             var q = w.unsafe_offset(row + ((k0 + wk) >> 1)).unsafe_load[
                 width=MMA_KPT // 2
             ]() if live_row else SIMD[DType.uint8, MMA_KPT // 2](0)
@@ -1169,6 +1300,41 @@ def planar_mma_kernel[
                 )
                 w_tile[unsafe_offset=(wk + 2 * j + 1) * MMA_ROWS + wr] = (
                     d * nibble_float[form](b >> 4) + m
+                )
+        else:
+            # Two contiguous loads instead of one, the nibble plane and the
+            # slice of the high plane that covers the same values. A thread
+            # stages `MMA_KPT` values, which is sixteen, so that slice is two
+            # bytes at five bits and four at six and both are a load of a width
+            # the hardware has.
+            comptime hbits = quant_high_bits(form)
+            comptime hshift = high_shift[form]()
+            comptime hper = 1 << hshift
+            comptime hmask = UInt32((1 << hbits) - 1)
+            var q = w.unsafe_offset(row + ((k0 + wk) >> 1)).unsafe_load[
+                width=MMA_KPT // 2
+            ]() if live_row else SIMD[DType.uint8, MMA_KPT // 2](0)
+            var hq = w.unsafe_offset(
+                row + (cols >> 1) + ((k0 + wk) >> hshift)
+            ).unsafe_load[width=MMA_KPT >> hshift]() if live_row else SIMD[
+                DType.uint8, MMA_KPT >> hshift
+            ](
+                0
+            )
+            comptime for j in range(MMA_KPT // 2):
+                var b = UInt32(q[j])
+                var h = UInt32(hq[(2 * j) >> hshift])
+                var s0 = UInt32(((2 * j) & (hper - 1)) * hbits)
+                w_tile[unsafe_offset=(wk + 2 * j) * MMA_ROWS + wr] = (
+                    d * wide_float[form]((b & 0xF) | (((h >> s0) & hmask) << 4))
+                    + m
+                )
+                w_tile[unsafe_offset=(wk + 2 * j + 1) * MMA_ROWS + wr] = (
+                    d
+                    * wide_float[form](
+                        (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
+                    )
+                    + m
                 )
         barrier()
 
@@ -1354,12 +1520,17 @@ def device_matmul_into(
                         ctx, w, p, o, a, epi, tokens
                     )
                     return
-                if form == QUANT_I8 and carries_min:
-                    _launch_mma[32, True, QUANT_I8](
+                if form == QUANT_U5 and carries_min:
+                    _launch_mma[32, True, QUANT_U5](
                         ctx, w, p, o, a, epi, tokens
                     )
                     return
-                if form == QUANT_I8:
+                if form == QUANT_S5 and not carries_min:
+                    _launch_mma[32, False, QUANT_S5](
+                        ctx, w, p, o, a, epi, tokens
+                    )
+                    return
+                if form == QUANT_I8 and not carries_min:
                     _launch_mma[32, False, QUANT_I8](
                         ctx, w, p, o, a, epi, tokens
                     )
@@ -1372,16 +1543,20 @@ def device_matmul_into(
             _launch_mm[MM_TILE, 32, False, QUANT_S4](
                 ctx, w, p, o, a, epi, tokens
             )
-        elif form == QUANT_I8 and g == 32 and carries_min:
-            _launch_mm[MM_TILE, 32, True, QUANT_I8](
+        elif form == QUANT_U5 and g == 32 and carries_min:
+            _launch_mm[MM_TILE, 32, True, QUANT_U5](
                 ctx, w, p, o, a, epi, tokens
             )
-        elif form == QUANT_I8 and g == 32:
+        elif form == QUANT_S5 and g == 32 and not carries_min:
+            _launch_mm[MM_TILE, 32, False, QUANT_S5](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_S6 and g == 16 and not carries_min:
+            _launch_mm[MM_TILE, 16, False, QUANT_S6](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_I8 and g == 32 and not carries_min:
             _launch_mm[MM_TILE, 32, False, QUANT_I8](
-                ctx, w, p, o, a, epi, tokens
-            )
-        elif form == QUANT_I8 and g == 16 and not carries_min:
-            _launch_mm[MM_TILE, 16, False, QUANT_I8](
                 ctx, w, p, o, a, epi, tokens
             )
         else:

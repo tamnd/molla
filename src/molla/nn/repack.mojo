@@ -106,7 +106,22 @@ of every result, and there is no reason to spend that on a change whose whole
 point is that the numbers do not move.
 """
 
-comptime LAYOUT_VERSION = 2
+comptime QUANT_U5 = 3
+"""Five bits a value in two planes, values 0 to 31. q5_1 and q5_k."""
+
+comptime QUANT_S5 = 4
+"""The same two planes, read sixteen lower, values -16 to 15. q5_0 alone."""
+
+comptime QUANT_S6 = 5
+"""Six bits a value in two planes, read thirty two lower, values -32 to 31.
+
+q6_k alone. Kept apart from `QUANT_S5` rather than folded into one six bit form
+with a parameter, because the two differ in the width of the second plane and
+so in every index into it, and a parameter that changes an index is a runtime
+shift where a separate form is a constant.
+"""
+
+comptime LAYOUT_VERSION = 3
 """Bumped whenever the meaning of a planar byte changes.
 
 A cache file records this and a load that finds a different number treats the
@@ -197,27 +212,70 @@ def quant_form(kind: Int) -> Int:
         return QUANT_U4
     if kind == Q_Q4_0:
         return QUANT_S4
+    if kind == Q_Q5_1 or kind == Q_Q5_K:
+        return QUANT_U5
+    if kind == Q_Q5_0:
+        return QUANT_S5
+    if kind == Q_Q6_K:
+        return QUANT_S6
     return QUANT_I8
 
 
 def quant_bits(kind: Int) -> Int:
-    """Bits a value occupies in the quant plane, 4 or 8."""
-    return 8 if quant_form(kind) == QUANT_I8 else 4
+    """Bits a value occupies in the quant plane, 4, 5, 6 or 8."""
+    var form = quant_form(kind)
+    if form == QUANT_I8:
+        return 8
+    if form == QUANT_S6:
+        return 6
+    if form == QUANT_U5 or form == QUANT_S5:
+        return 5
+    return 4
 
 
-def planar_quant_bytes(kind: Int, cols: Int) raises -> Int:
-    """Bytes the quant plane of one row occupies.
+def quant_high_bits(form: Int) -> Int:
+    """Bits of a value that live in the second plane, 0, 1 or 2.
 
-    A whole number for every type and row width molla accepts, because a four
-    bit type packs 32 or 256 values to a block and a row is a whole number of
-    blocks, so `cols` is even long before it gets here. Checked anyway, because
-    the alternative to checking is a row width that silently drops its last
-    value.
+    The four and eight bit forms have one plane and this is zero for them. A
+    five bit value is a nibble and one bit, a six bit value is a nibble and two,
+    and the odd bits go in a plane of their own rather than in a stream, because
+    a stream costs a shift chain per value on the read side and the whole point
+    of the layout is that the read is cheap.
+    """
+    if form == QUANT_S6:
+        return 2
+    if form == QUANT_U5 or form == QUANT_S5:
+        return 1
+    return 0
+
+
+def quant_bias(form: Int) -> Int:
+    """What a form's reader subtracts after assembling the value, 0, 16 or 32.
+
+    The four and eight bit forms carry their sign in the byte and subtract
+    nothing here. The five and six bit forms store an unsigned value and take
+    the offset off at the end, which is free: the reader turns the integer into
+    a float by putting it in the mantissa of two to the twenty third and
+    subtracting that constant back off, so an offset of sixteen is a different
+    constant in a subtraction that was happening anyway.
+    """
+    if form == QUANT_S5:
+        return 16
+    if form == QUANT_S6:
+        return 32
+    return 0
+
+
+def planar_low_bytes(kind: Int, cols: Int) raises -> Int:
+    """Bytes the first plane of one row occupies.
+
+    A byte a value at eight bits and a nibble a value at every other width, so
+    the five and six bit types share their first plane with the four bit ones
+    and only differ in what follows it.
     """
     if not repackable(kind):
         raise Error("ggml type " + String(kind) + " has no planar form")
-    var bits = quant_bits(kind)
-    if bits == 8:
+    if quant_bits(kind) == 8:
         return cols
     if cols % 2 != 0:
         raise Error(
@@ -226,6 +284,34 @@ def planar_quant_bytes(kind: Int, cols: Int) raises -> Int:
             + " cannot be packed two values to a byte"
         )
     return cols // 2
+
+
+def planar_quant_bytes(kind: Int, cols: Int) raises -> Int:
+    """Bytes both quant planes of one row occupy.
+
+    A whole number for every type and row width molla accepts, because a four
+    bit type packs 32 or 256 values to a block and a row is a whole number of
+    blocks, so `cols` is even long before it gets here. Checked anyway, because
+    the alternative to checking is a row width that silently drops its last
+    value.
+
+    The second plane is `cols / 8` bytes at five bits and `cols / 4` at six, and
+    both divide because a row is a whole number of 32 or 256 value blocks.
+    """
+    var low = planar_low_bytes(kind, cols)
+    var high = quant_high_bits(quant_form(kind))
+    if high == 0:
+        return low
+    var per = 8 // high
+    if cols % per != 0:
+        raise Error(
+            "a row of "
+            + String(cols)
+            + " cannot be packed "
+            + String(per)
+            + " values to a byte"
+        )
+    return low + cols // per
 
 
 def planar_groups(kind: Int, cols: Int) raises -> Int:
@@ -304,28 +390,62 @@ def _put_nibble(p: RawPtr, base: Int, i: Int, value: Int):
     p.unsafe_store(at, UInt8(b))
 
 
-def _put_quant(form: Int, p: RawPtr, base: Int, i: Int, value: Int):
-    """Value `i` of a quant plane, at whichever width the type uses."""
+def _put_high(form: Int, p: RawPtr, hi: Int, i: Int, value: Int):
+    """The bits of value `i` above the fourth, into the second plane.
+
+    Read, merge, write, for the reason `_put_nibble` gives: the scratch buffer
+    is reused row after row and is never cleared, so every position has to be
+    written rather than assumed zero. Every position is, because the loops that
+    call this walk a whole row.
+    """
+    var bits = quant_high_bits(form)
+    var per = 8 // bits
+    var at = hi + i // per
+    var shift = (i % per) * bits
+    var mask = ((1 << bits) - 1) << shift
+    var b = Int(p.unsafe_load(at))
+    p.unsafe_store(at, UInt8((b & ~mask) | (((value >> 4) << shift) & mask)))
+
+
+def _put_quant(form: Int, p: RawPtr, base: Int, hi: Int, i: Int, value: Int):
+    """Value `i` of a quant plane, at whichever width the type uses.
+
+    `value` arrives already offset for the form: a `QUANT_S5` caller passes 0 to
+    31 and not -16 to 15, because the offset is the reader's and taking it here
+    would need the plane to hold a sign it has no bit for.
+    """
     if form == QUANT_I8:
         _put_i8(p, base + i, value)
         return
     _put_nibble(p, base, i, value)
+    if quant_high_bits(form) != 0:
+        _put_high(form, p, hi, i, value)
 
 
-def _quant_at(form: Int, p: RawPtr, base: Int, i: Int) -> Int:
+def _quant_at(form: Int, p: RawPtr, base: Int, hi: Int, i: Int) -> Int:
     """Value `i` of a quant plane, back out.
 
     The sign extension for `QUANT_S4` is subtracting sixteen and not eight. The
     stored nibble is the value's low four bits in two's complement, so -8 is
     stored as 8 and -1 as 15, and it is the whole four bit word that wraps.
+
+    The five and six bit forms are the other way round. Nothing about them
+    wraps: the two planes assemble an unsigned value and the offset comes off
+    afterwards, which is what `quant_bias` gives.
     """
     if form == QUANT_I8:
         return _i8(p, base + i)
     var b = Int(p.unsafe_load(base + (i >> 1)))
     var n = (b >> 4) if (i & 1) != 0 else (b & 0xF)
-    if form == QUANT_S4 and n >= 8:
-        return n - 16
-    return n
+    if form == QUANT_S4:
+        return n - 16 if n >= 8 else n
+    var bits = quant_high_bits(form)
+    if bits == 0:
+        return n
+    var per = 8 // bits
+    var h = Int(p.unsafe_load(hi + i // per))
+    n |= ((h >> ((i % per) * bits)) & ((1 << bits) - 1)) << 4
+    return n - quant_bias(form)
 
 
 def repack_row(
@@ -354,6 +474,7 @@ def repack_row(
     var groups = cols // g
     var stride = block_bytes(kind)
     var per_groups = per // g
+    var h_at = to + planar_low_bytes(kind, cols)
     var d_at = to + planar_quant_bytes(kind, cols)
     var m_at = d_at + groups * 4
     # `q` counts values and not bytes, because the two stopped being the same
@@ -369,17 +490,17 @@ def repack_row(
         elif kind == Q_Q4_1:
             _pack_q4_1(src, block, dst, to, q, d, m)
         elif kind == Q_Q5_0:
-            _pack_q5_0(src, block, dst, to, q, d)
+            _pack_q5_0(src, block, dst, to, h_at, q, d)
         elif kind == Q_Q5_1:
-            _pack_q5_1(src, block, dst, to, q, d, m)
+            _pack_q5_1(src, block, dst, to, h_at, q, d, m)
         elif kind == Q_Q8_0:
             _pack_q8_0(src, block, dst, to, q, d)
         elif kind == Q_Q4_K:
             _pack_q4_k(src, block, dst, to, q, d, m)
         elif kind == Q_Q5_K:
-            _pack_q5_k(src, block, dst, to, q, d, m)
+            _pack_q5_k(src, block, dst, to, h_at, q, d, m)
         else:
-            _pack_q6_k(src, block, dst, to, q, d)
+            _pack_q6_k(src, block, dst, to, h_at, q, d)
 
 
 def _pack_q4_0(src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int):
@@ -414,19 +535,29 @@ def _pack_q4_1(
         _put_nibble(dst, to, q + l + 16, b >> 4)
 
 
-def _pack_q5_0(src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int):
+def _pack_q5_0(
+    src: RawPtr, at: Int, dst: RawPtr, to: Int, up: Int, q: Int, d: Int
+):
+    """Five bits a value, split four and one, with the offset left to the reader.
+
+    The file stores 0 to 31 and the value is that minus sixteen. What goes in
+    the planes is the stored 0 to 31 unchanged, and `QUANT_S5` takes the sixteen
+    off on the way out. That is not a choice about where to put the subtraction:
+    a plane four bits wide and a plane one bit wide have no room for a sign, so
+    the offset has to survive the round trip.
+    """
     _put_f32(dst, d, f16_at(src, at))
     var qh = _qh(src, at + 2)
     for l in range(16):
         var b = _u8(src, at + 6 + l)
         var hl = ((qh >> l) << 4) & 0x10
         var hh = (qh >> (l + 12)) & 0x10
-        _put_i8(dst, to + q + l, ((b & 0xF) | hl) - 16)
-        _put_i8(dst, to + q + l + 16, ((b >> 4) | hh) - 16)
+        _put_quant(QUANT_S5, dst, to, up, q + l, (b & 0xF) | hl)
+        _put_quant(QUANT_S5, dst, to, up, q + l + 16, (b >> 4) | hh)
 
 
 def _pack_q5_1(
-    src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int, m: Int
+    src: RawPtr, at: Int, dst: RawPtr, to: Int, up: Int, q: Int, d: Int, m: Int
 ):
     _put_f32(dst, d, f16_at(src, at))
     _put_f32(dst, m, f16_at(src, at + 2))
@@ -435,8 +566,8 @@ def _pack_q5_1(
         var b = _u8(src, at + 8 + l)
         var hl = ((qh >> l) << 4) & 0x10
         var hh = (qh >> (l + 12)) & 0x10
-        _put_i8(dst, to + q + l, (b & 0xF) | hl)
-        _put_i8(dst, to + q + l + 16, (b >> 4) | hh)
+        _put_quant(QUANT_U5, dst, to, up, q + l, (b & 0xF) | hl)
+        _put_quant(QUANT_U5, dst, to, up, q + l + 16, (b >> 4) | hh)
 
 
 def _pack_q8_0(src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int):
@@ -491,7 +622,7 @@ def _pack_q4_k(
 
 
 def _pack_q5_k(
-    src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int, m: Int
+    src: RawPtr, at: Int, dst: RawPtr, to: Int, up: Int, q: Int, d: Int, m: Int
 ):
     """q4_k with the fifth bit plane merged into the byte.
 
@@ -518,17 +649,27 @@ def _pack_q5_k(
         for l in range(32):
             var b = _u8(src, b_at + l)
             var h = _u8(src, qh + l)
-            _put_i8(
-                dst, to + base + l, (b & 0xF) + (16 if (h & u1) != 0 else 0)
-            )
-            _put_i8(
+            _put_quant(
+                QUANT_U5,
                 dst,
-                to + base + l + 32,
+                to,
+                up,
+                base + l,
+                (b & 0xF) + (16 if (h & u1) != 0 else 0),
+            )
+            _put_quant(
+                QUANT_U5,
+                dst,
+                to,
+                up,
+                base + l + 32,
                 (b >> 4) + (16 if (h & u2) != 0 else 0),
             )
 
 
-def _pack_q6_k(src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int):
+def _pack_q6_k(
+    src: RawPtr, at: Int, dst: RawPtr, to: Int, up: Int, q: Int, d: Int
+):
     """Sixteen groups of sixteen, and the awkward interleave paid off once.
 
     The four output positions this loop writes are `l`, `l + 32`, `l + 64` and
@@ -545,27 +686,41 @@ def _pack_q6_k(src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int):
         _put_f32(dst, d + gi * 4, d0 * Float32(_i8(src, sc + gi)))
     for n in range(2):
         var lo = ql + n * 64
-        var hi = qh + n * 32
-        var base = to + q + n * 128
+        var hb = qh + n * 32
+        var base = q + n * 128
         for l in range(32):
-            var h = _u8(src, hi + l)
-            _put_i8(
-                dst, base + l, ((_u8(src, lo + l) & 0xF) | ((h & 3) << 4)) - 32
-            )
-            _put_i8(
+            var h = _u8(src, hb + l)
+            _put_quant(
+                QUANT_S6,
                 dst,
+                to,
+                up,
+                base + l,
+                (_u8(src, lo + l) & 0xF) | ((h & 3) << 4),
+            )
+            _put_quant(
+                QUANT_S6,
+                dst,
+                to,
+                up,
                 base + l + 32,
-                ((_u8(src, lo + l + 32) & 0xF) | (((h >> 2) & 3) << 4)) - 32,
+                (_u8(src, lo + l + 32) & 0xF) | (((h >> 2) & 3) << 4),
             )
-            _put_i8(
+            _put_quant(
+                QUANT_S6,
                 dst,
+                to,
+                up,
                 base + l + 64,
-                ((_u8(src, lo + l) >> 4) | (((h >> 4) & 3) << 4)) - 32,
+                (_u8(src, lo + l) >> 4) | (((h >> 4) & 3) << 4),
             )
-            _put_i8(
+            _put_quant(
+                QUANT_S6,
                 dst,
+                to,
+                up,
                 base + l + 96,
-                ((_u8(src, lo + l + 32) >> 4) | (((h >> 6) & 3) << 4)) - 32,
+                (_u8(src, lo + l + 32) >> 4) | (((h >> 6) & 3) << 4),
             )
 
 
@@ -598,6 +753,7 @@ def planar_row_dot(
         )
     var groups = n // g
     var form = quant_form(kind)
+    var h_at = at + planar_low_bytes(kind, n)
     var d_at = at + planar_quant_bytes(kind, n)
     var m_at = d_at + groups * 4
     var total = Float32(0)
@@ -609,7 +765,7 @@ def planar_row_dot(
             var sx = Float32(0)
             for l in range(g):
                 var a = x[xb + l]
-                qx += Float32(_quant_at(form, p, at, qb + l)) * a
+                qx += Float32(_quant_at(form, p, at, h_at, qb + l)) * a
                 sx += a
             total += f32_at(p, d_at + gi * 4) * qx
             total += f32_at(p, m_at + gi * 4) * sx
@@ -619,7 +775,7 @@ def planar_row_dot(
         var xb = to + gi * g
         var qx = Float32(0)
         for l in range(g):
-            qx += Float32(_quant_at(form, p, at, qb + l)) * x[xb + l]
+            qx += Float32(_quant_at(form, p, at, h_at, qb + l)) * x[xb + l]
         total += f32_at(p, d_at + gi * 4) * qx
     return total
 
@@ -650,6 +806,7 @@ def planar_run(
         raise Error("unpack would write past the end of the output")
     var groups = count // g
     var form = quant_form(kind)
+    var h_at = at + planar_low_bytes(kind, count)
     var d_at = at + planar_quant_bytes(kind, count)
     var m_at = d_at + groups * 4
     var carries_min = has_min(kind)
@@ -659,7 +816,7 @@ def planar_run(
         var qb = gi * g
         var ob = to + gi * g
         for l in range(g):
-            out[ob + l] = d * Float32(_quant_at(form, p, at, qb + l)) + m
+            out[ob + l] = d * Float32(_quant_at(form, p, at, h_at, qb + l)) + m
 
 
 def unpack_run(

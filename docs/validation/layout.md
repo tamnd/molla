@@ -146,6 +146,43 @@ On the small models it is worth nothing at all, because q8_0 barely moves. Those
 
 The disk win is not nothing either. A repack cache that is 1.1 times the model instead of 2.04 times it is the difference between a cache people tolerate and one they turn off.
 
+## What the bit planes were worth
+
+The five and six bit half of the layout landed after the four bit half and out of the order below, and the reason it moved up is that it stopped being a memory change. #203 measured the Metal matvec against a variant that does the loads and no arithmetic at all and found the shipped loop within ten per cent of that floor, which means on that backend the loop is paid by the byte and the only thing left that removes a byte is this.
+
+Before it, `quant_form` widened every five and six bit type to a byte a value, so q5_0, q5_1, q5_K and q6_K were all stored at eight bits of quant where the file holds five or six. Now they are a nibble plane of `cols / 2` bytes followed by a high plane of `cols / 8` bytes at five bits and `cols / 4` at six, which is the shape the section above describes.
+
+On an M4 laptop, greedy, the same prompt and 32 tokens out of it, three runs each of the shipped build and the same tree with the change reverted, both in one sitting.
+
+| model | repack cache before | after | decode ms a token before | after |
+| --- | --- | --- | --- | --- |
+| Llama 3.1 8B q4_K_M | 6474 MiB | 6108 MiB | 240, 243, 252 | 177, 159, 182 |
+| Qwen 2.5 0.5B | 663 MiB | 512 MiB | 38, 38, 38 | 29, 29, 29 |
+
+The load average was between 13 and 25 across that sitting, which on this machine is normal and is usually enough to make a timing worthless. It is not here, and the Qwen rows say why: four runs of one build in a row gave 38 four times and four of the other gave 29 four times, at a load that moved by half over the same minutes. Decode on Metal at this size is waiting on the GPU and not competing for the cores, so the number holds while a prefill number on the same machine would not.
+
+The 8B is the case worth reading. The cache is 5.7 per cent smaller and decode is a quarter faster, which is not the same number and is not supposed to be. The cache holds `token_embd` and the output head, which a decode token reads one row of and all of, and the tensors this change touches are the thirty three q6_K ones, which in a q4_K_M file are `ffn_down` and `attn_v`. `ffn_down` is the widest matrix in a layer, so the share of the bytes a token actually reads that moved from eight bits to six is much larger than the share of the file that did.
+
+Qwen is the other case and it is there because the file is misnamed. It says q4_K_M and `molla gguf` reports 133 q5_0 tensors against 14 q4_K, so almost the whole model was on the widened path and almost the whole model moved.
+
+Through `scripts/bench.py` at the 512 and 128 the gate uses, which is a longer context than the table above and reports prefill and resident bytes as well, Qwen goes 542.8 to 665.8 tokens a second of prefill, 21.1 to 28.0 of decode, and 1316 to 763 MiB resident, with the two builds a minute apart. That is the same result the table reports and it is the one to quote, because it is the harness the rest of the bench page uses. The 8B is not quoted at that length on this machine: the load went past fifty during the run and it produced 2.8 tokens a second of decode for a build that does better than that, which is a fact about the laptop and not about the layout.
+
+On a 4090 it is a different shape of result, and the memory is the part that carries. Both builds, six runs, one sitting, `scripts/bench.py` at the same 512 and 128 the gate uses, the load between 1.4 and 2.0 the whole way through.
+
+| model | prefill before | after | decode before | after | card before | after |
+| --- | --- | --- | --- | --- | --- | --- |
+| SmolLM2 135M | 10489.8 | 10280.0 | 275.3 | 263.9 | 656 MiB | 656 MiB |
+| Qwen 2.5 0.5B | 5039.2 | 4942.3 | 297.7 | 297.7 | 1110 MiB | 960 MiB |
+| Llama 3.1 8B q4_K_M | 377.3 | 366.3 | 85.8 | 89.1 | 7404 MiB | 7038 MiB |
+
+SmolLM2 is the control and it is the row to read first. It is q8_0 throughout, this change cannot reach it, and it still moved 4 per cent on decode and 2 per cent on prefill between two builds that do the identical thing to it. That is the noise floor on the small models, and it is why the Qwen row is written down as no timing change rather than as a win: an earlier sitting had the same pair at 294 against 307 and this one has them equal, which means neither number is a measurement of anything. The Qwen memory is, and it is 150 MiB.
+
+The 8B is outside that floor in both directions. Prefill costs 2.9 per cent, decode gains 3.8, and each of those is three runs a side clustered within a few tenths of a per cent with a gap between the clusters ten times wider. Prefill on CUDA is matmul bound and the wide path does two loads a pass where the nibble path does one, so the second plane is a second stream to carry. Decode is bound by the bytes and the bytes went down. The card holds 366 MiB less and the host holds 128 MiB less, so the trade is worth taking, but the prefill side of it is a real cost and not a rounding.
+
+That gap is also the whole reason the loop steps the way it does. The first cut walked a whole high byte a pass, eight values at five bits, which is the natural shape on Metal and takes 4090 prefill on Qwen from 4895 to 2937 tokens a second. The shipped loop steps by the same `MATVEC_STEP` and 2 the nibble path beside it uses and computes the high index and shift a pass, which constant folds back to the hoisted form wherever the step covers a whole high byte, so Metal keeps its shape and CUDA keeps its occupancy.
+
+This is the change that makes the layout worth what the table above says. It is also the last one that is bit exact: every value the planes assemble is the value the byte held, the offset that makes it signed comes off in the subtraction the magic number was doing anyway, and the corpus logits are the corpus logits. #182, the float16 scale planes, is the one that moves a number.
+
 ## What was in the way, on Metal
 
 The section above is a CUDA answer that was allowed to stand as a general one for a day. `scripts/matvec_probe.mojo` was written because nsys on an 8B is an hour a question: it runs the same kernel over a synthetic planar tensor of a real shape, and it runs five variants of it that each delete one piece of the work so that the piece can be priced.
@@ -230,6 +267,8 @@ Pack the quant plane first and leave the scales at float32. That is 9574 MiB to 
 Narrow the scale planes to float16 second, as its own change, because it is the only part of this that moves a number. It is worth 6475 MiB to 5518 MiB and it needs the corpus run with a tolerance and a statement of what the tolerance is.
 
 Bit plane the five and six bit types third, which takes q6_K from eight bits of quant to six and gets the 8B to 5153 MiB. It is worth 365 MiB on this model and it is the fiddliest part, so it goes after the two that are worth more and are simpler.
+
+That order was written when this was a memory change and it did not survive the measurement above. The bit planes went second and the float16 scales are still to come, because #203 found the Metal matvec at the byte floor and a byte removed there is time and not only space. Swapping the two costs nothing, since they touch different planes of the same row. The 8B landed at 6108 MiB, which is 366 saved against the 365 predicted on this line, so the float16 scales still have their own 957 to give and the end of both is still about 5151.
 
 Fix `scripts/bench.py` to report `phys_footprint` on macOS rather than `ru_maxrss`, before any of the above, so that the Metal numbers in bench.md mean what they say while this work is happening. There is no equivalent problem on Linux, where the CUDA weights are genuinely not host memory and `ru_maxrss` is right.
 
