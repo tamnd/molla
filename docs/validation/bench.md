@@ -26,7 +26,7 @@ Ollama is asked through `/api/generate` with `stream` off and `raw` on, which re
 
 An RTX 4090 with 24564 MiB, reached through WSL2 on a Windows machine, which is why the harness reports Linux x86_64 with 32 logical cores. It is a WSL2 CUDA result and not a Linux CUDA result, for the reason in [toolchain.md](toolchain.md): the only NVIDIA card in the fleet is in a Windows box. This is the quietest machine in the set and the one where a number is a measurement.
 
-molla 0.4.10 with #222 fixed, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-04. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, five runs, median, and the load average was 0.8 before each run. These are the lengths M7 takes its gate at.
+molla 0.4.11, which the harness reported as 0.4.10 because it was built from the branch before the version bump, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-04. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, five runs, median, and the load average was 0.8 before each run. These are the lengths M7 takes its gate at.
 
 The molla, llama.cpp and Ollama rows of the three tables below were taken in one sitting on this build, which is a change from the version of this page before last: the llama.cpp and Ollama rows used to be carried forward from molla 0.4.5. The last row of each table is molla 0.4.9, which is the release before the fused kernel landed, measured on this machine earlier the same day, and that is the row the molla row should be read against.
 
