@@ -95,3 +95,19 @@ def main() raises:
         )
         ctx.synchronize()
     _report("  sync each ", Float64(monotonic() - at) / 256.0, 200)
+
+    # The split that says whose cost it is. If queueing a launch returns in
+    # almost no time and the wait at the end is the whole figure, the device is
+    # busy and the launch is cheap. If queueing is the figure, the cost is on
+    # this thread, in the driver, before the device has been told anything, and
+    # no amount of work per kernel hides it.
+    var q = monotonic()
+    for _ in range(512):
+        ctx.enqueue_function[touch_kernel](
+            o, grid_dim=(1, 1, 1), block_dim=(128, 1, 1)
+        )
+    var queued = monotonic()
+    ctx.synchronize()
+    var done = monotonic()
+    _report("  queueing  ", Float64(queued - q) / 512.0, 200)
+    _report("  waiting   ", Float64(done - queued) / 512.0, 200)
