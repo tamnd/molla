@@ -900,6 +900,7 @@ def main() raises:
     _sweep_cold[Q_Q4_K, 32, True, QUANT_U4](ctx, "cold gate", 14336, 4096)
     _sweep_cold[Q_Q4_K, 32, True, QUANT_U4](ctx, "cold down", 4096, 14336)
     _sweep_cold[Q_Q4_K, 32, True, QUANT_U4](ctx, "cold attn", 4096, 4096)
+    _sweep_cold[Q_Q4_K, 32, True, QUANT_U4](ctx, "cold kv", 1024, 4096)
 
     # The same three at narrower blocks. TILE has been 128 since the kernel was
     # written and nothing had ever asked what it should be.
