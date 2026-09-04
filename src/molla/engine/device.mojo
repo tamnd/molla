@@ -48,7 +48,7 @@ none.
 """
 
 from std.os.env import getenv
-from std.sys.info import has_accelerator
+from std.sys.info import CompilationTarget, has_accelerator
 
 from max.gpu.host import DeviceContext
 
@@ -72,13 +72,34 @@ from molla.nn.tensor import Buffer
 from molla.sys.device import Device
 
 comptime FUSED_ENV = "MOLLA_FUSED"
-"""Set to anything to send a decode through the one launch a layer kernel.
+"""Set to `0` to keep a decode off the one launch a layer kernel, or to anything
+else to put it there whatever the model.
 
-Off by default because the two paths have to be shown to agree on every model
-and every backend before one of them stops being the one that ships, and because
-the thing the fused path trades away is arithmetic width, which is a loss on a
-large model and a gain on a small one until somebody measures where the line is.
-See [docs/validation/fused.md](../../../docs/validation/fused.md).
+Unset picks by the model, which is `fused_by_default`. The knob stays because
+the line that function draws is drawn from three models on one card, and the
+first machine that disagrees with it should be able to say so without a
+rebuild. See [docs/validation/fused.md](../../../docs/validation/fused.md).
+"""
+
+comptime FUSED_MAX_BYTES = 1024 * 1024 * 1024
+"""Weight bytes a token may read and still be better off fused.
+
+The fused path trades arithmetic width for launches. It has a few hundred blocks
+where the unfused matvec has one a row, so it wins by however much the launches
+were costing and loses by however much the narrower grid costs, and which of
+those is larger is a property of the model rather than of the machine.
+
+The crossover is where the two are equal. A token reads the weights once, so a
+gibibyte at the 700 GB/s the matvec achieves is 1.5 ms of memory, and 363
+launches at the 4.9 microseconds a 4090 charges for one is 1.8 ms of submission.
+Around a gibibyte those are the same number, and either side of it one of them
+is most of the token.
+
+Measured on a 4090, decoding, against the unfused path: SmolLM2 135M at 136 MiB
+a token is 1.89 times faster fused, Qwen 2.5 0.5B at 468 MiB is 1.55 times, and
+Llama 3.1 8B at 5151 MiB is 0.79 times, which is a loss of a fifth. The
+threshold sits between the second and the third and the arithmetic above says
+where in that gap, which is why it is a round number and not a fitted one.
 """
 
 
@@ -152,6 +173,37 @@ struct DeviceKvCache(Movable):
     def advance(mut self, count: Int = 1) raises:
         self.reserve(count)
         self.filled += count
+
+
+def fused_by_default(m: DeviceModel) raises -> Bool:
+    """Whether this model decodes better through the fused kernel.
+
+    One question, asked of the model and not of the machine: how many weight
+    bytes does a token read. `FUSED_MAX_BYTES` says why that is the question and
+    where the line is.
+
+    Only the seven matrices of a layer are counted. They are all a decode reads
+    that is worth counting, since the norm gains are a few thousand floats and
+    the embedding is one row, and the head is left out because both paths run it
+    the same way.
+
+    False on Metal whatever the model, and that is a measurement rather than a
+    caution. The fused path is slower there on both models it has been run on,
+    28 ms a token against 22 on SmolLM2 135M and 49 against 31 on Qwen 2.5 0.5B,
+    because an M4 holds a fifth of the blocks a 4090 does and charges more for a
+    barrier across them. Stage two is what changes that, if anything does.
+    """
+    comptime if CompilationTarget.is_macos():
+        return False
+    else:
+        var bytes = 0
+        for i in range(len(m.layers)):
+            ref one = m.layers[i]
+            bytes += one.wq.bytes() + one.wk.bytes() + one.wv.bytes()
+            bytes += one.wo.bytes() + one.up.bytes() + one.down.bytes()
+            if one.has_gate:
+                bytes += one.gate.bytes()
+        return bytes <= FUSED_MAX_BYTES
 
 
 struct DeviceSession(Movable):
@@ -271,7 +323,11 @@ struct DeviceSession(Movable):
             context,
             len(frequency_factors(host.model)) > 0,
         )
-        self.use_fused = getenv(FUSED_ENV) != ""
+        var asked = getenv(FUSED_ENV)
+        if asked == "":
+            self.use_fused = fused_by_default(self.model)
+        else:
+            self.use_fused = asked != "0"
         self.pos = 0
         self.batched = False
 

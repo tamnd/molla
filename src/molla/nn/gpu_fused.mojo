@@ -966,15 +966,21 @@ struct WorkPlan(Copyable, ImplicitlyCopyable, Movable):
         self.elements = at
 
 
-comptime CUDA_BLOCKS = 96
+comptime CUDA_BLOCKS = 384
 """How many blocks a fused launch uses on a backend with an occupancy query.
 
 The sweep in max.md says a barrier round over 1536 blocks costs 4.59
 microseconds, which is a launch, and that it falls to 1.26 at 384, 0.75 at 96
 and is flat below that. The cost at the top is 1536 blocks contending on one
 counter word rather than the rendezvous itself, so the useful grid is a few
-hundred and this is the bottom of the flat part. It is capped by the occupancy
-bound as well, because a grid that is not resident does not deadlock politely.
+hundred.
+
+Decoding a real model says the same range and picks the top of it rather than
+the bottom. SmolLM2 135M on a 4090 at 128 tokens decodes in 366 ms at 96
+blocks, 239 at 256, 238 at 384 and 239 at 512, against 451 unfused, so
+everything from 256 up is flat and 96 gives away half of what the path is
+worth. Above that it stops working rather than getting slower: 640 blocks and
+768 blocks never finish a token.
 
 What it costs is arithmetic width: a 4096 row projection here is 43 rows a block
 in a strided loop rather than one row a block. That is the number this design is
@@ -982,13 +988,37 @@ most likely to be wrong about on a large model and it is why the fused path is
 measured against the unfused one rather than assumed to win.
 """
 
-comptime METAL_PER_SM = 1
+comptime METAL_PER_SM = 4
 """Blocks a multiprocessor on a backend with no occupancy query.
 
-One, because one block a multiprocessor is the only count every Metal device is
-known to hold, and a grid that is not fully resident hangs the GPU, which on a
-laptop is the display. Raising it is a measurement rather than a guess and
-`fused_selftest` is what would have to say it is safe.
+It was one, because one block a multiprocessor is the only count every Metal
+device is known to hold, and a grid that is not fully resident hangs the GPU,
+which on a laptop is the display. Four is what an M4 measures: Qwen 2.5 0.5B
+decodes at 100 ms a token at ten blocks, 63 at twenty, 50 at forty, 49 at fifty
+and 55 at sixty, and at seventy it stops finishing a token at all. The M4 has
+ten multiprocessors, so the cliff is between six and seven blocks a
+multiprocessor and four is the flat part with a margin under it.
+
+The margin is the whole point, because the self test does not cover this. It
+runs the barrier and nothing else, and a kernel that is only a barrier is
+resident at counts the real one is not: the same M4 rendezvouses fine at a
+hundred and sixty blocks, sixteen a multiprocessor, where the fused kernel
+deadlocks at seventy. A probe cannot be the safety net for a grid whose
+residency depends on the registers of the kernel that runs in it, so the number
+is conservative instead.
+"""
+
+comptime CUDA_PER_SM = 3
+"""And the same ceiling on a backend that does have the query, because the
+query does not answer this question either.
+
+`occupancy_max_active_blocks_per_multiprocessor` says how many blocks fit on a
+multiprocessor, not how many the scheduler will run at once, and an ordinary
+launch is not a cooperative one. On a 4090 the fused kernel deadlocks at 640
+blocks, which is five a multiprocessor, so the query is an upper bound on the
+answer rather than the answer. Three, so that a card with a tenth of the
+multiprocessors gets a grid a tenth as wide instead of one that is over its own
+cliff.
 """
 
 
@@ -1071,6 +1101,8 @@ def fused_grid(ctx: DeviceContext) raises -> Int:
         per_sm = 0
     if per_sm <= 0:
         return sms * METAL_PER_SM
+    if per_sm > CUDA_PER_SM:
+        per_sm = CUDA_PER_SM
     var blocks = sms * per_sm
     if blocks > CUDA_BLOCKS:
         blocks = CUDA_BLOCKS
