@@ -152,16 +152,20 @@ The five and six bit half of the layout landed after the four bit half and out o
 
 Before it, `quant_form` widened every five and six bit type to a byte a value, so q5_0, q5_1, q5_K and q6_K were all stored at eight bits of quant where the file holds five or six. Now they are a nibble plane of `cols / 2` bytes followed by a high plane of `cols / 8` bytes at five bits and `cols / 4` at six, which is the shape the section above describes.
 
-On an M4 laptop, greedy, the same prompt, three runs each of the shipped build and the same tree with the change reverted.
+On an M4 laptop, greedy, the same prompt and 32 tokens out of it, three runs each of the shipped build and the same tree with the change reverted, both in one sitting.
 
 | model | repack cache before | after | decode ms a token before | after |
 | --- | --- | --- | --- | --- |
-| Llama 3.1 8B q4_K_M | 6474 MiB | 6108 MiB | 301, 316, 338 | 195, 205, 208 |
-| Qwen 2.5 0.5B | 663 MiB | 512 MiB | 38, 38, 47 | 30, 37, 39 |
+| Llama 3.1 8B q4_K_M | 6474 MiB | 6108 MiB | 240, 243, 252 | 177, 159, 182 |
+| Qwen 2.5 0.5B | 663 MiB | 512 MiB | 38, 38, 38 | 29, 29, 29 |
 
-The 8B is the case worth reading. The cache is 5.7 per cent smaller and decode is a third faster, which is not the same number and is not supposed to be. The cache holds `token_embd` and the output head, which a decode token reads one row of and all of, and the tensors this change touches are the thirty three q6_K ones, which in a q4_K_M file are `ffn_down` and `attn_v`. `ffn_down` is the widest matrix in a layer, so the share of the bytes a token actually reads that moved from eight bits to six is much larger than the share of the file that did.
+The load average was between 13 and 25 across that sitting, which on this machine is normal and is usually enough to make a timing worthless. It is not here, and the Qwen rows say why: four runs of one build in a row gave 38 four times and four of the other gave 29 four times, at a load that moved by half over the same minutes. Decode on Metal at this size is waiting on the GPU and not competing for the cores, so the number holds while a prefill number on the same machine would not.
+
+The 8B is the case worth reading. The cache is 5.7 per cent smaller and decode is a quarter faster, which is not the same number and is not supposed to be. The cache holds `token_embd` and the output head, which a decode token reads one row of and all of, and the tensors this change touches are the thirty three q6_K ones, which in a q4_K_M file are `ffn_down` and `attn_v`. `ffn_down` is the widest matrix in a layer, so the share of the bytes a token actually reads that moved from eight bits to six is much larger than the share of the file that did.
 
 Qwen is the other case and it is there because the file is misnamed. It says q4_K_M and `molla gguf` reports 133 q5_0 tensors against 14 q4_K, so almost the whole model was on the widened path and almost the whole model moved.
+
+Through `scripts/bench.py` at the 512 and 128 the gate uses, which is a longer context than the table above and reports prefill and resident bytes as well, Qwen goes 542.8 to 665.8 tokens a second of prefill, 21.1 to 28.0 of decode, and 1316 to 763 MiB resident, with the two builds a minute apart. That is the same result the table reports and it is the one to quote, because it is the harness the rest of the bench page uses. The 8B is not quoted at that length on this machine: the load went past fifty during the run and it produced 2.8 tokens a second of decode for a build that does better than that, which is a fact about the laptop and not about the layout.
 
 On a 4090 it is a different shape of result, and the memory is the part that carries. Both builds, six runs, one sitting, `scripts/bench.py` at the same 512 and 128 the gate uses, the load between 1.4 and 2.0 the whole way through.
 
