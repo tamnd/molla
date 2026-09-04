@@ -47,9 +47,10 @@ called with device buffers could not be checked against the host at all.
 """
 
 from std.gpu import block_idx, thread_idx
+from std.gpu.primitives.warp import WARP_SIZE, lane_group_sum
 from std.math import exp
 from std.memory import AddressSpace, bitcast, stack_allocation
-from std.sys.info import has_accelerator
+from std.sys.info import CompilationTarget, has_accelerator
 
 from max.gpu import barrier
 from max.gpu.host import DeviceBuffer, DeviceContext
@@ -494,6 +495,233 @@ def planar_matvec_kernel[
             o[unsafe_offset=r] = v
 
 
+comptime SPAN = 16 if CompilationTarget.is_macos() else 8
+"""How many tokens one group of threads in a matmul block carries at once.
+
+The number that decides whether prefill is bandwidth bound or compute bound. A
+block reads and dequantizes a weight value once and multiplies it into `SPAN`
+accumulators, so the weight traffic and the conversion work for a chunk of `T`
+tokens are `ceil(T / SPAN)` passes over the matrix rather than `T` of them. It
+costs `SPAN` registers of accumulator, which is what stops it growing, and
+`MM_GROUPS` is how the amortization goes past what the registers allow.
+
+The two backends want different numbers and the difference is measured and
+consistent rather than noise. Metal is 11 per cent faster at sixteen than at
+eight and CUDA is 19 per cent faster at eight than at sixteen, on both models
+that fit in cache. A macOS build targets Metal and a build anywhere else
+targets CUDA, which is why the operating system is the thing asked here.
+"""
+
+comptime PREFILL_CHUNK = 64
+"""How many prompt tokens go through the stack in one pass.
+
+A prompt is a matrix rather than a run of decodes, and this is how much of it
+is in flight at once. It trades launches against scratch: the launches for a
+prompt fall by this factor, and the attention scores grow by it, which on a
+thirty two head model at a four thousand context is 2 MiB a token. Sixty four
+is 128 times fewer launches than a token at a time and 33 MiB of scores on an
+8B, and at four passes for a five hundred token prompt the launches are no
+longer what is left.
+"""
+
+comptime MM_TILE = 32
+"""Threads in a batched matmul block, which is not the matvec's tile.
+
+A quarter of it, measured. A matmul block reduces `SPAN` accumulators rather
+than one, so the reduction at the end of it costs `SPAN` times what the
+matvec's does, and past a certain width the reduction is more work than the dot
+product that fed it. Thirty two threads is the best of every width from sixteen
+to five hundred and twelve on both backends and on all three models, and the
+losses either side of it are large: on a 4090 a 514 token prompt through
+SmolLM2 runs at 2734 tokens a second here, 2089 at 128 threads and 1034 at 512.
+
+It is also a warp on both backends, which the reduction relies on and which
+lets a group of threads whose tokens are all past the end of a short chunk
+leave without stranding the rest of the block.
+"""
+
+comptime MM_GROUPS = PREFILL_CHUNK // SPAN
+"""How many groups of `SPAN` tokens one matmul block carries.
+
+Amortization the accumulators cannot pay for. A block covers `SPAN` tokens per
+group of threads because `SPAN` accumulators is as many as fit in registers, so
+without this a chunk of 64 tokens reads the whole weight matrix eight times,
+and on an 8B that was 52 GiB of reads a chunk and a prefill slower than
+decoding the prompt a token at a time.
+
+The groups share the weight row rather than the registers. Each one walks the
+same columns and keeps its own accumulators, so the row is fetched from memory
+once for the block and out of the L1 for the groups behind the first, and the
+traffic for a chunk falls by this factor with no register cost at all.
+
+A whole chunk to a block, which is the number the sweeps land on from either
+side. Both backends want `SPAN * MM_GROUPS` to be the chunk exactly: on a 4090
+the 8B runs at 388 tokens a second with eight groups of eight and 262 with four
+of eight, and Metal falls off a cliff the other way when the product is twice
+the chunk. Once a block is the whole chunk, the grid is one block to an output
+row and the weight matrix is read once a chunk rather than once a block.
+"""
+
+
+def planar_matmul_kernel[
+    tile: Int, group: Int, with_min: Bool, form: Int
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+    epi_dev: Int32,
+    rows_dev: Int32,
+    tokens_dev: Int32,
+):
+    """`o[t][r] = dot(row r of w, x[t])` for `SPAN` tokens at a time.
+
+    The same inner loop as `planar_matvec_kernel` with the accumulator widened
+    from one float to `SPAN` of them. That is the entire difference and it is
+    the entire point: the expensive part of a decode matvec is reading a weight
+    byte and turning it into a float, and both of those happen once here for
+    `SPAN` multiplies rather than once for one.
+
+    The block is `MM_GROUPS` groups of `tile` threads. Every group walks the
+    whole weight row and holds `SPAN` accumulators of its own, so the row is
+    read from memory once for the block and out of the L1 for the groups behind
+    the first, and a block covers `SPAN * MM_GROUPS` tokens for one pass over
+    the weights. That is the difference between reading an 8B eight times a
+    chunk and reading it twice.
+
+    The grid is `(ceil(tokens / (SPAN * MM_GROUPS)), rows)` and the order is
+    deliberate. Blocks that share an output row differ only in the token index,
+    and they have to be co-resident for the L2 to serve that row once rather
+    than once each, so the token index is the fast axis.
+
+    A chunk is not a multiple of `SPAN` in general, and the tail block runs its
+    dead lanes off the end of the chunk rather than branching around them. Every
+    scratch vector a chunk uses is allocated with a block of rows of slack for
+    exactly this, so those lanes read real memory, compute a dot product of
+    whatever is in it, and never store it. It costs the tail block alone a
+    fraction of one launch and it keeps the inner loop free of a test.
+
+    See [docs/validation/prefill.md](../../../docs/validation/prefill.md).
+    """
+    var cols = Int(cols_dev)
+    var stride = Int(stride_dev)
+    var rows = Int(rows_dev)
+    var tokens = Int(tokens_dev)
+    var r = Int(block_idx.y)
+    var g = Int(thread_idx.y)
+    var base = (Int(block_idx.x) * MM_GROUPS + g) * SPAN
+    var t = Int(thread_idx.x)
+
+    var row = r * stride
+    var groups = cols // group
+    var packed = w
+    var scales = w.unsafe_bitcast[Float32]()
+    var quant_bytes = cols if form == QUANT_I8 else cols // 2
+    var d_base = (row + quant_bytes) // 4
+    var m_base = d_base + groups
+
+    comptime shift = group_shift(group)
+
+    var live = tokens - base
+    if live > SPAN:
+        live = SPAN
+    # A group whose whole run is past the end of the chunk stops here rather
+    # than walking the columns for nothing. It can, because a group is a warp of
+    # its own and the reduction below is the only thing the lanes of a block
+    # agree on, so there is no barrier left for the ones still working to wait
+    # at. That holds only while a group is exactly a warp wide.
+    if tile == WARP_SIZE and live <= 0:
+        return
+
+    # Every loop over `SPAN` below has a constant trip count so that the index
+    # into `acc` is a constant after unrolling and the accumulators stay in
+    # registers. A runtime bound would put all of them in local memory and undo
+    # the whole change.
+    #
+    # The dead lanes of a tail block read past the last token rather than
+    # clamping onto it, which is why every scratch vector a chunk uses is
+    # allocated with `SPAN * MM_GROUPS` rows of slack. Clamping would need a
+    # token index per lane held in a register for the length of the
+    # accumulation, which is
+    # `SPAN` registers taken from the accumulators for arithmetic that is
+    # thrown away. Reading slack is an affine offset the address unit folds in
+    # for free, and what it computes is discarded by the `t < live` below.
+    var at0 = base * cols
+
+    var acc = InlineArray[Float32, SPAN](fill=0)
+    comptime if form == QUANT_I8:
+        var i = t
+        while i < cols:
+            var gi = i >> shift
+            var q = byte_float(UInt32(packed[unsafe_offset=row + i]))
+            var d = scales[unsafe_offset=d_base + gi] * q
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                for k in range(SPAN):
+                    var a = x[unsafe_offset=at0 + k * cols + i]
+                    acc[k] += d * a + m * a
+            else:
+                for k in range(SPAN):
+                    acc[k] += d * x[unsafe_offset=at0 + k * cols + i]
+            i += tile
+    else:
+        var i = t * 2
+        while i < cols:
+            var gi = i >> shift
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            var d = scales[unsafe_offset=d_base + gi]
+            var lo = d * nibble_float[form](b & 0xF)
+            var hi = d * nibble_float[form](b >> 4)
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                for k in range(SPAN):
+                    var a0 = x[unsafe_offset=at0 + k * cols + i]
+                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
+                    acc[k] += lo * a0 + hi * a1 + m * (a0 + a1)
+            else:
+                for k in range(SPAN):
+                    var a0 = x[unsafe_offset=at0 + k * cols + i]
+                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
+                    acc[k] += lo * a0 + hi * a1
+            i += tile * 2
+
+    # A lane group reduction and not a tree through shared memory. A group is a
+    # warp wide, so `SPAN` reductions are `SPAN` times five shuffles with no
+    # shared memory, no barrier, and no occupancy given up to a scratch array
+    # that is only touched in the last few instructions of the kernel. The tree
+    # this replaced was more work than the dot product that fed it whenever the
+    # matrix was narrow.
+    #
+    # Every lane ends up holding every total, so each one keeps the total for
+    # the token it is about to write and drops the rest.
+    var got = Float32(0)
+    comptime for k in range(SPAN):
+        var whole = lane_group_sum[num_lanes=tile](acc[k])
+        if t == k:
+            got = whole
+
+    # One thread a token rather than one thread for the whole group, so the
+    # tail is `SPAN` threads doing one epilogue each.
+    if t < live:
+        var v = got
+        var epi = Int(epi_dev)
+        var out_at = (base + t) * rows + r
+        if epi & EPI_BIAS != 0:
+            v += aux[unsafe_offset=r]
+        elif epi & EPI_GLU != 0:
+            var g = aux[unsafe_offset=out_at]
+            if epi & ACT_BIT != 0:
+                v = activate[ACT_GELU](v) * g
+            else:
+                v = activate[ACT_SILU](v) * g
+        if epi & EPI_ADD != 0:
+            o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + v
+        else:
+            o[unsafe_offset=out_at] = v
+
+
 def device_ready() -> Bool:
     """Whether this build has device code in it at all.
 
@@ -539,7 +767,13 @@ def check_matvec_shapes(w: Tensor, in_elements: Int, out_elements: Int) raises:
             " in host memory, which a device kernel reads as zeros rather than"
             " as an error"
         )
-    if in_elements != w.cols:
+    # A matvec reads one row from the front of its input, and since prefill a
+    # scratch vector is a chunk of rows rather than one, so the width it has to
+    # hold is a whole number of rows and at least one. Exact equality would
+    # refuse the output head reading the last row of a prefill chunk, and a
+    # width that is not a multiple of the row is still the wiring mistake this
+    # check exists to catch.
+    if in_elements < w.cols or in_elements % w.cols != 0:
         raise Error(
             "the device matvec wants an input of "
             + String(w.cols)
@@ -653,6 +887,125 @@ def device_matvec_into(
         else:
             raise Error(
                 "no device matvec is compiled for quant form "
+                + String(form)
+                + " with a group of "
+                + String(g)
+                + (" and a minimum plane" if carries_min else " and no minimum")
+            )
+
+
+def _launch_mm[
+    tile: Int, group: Int, with_min: Bool, form: Int
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+    tokens: Int,
+) raises:
+    """One instantiation of the batched form, launched."""
+    ctx.enqueue_function[planar_matmul_kernel[tile, group, with_min, form]](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
+        x,
+        o,
+        aux,
+        Int32(w.cols),
+        Int32(w.row_bytes()),
+        Int32(epi),
+        Int32(w.rows),
+        Int32(tokens),
+        grid_dim=(
+            (tokens + SPAN * MM_GROUPS - 1) // (SPAN * MM_GROUPS),
+            w.rows,
+            1,
+        ),
+        block_dim=(tile, MM_GROUPS, 1),
+    )
+
+
+def device_matmul_into(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    mut out: DeviceVec,
+    tokens: Int,
+    at: Int = 0,
+    epi: Int = EPI_NONE,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
+) raises:
+    """`out[at + t * w.rows + r] = dot(row r of w, x[t])`, for `tokens` of them.
+
+    The batched form of `device_matvec_into`, with the same dispatch over the
+    same five instantiations and the same epilogue. `x` holds `tokens` rows of
+    `w.cols` laid out one after another and `out` holds `tokens` rows of
+    `w.rows` the same way, which is what makes a key projection write a run of
+    cache slots with no copy: the slots are contiguous and so are the rows.
+
+    Queued and not synchronized, for the reason the single token form gives.
+    """
+    if tokens <= 0:
+        raise Error("a batched matmul needs at least one token")
+    if at < 0:
+        raise Error("a matmul cannot write at a negative offset")
+    if x.elements() < tokens * w.cols:
+        raise Error(
+            "the device matmul wants "
+            + String(tokens)
+            + " rows of "
+            + String(w.cols)
+            + " and the input holds "
+            + String(x.elements())
+        )
+    if out.elements() < at + tokens * w.rows:
+        raise Error(
+            "the device matmul writes "
+            + String(tokens)
+            + " rows of "
+            + String(w.rows)
+            + " at offset "
+            + String(at)
+            + " and the output ends at "
+            + String(out.elements())
+        )
+    check_matvec_shapes(w, w.cols, w.rows)
+    comptime if not has_accelerator():
+        raise Error(
+            "this build has no device code in it, so there is no device matmul"
+            " to run. Accelerator support is decided when molla is compiled,"
+            " not when it is run"
+        )
+    else:
+        var o = out.ptr_at(at)
+        var a = aux.value() if aux and epi != EPI_NONE else o
+        var p = x.ptr()
+        var g = group_size(w.kind)
+        var carries_min = has_min(w.kind)
+        var form = quant_form(w.kind)
+        if form == QUANT_U4 and g == 32 and carries_min:
+            _launch_mm[MM_TILE, 32, True, QUANT_U4](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_S4 and g == 32 and not carries_min:
+            _launch_mm[MM_TILE, 32, False, QUANT_S4](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_I8 and g == 32 and carries_min:
+            _launch_mm[MM_TILE, 32, True, QUANT_I8](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_I8 and g == 32:
+            _launch_mm[MM_TILE, 32, False, QUANT_I8](
+                ctx, w, p, o, a, epi, tokens
+            )
+        elif form == QUANT_I8 and g == 16 and not carries_min:
+            _launch_mm[MM_TILE, 16, False, QUANT_I8](
+                ctx, w, p, o, a, epi, tokens
+            )
+        else:
+            raise Error(
+                "no device matmul is compiled for quant form "
                 + String(form)
                 + " with a group of "
                 + String(g)

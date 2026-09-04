@@ -132,27 +132,35 @@ def _block_max[tile: Int](value: Float32) -> Float32:
 def rms_norm_kernel[
     tile: Int
 ](
-    x: Pointer[Float32, MutAnyOrigin],
+    x_all: Pointer[Float32, MutAnyOrigin],
     g: Pointer[Float32, MutAnyOrigin],
-    o: Pointer[Float32, MutAnyOrigin],
+    o_all: Pointer[Float32, MutAnyOrigin],
     n_dev: Int32,
     eps: Float32,
 ):
-    """`o[i] = x[i] * rsqrt(mean(x*x) + eps) * g[i]`, one block over the row.
+    """`o[i] = x[i] * rsqrt(mean(x*x) + eps) * g[i]`, one block over a run.
 
     One block and not one per element because the scale is a reduction over the
-    whole row, so a second kernel to apply it would mean writing the sum to
+    whole run, so a second kernel to apply it would mean writing the sum to
     memory and reading it back. At 4096 wide with 128 threads that is 32
     elements each, which is enough work to be worth a launch and little enough
     that the reduction is most of the time.
+
+    The grid says how many runs, and run `b` is the `n` values starting at
+    `b * n`. A single vector is one run and a prefill chunk is one run a token,
+    and a per head norm is one run a head of a token, because in all three the
+    runs are the whole buffer end to end. The gain restarts at every run, which
+    is what makes the last of those work: a head norm is the same few hundred
+    weights applied to every head of every token in the chunk.
     """
     var n = Int(n_dev)
     var t = Int(thread_idx.x)
+    var at = Int(block_idx.x) * n
 
     var acc = Float32(0)
     var i = t
     while i < n:
-        var v = x[unsafe_offset=i]
+        var v = x_all[unsafe_offset=at + i]
         acc += v * v
         i += tile
     var total = _block_sum[tile](acc)
@@ -160,7 +168,9 @@ def rms_norm_kernel[
     var scale = Float32(1.0) / sqrt(total / Float32(n) + eps)
     i = t
     while i < n:
-        o[unsafe_offset=i] = x[unsafe_offset=i] * scale * g[unsafe_offset=i]
+        o_all[unsafe_offset=at + i] = (
+            x_all[unsafe_offset=at + i] * scale * g[unsafe_offset=i]
+        )
         i += tile
 
 
@@ -292,11 +302,11 @@ def planar_row_kernel[
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     o: Pointer[Float32, MutAnyOrigin],
+    ids: Pointer[Float32, MutAnyOrigin],
     cols_dev: Int32,
     stride_dev: Int32,
-    row_dev: Int32,
 ):
-    """One planar row of a weight, dequantized into a float32 vector.
+    """One planar row of a weight per block row, dequantized into floats.
 
     This is the embedding lookup and nothing else uses it. Every other weight in
     a forward pass is read by the matvec, which never materialises a row, and
@@ -310,9 +320,19 @@ def planar_row_kernel[
     accumulation loop that also reads the input vector, and a shared helper
     would be a function call per element in the hottest loop in the program to
     save a dozen lines here.
+
+    The rows come in through a device vector rather than as an argument, because
+    a prefill chunk wants all of its tokens looked up in one launch and a chunk
+    of token ids is not known until the chunk is. They are float32 holding whole
+    numbers, which every vocabulary fits in: a float32 is exact on the integers
+    to 16.7 million and the largest vocabulary anybody ships is a fifth of that.
+    A decode uploads one of them once per token, which is 4 bytes against the
+    width of a residual stream.
     """
     var cols = Int(cols_dev)
-    var row = Int(row_dev) * Int(stride_dev)
+    var ty = Int(block_idx.y)
+    var row = Int(ids[unsafe_offset=ty]) * Int(stride_dev)
+    var out_at = ty * cols
     var packed = w
     var scales = w.unsafe_bitcast[Float32]()
     var groups = cols // group
@@ -340,7 +360,7 @@ def planar_row_kernel[
         var v = scales[unsafe_offset=d_base + gi] * q
         comptime if with_min:
             v += scales[unsafe_offset=m_base + gi]
-        o[unsafe_offset=i] = v
+        o[unsafe_offset=out_at + i] = v
         i += stride
 
 
@@ -427,6 +447,7 @@ def rope_kernel[
     head_dim_dev: Int32,
     dim_dev: Int32,
     pos_dev: Int32,
+    row_dev: Int32,
     scale: Float32,
     ext_factor: Float32,
     attn_factor: Float32,
@@ -460,13 +481,20 @@ def rope_kernel[
     adjacent elements, which is what a converted Llama wants because its weights
     were permuted to suit. Elements past `dim` are not touched, which is what
     partial rotary means: they carry content and zeroing them throws it away.
+
+    The second grid dimension is the token, and it is the one place a batched
+    kernel here needs a per token scalar rather than a base and a stride: the
+    row moves by `row` and the angle moves with it, because a token at
+    `pos + ty` rotates by `pos + ty`. A single token is one block deep with a
+    row stride of zero and the arithmetic below collapses to what it was.
     """
     var head_dim = Int(head_dim_dev)
     var dim = Int(dim_dev)
-    var pos = Int(pos_dev)
+    var ty = Int(block_idx.y)
+    var pos = Int(pos_dev) + ty
     var pairs = dim // 2
     var head = Int(block_idx.x)
-    var at = Int(at_dev) + head * head_dim
+    var at = Int(at_dev) + ty * Int(row_dev) + head * head_dim
 
     var pair = Int(thread_idx.x)
     while pair < pairs:
@@ -596,6 +624,8 @@ def attend_kernel[
     group_dev: Int32,
     window_dev: Int32,
     sinks_dev: Int32,
+    q_row_dev: Int32,
+    score_row_dev: Int32,
     scale: Float32,
     softcap: Float32,
 ):
@@ -612,23 +642,32 @@ def attend_kernel[
     maximum is taken over the same finite values, and a masked key exponentiates
     to exactly zero and contributes nothing to the sum or to the output.
 
-    `scores` is scratch of at least `heads * count`, passed in rather than
-    allocated for the reason the host version takes it: a decode calls this once
-    per layer per token.
+    `scores` is scratch of at least `heads * score_row` per token, passed in
+    rather than allocated for the reason the host version takes it: a decode
+    calls this once per layer per token.
+
+    The second grid dimension is the token in a prefill chunk. Token `ty` is at
+    position `pos + ty` and attends over `count + ty` keys, and that count is
+    the causal mask: there is nothing to mask because a query cannot reach a key
+    the loop never visits. The window and the sinks are unchanged, since both
+    were already expressed against `pos` and `pos` now moves with the token. A
+    decode is one block deep with a query row stride of zero.
     """
-    var count = Int(count_dev)
-    var pos = Int(pos_dev)
+    var ty = Int(block_idx.y)
+    var count = Int(count_dev) + ty
+    var pos = Int(pos_dev) + ty
     var head_dim = Int(head_dim_dev)
     var kv_width = Int(kv_width_dev)
     var group = Int(group_dev)
     var window = Int(window_dev)
     var sinks = Int(sinks_dev)
+    var score_row = Int(score_row_dev)
 
     var h = Int(block_idx.x)
     var t = Int(thread_idx.x)
     var kvh = h // group
-    var qa = h * head_dim
-    var sa = h * count
+    var qa = ty * Int(q_row_dev) + h * head_dim
+    var sa = (ty * Int(grid_dim.x) + h) * score_row
 
     var mine = NEG_INF
     var j = t
@@ -695,22 +734,61 @@ def device_rms_norm(
     gain: DeviceVec,
     mut out: DeviceVec,
     eps: Float32,
+    runs: Int = 1,
+    x_at: Int = 0,
 ) raises:
-    """`out = x * rsqrt(mean(x*x) + eps) * gain`.
+    """`out = x * rsqrt(mean(x*x) + eps) * gain`, `runs` rows of it.
+
+    A prefill chunk is `runs` rows end to end through the same gain, and the
+    last row of a chunk on its own is one run at `x_at`, which is what the
+    output head wants: a chunk of a hundred tokens has one token's logits worth
+    reading and normalising the other ninety nine would be the largest matmul
+    in the pass done for nothing.
 
     The gain arrives as a device vector and not as a `Tensor`, because a norm
     weight is a few thousand f32 values that are read every token of every
     layer and never change, so it is dequantized once when the model binds
     rather than per call.
     """
-    _check_norm(x.elements(), gain.elements(), out.elements())
+    if runs < 1:
+        raise Error("a norm needs at least one run")
+    var n = gain.elements()
+    # A plain norm covers its whole input, and a mismatched gain there is the
+    # caller wiring the wrong weight in rather than describing a geometry. Once
+    # a run count or an offset is given the caller has said what the shape is,
+    # and the input is allowed to be longer, because a prefill chunk holds room
+    # for the largest chunk and a short one does not fill it.
+    if runs == 1 and x_at == 0:
+        _check_norm(x.elements(), n, out.elements())
+    if x_at < 0 or x.elements() < x_at + runs * n:
+        raise Error(
+            "a norm over "
+            + String(runs)
+            + " runs of "
+            + String(n)
+            + " from offset "
+            + String(x_at)
+            + " does not fit in a vector of "
+            + String(x.elements())
+        )
+    if out.elements() < runs * n:
+        raise Error(
+            "a norm of "
+            + String(runs * n)
+            + " values does not fit in an output of "
+            + String(out.elements())
+        )
     _need_device()
     comptime if has_accelerator():
-        _norm_launch(ctx, x.ptr(), gain.ptr(), out.ptr(), x.elements(), eps)
+        _norm_launch(ctx, x.ptr_at(x_at), gain.ptr(), out.ptr(), n, eps, runs)
 
 
 def device_rms_norm_inplace(
-    ctx: DeviceContext, mut x: DeviceVec, gain: DeviceVec, eps: Float32
+    ctx: DeviceContext,
+    mut x: DeviceVec,
+    gain: DeviceVec,
+    eps: Float32,
+    runs: Int = 1,
 ) raises:
     """The same norm, over the vector it read.
 
@@ -726,10 +804,27 @@ def device_rms_norm_inplace(
     before any thread writes, and after that each thread reads and writes the
     same index.
     """
-    _check_norm(x.elements(), gain.elements(), x.elements())
+    if runs < 1:
+        raise Error("a norm needs at least one run")
+    var n = gain.elements()
+    # The width comes from the gain rather than from dividing the vector by the
+    # run count, because a prefill chunk holds room for the largest chunk and a
+    # short one does not fill it, so that division is the wrong width whenever
+    # a prompt does not end on a chunk boundary.
+    if runs == 1:
+        _check_norm(x.elements(), n, x.elements())
+    elif x.elements() < runs * n:
+        raise Error(
+            "a norm over "
+            + String(runs)
+            + " runs of "
+            + String(n)
+            + " does not fit in a vector of "
+            + String(x.elements())
+        )
     _need_device()
     comptime if has_accelerator():
-        _norm_launch(ctx, x.ptr(), gain.ptr(), x.ptr(), x.elements(), eps)
+        _norm_launch(ctx, x.ptr(), gain.ptr(), x.ptr(), n, eps, runs)
 
 
 def device_rms_norm_run(
@@ -739,19 +834,28 @@ def device_rms_norm_run(
     n: Int,
     gain: DeviceVec,
     eps: Float32,
+    runs: Int = 1,
 ) raises:
-    """The same norm again, in place over `n` values starting at `at`.
+    """The same norm again, in place over `runs` runs of `n` from `at`.
 
     Qwen 3 normalises each head of a query and of a key before rotating it, and
     a key at that point is already lying in the cache at the slot this position
     occupies. So the run this covers is not the front of anything, which is the
     whole reason there is a third entry point rather than two.
+
+    The heads of a token lie end to end and so do the tokens of a chunk, so
+    every head of every token in a chunk is one launch of `runs` blocks rather
+    than a launch a head, which is what it used to be even for one token.
     """
-    if at < 0 or n <= 0 or x.elements() < at + n:
+    if runs < 1:
+        raise Error("a norm needs at least one run")
+    if at < 0 or n <= 0 or x.elements() < at + runs * n:
         raise Error(
             "a norm over "
+            + String(runs)
+            + " runs of "
             + String(n)
-            + " values from offset "
+            + " from offset "
             + String(at)
             + " does not fit in a vector of "
             + String(x.elements())
@@ -760,7 +864,7 @@ def device_rms_norm_run(
     _need_device()
     comptime if has_accelerator():
         var p = x.ptr_at(at)
-        _norm_launch(ctx, p, gain.ptr(), p, n, eps)
+        _norm_launch(ctx, p, gain.ptr(), p, n, eps, runs)
 
 
 def _check_norm(n: Int, gain: Int, written: Int) raises:
@@ -779,6 +883,7 @@ def _norm_launch(
     out_ptr: Pointer[Float32, MutAnyOrigin],
     n: Int,
     eps: Float32,
+    runs: Int = 1,
 ) raises:
     ctx.enqueue_function[rms_norm_kernel[TILE]](
         x,
@@ -786,7 +891,7 @@ def _norm_launch(
         out_ptr,
         Int32(n),
         eps,
-        grid_dim=(1, 1, 1),
+        grid_dim=(runs, 1, 1),
         block_dim=(TILE, 1, 1),
     )
 
@@ -848,10 +953,12 @@ def _gated(
             )
 
 
-def device_silu(ctx: DeviceContext, mut x: DeviceVec) raises:
+def device_silu(ctx: DeviceContext, mut x: DeviceVec, count: Int = 0) raises:
+    """In place over the first `count` values, or all of them when it is zero.
+    """
     _need_device()
     comptime if has_accelerator():
-        var n = x.elements()
+        var n = count if count > 0 else x.elements()
         ctx.enqueue_function[act_kernel[ACT_SILU]](
             x.ptr(),
             Int32(n),
@@ -860,10 +967,12 @@ def device_silu(ctx: DeviceContext, mut x: DeviceVec) raises:
         )
 
 
-def device_gelu(ctx: DeviceContext, mut x: DeviceVec) raises:
+def device_gelu(ctx: DeviceContext, mut x: DeviceVec, count: Int = 0) raises:
+    """In place over the first `count` values, or all of them when it is zero.
+    """
     _need_device()
     comptime if has_accelerator():
-        var n = x.elements()
+        var n = count if count > 0 else x.elements()
         ctx.enqueue_function[act_kernel[ACT_GELU]](
             x.ptr(),
             Int32(n),
@@ -944,10 +1053,15 @@ def device_softcap(
         )
 
 
-def device_unpack_row(
-    ctx: DeviceContext, w: Tensor, row: Int, mut out: DeviceVec, at: Int = 0
+def device_unpack_rows(
+    ctx: DeviceContext,
+    w: Tensor,
+    ids: DeviceVec,
+    tokens: Int,
+    mut out: DeviceVec,
+    at: Int = 0,
 ) raises:
-    """One row of a planar weight into `out[at ..]`, dequantized.
+    """`tokens` rows of a planar weight into `out[at ..]`, dequantized.
 
     The embedding lookup, and the one read of a weight in a forward pass that is
     not a matvec. It refuses the same three things the matvec refuses, and for
@@ -971,19 +1085,23 @@ def device_unpack_row(
             " this one is in host memory, which a device kernel reads as zeros"
             " rather than as an error"
         )
-    if row < 0 or row >= w.rows:
+    if tokens < 1:
+        raise Error("an embedding lookup needs at least one token")
+    if ids.elements() < tokens:
         raise Error(
-            "row "
-            + String(row)
-            + " is out of range for a weight with "
-            + String(w.rows)
-            + " rows"
+            "an embedding lookup of "
+            + String(tokens)
+            + " tokens was given "
+            + String(ids.elements())
+            + " row indices"
         )
-    if at < 0 or out.elements() < at + w.cols:
+    if at < 0 or out.elements() < at + tokens * w.cols:
         raise Error(
             "a row of "
             + String(w.cols)
-            + " at offset "
+            + " for each of "
+            + String(tokens)
+            + " tokens at offset "
             + String(at)
             + " does not fit in a vector of "
             + String(out.elements())
@@ -994,15 +1112,15 @@ def device_unpack_row(
         var carries_min = has_min(w.kind)
         var form = quant_form(w.kind)
         if form == QUANT_U4 and g == 32 and carries_min:
-            _unpack[32, True, QUANT_U4](ctx, w, out.ptr_at(at), row)
+            _unpack[32, True, QUANT_U4](ctx, w, out.ptr_at(at), ids, tokens)
         elif form == QUANT_S4 and g == 32 and not carries_min:
-            _unpack[32, False, QUANT_S4](ctx, w, out.ptr_at(at), row)
+            _unpack[32, False, QUANT_S4](ctx, w, out.ptr_at(at), ids, tokens)
         elif form == QUANT_I8 and g == 32 and carries_min:
-            _unpack[32, True, QUANT_I8](ctx, w, out.ptr_at(at), row)
+            _unpack[32, True, QUANT_I8](ctx, w, out.ptr_at(at), ids, tokens)
         elif form == QUANT_I8 and g == 32:
-            _unpack[32, False, QUANT_I8](ctx, w, out.ptr_at(at), row)
+            _unpack[32, False, QUANT_I8](ctx, w, out.ptr_at(at), ids, tokens)
         elif form == QUANT_I8 and g == 16 and not carries_min:
-            _unpack[16, False, QUANT_I8](ctx, w, out.ptr_at(at), row)
+            _unpack[16, False, QUANT_I8](ctx, w, out.ptr_at(at), ids, tokens)
         else:
             raise Error(
                 "no device row read is compiled for quant form "
@@ -1019,23 +1137,35 @@ def _unpack[
     ctx: DeviceContext,
     w: Tensor,
     o: Pointer[Float32, MutAnyOrigin],
-    row: Int,
+    ids: DeviceVec,
+    tokens: Int,
 ) raises:
     ctx.enqueue_function[planar_row_kernel[group, with_min, form]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         o,
+        ids.ptr(),
         Int32(w.cols),
         Int32(w.row_bytes()),
-        Int32(row),
-        grid_dim=(_grid(w.cols), 1, 1),
+        grid_dim=(_grid(w.cols), tokens, 1),
         block_dim=(TILE, 1, 1),
     )
 
 
-def device_scale_into(ctx: DeviceContext, mut x: DeviceVec, by: Float32) raises:
+def device_scale_into(
+    ctx: DeviceContext, mut x: DeviceVec, by: Float32, count: Int = 0
+) raises:
+    """In place over the first `count` values, or all of them when it is zero.
+    """
+    if count < 0 or count > x.elements():
+        raise Error(
+            "a scale over "
+            + String(count)
+            + " does not fit in a vector of "
+            + String(x.elements())
+        )
     _need_device()
     comptime if has_accelerator():
-        var n = x.elements()
+        var n = count if count > 0 else x.elements()
         ctx.enqueue_function[scale_into_kernel](
             x.ptr(),
             Int32(n),
@@ -1123,6 +1253,8 @@ def device_rope(
     head_dim: Int,
     pos: Int,
     tables: RopeTables,
+    tokens: Int = 1,
+    row: Int = 0,
 ) raises:
     """Rotate `heads` heads laid end to end at `at`, in place.
 
@@ -1145,10 +1277,12 @@ def device_rope(
             + " does not fit in a head of "
             + String(head_dim)
         )
-    if at < 0 or x.elements() < at + heads * head_dim:
+    if tokens < 1:
+        raise Error("rope needs at least one token")
+    if at < 0 or x.elements() < at + (tokens - 1) * row + heads * head_dim:
         raise Error(
             "rope wants "
-            + String(heads * head_dim)
+            + String((tokens - 1) * row + heads * head_dim)
             + " values from offset "
             + String(at)
             + " but the vector ends at "
@@ -1179,19 +1313,63 @@ def device_rope(
             high = ends[1]
         if spec.neox and tables.use_factors:
             _rope[True, True](
-                ctx, spec, x, tables, at, heads, head_dim, pos, low, high
+                ctx,
+                spec,
+                x,
+                tables,
+                at,
+                heads,
+                head_dim,
+                pos,
+                low,
+                high,
+                tokens,
+                row,
             )
         elif spec.neox:
             _rope[True, False](
-                ctx, spec, x, tables, at, heads, head_dim, pos, low, high
+                ctx,
+                spec,
+                x,
+                tables,
+                at,
+                heads,
+                head_dim,
+                pos,
+                low,
+                high,
+                tokens,
+                row,
             )
         elif tables.use_factors:
             _rope[False, True](
-                ctx, spec, x, tables, at, heads, head_dim, pos, low, high
+                ctx,
+                spec,
+                x,
+                tables,
+                at,
+                heads,
+                head_dim,
+                pos,
+                low,
+                high,
+                tokens,
+                row,
             )
         else:
             _rope[False, False](
-                ctx, spec, x, tables, at, heads, head_dim, pos, low, high
+                ctx,
+                spec,
+                x,
+                tables,
+                at,
+                heads,
+                head_dim,
+                pos,
+                low,
+                high,
+                tokens,
+                row,
             )
 
 
@@ -1208,6 +1386,8 @@ def _rope[
     pos: Int,
     low: Float32,
     high: Float32,
+    tokens: Int,
+    row: Int,
 ) raises:
     ctx.enqueue_function[rope_kernel[neox, with_factors]](
         x.ptr(),
@@ -1217,12 +1397,13 @@ def _rope[
         Int32(head_dim),
         Int32(spec.dim),
         Int32(pos),
+        Int32(row),
         spec.scale,
         spec.ext_factor,
         spec.attn_factor,
         low,
         high,
-        grid_dim=(heads, 1, 1),
+        grid_dim=(heads, tokens, 1),
         block_dim=(TILE, 1, 1),
     )
 
@@ -1237,8 +1418,13 @@ def device_attend(
     pos: Int,
     mut out: DeviceVec,
     mut scores: DeviceVec,
+    tokens: Int = 1,
 ) raises:
-    """One query against `count` keys, writing `heads * head_dim` values.
+    """`tokens` queries against `count` keys and up, `heads * head_dim` out each.
+
+    Token `i` of a chunk sits at position `pos + i` and attends over `count + i`
+    keys, so the causal mask is the count rather than a comparison. A decode is
+    one token and reads exactly as it did.
 
     The one thing this refuses that the host version also refuses is a position
     that can see no keys at all, and it is checked here rather than in the
@@ -1247,40 +1433,40 @@ def device_attend(
     and it produces a division by a zero sum, which arrives as a buffer of nans
     several layers later.
     """
+    if tokens < 1:
+        raise Error("attention needs at least one query")
     var width = spec.heads * spec.head_dim
-    if q.elements() < width:
+    var last = count + tokens - 1
+    if q.elements() < tokens * width:
         raise Error(
             "attention wants a query of "
-            + String(width)
+            + String(tokens * width)
             + " but got "
             + String(q.elements())
         )
-    if out.elements() < width:
+    if out.elements() < tokens * width:
         raise Error(
             "attention wants an output of "
-            + String(width)
+            + String(tokens * width)
             + " but got "
             + String(out.elements())
         )
     if count <= 0:
         raise Error("attention needs at least one key to look at")
     var kv_width = spec.kv_heads * spec.head_dim
-    if (
-        keys.elements() < count * kv_width
-        or values.elements() < count * kv_width
-    ):
+    if keys.elements() < last * kv_width or values.elements() < last * kv_width:
         raise Error(
             "attention wants "
-            + String(count * kv_width)
+            + String(last * kv_width)
             + " keys and values but got "
             + String(keys.elements())
             + " and "
             + String(values.elements())
         )
-    if scores.elements() < spec.heads * count:
+    if scores.elements() < tokens * spec.heads * last:
         raise Error(
             "attention wants scratch for "
-            + String(spec.heads * count)
+            + String(tokens * spec.heads * last)
             + " scores but got "
             + String(scores.elements())
         )
@@ -1313,9 +1499,11 @@ def device_attend(
             Int32(spec.group()),
             Int32(spec.window),
             Int32(spec.sinks),
+            Int32(width),
+            Int32(last),
             spec.scale,
             spec.softcap,
-            grid_dim=(spec.heads, 1, 1),
+            grid_dim=(spec.heads, tokens, 1),
             block_dim=(TILE, 1, 1),
         )
 

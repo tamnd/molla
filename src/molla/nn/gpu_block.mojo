@@ -54,12 +54,17 @@ from molla.nn.gpu import (
     EPI_BIAS,
     EPI_GLU,
     EPI_NONE,
+    MM_GROUPS,
+    PREFILL_CHUNK,
+    SPAN,
     DeviceVec,
+    device_matmul_into,
     device_matvec_into,
 )
 from molla.nn.gpu_ops import (
     RopeTables,
     device_add_into,
+    device_add_run,
     device_attend,
     device_gelu,
     device_rms_norm,
@@ -69,7 +74,7 @@ from molla.nn.gpu_ops import (
     device_scale_into,
     device_silu,
     device_softcap,
-    device_unpack_row,
+    device_unpack_rows,
 )
 from molla.nn.model import ModelWeights
 from molla.nn.repack import LAYOUT_PLANAR, unpack_run
@@ -352,6 +357,16 @@ struct DeviceScratch(Movable):
     var up: DeviceVec
     var scores: DeviceVec
     var logits: DeviceVec
+    var ids: DeviceVec
+    """The token indices this pass is looking up, one float each.
+
+    A device vector because the embedding lookup reads its rows from the device
+    now that a prefill chunk looks up many at once, and float32 because every
+    vocabulary is exact in one. See `device_unpack_rows`.
+    """
+
+    var chunk: Int
+    """How many tokens this scratch is sized for. One, for a decode."""
 
     var tracing: Bool
     """Whether `device_forward` records the residual stream as it goes. Off.
@@ -365,20 +380,45 @@ struct DeviceScratch(Movable):
     var trace: List[Float32]
 
     def __init__(
-        out self, ctx: DeviceContext, spec: BlockSpec, context: Int, vocab: Int
+        out self,
+        ctx: DeviceContext,
+        spec: BlockSpec,
+        context: Int,
+        vocab: Int,
+        chunk: Int = 1,
     ) raises:
+        """Sized for `chunk` tokens at once, which is one unless this is prefill.
+
+        Every field except the logits scales with the chunk, and the scores
+        scale with the chunk and the context together, which is what decides
+        how large a chunk is worth having. See
+        [docs/validation/prefill.md](../../../docs/validation/prefill.md).
+        """
         if context <= 0:
             raise Error("a layer needs room for at least one position")
         if vocab <= 0:
             raise Error("a model needs a vocabulary to write logits into")
-        self.norm = DeviceVec(ctx, spec.width)
-        self.q = DeviceVec(ctx, spec.q_width())
-        self.heads_out = DeviceVec(ctx, spec.q_width())
-        self.projected = DeviceVec(ctx, spec.width)
-        self.gate = DeviceVec(ctx, spec.hidden)
-        self.up = DeviceVec(ctx, spec.hidden)
-        self.scores = DeviceVec(ctx, spec.attn.heads * context)
+        if chunk <= 0:
+            raise Error("a pass has to carry at least one token")
+        # Everything a matmul reads is rounded up to a whole block of tokens,
+        # because the dead lanes of a short chunk read past its last token
+        # rather than clamping onto it. See `planar_matmul_kernel`. At the
+        # shipped chunk this is exact and costs nothing, and it is only a
+        # caller asking for a smaller chunk that pays for the rounding.
+        var wide = chunk
+        if chunk > 1:
+            var block = SPAN * MM_GROUPS
+            wide = (chunk + block - 1) // block * block
+        self.norm = DeviceVec(ctx, wide * spec.width)
+        self.q = DeviceVec(ctx, wide * spec.q_width())
+        self.heads_out = DeviceVec(ctx, wide * spec.q_width())
+        self.projected = DeviceVec(ctx, wide * spec.width)
+        self.gate = DeviceVec(ctx, wide * spec.hidden)
+        self.up = DeviceVec(ctx, wide * spec.hidden)
+        self.scores = DeviceVec(ctx, chunk * spec.attn.heads * context)
         self.logits = DeviceVec(ctx, vocab)
+        self.ids = DeviceVec(ctx, chunk)
+        self.chunk = chunk
         self.tracing = False
         self.trace = List[Float32]()
 
@@ -411,6 +451,31 @@ struct DeviceScratch(Movable):
         return len(self.trace) // width
 
 
+def _project(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    mut out: DeviceVec,
+    tokens: Int,
+    at: Int = 0,
+    epi: Int = EPI_NONE,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
+) raises:
+    """One token through the matvec, more than one through the matmul.
+
+    The two kernels compute the same thing and neither is a good substitute for
+    the other. The matmul carries `SPAN` tokens in a block whether they exist or
+    not, so at one token it would do eight dot products to keep one and hold
+    eight times the shared memory doing it. The matvec launches once a token, so
+    at a hundred tokens it would read the weights a hundred times. The dividing
+    line is not delicate and it is at one.
+    """
+    if tokens == 1:
+        device_matvec_into(ctx, w, x, out, at, epi, aux)
+    else:
+        device_matmul_into(ctx, w, x, out, tokens, at, epi, aux)
+
+
 def device_attention(
     ctx: DeviceContext,
     spec: BlockSpec,
@@ -421,8 +486,14 @@ def device_attention(
     mut values: DeviceVec,
     slot: Int,
     pos: Int,
+    tokens: Int = 1,
 ) raises:
     """The attention sublayer, in place on the residual stream.
+
+    `tokens` of them at once, occupying cache slots `slot` through
+    `slot + tokens - 1` at positions `pos` through `pos + tokens - 1`. Every
+    kernel below takes the count and none of them branch on it, because a chunk
+    of one is the geometry a decode already had.
 
     The same eleven steps in the same order as `molla.nn.block.attention_layer`,
     and the order is the part that matters rather than the kernels: the bias
@@ -430,28 +501,31 @@ def device_attention(
     per head norm before rope because a rotation of a normalised vector is still
     normalised and the other way round is not.
     """
-    if x.elements() != spec.width:
+    if tokens < 1:
+        raise Error("a layer has to be given at least one token")
+    if x.elements() < tokens * spec.width:
         raise Error(
             "the residual stream is "
             + String(x.elements())
             + " wide where the layer wants "
-            + String(spec.width)
+            + String(tokens * spec.width)
         )
     if slot < 0:
         raise Error("a cache slot cannot be negative")
 
     var kv_width = spec.kv_width()
     var at = slot * kv_width
-    if keys.elements() < at + kv_width or values.elements() < at + kv_width:
+    var span = tokens * kv_width
+    if keys.elements() < at + span or values.elements() < at + span:
         raise Error(
             "the cache has no room for slot "
             + String(slot)
             + ", which needs "
-            + String(at + kv_width)
+            + String(at + span)
             + " values"
         )
 
-    device_rms_norm(ctx, x, w.attn_norm, s.norm, spec.eps)
+    device_rms_norm(ctx, x, w.attn_norm, s.norm, spec.eps, tokens)
 
     # The bias goes on in the projection's own epilogue rather than in three
     # kernels behind it. One thread of each block adds one float to the row it
@@ -462,20 +536,26 @@ def device_attention(
     # what the offset on the matvec is for. The cache is where they are needed
     # and this is the only place they are written.
     var bias_epi = EPI_BIAS if w.has_bias else EPI_NONE
-    device_matvec_into(ctx, w.wq, s.norm, s.q, 0, bias_epi, w.q_bias.ptr())
-    device_matvec_into(ctx, w.wk, s.norm, keys, at, bias_epi, w.k_bias.ptr())
-    device_matvec_into(ctx, w.wv, s.norm, values, at, bias_epi, w.v_bias.ptr())
+    _project(ctx, w.wq, s.norm, s.q, tokens, 0, bias_epi, w.q_bias.ptr())
+    _project(ctx, w.wk, s.norm, keys, tokens, at, bias_epi, w.k_bias.ptr())
+    _project(ctx, w.wv, s.norm, values, tokens, at, bias_epi, w.v_bias.ptr())
 
+    # Every head of every token in the chunk is one launch, because the heads of
+    # a token lie end to end and so do the tokens.
     if w.has_qk_norm:
         var head_dim = spec.attn.head_dim
-        for h in range(spec.attn.heads):
-            device_rms_norm_run(
-                ctx, s.q, h * head_dim, head_dim, w.q_norm, spec.eps
-            )
-        for h in range(spec.attn.kv_heads):
-            device_rms_norm_run(
-                ctx, keys, at + h * head_dim, head_dim, w.k_norm, spec.eps
-            )
+        device_rms_norm_run(
+            ctx, s.q, 0, head_dim, w.q_norm, spec.eps, tokens * spec.attn.heads
+        )
+        device_rms_norm_run(
+            ctx,
+            keys,
+            at,
+            head_dim,
+            w.k_norm,
+            spec.eps,
+            tokens * spec.attn.kv_heads,
+        )
 
     device_rope(
         ctx,
@@ -486,6 +566,8 @@ def device_attention(
         spec.attn.head_dim,
         pos,
         w.rope,
+        tokens,
+        spec.q_width(),
     )
     device_rope(
         ctx,
@@ -496,6 +578,8 @@ def device_attention(
         spec.attn.head_dim,
         pos,
         w.rope,
+        tokens,
+        kv_width,
     )
 
     device_attend(
@@ -508,17 +592,20 @@ def device_attention(
         pos,
         s.heads_out,
         s.scores,
+        tokens,
     )
     # The residual add rides the output projection's epilogue, so `s.projected`
     # is only used by the models that put a norm between the two. Those still
     # pay for the scratch vector and the two launches, because a norm over the
     # whole projection cannot be computed by a block that owns one row of it.
     if w.has_attn_post:
-        device_matvec_into(ctx, w.wo, s.heads_out, s.projected)
-        device_rms_norm_inplace(ctx, s.projected, w.attn_post_norm, spec.eps)
-        device_add_into(ctx, x, s.projected)
+        _project(ctx, w.wo, s.heads_out, s.projected, tokens)
+        device_rms_norm_inplace(
+            ctx, s.projected, w.attn_post_norm, spec.eps, tokens
+        )
+        device_add_run(ctx, x, 0, s.projected, tokens * spec.width)
     else:
-        device_matvec_into(ctx, w.wo, s.heads_out, x, 0, EPI_ADD)
+        _project(ctx, w.wo, s.heads_out, x, tokens, 0, EPI_ADD)
 
 
 def device_mlp(
@@ -527,18 +614,21 @@ def device_mlp(
     w: DeviceLayer,
     mut x: DeviceVec,
     mut s: DeviceScratch,
+    tokens: Int = 1,
 ) raises:
-    """The mlp sublayer, in place on the residual stream."""
-    if x.elements() != spec.width:
+    """The mlp sublayer, in place on the residual stream, `tokens` at once."""
+    if tokens < 1:
+        raise Error("a layer has to be given at least one token")
+    if x.elements() < tokens * spec.width:
         raise Error(
             "the residual stream is "
             + String(x.elements())
             + " wide where the layer wants "
-            + String(spec.width)
+            + String(tokens * spec.width)
         )
 
-    device_rms_norm(ctx, x, w.ffn_norm, s.norm, spec.eps)
-    device_matvec_into(ctx, w.up, s.norm, s.up)
+    device_rms_norm(ctx, x, w.ffn_norm, s.norm, spec.eps, tokens)
+    _project(ctx, w.up, s.norm, s.up, tokens)
 
     # The gate half of a gated MLP is `act(gate) * up` and the up projection has
     # already been written by the line above, so the gate projection's own
@@ -547,24 +637,28 @@ def device_mlp(
     # activation is still its own launch over `s.up`.
     if w.has_gate:
         var glu = EPI_GLU | (0 if spec.act == ACT_SILU else ACT_BIT)
-        device_matvec_into(ctx, w.gate, s.norm, s.gate, 0, glu, s.up.ptr())
+        _project(ctx, w.gate, s.norm, s.gate, tokens, 0, glu, s.up.ptr())
         if w.has_ffn_post:
-            device_matvec_into(ctx, w.down, s.gate, s.projected)
-            device_rms_norm_inplace(ctx, s.projected, w.ffn_post_norm, spec.eps)
-            device_add_into(ctx, x, s.projected)
+            _project(ctx, w.down, s.gate, s.projected, tokens)
+            device_rms_norm_inplace(
+                ctx, s.projected, w.ffn_post_norm, spec.eps, tokens
+            )
+            device_add_run(ctx, x, 0, s.projected, tokens * spec.width)
         else:
-            device_matvec_into(ctx, w.down, s.gate, x, 0, EPI_ADD)
+            _project(ctx, w.down, s.gate, x, tokens, 0, EPI_ADD)
     else:
         if spec.act == ACT_SILU:
-            device_silu(ctx, s.up)
+            device_silu(ctx, s.up, tokens * spec.hidden)
         else:
-            device_gelu(ctx, s.up)
+            device_gelu(ctx, s.up, tokens * spec.hidden)
         if w.has_ffn_post:
-            device_matvec_into(ctx, w.down, s.up, s.projected)
-            device_rms_norm_inplace(ctx, s.projected, w.ffn_post_norm, spec.eps)
-            device_add_into(ctx, x, s.projected)
+            _project(ctx, w.down, s.up, s.projected, tokens)
+            device_rms_norm_inplace(
+                ctx, s.projected, w.ffn_post_norm, spec.eps, tokens
+            )
+            device_add_run(ctx, x, 0, s.projected, tokens * spec.width)
         else:
-            device_matvec_into(ctx, w.down, s.up, x, 0, EPI_ADD)
+            _project(ctx, w.down, s.up, x, tokens, 0, EPI_ADD)
 
 
 def device_layer(
@@ -577,10 +671,11 @@ def device_layer(
     mut values: DeviceVec,
     slot: Int,
     pos: Int,
+    tokens: Int = 1,
 ) raises:
     """Both sublayers, which is one decoder layer."""
-    device_attention(ctx, spec, w, x, s, keys, values, slot, pos)
-    device_mlp(ctx, spec, w, x, s)
+    device_attention(ctx, spec, w, x, s, keys, values, slot, pos, tokens)
+    device_mlp(ctx, spec, w, x, s, tokens)
 
 
 def device_forward(
@@ -588,13 +683,13 @@ def device_forward(
     m: DeviceModel,
     mut s: DeviceScratch,
     mut x: DeviceVec,
-    token: Int,
+    tokens: List[Int],
     pos: Int,
     slot: Int,
     mut keys: List[DeviceVec],
     mut values: List[DeviceVec],
 ) raises:
-    """One token through the whole stack, leaving its logits on the device.
+    """A run of tokens through the whole stack, logits left on the device.
 
     Queued and not synchronized. Everything here is one stream of launches with
     no wait between them, which is the thing that makes a token one command
@@ -603,9 +698,16 @@ def device_forward(
 
     `pos` and `slot` are two arguments for the reason the host version gives:
     they are the same number until something evicts, and the day they stop being
-    the same is the day a single argument becomes a bug in two places.
+    the same is the day a single argument becomes a bug in two places. A run
+    occupies `len(tokens)` of each, starting at these.
+
+    Only the last token of the run gets logits, because it is the only one a
+    caller can do anything with and the output head is the largest single
+    projection in the pass. See
+    [docs/validation/prefill.md](../../../docs/validation/prefill.md).
     """
     var count = m.block_count()
+    var run = len(tokens)
     if len(keys) != count or len(values) != count:
         raise Error(
             "the cache has room for "
@@ -615,17 +717,58 @@ def device_forward(
         )
     if pos < 0:
         raise Error("a position cannot be negative")
-    if x.elements() != m.width():
+    if run < 1:
+        raise Error("a forward pass needs at least one token")
+    if run > s.chunk:
+        raise Error(
+            "a run of "
+            + String(run)
+            + " tokens was given scratch sized for "
+            + String(s.chunk)
+        )
+    # A chunk is read a whole block of tokens at a time, so the residual stream
+    # has to hold the rounded up count and not the run. See the scratch.
+    var rows = run
+    if run > 1:
+        var block = SPAN * MM_GROUPS
+        rows = (run + block - 1) // block * block
+    if x.elements() < rows * m.width():
         raise Error(
             "the residual stream is "
             + String(x.elements())
-            + " wide where the model is "
-            + String(m.width())
+            + " wide where the model wants "
+            + String(rows * m.width())
+        )
+    if s.tracing and run != 1:
+        raise Error(
+            "a trace records one residual stream per layer and this pass"
+            " carries "
+            + String(run)
+            + " of them, so tracing runs a token at a time"
         )
 
-    device_unpack_row(ctx, m.embedding, token, x)
+    var row = List[Float32]()
+    for i in range(run):
+        if tokens[i] < 0 or tokens[i] >= m.embedding.rows:
+            raise Error(
+                "token "
+                + String(tokens[i])
+                + " is outside a vocabulary of "
+                + String(m.embedding.rows)
+            )
+        row.append(Float32(tokens[i]))
+    # Padded to the scratch, because a copy fills the vector it is given and a
+    # short chunk is the ordinary case at the end of a prompt. The lookup only
+    # launches `run` rows deep, so the padding is never read.
+    while len(row) < s.ids.elements():
+        row.append(Float32(0))
+    s.ids.copy_in(row)
+
+    device_unpack_rows(ctx, m.embedding, s.ids, run, x)
     if m.arch.scale_embedding:
-        device_scale_into(ctx, x, Float32(sqrt(Float64(m.width()))))
+        device_scale_into(
+            ctx, x, Float32(sqrt(Float64(m.width()))), run * m.width()
+        )
 
     # The same numbering the host trace uses, so snapshot k is the residual
     # stream layer k was handed and a comparison can say which layer a
@@ -633,11 +776,28 @@ def device_forward(
     s.record(ctx, x)
     for i in range(count):
         device_layer(
-            ctx, m.specs[i], m.layers[i], x, s, keys[i], values[i], slot, pos
+            ctx,
+            m.specs[i],
+            m.layers[i],
+            x,
+            s,
+            keys[i],
+            values[i],
+            slot,
+            pos,
+            run,
         )
         s.record(ctx, x)
 
-    device_rms_norm(ctx, x, m.output_norm, s.norm, m.specs[0].eps)
+    device_rms_norm(
+        ctx,
+        x,
+        m.output_norm,
+        s.norm,
+        m.specs[0].eps,
+        1,
+        (run - 1) * m.width(),
+    )
     device_matvec_into(ctx, m.head, s.norm, s.logits)
     if m.arch.final_softcap > 0:
         device_softcap(ctx, s.logits, m.arch.final_softcap, m.vocab())
