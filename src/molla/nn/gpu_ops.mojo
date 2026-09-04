@@ -779,12 +779,14 @@ def attend_partials(spec: AttnSpec, tokens: Int, context: Int) -> Int:
     the buffer it was given has room for, and a buffer with room for one piece
     is the single kernel path it always took.
     """
-    return (
-        tokens
-        * spec.heads
-        * _attend_chunks(spec.heads, tokens, context)
-        * (spec.head_dim + 2)
-    )
+    var chunks = _attend_chunks(spec.heads, tokens, context)
+    # A geometry that will never be cut wants no buffer at all, and one float is
+    # the smallest a `DeviceVec` will hold. That is what a prefill scratch gets,
+    # and it matters: a chunk of 512 tokens sized the way a decode is would be
+    # eight megabytes that nothing ever reads.
+    if chunks < 2:
+        return 1
+    return tokens * spec.heads * chunks * (spec.head_dim + 2)
 
 
 def attend_split_kernel[
