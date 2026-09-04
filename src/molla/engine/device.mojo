@@ -324,17 +324,21 @@ struct DeviceSession(Movable):
         self.wide = DeviceVec(ctx, rows * dev.width())
         self.x = DeviceVec(ctx, dev.width())
         self.logits = Buffer(dev.vocab())
-        self.fused = build_fused_plan(
-            ctx,
-            self.model,
-            context,
-            len(frequency_factors(host.model)) > 0,
-        )
+        # Asked before the plan is built rather than after, because building one
+        # compiles the fused kernel and that is not free in host memory. See
+        # `build_fused_plan`.
         var asked = getenv(FUSED_ENV)
         if asked == "":
             self.use_fused = fused_by_default(self.model)
         else:
             self.use_fused = asked != "0"
+        self.fused = build_fused_plan(
+            ctx,
+            self.model,
+            context,
+            len(frequency_factors(host.model)) > 0,
+            self.use_fused,
+        )
         self.pos = 0
         self.batched = False
 

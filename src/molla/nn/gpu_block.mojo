@@ -1270,14 +1270,27 @@ def _layer_records(
 
 
 def build_fused_plan(
-    ctx: DeviceContext, m: DeviceModel, context: Int, use_factors: Bool
+    ctx: DeviceContext,
+    m: DeviceModel,
+    context: Int,
+    use_factors: Bool,
+    wanted: Bool = True,
 ) raises -> FusedPlan:
     """The whole model's step table, built once when a session opens.
 
     The self test runs before this returns, because a grid that is not fully
     resident deadlocks rather than failing, and a deadlock inside a forward pass
     is a hung display rather than an error message.
+
+    `wanted` is False for a session that has decided against the fused path, and
+    then nothing is built. That is a memory decision and not a speed one:
+    sizing the grid compiles the fused kernel to ask it about occupancy, and
+    compiling it costs about 1.2 GiB of host memory, which a session that is
+    never going to launch it should not be holding. It is measured on gpc, where
+    SmolLM2 135M goes from 274 MiB resident to 1467 with the plan built.
     """
+    if not wanted:
+        return FusedPlan(ctx)
     var shape = WorkPlan(m.specs, context)
     var plan = StepPlan()
     var starts = List[Int]()

@@ -1247,6 +1247,25 @@ struct FusedPlan(Movable):
     var blocks: Int
     var records: Int
 
+    def __init__(out self, ctx: DeviceContext) raises:
+        """A plan for a session that has decided against the fused path.
+
+        Nothing is compiled and nothing is sized, which is the point of it: a
+        session that will never launch the kernel should not pay what compiling
+        it costs. `records` is zero, and a launch against a plan with no records
+        in it raises rather than doing anything quietly.
+        """
+        self.pool = 0
+        self.blocks = 0
+        self.records = 0
+        self.starts = List[Int]()
+        self.work = DeviceVec(ctx, 1)
+        self.ints = ctx.enqueue_create_buffer[DType.int64](1)
+        self.floats = ctx.enqueue_create_buffer[DType.float32](1)
+        self.sync = ctx.enqueue_create_buffer[DType.int32](3)
+        ctx.enqueue_memset(self.sync, Int32(0))
+        ctx.synchronize()
+
     def __init__(
         out self,
         ctx: DeviceContext,
