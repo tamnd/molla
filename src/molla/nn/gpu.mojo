@@ -495,19 +495,52 @@ def planar_matvec_kernel[
             o[unsafe_offset=r] = v
 
 
+comptime SPAN = 16 if CompilationTarget.is_macos() else 8
+"""How many tokens one group of threads in a matmul block carries at once.
+
+The number that decides whether prefill is bandwidth bound or compute bound. A
+block reads and dequantizes a weight value once and multiplies it into `SPAN`
+accumulators, so the weight traffic and the conversion work for a chunk of `T`
+tokens are `ceil(T / SPAN)` passes over the matrix rather than `T` of them. It
+costs `SPAN` registers of accumulator, which is what stops it growing, and
+`MM_GROUPS` is how the amortization goes past what the registers allow.
+
+The two backends want different numbers and the difference is measured and
+consistent rather than noise. Metal is 11 per cent faster at sixteen than at
+eight and CUDA is 19 per cent faster at eight than at sixteen, on both models
+that fit in cache. A macOS build targets Metal and a build anywhere else
+targets CUDA, which is why the operating system is the thing asked here.
+"""
+
+comptime PREFILL_CHUNK = 64
+"""How many prompt tokens go through the stack in one pass.
+
+A prompt is a matrix rather than a run of decodes, and this is how much of it
+is in flight at once. It trades launches against scratch: the launches for a
+prompt fall by this factor, and the attention scores grow by it, which on a
+thirty two head model at a four thousand context is 2 MiB a token. Sixty four
+is 128 times fewer launches than a token at a time and 33 MiB of scores on an
+8B, and at four passes for a five hundred token prompt the launches are no
+longer what is left.
+"""
+
 comptime MM_TILE = 32
 """Threads in a batched matmul block, which is not the matvec's tile.
 
 A quarter of it, measured. A matmul block reduces `SPAN` accumulators rather
-than one, so the tree at the end of it costs `SPAN` times what the matvec's
-does, and past a certain width the reduction is more work than the dot product
-that fed it. Thirty two threads is the best of every width from sixteen to five
-hundred and twelve on both backends and on all three models, and the losses
-either side of it are large: on a 4090 a 514 token prompt through SmolLM2 runs
-at 2734 tokens a second here, 2089 at 128 threads and 1034 at 512.
+than one, so the reduction at the end of it costs `SPAN` times what the
+matvec's does, and past a certain width the reduction is more work than the dot
+product that fed it. Thirty two threads is the best of every width from sixteen
+to five hundred and twelve on both backends and on all three models, and the
+losses either side of it are large: on a 4090 a 514 token prompt through
+SmolLM2 runs at 2734 tokens a second here, 2089 at 128 threads and 1034 at 512.
+
+It is also a warp on both backends, which the reduction relies on and which
+lets a group of threads whose tokens are all past the end of a short chunk
+leave without stranding the rest of the block.
 """
 
-comptime MM_GROUPS = 4
+comptime MM_GROUPS = PREFILL_CHUNK // SPAN
 """How many groups of `SPAN` tokens one matmul block carries.
 
 Amortization the accumulators cannot pay for. A block covers `SPAN` tokens per
@@ -520,24 +553,13 @@ The groups share the weight row rather than the registers. Each one walks the
 same columns and keeps its own accumulators, so the row is fetched from memory
 once for the block and out of the L1 for the groups behind the first, and the
 traffic for a chunk falls by this factor with no register cost at all.
-"""
 
-comptime SPAN = 16 if CompilationTarget.is_macos() else 8
-"""How many tokens one group of threads in a matmul block carries at once.
-
-The number that decides whether prefill is bandwidth bound or compute bound. A
-block reads and dequantizes a weight value once and multiplies it into `SPAN`
-accumulators, so the weight traffic and the conversion work for a chunk of `T`
-tokens are `ceil(T / SPAN)` passes over the matrix rather than `T` of them. It
-costs `SPAN * MM_TILE` floats of shared memory and `SPAN` registers of
-accumulator, and the second one is what stops it growing. `MM_GROUPS` is how
-the amortization goes past what the registers allow.
-
-The two backends want different numbers and the difference is measured and
-consistent rather than noise. Metal is 11 per cent faster at sixteen than at
-eight and CUDA is 19 per cent faster at eight than at sixteen, on both models
-that fit in cache. A macOS build targets Metal and a build anywhere else
-targets CUDA, which is why the operating system is the thing asked here.
+A whole chunk to a block, which is the number the sweeps land on from either
+side. Both backends want `SPAN * MM_GROUPS` to be the chunk exactly: on a 4090
+the 8B runs at 388 tokens a second with eight groups of eight and 262 with four
+of eight, and Metal falls off a cliff the other way when the product is twice
+the chunk. Once a block is the whole chunk, the grid is one block to an output
+row and the weight matrix is read once a chunk rather than once a block.
 """
 
 

@@ -55,6 +55,7 @@ from molla.nn.gpu import (
     EPI_GLU,
     EPI_NONE,
     MM_GROUPS,
+    PREFILL_CHUNK,
     SPAN,
     DeviceVec,
     device_matmul_into,
@@ -399,10 +400,15 @@ struct DeviceScratch(Movable):
             raise Error("a model needs a vocabulary to write logits into")
         if chunk <= 0:
             raise Error("a pass has to carry at least one token")
-        # A block of slack on everything a matmul reads, because the dead lanes
-        # of a tail block read past the last token of the chunk rather than
-        # clamping onto it. See `planar_matmul_kernel`.
-        var wide = chunk + (SPAN * MM_GROUPS if chunk > 1 else 0)
+        # Everything a matmul reads is rounded up to a whole block of tokens,
+        # because the dead lanes of a short chunk read past its last token
+        # rather than clamping onto it. See `planar_matmul_kernel`. At the
+        # shipped chunk this is exact and costs nothing, and it is only a
+        # caller asking for a smaller chunk that pays for the rounding.
+        var wide = chunk
+        if chunk > 1:
+            var block = SPAN * MM_GROUPS
+            wide = (chunk + block - 1) // block * block
         self.norm = DeviceVec(ctx, wide * spec.width)
         self.q = DeviceVec(ctx, wide * spec.q_width())
         self.heads_out = DeviceVec(ctx, wide * spec.q_width())
@@ -443,19 +449,6 @@ struct DeviceScratch(Movable):
         if len(self.trace) % width != 0:
             raise Error("the trace is not a whole number of snapshots")
         return len(self.trace) // width
-
-
-comptime PREFILL_CHUNK = 64
-"""How many prompt tokens go through the stack in one pass.
-
-A prompt is a matrix rather than a run of decodes, and this is how much of it
-is in flight at once. It trades launches against scratch: the launches for a
-prompt fall by this factor, and the attention scores grow by it, which on a
-thirty two head model at a four thousand context is 2 MiB a token. Sixty four
-is 128 times fewer launches than a token at a time and 33 MiB of scores on an
-8B, and at four passes for a five hundred token prompt the launches are no
-longer what is left.
-"""
 
 
 def _project(
@@ -733,9 +726,12 @@ def device_forward(
             + " tokens was given scratch sized for "
             + String(s.chunk)
         )
-    # A chunk wants `SPAN - 1` rows of slack past its last token, because the
-    # dead lanes of a tail matmul block read there. See `planar_matmul_kernel`.
-    var rows = run if run == 1 else run + SPAN * MM_GROUPS - 1
+    # A chunk is read a whole block of tokens at a time, so the residual stream
+    # has to hold the rounded up count and not the run. See the scratch.
+    var rows = run
+    if run > 1:
+        var block = SPAN * MM_GROUPS
+        rows = (run + block - 1) // block * block
     if x.elements() < rows * m.width():
         raise Error(
             "the residual stream is "

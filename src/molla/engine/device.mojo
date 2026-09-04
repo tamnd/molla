@@ -57,9 +57,8 @@ from molla.engine.sample import Sampler
 from molla.model.gguf import Gguf
 from molla.model.load import Weights, device_refusal, load, plan_load
 from molla.model.repack import RepackCache, model_key, open_cache
-from molla.nn.gpu import MM_GROUPS, SPAN, DeviceVec
+from molla.nn.gpu import MM_GROUPS, PREFILL_CHUNK, SPAN, DeviceVec
 from molla.nn.gpu_block import (
-    PREFILL_CHUNK,
     DeviceModel,
     DeviceScratch,
     device_forward,
@@ -230,9 +229,11 @@ struct DeviceSession(Movable):
         self.batch = DeviceScratch(
             ctx, dev.specs[0], context, dev.vocab(), chunk
         )
-        # The same rows of slack the scratch carries, for the same reason: the
+        # Rounded up the same way the scratch is, for the same reason: the
         # residual stream is what the first matmul of a layer reads.
-        self.wide = DeviceVec(ctx, (chunk + SPAN * MM_GROUPS) * dev.width())
+        var block = SPAN * MM_GROUPS
+        var rows = (chunk + block - 1) // block * block
+        self.wide = DeviceVec(ctx, rows * dev.width())
         self.x = DeviceVec(ctx, dev.width())
         self.logits = Buffer(dev.vocab())
         self.pos = 0
