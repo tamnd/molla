@@ -89,6 +89,39 @@ fleet reports while still being wide enough that a 4096 wide row is 32 elements
 of work per thread. It is a parameter of the kernel rather than a constant
 inside it so that changing it is a launch site edit and not a rewrite, which is
 the form D7 asks divergence between targets to take.
+
+The matvec launches at `MATVEC_TILE` and not at this, which is a narrower block
+on one backend. Everything else here still launches at 128.
+"""
+
+comptime MATVEC_TILE = 32 if CompilationTarget.is_macos() else TILE
+"""Threads per output row for the matvec, which is not `TILE` on Metal.
+
+128 was never measured, it was the width every other kernel here uses. Sweeping
+it in `scripts/matvec_probe.mojo` on an M4 says it is the wrong number for this
+kernel at every shape a decode runs, and by a lot:
+
+```text
+q4_k attn  4096 by 4096      t32 216 us   t64 272 us   t128 444 us
+q4_k down  4096 by 14336     t32 571 us   t64 622 us   t128 886 us
+q8_0 head  49152 by 576      t32 1209 us  t64 2091 us  t128 3857 us
+```
+
+The floor for those three, a kernel that reads the same bytes and does no
+arithmetic, is 206, 669 and 322 microseconds. So at 32 the two q4_K shapes are
+at the floor and at 128 they are twice off it, and the head, which is the shape
+a small model spends a fifth of its decode in, is three and a half times faster.
+
+Two things cost at 128 and both get worse as the row gets narrower. The
+reduction is a tree over the whole block, so its cost is the block width and not
+the work, and a 576 column row at eight values a thread is 72 threads of work,
+so 56 of the 128 arrive at that reduction with nothing in them. Neither shows up
+on a 4096 column row, which is why this was invisible on the 8B.
+
+CUDA keeps 128 until the same sweep runs on a 4090. A block there is four warps
+and a warp is 32, so the arrangement that wins on Metal is one warp a row, and
+whether that starves the scheduler is a different question on a card with 128
+resident blocks a multiprocessor. See #228.
 """
 
 
@@ -1172,17 +1205,17 @@ def device_matvec_into(
         var carries_min = has_min(w.kind)
         var form = quant_form(w.kind)
         if form == QUANT_U4 and g == 32 and carries_min:
-            _launch[TILE, 32, True, QUANT_U4](ctx, w, x, o, a, epi)
+            _launch[MATVEC_TILE, 32, True, QUANT_U4](ctx, w, x, o, a, epi)
         elif form == QUANT_S4 and g == 32 and not carries_min:
-            _launch[TILE, 32, False, QUANT_S4](ctx, w, x, o, a, epi)
+            _launch[MATVEC_TILE, 32, False, QUANT_S4](ctx, w, x, o, a, epi)
         elif form == QUANT_U5 and g == 32 and carries_min:
-            _launch[TILE, 32, True, QUANT_U5](ctx, w, x, o, a, epi)
+            _launch[MATVEC_TILE, 32, True, QUANT_U5](ctx, w, x, o, a, epi)
         elif form == QUANT_S5 and g == 32 and not carries_min:
-            _launch[TILE, 32, False, QUANT_S5](ctx, w, x, o, a, epi)
+            _launch[MATVEC_TILE, 32, False, QUANT_S5](ctx, w, x, o, a, epi)
         elif form == QUANT_S6 and g == 16 and not carries_min:
-            _launch[TILE, 16, False, QUANT_S6](ctx, w, x, o, a, epi)
+            _launch[MATVEC_TILE, 16, False, QUANT_S6](ctx, w, x, o, a, epi)
         elif form == QUANT_I8 and g == 32 and not carries_min:
-            _launch[TILE, 32, False, QUANT_I8](ctx, w, x, o, a, epi)
+            _launch[MATVEC_TILE, 32, False, QUANT_I8](ctx, w, x, o, a, epi)
         else:
             raise Error(
                 "no device matvec is compiled for quant form "
