@@ -127,7 +127,7 @@ Taken through the budget, at five stages a layer on a thirty layer model, so abo
 
 So the persistent kernel fits, and it fits with a condition that was not visible before: on CUDA the grid has to be a few hundred blocks rather than everything that is resident. That is a constraint on the fused kernel and not on the barrier, because a few hundred blocks of 128 threads is a small fraction of a 4090 and the arithmetic has to be arranged so that each block carries many output rows. It also means the residency question at the bottom of this page has an answer that cuts the other way from the one expected: the risk is not that the resident grid is too small to be worth it, it is that the resident grid is too large to synchronise cheaply.
 
-Both pieces of the mechanism compile today and one of them is missing on Metal, which is a grid chosen by hand there rather than a blocker.
+Both pieces of the mechanism compile today and one of them is missing on Metal, which is a grid chosen by hand there rather than a blocker. What gets built on them is [fused.md](fused.md).
 
 ## What MAX already has that molla wrote by hand
 
