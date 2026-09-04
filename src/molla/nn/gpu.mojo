@@ -69,6 +69,7 @@ from molla.nn.repack import (
     QUANT_S6,
     QUANT_U4,
     QUANT_U5,
+    SCALE_BYTES,
     group_shift,
     group_size,
     has_min,
@@ -379,6 +380,19 @@ def wide_float[form: Int](u: UInt32) -> Float32:
 
 
 @always_inline
+def _scale(s: Pointer[Float16, MutAnyOrigin], at: Int) -> Float32:
+    """One group scale, widened on load.
+
+    The plane is float16 and everything downstream of this is float32, and every
+    GPU in the fleet widens in the load instruction rather than in an
+    instruction after it, so the convert this looks like is not one. It is a
+    function rather than a `.cast` at each of the sixteen sites because the
+    width of a scale is one decision and it should read as one.
+    """
+    return s[unsafe_offset=at].cast[DType.float32]()
+
+
+@always_inline
 def high_shift[form: Int]() -> Int:
     """`log2` of how many values one byte of the second plane covers.
 
@@ -485,8 +499,8 @@ def planar_matvec_kernel[
     # extension a centred type needs is a constant in the subtraction either
     # way.
     var packed = w
-    var scales = w.unsafe_bitcast[Float32]()
-    var d_base = (row + planar_quant_stride[form](cols)) // 4
+    var scales = w.unsafe_bitcast[Float16]()
+    var d_base = (row + planar_quant_stride[form](cols)) // SCALE_BYTES
     var m_base = d_base + groups
 
     # A shift and not `i // group`, which is a signed divide and which Metal
@@ -499,10 +513,10 @@ def planar_matvec_kernel[
         while i < cols:
             var gi = i >> shift
             var at = row + i
-            var d = scales[unsafe_offset=d_base + gi]
+            var d = _scale(scales, d_base + gi)
             var m = Float32(0)
             comptime if with_min:
-                m = scales[unsafe_offset=m_base + gi]
+                m = _scale(scales, m_base + gi)
             comptime for k in range(MATVEC_BYTES):
                 var q = byte_float(UInt32(packed[unsafe_offset=at + k]))
                 var a = x[unsafe_offset=i + k]
@@ -543,10 +557,10 @@ def planar_matvec_kernel[
         while i < cols:
             var gi = i >> shift
             var at = row + (i >> 1)
-            var d = scales[unsafe_offset=d_base + gi]
+            var d = _scale(scales, d_base + gi)
             var m = Float32(0)
             comptime if with_min:
-                m = scales[unsafe_offset=m_base + gi]
+                m = _scale(scales, m_base + gi)
             comptime for k in range(MATVEC_STEP // 2):
                 var b = UInt32(packed[unsafe_offset=at + k])
                 var lo = nibble_float[form](b & 0xF)
@@ -584,10 +598,10 @@ def planar_matvec_kernel[
         while i < cols:
             var gi = i >> shift
             var at = row + (i >> 1)
-            var d = scales[unsafe_offset=d_base + gi]
+            var d = _scale(scales, d_base + gi)
             var m = Float32(0)
             comptime if with_min:
-                m = scales[unsafe_offset=m_base + gi]
+                m = _scale(scales, m_base + gi)
             comptime for k in range(MATVEC_STEP // 2):
                 var b = UInt32(packed[unsafe_offset=at + k])
                 # `i` is a multiple of the step, so when the step covers a whole
@@ -812,8 +826,8 @@ def planar_matmul_kernel[
     var row = r * stride
     var groups = cols // group
     var packed = w
-    var scales = w.unsafe_bitcast[Float32]()
-    var d_base = (row + planar_quant_stride[form](cols)) // 4
+    var scales = w.unsafe_bitcast[Float16]()
+    var d_base = (row + planar_quant_stride[form](cols)) // SCALE_BYTES
     var m_base = d_base + groups
 
     comptime shift = group_shift(group)
@@ -850,9 +864,9 @@ def planar_matmul_kernel[
         while i < cols:
             var gi = i >> shift
             var q = byte_float(UInt32(packed[unsafe_offset=row + i]))
-            var d = scales[unsafe_offset=d_base + gi] * q
+            var d = _scale(scales, d_base + gi) * q
             comptime if with_min:
-                var m = scales[unsafe_offset=m_base + gi]
+                var m = _scale(scales, m_base + gi)
                 for k in range(SPAN):
                     var a = x[unsafe_offset=at0 + k * cols + i]
                     acc[k] += d * a + m * a
@@ -865,11 +879,11 @@ def planar_matmul_kernel[
         while i < cols:
             var gi = i >> shift
             var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
-            var d = scales[unsafe_offset=d_base + gi]
+            var d = _scale(scales, d_base + gi)
             var lo = d * nibble_float[form](b & 0xF)
             var hi = d * nibble_float[form](b >> 4)
             comptime if with_min:
-                var m = scales[unsafe_offset=m_base + gi]
+                var m = _scale(scales, m_base + gi)
                 for k in range(SPAN):
                     var a0 = x[unsafe_offset=at0 + k * cols + i]
                     var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
@@ -896,7 +910,7 @@ def planar_matmul_kernel[
             var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
             var h = UInt32(packed[unsafe_offset=high + (i >> hshift)])
             var s0 = UInt32((i & (hper - 1)) * hbits)
-            var d = scales[unsafe_offset=d_base + gi]
+            var d = _scale(scales, d_base + gi)
             var lo = d * wide_float[form](
                 (b & 0xF) | (((h >> s0) & hmask) << 4)
             )
@@ -904,7 +918,7 @@ def planar_matmul_kernel[
                 (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
             )
             comptime if with_min:
-                var m = scales[unsafe_offset=m_base + gi]
+                var m = _scale(scales, m_base + gi)
                 for k in range(SPAN):
                     var a0 = x[unsafe_offset=at0 + k * cols + i]
                     var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
@@ -1254,8 +1268,8 @@ def planar_mma_kernel[
     var live_row = r0 + wr < rows
     var row = (r0 + wr) * stride if live_row else 0
     var groups = cols // group
-    var scales = w.unsafe_bitcast[Float32]()
-    var d_base = (row + planar_quant_stride[form](cols)) // 4
+    var scales = w.unsafe_bitcast[Float16]()
+    var d_base = (row + planar_quant_stride[form](cols)) // SCALE_BYTES
     var m_base = d_base + groups
     comptime shift = group_shift(group)
 
@@ -1276,11 +1290,11 @@ def planar_mma_kernel[
             )
 
         var gi = (k0 + wk) >> shift
-        var d = scales[unsafe_offset=d_base + gi] if live_row else Float32(0)
+        var d = _scale(scales, d_base + gi) if live_row else Float32(0)
         var m = Float32(0)
         comptime if with_min:
             if live_row:
-                m = scales[unsafe_offset=m_base + gi]
+                m = _scale(scales, m_base + gi)
         comptime if form == QUANT_I8:
             var q = w.unsafe_offset(row + k0 + wk).unsafe_load[
                 width=MMA_KPT

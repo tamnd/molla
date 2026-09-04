@@ -344,7 +344,14 @@ def test_sources(mut suite: Suite, path: String) raises:
             "while the file size stays on record " + names[i],
         )
         grew += one.length - one.bytes
-    suite.check(grew > 0, "the planar form of a quantized weight is bigger")
+    # Zero, and that is the point rather than a coincidence. A q8_0 block is 32
+    # bytes of quant and a float16 scale and a q4_0 block is 16 and the same
+    # scale, and the planar row for both is now exactly those bytes in two
+    # planes instead of one block. The layout costs nothing over the file for
+    # these two types, which was not true of any version of it before #182.
+    suite.check(
+        grew == 0, "the planar form of q4_0 and q8_0 is the size of the file"
+    )
 
     # The f32 tensor has no planar form, is not in the cache, and has to still
     # come from the file. A plan that sent every tensor to the cache would be

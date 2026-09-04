@@ -290,18 +290,18 @@ def test_geometry(mut suite: Suite) raises:
         "and six bits is a nibble plane and a two bit one",
     )
 
-    # The quant plane at the type's own width, plus one scale plane, or two
-    # planes when there is a minimum.
+    # The quant plane at the type's own width, plus one float16 scale plane, or
+    # two planes when there is a minimum.
     suite.check(
-        planar_row_bytes(Q_Q8_0, 256) == 256 + 8 * 4,
+        planar_row_bytes(Q_Q8_0, 256) == 256 + 8 * 2,
         "a centred row is the quants and one scale plane",
     )
     suite.check(
-        planar_row_bytes(Q_Q4_K, 256) == 128 + 8 * 4 + 8 * 4,
+        planar_row_bytes(Q_Q4_K, 256) == 128 + 8 * 2 + 8 * 2,
         "and a row with a minimum carries a second plane",
     )
     suite.check(
-        planar_row_bytes(Q_Q6_K, 256) == 128 + 64 + 16 * 4,
+        planar_row_bytes(Q_Q6_K, 256) == 128 + 64 + 16 * 2,
         "q6_k has twice the scales and no minimum",
     )
     for i in range(len(kinds)):
@@ -319,12 +319,28 @@ def test_geometry(mut suite: Suite) raises:
     suite.check(raised, "a row that is not whole groups has no planar size")
 
 
-def test_round_trip(mut suite: Suite) raises:
-    """Repack and decode gives back exactly what the blocks decode to.
+def _exact(kind: Int) -> Bool:
+    """Whether this type round trips through the planar layout bit for bit.
 
-    Exactly, with no tolerance. Every step of the fold is either an integer
-    operation or a float32 multiply of the same two numbers the decoder
-    multiplies, so any difference at all is a bug and not rounding.
+    Five of the eight do. Their scale is a float16 out of the block and it goes
+    into a float16 plane, so nothing about it moves. The three k types do not,
+    because what their planes hold is a product of that float16 and a small
+    integer, and a product needs more mantissa than either factor. That is the
+    one lossy step in the whole module and this is where it is named.
+    """
+    return kind != Q_Q4_K and kind != Q_Q5_K and kind != Q_Q6_K
+
+
+def test_round_trip(mut suite: Suite) raises:
+    """Repack and decode gives back what the blocks decode to.
+
+    Exactly for the five types `_exact` names, because every step of their fold
+    is an integer operation or a float32 multiply of the same two numbers the
+    decoder multiplies. Within a bound for the three k types, whose scale is
+    rounded to float16 once at repack time. The bound is 2^-11 of the largest
+    magnitude in the run, which is what one rounding of one factor can be worth,
+    and the observed worst case is well inside it: see docs/validation/logits.md
+    for the same question asked of a whole model.
     """
     suite.group("nn.repack decodes to the same numbers")
 
@@ -342,17 +358,29 @@ def test_round_trip(mut suite: Suite) raises:
         var got = _floats(n)
         planar_run(kind, _ptr(planar), 0, n, got, 0)
 
-        var same = True
+        var peak = Float32(0)
+        var worst = Float32(0)
         var first = -1
         for j in range(n):
-            if got[j] != want[j]:
-                same = False
-                if first < 0:
-                    first = j
+            var a = want[j] if want[j] >= 0 else -want[j]
+            if a > peak:
+                peak = a
+            var gap = got[j] - want[j]
+            if gap < 0:
+                gap = -gap
+            if gap > worst:
+                worst = gap
+            if gap != 0 and first < 0:
+                first = j
+        var bound = Float32(0) if _exact(kind) else peak / 2048.0
         suite.check(
-            same,
+            worst <= bound,
             _label(kind)
-            + " repacked and decoded is bit for bit the blocks decoded"
+            + (
+                " repacked and decoded is bit for bit the blocks decoded" if _exact(
+                    kind
+                ) else " repacked and decoded is within one float16 rounding"
+            )
             + ("" if first < 0 else ", first differs at " + String(first)),
         )
 
@@ -362,7 +390,7 @@ def test_round_trip(mut suite: Suite) raises:
         unpack_run(kind, LAYOUT_PLANAR, _ptr(planar), 0, n, by_layout, 0)
         var routed = True
         for j in range(n):
-            if by_layout[j] != want[j]:
+            if by_layout[j] != got[j]:
                 routed = False
         suite.check(
             routed, "and unpack_run routes " + _label(kind) + " by layout"

@@ -46,6 +46,7 @@ from molla.nn.gpu import (
     ACT_SILU,
     TILE,
     DeviceVec,
+    _scale,
     activate,
     byte_float,
     high_shift,
@@ -61,6 +62,7 @@ from molla.nn.repack import (
     QUANT_S6,
     QUANT_U4,
     QUANT_U5,
+    SCALE_BYTES,
     group_shift,
     group_size,
     has_min,
@@ -341,9 +343,9 @@ def planar_row_kernel[
     var row = Int(ids[unsafe_offset=ty]) * Int(stride_dev)
     var out_at = ty * cols
     var packed = w
-    var scales = w.unsafe_bitcast[Float32]()
+    var scales = w.unsafe_bitcast[Float16]()
     var groups = cols // group
-    var d_base = (row + planar_quant_stride[form](cols)) // 4
+    var d_base = (row + planar_quant_stride[form](cols)) // SCALE_BYTES
     var m_base = d_base + groups
 
     # A shift and not a divide, for the reason `group_shift` gives. This one is
@@ -375,9 +377,9 @@ def planar_row_kernel[
             q = wide_float[form](
                 ((b >> UInt32((i & 1) * 4)) & 0xF) | (((h >> s) & hmask) << 4)
             )
-        var v = scales[unsafe_offset=d_base + gi] * q
+        var v = _scale(scales, d_base + gi) * q
         comptime if with_min:
-            v += scales[unsafe_offset=m_base + gi]
+            v += _scale(scales, m_base + gi)
         o[unsafe_offset=out_at + i] = v
         i += stride
 
