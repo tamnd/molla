@@ -282,6 +282,62 @@ The second reason is the launches, and it is the one that decides. Quantizing an
 
 So the integer path is worth roughly a further 1.3 times on the four bit shapes on top of what is landing here, and it costs a regression on the smallest model that has to be paid off first. Three of its four launches per layer disappear if the norm and the activation function write the quantized form as they go, which is #168. That is the order: this change now, because it is free everywhere and costs nothing anywhere, then #168, then the integer path on top of it with the launches already gone. The branch is kept rather than deleted so that the second half of it does not have to be rediscovered.
 
+## The block width, which was never measured at all
+
+The section above ends by asking whether the 72 per cent of peak holds once the rows are half as long, and says that if it does not then the block reduction is the next thing to look at. It does not, and it is.
+
+`TILE` has been 128 since the matvec was written. It was not chosen for the matvec, it is the width every other kernel in `gpu_ops.mojo` launches at, and the matvec took it because it was there. The probe grew a block width parameter and the answer is that 128 is the wrong number on Metal at every shape a decode runs.
+
+Microseconds a launch, best of five batches of sixteen, one run on the M4 at a load average of 3.7. The floor is a kernel that reads the same bytes and does no arithmetic with them.
+
+| shape | t32 | t64 | t128 | floor |
+| --- | --- | --- | --- | --- |
+| q4_K 4096 by 4096 | 190 | 236 | 334 | 192 |
+| q4_K 4096 by 14336 | 504 | 538 | 638 | 574 |
+| q8_0 192 by 576 | 26 | | 30 | 25 |
+| q8_0 576 by 576 | 29 | | 39 | 27 |
+| q8_0 1536 by 576 | 40 | | 89 | 31 |
+| q8_0 576 by 1536 | 33 | | 42 | 31 |
+| q8_0 49152 by 576 | 818 | | 2769 | 315 |
+| q8_0 4096 by 14336 | 651 | | 600 | 558 |
+
+Two things cost at 128 and both get worse as the row gets narrower. The reduction is a tree over the whole block, so what it costs is the block width and not the work in it. And a 576 column row at eight values a thread is 72 threads of work, so 56 of the 128 threads arrive at that reduction with nothing in them. The last row is the control: a byte wide type at a 14336 column row does not care about the width and if anything prefers 128 by eight per cent, which is what says this is about the shape of the row and not about the arithmetic in the loop.
+
+The largest single number on that table is the output head. 49152 by 576 is a fifth of what a SmolLM2 decode reads and it was running at a tenth of the floor.
+
+End to end on the M4, the same binary either side of the one constant, decode of 128 tokens after a 1121 token prompt, best of two alternating runs at a load average between 3.3 and 7:
+
+| model | t128 | t32 | tokens a second |
+| --- | --- | --- | --- |
+| SmolLM2 135M q8_0 | 3129 ms | 2296 ms | 40.9 to 55.7 |
+| Qwen 2.5 0.5B q4_K_M | 5025 ms | 2761 ms | 25.5 to 46.4 |
+| Llama 3.1 8B q4_K_M | 7115 ms | 4781 ms | 4.5 to 6.7, at 32 tokens |
+
+16 and 32 tie on all three models and 64 is already worse, so the constant is 32, which is also the Metal simd width. That looked like it mattered for what comes next as well as for what landed, since at one simd group a row the reduction can become a shuffle with no shared memory and no barrier in it at all. The section after this one is that shuffle being written and measured, and it is worth nothing.
+
+It is not exact and it is not meant to be. Nothing about the arithmetic changed, but a partial sum belongs to a different thread than it did and the reduction tree over it is two levels shallower, so the additions happen in a different order. The whole logit corpus was run on Metal on both widths. All thirteen cases pass on both, the same eleven of them report the same number of swaps, the one case with a greedy pick different from llama.cpp picks the same token at the same distance, and every figure moves in the fifth or sixth significant digit. The worst case in the corpus reads 0.029897989 at 32 against 0.029897009 at 128, against a tolerance of 8e-2.
+
+CUDA keeps 128 until the same sweep runs on a 4090, which is #228. A block there is four warps of 32, so the arrangement that wins on Metal is one warp a row, and whether that starves a scheduler that holds many more blocks a multiprocessor than an M4 does is a real question rather than a formality.
+
+## The shuffle that was worth nothing, and what that says
+
+Once a matvec block is one simd group the reduction over it does not need shared memory. `planar_matmul_kernel` has reduced through `lane_group_sum` since `MM_TILE` was measured at 32, and the objection written against doing the same in the matvec, that a shuffle needs the warp width and that is a target constant in a kernel, is not true: `tile` is already a parameter and `WARP_SIZE` is what the target reports, so `tile <= WARP_SIZE` is the kernel asking whether its own block still spans more than one warp and it resolves at compile time at every launch site.
+
+So it was written that way. Five rounds through shared memory and the six barriers around them become five shuffles, and the block stops holding a scratch array it touches only in its last few instructions. On the same protocol as the table above, three alternating runs of each binary at a load average between 2.8 and 5.9:
+
+| model | tree | shuffle |
+| --- | --- | --- |
+| SmolLM2 135M q8_0 | 2260, 2262, 2282 ms | 2260, 2286, 2323 ms |
+| Qwen 2.5 0.5B q4_K_M | 2733, 2816, 3268 ms | 2704, 2933, 3112 ms |
+
+That is a wash on both, inside the spread of the runs either way, so the change was reverted rather than shipped. It is not free: it changes the order the partial sums are added in, and paying for that with nothing in return is a worse trade than leaving the tree alone.
+
+The useful part is what the negative result rules out. Narrowing the block from 128 to 32 was worth 1.4 to 1.8 times, and removing the reduction underneath it entirely is worth zero, so what 128 was costing was never the reduction itself. It was the 56 of 128 threads that arrived at a 576 column row with no work in them. Once every thread in the block has something to do, the reduction over it is not on the critical path at all.
+
+It also says the matvec is close to done as a place to look. The three models fit a straight line in bytes read per token: 136 MiB at 17.6 ms, and 4.6 GiB at about 149 ms, which is a slope of 29.4 ms a GiB and an intercept of 13.6 ms a token that does not depend on the model at all. The slope is 34 GB/s against an M4 that does about 120, and the intercept is most of what a small model spends. A decode layer here is a norm, three projections, two ropes, an attend, an output projection and an add, then a norm, a gate, an up, an activation, a down and an add, so a thirty layer token is around 450 launches, and `scripts/launch_probe.mojo` puts a launch on a quiet M4 at 19.6 us with 17.6 of that on the host thread before the device is told anything. 450 launches is 8.8 ms, which is the same order as the 13.6 ms the fit asks for and most of a 17.6 ms token.
+
+Decode on the small models is launch bound. That is why the shuffle did nothing, and it is why the remaining distance to a rival is not in this kernel. It is in how many times a token crosses the driver, which is #170 stage two.
+
 ## Order
 
 Pack the quant plane first and leave the scales at float32. That is 9574 MiB to 6475 MiB on the 8B, it is bit exact against the current layout because the integers written are the same integers, and it can be verified by running the corpus with the old cache and the new one and comparing logits with no tolerance at all.
@@ -298,4 +354,6 @@ Fix `scripts/bench.py` to report `phys_footprint` on macOS rather than `ru_maxrs
 
 Whether a repack cache should exist at all once the layout is within ten per cent of the file. At 4.5 bits for q4_K the honest alternative is reading ggml blocks on the device directly, which is what llama.cpp's own CUDA and Metal kernels do, and it would remove the cache, the second copy on disk, the load stage that reads it, and the layout version problem in one move. The cost is that the eight per type unpacking loops come back, on the device this time. MAX's own GPU quantized matmul, `matmul_gpu_qint4` at `quantization/qmatmul_gpu.mojo:1773`, takes packed int4 with a group size, which is evidence that packed is the shape a GPU kernel wants and not evidence either way about blocks. This is worth a measurement before M3 and not a rewrite now.
 
-Whether the 72 per cent of peak bandwidth holds once the rows are half as long. A shorter row is less work to amortise the block reduction over, and the reduction at `gpu.mojo:300` is a shared memory tree rather than a warp shuffle. If the packed kernel lands under 72 per cent then that reduction is the next thing to look at.
+Whether the 72 per cent of peak bandwidth holds once the rows are half as long. A shorter row is less work to amortise the block reduction over, and the reduction is a shared memory tree rather than a warp shuffle. If the packed kernel lands under 72 per cent then that reduction is the next thing to look at. Answered twice, in the two sections above. It does not hold, by a factor of ten at the narrowest shape, and the fix was the block width rather than the reduction: the shuffle was written, measured and reverted, because with a block that is one simd group wide the reduction is not what the kernel is paying for.
+
+What the same sweep says on CUDA, which is #228 and needs a 4090 that is answering ssh.
