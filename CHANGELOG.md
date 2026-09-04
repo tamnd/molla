@@ -8,7 +8,7 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 The decode matvec on Metal takes eight values a thread instead of two. That is the whole change and it is worth 1.17, 1.32 and 1.89 times on the three models in the bench set, in the order of their sizes. It came out of answering #203, which asked for something else.
 
-#203 asked for the nibble masks from the Metal q4_K matvec in llama.cpp: read four values out of a `uint16`, let them come out sixteen and two hundred and fifty six and four thousand and ninety six times too large, and correct that in the scale so no shift is ever issued. The masks change two things at once, the extraction and how many values a thread carries, and a control that changes only the second one gets everything the masks get and more. So the shifts were never what the loop was paying for.
+What #203 asked for is the nibble masks from the Metal q4_K matvec in llama.cpp: read four values out of a `uint16`, let them come out sixteen and two hundred and fifty six and four thousand and ninety six times too large, and correct that in the scale so no shift is ever issued. The masks change two things at once, the extraction and how many values a thread carries, and a control that changes only the second one gets everything the masks get and more. So the shifts were never what the loop was paying for.
 
 At eight values a thread the Metal decode matvec is within ten per cent of a variant that does the loads and no arithmetic at all, which is as far as this kernel goes. What is left on that backend is the number of bytes it reads and the number of times it is launched, and both of those are other issues with numbers on them now.
 
