@@ -4,6 +4,22 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-09-04
+
+The five and six bit types are stored at five and six bits. Before this, `quant_form` widened q5_0, q5_1, q5_K and q6_K to a byte a value, so a file that held six bits was read at eight for the whole life of the process. A planar row for those types is now a nibble plane followed by a high plane of one or two bits a value, which is the shape ggml uses inside a block and the shape the four bit types already had here.
+
+It is worth a third off decode on Llama 3.1 8B q4_K_M on Metal even though it makes the repack cache only 5.7 per cent smaller, and the two numbers are different for a reason worth knowing. The tensors it reaches in a q4_K_M file are the 33 q6_K ones, which are `ffn_down` and `attn_v`, and `ffn_down` is the widest matrix in a layer. The share of the bytes a token reads that moved from eight bits to six is much larger than the share of the file that did.
+
+Every value the planes assemble is the value the byte held. The offset that makes q5_0 and q6_K signed comes off in the magic number subtraction the decode was already doing, so nothing about the terms the dot product sums changed, and the logit corpus is unchanged on both backends.
+
+### Changed
+
+- q5_0, q5_1, q5_K and q6_K repack to bit planes instead of a byte a value. A row is `5 * cols / 8` bytes at five bits and `3 * cols / 4` at six, both of which are a multiple of four for every row width molla accepts, so the scale planes stay aligned without padding. `LAYOUT_VERSION` goes to 3, which invalidates existing repack caches.
+- On an M4, the repack cache for Llama 3.1 8B q4_K_M goes 6474 to 6108 MiB and Qwen 2.5 0.5B goes 663 to 512 MiB. A locally requantized pure q6_K 8B, which is the case the layout reaches hardest, goes 9572 to 7658 MiB and 393 to 266 ms a token.
+- On a 4090 the 8B holds 366 MiB less on the card and 128 MiB less on the host, decode goes 85.8 to 89.1 and prefill goes 377.3 to 366.3. The prefill cost is real and not noise, and [docs/validation/layout.md](docs/validation/layout.md) says what it is: the wide path does two loads a pass where the nibble path does one. The q8_0 control moved 4 per cent between the same two builds in the same sitting, so the two small models are inside the noise on time and outside it on memory.
+- The wide matvec and matmul step by the same `MATVEC_STEP` and 2 the nibble paths beside them use, rather than by a whole high byte. A whole high byte is the natural shape on Metal and costs occupancy on CUDA, where the first cut of this took 4090 prefill on Qwen from 4895 to 2937 tokens a second. Computing the high index and shift a pass constant folds back to the hoisted form wherever the step covers a whole byte, so both backends get the loop they want out of one body.
+- `tests/test_repack.mojo` gains a device check that runs all eight repackable types through `device_matvec` and compares against `planar_row_dot` over the same host mapping, on whichever backend the suite is running.
+
 ## [0.4.7] - 2026-09-04
 
 The decode matvec on Metal takes eight values a thread instead of two. That is the whole change and it is worth 1.17, 1.32 and 1.89 times on the three models in the bench set, in the order of their sizes. It came out of answering #203, which asked for something else.

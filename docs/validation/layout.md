@@ -163,6 +163,20 @@ The 8B is the case worth reading. The cache is 5.7 per cent smaller and decode i
 
 Qwen is the other case and it is there because the file is misnamed. It says q4_K_M and `molla gguf` reports 133 q5_0 tensors against 14 q4_K, so almost the whole model was on the widened path and almost the whole model moved.
 
+On a 4090 it is a different shape of result, and the memory is the part that carries. Both builds, six runs, one sitting, `scripts/bench.py` at the same 512 and 128 the gate uses, the load between 1.4 and 2.0 the whole way through.
+
+| model | prefill before | after | decode before | after | card before | after |
+| --- | --- | --- | --- | --- | --- | --- |
+| SmolLM2 135M | 10489.8 | 10280.0 | 275.3 | 263.9 | 656 MiB | 656 MiB |
+| Qwen 2.5 0.5B | 5039.2 | 4942.3 | 297.7 | 297.7 | 1110 MiB | 960 MiB |
+| Llama 3.1 8B q4_K_M | 377.3 | 366.3 | 85.8 | 89.1 | 7404 MiB | 7038 MiB |
+
+SmolLM2 is the control and it is the row to read first. It is q8_0 throughout, this change cannot reach it, and it still moved 4 per cent on decode and 2 per cent on prefill between two builds that do the identical thing to it. That is the noise floor on the small models, and it is why the Qwen row is written down as no timing change rather than as a win: an earlier sitting had the same pair at 294 against 307 and this one has them equal, which means neither number is a measurement of anything. The Qwen memory is, and it is 150 MiB.
+
+The 8B is outside that floor in both directions. Prefill costs 2.9 per cent, decode gains 3.8, and each of those is three runs a side clustered within a few tenths of a per cent with a gap between the clusters ten times wider. Prefill on CUDA is matmul bound and the wide path does two loads a pass where the nibble path does one, so the second plane is a second stream to carry. Decode is bound by the bytes and the bytes went down. The card holds 366 MiB less and the host holds 128 MiB less, so the trade is worth taking, but the prefill side of it is a real cost and not a rounding.
+
+That gap is also the whole reason the loop steps the way it does. The first cut walked a whole high byte a pass, eight values at five bits, which is the natural shape on Metal and takes 4090 prefill on Qwen from 4895 to 2937 tokens a second. The shipped loop steps by the same `MATVEC_STEP` and 2 the nibble path beside it uses and computes the high index and shift a pass, which constant folds back to the hoisted form wherever the step covers a whole high byte, so Metal keeps its shape and CUDA keeps its occupancy.
+
 This is the change that makes the layout worth what the table above says. It is also the last one that is bit exact: every value the planes assemble is the value the byte held, the offset that makes it signed comes off in the subtraction the magic number was doing anyway, and the corpus logits are the corpus logits. #182, the float16 scale planes, is the one that moves a number.
 
 ## What was in the way, on Metal
