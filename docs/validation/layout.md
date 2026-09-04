@@ -364,6 +364,34 @@ So on CUDA the small models are held by the fused kernel's grid and barriers, an
 
 Metal is a single path, since `fused_by_default` is False there whatever the model, so the fit earlier on this page is comparing like with like and stands as written.
 
+## What the probe cannot see
+
+Every number on this page above this line came out of `scripts/matvec_probe.mojo`, which builds one tensor of a given shape and times five passes over it. On an M4 that is a fair model of a decode. On a 4090 it is not, and the tell was in the output the whole time: the probe reports its loads only variant at 1774 GB/s on the down projection shape and 1854 GB/s on a rerun, and a 4090 has 1008 GB/s of memory. A kernel cannot read memory faster than the memory goes. What it can do is read a 35 MiB tensor that has been sitting in a 72 MB L2 cache since the pass before, and that is what the probe is timing.
+
+So on that card the probe measures an L2 resident kernel, where the instructions a value costs are most of it, and a decode on any model large enough to need this work measures an HBM resident one, where they are not. `scripts/mem_probe.mojo`, which sweeps 2048 MiB and therefore cannot be cached, reads 901 GB/s at a 1024 byte row one byte a thread, which is the access shape the matvec uses. The two probes are not measuring the same machine and the difference is a factor of two.
+
+This is checkable rather than a caution, and #202 is what checked it.
+
+## What the integer activations were worth
+
+Issue #202 was written on the probe's reading. Quantize the activation vector to a signed byte a value with a float32 scale a group of 32, multiply both sides as integers into an `Int32` for a run of eight, and convert once at the end of the run. The probe on a 4090 says that is worth 21 per cent at the down projection shape, 33 microseconds against 26, and it says the same thing at every shape and every block width in the sweep.
+
+The decode says otherwise. Llama 3.1 8B q4_K_M on the 4090, 128 tokens from a 1121 token prompt, three runs of each, unfused because at 4.6 GiB it is the one model of the three that is:
+
+| activations | decode | a token |
+| --- | --- | --- |
+| float, as shipped | 1665, 1659, 1673 ms | 13.01 ms |
+| quantized, and the matvec still float | 1702, 1707, 1704 ms | 13.31 ms |
+| quantized, and the matvec integer | 1643, 1647, 1648 ms | 12.86 ms |
+
+The middle row is the control and it is what makes the other two readable. It runs the quantizer and then throws the result away, so it prices the four extra launches a layer on their own: 0.30 ms a token, or 2.3 per cent. Against it, the integer matvec itself is worth 58 ms over 128 tokens, which is 3.4 per cent. Net of the launches it pays for, the whole change is 1.2 per cent.
+
+Twenty one per cent at the kernel and three at the model is the L2 gap and nothing else. The arithmetic the integer path removes is real, and in a decode it was already hiding under a load that had not arrived. The 8B's matvec runs at the 630 GB/s the fit two sections above gives it, against the 901 the same access shape gets from a buffer too large to cache, so two thirds of the achievable bandwidth is what it gets and the missing third is not instructions. Removing all of the arithmetic would be worth 3.4 per cent and removing none of the gap.
+
+So #202 is answered rather than implemented, the same way #203 was, and for a stricter reason: #203 found the Metal kernel at the byte floor, and this finds the CUDA kernel at a bandwidth floor it does not reach for a reason the probe cannot see. The branch is in the history and the negative is here.
+
+What it leaves behind is the number worth chasing. The 8B is at 70 per cent of the bandwidth the card gives this access shape, on the path where the bus is most of the token, and that is a third of a token rather than a fortieth of one.
+
 ## Order
 
 Pack the quant plane first and leave the scales at float32. That is 9574 MiB to 6475 MiB on the 8B, it is bit exact against the current layout because the integers written are the same integers, and it can be verified by running the corpus with the old cache and the new one and comparing logits with no tolerance at all.
@@ -382,4 +410,6 @@ Whether a repack cache should exist at all once the layout is within ten per cen
 
 Whether the 72 per cent of peak bandwidth holds once the rows are half as long. A shorter row is less work to amortise the block reduction over, and the reduction is a shared memory tree rather than a warp shuffle. If the packed kernel lands under 72 per cent then that reduction is the next thing to look at. Answered twice, in the two sections above. It does not hold, by a factor of ten at the narrowest shape, and the fix was the block width rather than the reduction: the shuffle was written, measured and reverted, because with a block that is one simd group wide the reduction is not what the kernel is paying for.
 
-What the same sweep says on CUDA, which is #228 and needs a 4090 that is answering ssh.
+What the same sweep says on CUDA, which was #228 and is answered above, on a 4090 that started answering ssh again.
+
+Why the 8B reads 630 GB/s where the same access shape reads 901 from a buffer that cannot be cached. It is not the arithmetic, which the section above priced at three per cent of a token, and it is not the block width, which is flat at that shape. What is left is occupancy and the order rows are visited in, and it is worth a third of a token on the model where the bus is most of the token, so it is the largest thing this page has found and has not explained.

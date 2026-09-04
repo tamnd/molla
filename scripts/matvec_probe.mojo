@@ -12,6 +12,26 @@ that the piece can be priced. The baseline is a copy of the shipped kernel
 rather than a call to it, so that all of them read the same way and differ only
 where the comment says.
 
+## What it cannot tell you
+
+The tensors here are tens of mebibytes and every variant reads the same one five
+times in a row, so on a card with a large last level cache the second pass and
+the three after it are not reading memory. A 4090 has 72 MB of L2 and the widest
+shape below is 59 MiB, so on that card every number is an L2 number, and the way
+to see it in the output is to compare the loads only variant against the card:
+it reports 1774 GB/s where the card has 1008 GB/s of memory, which is not a
+kernel being fast.
+
+That does not make the readings wrong, it makes them readings about instructions
+rather than about bytes, and a decode on a model too large to cache is the other
+one. The two are a factor of two apart and a change worth twenty per cent here
+was worth three there. See `scripts/mem_probe.mojo` for the same access shapes
+over a buffer that cannot be cached, and the two sections about #202 in
+[docs/validation/layout.md](../docs/validation/layout.md) for what happened when
+that difference was not noticed.
+
+An M4 has no cache of that size and this problem is not on it.
+
 Usage:
 
     mojo run -I src scripts/matvec_probe.mojo
