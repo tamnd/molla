@@ -72,7 +72,7 @@ Above the kernels there is one more thing to get right and it does not look like
 A 514 token prompt and 64 decoded tokens on a 4090, three runs, molla before and after:
 
 | model | prefill before | prefill after | ttft before | ttft after |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | SmolLM2 135M Q8_0 | 358 tok/s | 9018 tok/s | 1434 ms | 57 ms |
 | Qwen2.5 0.5B Q4_K_M | 398 tok/s | 4673 tok/s | 1291 ms | 110 ms |
 | Llama 3.1 8B Q4_K_M | 100 tok/s | 369 tok/s | 5143 ms | 1397 ms |
