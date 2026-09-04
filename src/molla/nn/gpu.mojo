@@ -53,6 +53,7 @@ from std.memory import AddressSpace, bitcast, stack_allocation
 from std.sys.info import CompilationTarget, has_accelerator
 
 from max.gpu import barrier
+from max.gpu.compute.mma import mma
 from max.gpu.compute.arch.mma_apple import (
     _mma_apple_8x8,
     apple_mma_load_8x8,
@@ -359,6 +360,42 @@ def byte_float(u: UInt32) -> Float32:
     return bitcast[DType.float32, 1](MAGIC | (u ^ 0x80)) - Float32(8388736.0)
 
 
+@always_inline
+def write_epilogue(
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+    out_at: Int,
+    r: Int,
+    v: Float32,
+):
+    """The tail of every matmul kernel: bias or gate, then store or accumulate.
+
+    One copy rather than one per kernel. There are four kernels sharing this now
+    and the epilogue is the only part of them that has to agree exactly, since
+    a prefill and a decode of the same prompt are checked against each other to
+    a relative 2e-4 and a difference here would be a difference in the answer
+    rather than in the speed.
+
+    `out_at` is the index into the output and `r` is the row, which for a bias
+    is the index into `aux` and for a gate is not, because a gate is a whole
+    other output tensor of the same shape.
+    """
+    var got = v
+    if epi & EPI_BIAS != 0:
+        got += aux[unsafe_offset=r]
+    elif epi & EPI_GLU != 0:
+        var g = aux[unsafe_offset=out_at]
+        if epi & ACT_BIT != 0:
+            got = activate[ACT_GELU](got) * g
+        else:
+            got = activate[ACT_SILU](got) * g
+    if epi & EPI_ADD != 0:
+        o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + got
+    else:
+        o[unsafe_offset=out_at] = got
+
+
 def planar_matvec_kernel[
     tile: Int, group: Int, with_min: Bool, form: Int
 ](
@@ -485,19 +522,10 @@ def planar_matvec_kernel[
         barrier()
         step //= 2
     if t == 0:
-        var v = part[unsafe_offset=0]
-        var epi = Int(epi_dev)
-        if epi & EPI_BIAS != 0:
-            v += aux[unsafe_offset=r]
-        elif epi & EPI_GLU != 0:
-            if epi & ACT_BIT != 0:
-                v = activate[ACT_GELU](v) * aux[unsafe_offset=r]
-            else:
-                v = activate[ACT_SILU](v) * aux[unsafe_offset=r]
-        if epi & EPI_ADD != 0:
-            o[unsafe_offset=r] = o[unsafe_offset=r] + v
-        else:
-            o[unsafe_offset=r] = v
+        # One token, so the index into the output and the row are the same
+        # number, which is why a gate reads `aux[r]` here and `aux[out_at]`
+        # there and both are the same read.
+        write_epilogue(o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
 
 
 comptime SPAN = 16 if CompilationTarget.is_macos() else 8
@@ -719,21 +747,7 @@ def planar_matmul_kernel[
     # One thread a token rather than one thread for the whole group, so the
     # tail is `SPAN` threads doing one epilogue each.
     if t < live:
-        var v = got
-        var epi = Int(epi_dev)
-        var out_at = (base + t) * rows + r
-        if epi & EPI_BIAS != 0:
-            v += aux[unsafe_offset=r]
-        elif epi & EPI_GLU != 0:
-            var g = aux[unsafe_offset=out_at]
-            if epi & ACT_BIT != 0:
-                v = activate[ACT_GELU](v) * g
-            else:
-                v = activate[ACT_SILU](v) * g
-        if epi & EPI_ADD != 0:
-            o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + v
-        else:
-            o[unsafe_offset=out_at] = v
+        write_epilogue(o, aux, Int(epi_dev), (base + t) * rows + r, r, got)
 
 
 def device_ready() -> Bool:
@@ -1133,20 +1147,207 @@ def planar_mma_kernel[
         var r = idx % MMA_ROWS
         if t0 + t >= tokens or r0 + r >= rows:
             continue
-        var v = o_tile[unsafe_offset=idx]
-        var out_at = (t0 + t) * rows + r0 + r
-        if epi & EPI_BIAS != 0:
-            v += aux[unsafe_offset=r0 + r]
-        elif epi & EPI_GLU != 0:
-            var g = aux[unsafe_offset=out_at]
-            if epi & ACT_BIT != 0:
-                v = activate[ACT_GELU](v) * g
-            else:
-                v = activate[ACT_SILU](v) * g
-        if epi & EPI_ADD != 0:
-            o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + v
+        write_epilogue(
+            o,
+            aux,
+            epi,
+            (t0 + t) * rows + r0 + r,
+            r0 + r,
+            o_tile[unsafe_offset=idx],
+        )
+
+
+comptime NV_ROWS = 64
+comptime NV_TOKENS = 32
+comptime NV_K = 32
+comptime NV_THREADS = 128
+"""The same tile the Metal form uses, for the same reasons.
+
+Sixty four output rows by thirty two tokens, a reduction step of thirty two
+because that is the group size of every type molla repacks, and four warps.
+"""
+
+comptime NV_WARP_TOKENS = 16
+comptime NV_WARP_ROWS = 32
+comptime NV_FRAGS = NV_WARP_ROWS // 8
+"""What one warp of the four covers, arranged two by two.
+
+The instruction is sixteen by eight by sixteen, so a warp's sixteen tokens are
+one fragment of the token dimension and its thirty two rows are `NV_FRAGS` of
+the row dimension, which is `NV_FRAGS` accumulators of four floats a lane.
+"""
+
+comptime NV_ROW_THREADS = NV_THREADS // NV_ROWS
+comptime NV_KPT = NV_K // NV_ROW_THREADS
+comptime NV_XH = NV_TOKENS * NV_K
+comptime NV_WH = NV_ROWS * NV_K
+"""How the staging is split, and how many halves each staged tile holds."""
+
+
+def planar_nvmma_kernel[
+    group: Int, with_min: Bool, form: Int
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+    epi_dev: Int32,
+    rows_dev: Int32,
+    tokens_dev: Int32,
+):
+    """The same product as `planar_matmul_kernel`, on NVIDIA tensor cores.
+
+    `mma` at sixteen by eight by sixteen with half inputs and a float
+    accumulator, which is the widest shape a 4090 has outside the Hopper only
+    asynchronous form. `layout.tensor_core.TensorCore` wraps the same
+    instruction, and this calls it directly rather than through that, because
+    the wrapper wants both operands as `LayoutTensor` fragments loaded through
+    its own layout algebra and the whole kernel here is one staged tile with a
+    dequantization in the middle of it.
+
+    There is no integer form to reach for. `TensorCore` accepts fp32, half, fp8
+    and fp64 and nothing else, and there is no `dp4a` and no `s8.s8.s32`
+    anywhere in MAX, so the int8 tensor core a 4090 has is reachable only
+    through inline assembly. That is the last four times of the gap and it is
+    not this change. This is the first four to six.
+
+    Both operands land in shared memory as halves. Unlike the Metal form, half
+    is not optional here: the float tensor core shape is tf32, which has the
+    same ten bit mantissa as half at half the rate, so there is no accuracy to
+    buy by staying wide.
+
+    The weight needs no transpose. The instruction takes its second operand
+    column major, which for a weight held row major over the reduction is the
+    order it is already in, so a thread stages one row of one quant group and
+    writes thirty two contiguous bytes.
+
+    The result is written from the accumulators to global memory directly. The
+    fragment layout of this instruction is fixed and public, unlike the Apple
+    one, so there is no need to route the epilogue through a shared tile to find
+    out where a lane's four outputs belong.
+    """
+    var cols = Int(cols_dev)
+    var stride = Int(stride_dev)
+    var rows = Int(rows_dev)
+    var tokens = Int(tokens_dev)
+
+    var pool = stack_allocation[
+        NV_XH + NV_WH, Float16, address_space=AddressSpace.SHARED
+    ]()
+    var x_tile = pool
+    var w_tile = pool.unsafe_offset(NV_XH)
+
+    var tid = Int(thread_idx.x)
+    var warp = tid // WARP_SIZE
+    var lane = tid % WARP_SIZE
+    # The lane layout of `mma.m16n8k16.row.col`: a lane holds two adjacent
+    # elements of the reduction at `gc`, in the row or the column `gr` names.
+    var gr = lane // 4
+    var gc = (lane % 4) * 2
+    var sg_t = (warp // 2) * NV_WARP_TOKENS
+    var sg_r = (warp % 2) * NV_WARP_ROWS
+
+    var t0 = Int(block_idx.x) * NV_TOKENS
+    var r0 = Int(block_idx.y) * NV_ROWS
+
+    var wr = tid // NV_ROW_THREADS
+    var wk = (tid % NV_ROW_THREADS) * NV_KPT
+    var live_row = r0 + wr < rows
+    var row = (r0 + wr) * stride if live_row else 0
+    var groups = cols // group
+    var scales = w.unsafe_bitcast[Float32]()
+    var quant_bytes = cols if form == QUANT_I8 else cols // 2
+    var d_base = (row + quant_bytes) // 4
+    var m_base = d_base + groups
+    comptime shift = group_shift(group)
+
+    var acc = InlineArray[SIMD[DType.float32, 4], NV_FRAGS](fill=0)
+
+    for k0 in range(0, cols, NV_K):
+        comptime X_VECS = NV_XH // 8
+        for v in range(tid, X_VECS, NV_THREADS):
+            var xt = v // (NV_K // 8)
+            var xk = (v % (NV_K // 8)) * 8
+            x_tile.unsafe_offset(xt * NV_K + xk).unsafe_store(
+                x.unsafe_offset((t0 + xt) * cols + k0 + xk)
+                .unsafe_load[width=8]()
+                .cast[DType.float16]()
+            )
+
+        var gi = (k0 + wk) >> shift
+        var d = scales[unsafe_offset=d_base + gi] if live_row else Float32(0)
+        var m = Float32(0)
+        comptime if with_min:
+            if live_row:
+                m = scales[unsafe_offset=m_base + gi]
+        var vals = SIMD[DType.float32, NV_KPT](0)
+        comptime if form == QUANT_I8:
+            var q = w.unsafe_offset(row + k0 + wk).unsafe_load[
+                width=NV_KPT
+            ]() if live_row else SIMD[DType.uint8, NV_KPT](0)
+            comptime for j in range(NV_KPT):
+                vals[j] = d * byte_float(UInt32(q[j])) + m
         else:
-            o[unsafe_offset=out_at] = v
+            var q = w.unsafe_offset(row + ((k0 + wk) >> 1)).unsafe_load[
+                width=NV_KPT // 2
+            ]() if live_row else SIMD[DType.uint8, NV_KPT // 2](0)
+            comptime for j in range(NV_KPT // 2):
+                var b = UInt32(q[j])
+                vals[2 * j] = d * nibble_float[form](b & 0xF) + m
+                vals[2 * j + 1] = d * nibble_float[form](b >> 4) + m
+        w_tile.unsafe_offset(wr * NV_K + wk).unsafe_store(
+            vals.cast[DType.float16]()
+        )
+        barrier()
+
+        comptime for kk in range(0, NV_K, 16):
+            var af = SIMD[DType.float16, 8](0)
+            var a0 = x_tile.unsafe_offset(
+                (sg_t + gr) * NV_K + kk + gc
+            ).unsafe_load[width=2]()
+            var a1 = x_tile.unsafe_offset(
+                (sg_t + gr + 8) * NV_K + kk + gc
+            ).unsafe_load[width=2]()
+            var a2 = x_tile.unsafe_offset(
+                (sg_t + gr) * NV_K + kk + gc + 8
+            ).unsafe_load[width=2]()
+            var a3 = x_tile.unsafe_offset(
+                (sg_t + gr + 8) * NV_K + kk + gc + 8
+            ).unsafe_load[width=2]()
+            comptime for e in range(2):
+                af[e] = a0[e]
+                af[2 + e] = a1[e]
+                af[4 + e] = a2[e]
+                af[6 + e] = a3[e]
+            comptime for j in range(NV_FRAGS):
+                var at = (sg_r + j * 8 + gr) * NV_K + kk + gc
+                var b0 = w_tile.unsafe_offset(at).unsafe_load[width=2]()
+                var b1 = w_tile.unsafe_offset(at + 8).unsafe_load[width=2]()
+                var bf = SIMD[DType.float16, 4](b0[0], b0[1], b1[0], b1[1])
+                var got = SIMD[DType.float32, 4](0)
+                mma(got, af, bf, acc[j])
+                acc[j] = got
+        barrier()
+
+    var epi = Int(epi_dev)
+    comptime for j in range(NV_FRAGS):
+        var r_at = r0 + sg_r + j * 8 + gc
+        comptime for h in range(2):
+            var t_at = t0 + sg_t + gr + h * 8
+            if t_at >= tokens:
+                continue
+            comptime for e in range(2):
+                if r_at + e < rows:
+                    write_epilogue(
+                        o,
+                        aux,
+                        epi,
+                        t_at * rows + r_at + e,
+                        r_at + e,
+                        acc[j][h * 2 + e],
+                    )
 
 
 def _launch_mma[
@@ -1160,8 +1361,22 @@ def _launch_mma[
     epi: Int,
     tokens: Int,
 ) raises:
-    """One instantiation of the matrix core form, launched."""
-    ctx.enqueue_function[planar_mma_kernel[group, with_min, form]](
+    """One instantiation of the matrix core form, launched.
+
+    Which kernel that is comes from the operating system and not from a runtime
+    query, for the reason `MM_TILE` gives: a macOS build targets Metal and a
+    build anywhere else targets CUDA, so the two never coexist in one binary
+    and the branch costs nothing.
+    """
+    comptime kernel = planar_mma_kernel[
+        group, with_min, form
+    ] if CompilationTarget.is_macos() else planar_nvmma_kernel[
+        group, with_min, form
+    ]
+    comptime tile_tokens = MMA_TOKENS if CompilationTarget.is_macos() else NV_TOKENS
+    comptime tile_rows = MMA_ROWS if CompilationTarget.is_macos() else NV_ROWS
+    comptime threads = MMA_THREADS if CompilationTarget.is_macos() else NV_THREADS
+    ctx.enqueue_function[kernel](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x,
         o,
@@ -1172,11 +1387,11 @@ def _launch_mma[
         Int32(w.rows),
         Int32(tokens),
         grid_dim=(
-            (tokens + MMA_TOKENS - 1) // MMA_TOKENS,
-            (w.rows + MMA_ROWS - 1) // MMA_ROWS,
+            (tokens + tile_tokens - 1) // tile_tokens,
+            (w.rows + tile_rows - 1) // tile_rows,
             1,
         ),
-        block_dim=(MMA_THREADS, 1, 1),
+        block_dim=(threads, 1, 1),
     )
 
 
@@ -1269,33 +1484,28 @@ def device_matmul_into(
         var g = group_size(w.kind)
         var carries_min = has_min(w.kind)
         var form = quant_form(w.kind)
-        # The matrix core form first where it exists, which today is Apple
-        # only: `TensorCore` in MAX has no integer case and no Metal case, and
-        # the CUDA half of #201 is a kernel of its own rather than a parameter
-        # of this one. A group of sixteen stages two groups to a step and is
-        # left on the ordinary form until there is a model that wants it.
-        comptime if CompilationTarget.is_macos():
-            if g == 32:
-                if form == QUANT_U4 and carries_min:
-                    _launch_mma[32, True, QUANT_U4](
-                        ctx, w, p, o, a, epi, tokens
-                    )
-                    return
-                if form == QUANT_S4 and not carries_min:
-                    _launch_mma[32, False, QUANT_S4](
-                        ctx, w, p, o, a, epi, tokens
-                    )
-                    return
-                if form == QUANT_I8 and carries_min:
-                    _launch_mma[32, True, QUANT_I8](
-                        ctx, w, p, o, a, epi, tokens
-                    )
-                    return
-                if form == QUANT_I8:
-                    _launch_mma[32, False, QUANT_I8](
-                        ctx, w, p, o, a, epi, tokens
-                    )
-                    return
+        # The matrix core form first, on whichever one this build targets. They
+        # are two kernels and not one parameterized kernel, because the two
+        # instructions disagree about everything below the tile: the shape, the
+        # fragment layout, whether the second operand needs transposing, and
+        # whether half precision is a choice. What they share is the tile, and
+        # that is a constant rather than an abstraction.
+        #
+        # A group of sixteen stages two groups to a step and is left on the
+        # ordinary form until there is a model that wants it.
+        if g == 32:
+            if form == QUANT_U4 and carries_min:
+                _launch_mma[32, True, QUANT_U4](ctx, w, p, o, a, epi, tokens)
+                return
+            if form == QUANT_S4 and not carries_min:
+                _launch_mma[32, False, QUANT_S4](ctx, w, p, o, a, epi, tokens)
+                return
+            if form == QUANT_I8 and carries_min:
+                _launch_mma[32, True, QUANT_I8](ctx, w, p, o, a, epi, tokens)
+                return
+            if form == QUANT_I8:
+                _launch_mma[32, False, QUANT_I8](ctx, w, p, o, a, epi, tokens)
+                return
         if form == QUANT_U4 and g == 32 and carries_min:
             _launch_mm[MM_TILE, 32, True, QUANT_U4](
                 ctx, w, p, o, a, epi, tokens
