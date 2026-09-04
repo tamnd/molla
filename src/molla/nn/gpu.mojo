@@ -579,11 +579,8 @@ def planar_matvec_kernel[
         comptime hshift = high_shift[form]()
         comptime hper = 1 << hshift
         comptime hmask = UInt32((1 << hbits) - 1)
-        comptime step = MATVEC_STEP if MATVEC_STEP > hper else hper
-        comptime hbytes = step // hper
         var high = row + (cols >> 1)
-        var hb = high + t * hbytes
-        var i = t * step
+        var i = t * MATVEC_STEP
         while i < cols:
             var gi = i >> shift
             var at = row + (i >> 1)
@@ -591,30 +588,30 @@ def planar_matvec_kernel[
             var m = Float32(0)
             comptime if with_min:
                 m = scales[unsafe_offset=m_base + gi]
-            comptime for j in range(hbytes):
-                var h = UInt32(packed[unsafe_offset=hb + j])
-                comptime for k in range(hper // 2):
-                    var b = UInt32(
-                        packed[unsafe_offset=at + j * (hper // 2) + k]
-                    )
-                    var lo = wide_float[form](
-                        (b & 0xF)
-                        | (((h >> UInt32(k * 2 * hbits)) & hmask) << 4)
-                    )
-                    var hi = wide_float[form](
-                        (b >> 4)
-                        | (((h >> UInt32((k * 2 + 1) * hbits)) & hmask) << 4)
-                    )
-                    var xi = i + j * hper + k * 2
-                    var a0 = x[unsafe_offset=xi]
-                    var a1 = x[unsafe_offset=xi + 1]
-                    acc += d * lo * a0
-                    acc += d * hi * a1
-                    comptime if with_min:
-                        acc += m * a0
-                        acc += m * a1
-            i += tile * step
-            hb += tile * hbytes
+            comptime for k in range(MATVEC_STEP // 2):
+                var b = UInt32(packed[unsafe_offset=at + k])
+                # `i` is a multiple of the step, so when the step covers a whole
+                # high byte or more these two are constants after unrolling and
+                # the load is hoisted out of the `k` loop for nothing. When it
+                # covers less they are the index and the shift a narrower pass
+                # needs. One loop rather than two shapes of it.
+                var hi_at = (i + k * 2) >> hshift
+                var s0 = UInt32(((i + k * 2) & (hper - 1)) * hbits)
+                var h = UInt32(packed[unsafe_offset=high + hi_at])
+                var lo = wide_float[form](
+                    (b & 0xF) | (((h >> s0) & hmask) << 4)
+                )
+                var hv = wide_float[form](
+                    (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
+                )
+                var a0 = x[unsafe_offset=i + k * 2]
+                var a1 = x[unsafe_offset=i + k * 2 + 1]
+                acc += d * lo * a0
+                acc += d * hv * a1
+                comptime if with_min:
+                    acc += m * a0
+                    acc += m * a1
+            i += tile * MATVEC_STEP
 
     # The reduction is over the block rather than over a warp because `tile` is
     # a parameter and the warp width is not the same number on the two vendors.
@@ -892,33 +889,32 @@ def planar_matmul_kernel[
         comptime hshift = high_shift[form]()
         comptime hper = 1 << hshift
         comptime hmask = UInt32((1 << hbits) - 1)
-        var hb = row + (cols >> 1) + t
-        var i = t * hper
+        var high = row + (cols >> 1)
+        var i = t * 2
         while i < cols:
             var gi = i >> shift
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            var h = UInt32(packed[unsafe_offset=high + (i >> hshift)])
+            var s0 = UInt32((i & (hper - 1)) * hbits)
             var d = scales[unsafe_offset=d_base + gi]
-            var m = Float32(0)
+            var lo = d * wide_float[form](
+                (b & 0xF) | (((h >> s0) & hmask) << 4)
+            )
+            var hv = d * wide_float[form](
+                (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
+            )
             comptime if with_min:
-                m = scales[unsafe_offset=m_base + gi]
-            var h = UInt32(packed[unsafe_offset=hb])
-            comptime for j in range(hper // 2):
-                var b = UInt32(packed[unsafe_offset=row + (i >> 1) + j])
-                var lo = d * wide_float[form](
-                    (b & 0xF) | (((h >> UInt32(j * 2 * hbits)) & hmask) << 4)
-                )
-                var hi = d * wide_float[form](
-                    (b >> 4)
-                    | (((h >> UInt32((j * 2 + 1) * hbits)) & hmask) << 4)
-                )
-                var xi = at0 + i + j * 2
+                var m = scales[unsafe_offset=m_base + gi]
                 for k in range(SPAN):
-                    var a0 = x[unsafe_offset=xi + k * cols]
-                    var a1 = x[unsafe_offset=xi + k * cols + 1]
-                    acc[k] += lo * a0 + hi * a1
-                    comptime if with_min:
-                        acc[k] += m * (a0 + a1)
-            i += tile * hper
-            hb += tile
+                    var a0 = x[unsafe_offset=at0 + k * cols + i]
+                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
+                    acc[k] += lo * a0 + hv * a1 + m * (a0 + a1)
+            else:
+                for k in range(SPAN):
+                    var a0 = x[unsafe_offset=at0 + k * cols + i]
+                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
+                    acc[k] += lo * a0 + hv * a1
+            i += tile * 2
 
     # A lane group reduction and not a tree through shared memory. A group is a
     # warp wide, so `SPAN` reductions are `SPAN` times five shuffles with no
