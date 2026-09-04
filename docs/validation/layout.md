@@ -386,11 +386,11 @@ The decode says otherwise. Llama 3.1 8B q4_K_M on the 4090, 128 tokens from a 11
 
 The middle row is the control and it is what makes the other two readable. It runs the quantizer and then throws the result away, so it prices the four extra launches a layer on their own: 0.30 ms a token, or 2.3 per cent. Against it, the integer matvec itself is worth 58 ms over 128 tokens, which is 3.4 per cent. Net of the launches it pays for, the whole change is 1.2 per cent.
 
-Twenty one per cent at the kernel and three at the model is the L2 gap and nothing else. The arithmetic the integer path removes is real, and in a decode it was already hiding under a load that had not arrived. The 8B's matvec runs at the 630 GB/s the fit two sections above gives it, against the 901 the same access shape gets from a buffer too large to cache, so two thirds of the achievable bandwidth is what it gets and the missing third is not instructions. Removing all of the arithmetic would be worth 3.4 per cent and removing none of the gap.
+Twenty one per cent at the kernel and three at the model is the L2 gap and nothing else. The arithmetic the integer path removes is real, and in a decode it was already hiding under a load that had not arrived. Removing all of it would be worth 3.4 per cent.
 
-So #202 is answered rather than implemented, the same way #203 was, and for a stricter reason: #203 found the Metal kernel at the byte floor, and this finds the CUDA kernel at a bandwidth floor it does not reach for a reason the probe cannot see. The branch is in the history and the negative is here.
+So #202 is answered rather than implemented, the same way #203 was, and for a stricter reason: #203 found the Metal kernel at the byte floor, and this finds the CUDA kernel bound by something the probe cannot see. The branch is in the history and the negative is here.
 
-What it leaves behind is the number worth chasing. The 8B is at 70 per cent of the bandwidth the card gives this access shape, on the path where the bus is most of the token, and that is a third of a token rather than a fortieth of one.
+This section originally ended by saying the 8B's matvec runs at 630 GB/s against the 901 the same access shape reaches from a buffer too large to cache, so a third of the bandwidth was missing and worth chasing. That was wrong and the error is worth keeping written down. The 630 was not a measurement. It came out of the two parameter fit two sections above, and a fit with two free parameters will reproduce two measured points whatever the parameters mean. `scripts/proj_probe.mojo` times the shipped kernel at the 8B's own shapes with the cache defeated and gets 749 GB/s over a whole token, and the largest projection reaches 929, so there is no missing third. [budget.md](budget.md) has the replacement and what it found instead.
 
 ## Order
 
@@ -412,4 +412,6 @@ Whether the 72 per cent of peak bandwidth holds once the rows are half as long. 
 
 What the same sweep says on CUDA, which was #228 and is answered above, on a 4090 that started answering ssh again.
 
-Why the 8B reads 630 GB/s where the same access shape reads 901 from a buffer that cannot be cached. It is not the arithmetic, which the section above priced at three per cent of a token, and it is not the block width, which is flat at that shape. What is left is occupancy and the order rows are visited in, and it is worth a third of a token on the model where the bus is most of the token, so it is the largest thing this page has found and has not explained.
+Why the 8B reads 630 GB/s where the same access shape reads 901 from a buffer that cannot be cached. Withdrawn. It reads 749, the 630 was a fitted parameter and not a measurement, and there is nothing to explain. See the end of the integer activation section above and [budget.md](budget.md).
+
+What the whole q6_k half of a Q4_K_M model costs, which is two fifths of the bytes an 8B token reads and which no sweep on this page ever timed, because `scripts/matvec_probe.mojo` carries its own copy of the read loop and that copy only knows two of the five quant forms. Answered in [budget.md](budget.md) by timing the shipped kernel instead of a copy of it, and the answer is that q6_k is not slower.

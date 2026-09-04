@@ -25,7 +25,12 @@ from harness import Suite
 from molla.model.load import DevicePool
 from molla.nn.gpu import check_matvec, device_matvec, device_ready
 from molla.nn.quant import Q_F32, Q_Q8_0
-from molla.nn.repack import LAYOUT_PLANAR, planar_row_bytes, planar_row_dot
+from molla.nn.repack import (
+    LAYOUT_PLANAR,
+    SCALE_BYTES,
+    planar_row_bytes,
+    planar_row_dot,
+)
 from molla.nn.tensor import (
     WHERE_DEVICE,
     WHERE_HOST,
@@ -183,11 +188,13 @@ def test_matvec(mut suite: Suite, ctx: DeviceContext) raises:
                     p.unsafe_store(row + i, UInt8(q & 0xFF))
                 for g in range(cols // 32):
                     var scale = Float32(0.125) * Float32(g + 1) / Float32(r + 1)
-                    var bits = bitcast[DType.uint32, 1](scale)
-                    for b in range(4):
+                    var bits = bitcast[DType.uint16, 1](
+                        scale.cast[DType.float16]()
+                    )
+                    for b in range(SCALE_BYTES):
                         p.unsafe_store(
-                            row + cols + g * 4 + b,
-                            UInt8((bits >> UInt32(b * 8)) & 0xFF),
+                            row + cols + g * SCALE_BYTES + b,
+                            UInt8((bits >> UInt16(b * 8)) & 0xFF),
                         )
             for r in range(rows):
                 want.data[r] = planar_row_dot(
@@ -282,11 +289,13 @@ def test_pool(mut suite: Suite, ctx: DeviceContext) raises:
                     var scale = (
                         Float32(0.25) * Float32(g + 1 + t) / Float32(r + 1)
                     )
-                    var bits = bitcast[DType.uint32, 1](scale)
-                    for b in range(4):
+                    var bits = bitcast[DType.uint16, 1](
+                        scale.cast[DType.float16]()
+                    )
+                    for b in range(SCALE_BYTES):
                         hp.unsafe_store(
-                            row + cols + g * 4 + b,
-                            UInt8((bits >> UInt32(b * 8)) & 0xFF),
+                            row + cols + g * SCALE_BYTES + b,
+                            UInt8((bits >> UInt16(b * 8)) & 0xFF),
                         )
 
         var dev = default_device()
