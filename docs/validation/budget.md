@@ -61,7 +61,11 @@ Four of those rows have almost the same row width and differ only in how many ro
 
 Bandwidth is a function of grid size and nothing else across that range. A launch of 1024 blocks moves 2 MiB in 6 microseconds, and 2 MiB at the rate the same kernel reaches on a large grid would be 2. The missing 4 microseconds is the launch, which [performance.md](performance.md) priced at 4.9 for an empty kernel and `scripts/launch_probe.mojo` puts at 4.2 to 6.2.
 
-Add it up over a token. If every projection ran at the 929 GB/s the output head reaches, the term would be 5.46 ms instead of 6.70, so 1.24 ms of a token is the price of small grids, and almost all of it is in the five shapes with 4096 rows or fewer. Turning the fused kernel on for this model, which `fused_by_default` currently refuses because the layer weights exceed a gibibyte, is worth 4.6 per cent measured: 12.37 ms a token against 12.97. That is the same effect from the other side, and it is available today by changing a constant.
+Add it up over a token. If every projection ran at the 929 GB/s the output head reaches, the term would be 5.46 ms instead of 6.70, so 1.24 ms of a token is the price of small grids, and almost all of it is in the five shapes with 4096 rows or fewer.
+
+That 1.24 ms is launches and not width. A token issues eight projections a layer plus the output head, which is 257 launches, and 257 at the 4.2 microseconds the launch probe prices them at is 1.08 ms. The heading of this section is therefore half wrong and is kept because the table under it is right: bandwidth does track the grid across that range, and the reason it does is that a small grid finishes before it has amortized its own launch.
+
+The one thing that removes a launch is fusion, and fusion is not available here. A grid wide barrier needs a cooperative launch, a cooperative launch caps the grid at what fits the card at once, and on a model reading 4.72 GiB a token that cap costs more than the launches save. This was measured both ways. Before the attention split the fused path was 4.6 per cent ahead on this model, 12.37 ms a token against 12.97, which read as a free win available by raising `FUSED_MAX_BYTES`. After the split it is 35 per cent behind, 12.42 against 9.17, because the fused kernel has cut a head's keys across blocks since 0.4.10 and gained nothing from a change that gave the unfused path 30 per cent. The constant stays where it is.
 
 ## The attention is not close to done
 
