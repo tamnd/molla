@@ -158,12 +158,12 @@ Two ollama ideas are worth taking and neither is about speed. The lazy KV snapsh
 
 In order, largest ratio first.
 
-1. A half precision matrix core GEMM, on both backends, as one item. The measurement above says a tile with fp32 multiplies in it is worth eleven per cent against a target of a factor of twenty eight, so the instruction is the item and the tile is only the thing that feeds it. On CUDA that is `layout.tensor_core.TensorCore` at 16x8x16 with bf16 or f16 inputs and an f32 accumulator. On Metal it is `_mma_apple_8x8` with f16 inputs and an f32 accumulator, which is the same arrangement `kernel_mul_mm` uses. Both take a staged tile of weights dequantized to half on the way in and activations converted to half once, and both need the grid to stay wide enough on a small matrix, which the fp32 tile did not.
+1. A matrix core GEMM, which was written as one item covering both backends and turned out to be two. On Metal it is `_mma_apple_8x8`, the same eight by eight instruction `kernel_mul_mm` is built on, and it is done: SmolLM2 prefill goes 472 to 2142 tokens a second and Qwen goes 169 to 601, which takes the gap from twenty times to four and a half and from nineteen to five and a half. On CUDA it is `mma` at 16x8x16, the same tile ported, and it loses to the ordinary kernel on two models out of three, so it is out of the milestone and into #212 with the measurements and the diagnosis.
 2. The weight unpack folded into the tile load, with the scale and minimum pre multiplied once per tile, and the nibble shifts replaced by masks with the factor corrected in the scale. The tile makes this free and the fp32 version already showed it costs nothing to fold the minimum in.
 3. An f16 KV cache, then q8_0 behind a flag.
 4. Close the GGUF mapping between the two load passes, which removes the first run double residency.
 5. Make the repack size neutral, or skip it on the device path the way llama.cpp does.
-6. Answered, and it is no longer a spike. The Metal instruction is reachable, it is `_mma_apple_8x8`, and it is inside the first item. What replaces this line is the question the first item's number decides: whether an int8 mma written with `inlined_assembly` is worth carrying on CUDA to close the last four times.
+6. Answered, and it is no longer a spike. The Metal instruction is reachable, it is `_mma_apple_8x8`, and it is inside the first item. What replaces this line is the question the first item's number decides: whether an int8 mma written with `inlined_assembly` is worth carrying on CUDA to close the last four times. That question is now downstream of #212 rather than of item one, because there is no point hand writing an integer instruction into a tile that loses to the kernel it replaces at half precision.
 7. Shape specialized kernel compilation with a pipeline cache.
 
 One through three are one milestone and four and five can run beside them because they touch load and not kernels. Seven is a milestone of its own. They are #201 through #206 and #208, tracked in M2d, #209.
@@ -180,6 +180,12 @@ The standing goal is two times llama.cpp on tokens a second at half its memory. 
 | SmolLM2 135M Q8_0 | prefill tok/s | 10489.8 | 32487 |
 | Llama 3.1 8B Q4_K_M | card MiB | 7404 | 5198 |
 
-Half precision matrix cores are not expected to reach that table on their own. The arithmetic two sections up puts the first item near 2700 tokens a second on the 8B, which is a quarter of the way there and six times where molla is. If the tile lands near that number then the rest of the gap is the int8 instruction and the milestone closes or does not on whether hand written mma is taken on. If it lands well below 2700 then the tile is wrong rather than the instruction, and that is worth knowing before any assembly gets written. Either way the gate stays at parity, because a gate set to what the plan already predicts measures nothing.
+Half precision matrix cores were not expected to reach that table on their own. The arithmetic two sections up put the first item near 2700 tokens a second on the 8B, a quarter of the way there and six times where molla is, and said that if the tile landed well below that then the tile was wrong rather than the instruction.
+
+It landed well below. The CUDA tile measures 509 tokens a second on the 8B, about 8.2 TFLOP/s, which is five per cent of the tensor core peak, and it is slower than the ordinary kernel on the two smaller models. So the tile is wrong, that is worth knowing before any assembly gets written, and it is exactly what the prediction was there to find out. #212 has what the numbers say is missing, which is `ld_matrix` for the fragments, a swizzled shared layout and a K loop that stages ahead.
+
+The Metal side is the other half of the same prediction and it went the other way. 472 to 2142 on SmolLM2 and 169 to 601 on Qwen, which is 4.5 and 3.6 times, and the reason the two backends disagree this much is not the kernel. An Apple simdgroup matrix is about ten times its own GPU's scalar rate, measured at 3.04 TFLOP/s against 0.30, where an NVIDIA half precision tensor core is 165.2 against 82.6 for ordinary fused multiply adds, which is two. The same tile buys ten times on one machine and two on the other before anything is spent on feeding it.
+
+The gate stays at parity, because a gate set to what the plan already predicts measures nothing.
 
 Every item lands with a run of `scripts/bench.py` on gpc against all three models and all three engines, and the result goes into [bench.md](bench.md) in the same pull request. bench.md is a version stale as of this writing, which is how the 109x number survived long enough to shape a milestone, and refreshing it is the first commit rather than the last.

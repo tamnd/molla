@@ -560,9 +560,9 @@ On Metal the matrix core form covers thirty two tokens a block, so a chunk of
 sixty four is two blocks of the token axis and the GPU runs out of work before
 it runs out of rows: widening the chunk to 256 is 1611 tokens a second against
 2142 on SmolLM2. On CUDA the same widening goes the other way, and not by a
-little, 4990 to 3545 on Qwen and 378 to 181 on the 8B. Whatever the cause
-there, it is not this change's to find, and a chunk picked for the kernel that
-runs on the target is the honest thing to write until it is.
+little, 4990 to 3545 on Qwen and 378 to 181 on the 8B. That is #213, and a
+chunk picked for the kernel that runs on the target is the honest thing to
+write until it is answered.
 """
 
 comptime MM_TILE = 32
