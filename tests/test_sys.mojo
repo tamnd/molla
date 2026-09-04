@@ -23,7 +23,17 @@ from molla.sys.device import (
     default_device,
     devices,
 )
-from molla.sys.errno import EBADF, EEXIST, ENOENT, ENOTSUP, errno_name
+from molla.sys.errno import (
+    EACCES,
+    EAGAIN,
+    EBADF,
+    EEXIST,
+    ENOENT,
+    ENOSPC,
+    ENOTSUP,
+    errno_name,
+    errno_phrase,
+)
 from molla.sys.file import (
     DirEntry,
     FileInfo,
@@ -103,6 +113,7 @@ def _fill(buf: List[UInt8], mut into: List[UInt8]):
 
 def run(mut suite: Suite) raises:
     _check_result(suite)
+    _check_errno(suite)
     _check_files(suite)
     _check_directories(suite)
     _check_threads(suite)
@@ -110,6 +121,42 @@ def run(mut suite: Suite) raises:
     _check_signals(suite)
     _check_sockets(suite)
     _check_devices(suite)
+
+
+def _check_errno(mut suite: Suite) raises:
+    """The two ways a code is turned into words.
+
+    `errno_name` is what a log line wants and `errno_phrase` is what a person
+    being shown a failure once wants. The phrase only differs for the codes
+    whose name on its own sends a reader to the wrong problem, and the check
+    that it falls back to the name everywhere else is the point of it: a phrase
+    for every code would be a second table to keep in step with the first.
+    """
+    suite.group("sys.errno")
+
+    suite.check(errno_name(0) == "OK", "zero is not an error")
+    suite.check(errno_name(ENOSPC) == "ENOSPC", "a full disk has a name")
+    suite.check(
+        errno_name(-1).startswith("errno "),
+        "a code with no name is still printable",
+    )
+
+    suite.check(
+        errno_phrase(ENOSPC) == "ENOSPC, no space left on device",
+        "a full disk says so in words",
+    )
+    suite.check(
+        errno_phrase(EACCES) == "EACCES, permission denied",
+        "and so does a directory that cannot be written to",
+    )
+    suite.check(
+        errno_phrase(EAGAIN) == errno_name(EAGAIN),
+        "a code that needs no explaining keeps its name",
+    )
+    suite.check(
+        errno_phrase(EBADF) == errno_name(EBADF),
+        "and so does one that is a bug rather than a condition",
+    )
 
 
 def _check_devices(mut suite: Suite) raises:

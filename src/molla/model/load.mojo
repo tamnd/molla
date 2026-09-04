@@ -85,6 +85,7 @@ from molla.nn.tensor import (
 from molla.sys.atomic import AtomicBlock
 from molla.sys.clock import monotonic_ms
 from molla.sys.device import Device, default_device
+from molla.sys.errno import errno_phrase
 from molla.sys.mem import keep
 from molla.sys.mmap import RawPtr, drop_pages, page_size, will_need
 from molla.sys.queue import MpscQueue, round_up_pow2
@@ -782,6 +783,17 @@ struct LoadReport(Copyable, ImplicitlyCopyable, Movable):
     zero when there is no cache, and the note says which."""
 
     var repack_bytes: Int
+
+    var repack_written: Bool
+    """Whether a cache file was published by this load.
+
+    False for a load that was never asked to repack as well as for one that
+    tried and could not, which is why it is read alongside the note and not
+    instead of it. It exists so a caller that needs the cache can tell a repack
+    that failed from a cache file that is there and unreadable, because those
+    two have different causes and only the note knows which one happened.
+    """
+
     var repack_note: String
     """What happened to the cache, in one line. Always said out loud, because a
     repack that silently reruns on every load is the thing the cache exists to
@@ -969,6 +981,7 @@ def load(
         pool_bytes=pool_bytes,
         repacked=0,
         repack_bytes=0,
+        repack_written=False,
         repack_note=String("nothing was repacked on this load"),
     )
 
@@ -1107,11 +1120,12 @@ def load(
             out.report.repacked = 0
             out.report.repack_bytes = 0
             out.report.repack_note = String(
-                "the repack failed and was thrown away, errno "
-            ) + String(failed)
+                "the repack failed and was thrown away, "
+            ) + errno_phrase(failed)
         else:
             try:
                 commit_cache(job.repack_fd, temp, final)
+                out.report.repack_written = True
                 out.report.repack_note = (
                     String("repack cache written to ") + final
                 )
