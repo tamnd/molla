@@ -61,6 +61,52 @@ from molla.nn.gpu import (
     device_matmul_into,
     device_matvec_into,
 )
+from molla.nn.gpu_fused import (
+    OP_ACT,
+    OP_ADD,
+    OP_ATTEND,
+    OP_MATVEC,
+    OP_NORM,
+    OP_ROPE,
+    R_ATTN,
+    R_COLS,
+    R_DIM,
+    R_EPI,
+    R_EPS,
+    R_EXT,
+    R_G,
+    R_GROUP,
+    R_H,
+    R_HEAD_DIM,
+    R_HEADS,
+    R_HIGH,
+    R_KIND,
+    R_KV,
+    R_LOW,
+    R_N,
+    R_ROW,
+    R_ROWS,
+    R_RUNS,
+    R_SCALE,
+    R_SINKS,
+    R_SOFTCAP,
+    R_SPLIT,
+    R_STRIDE,
+    R_W,
+    R_WINDOW,
+    SPACE_ARENA,
+    SPACE_KEYS,
+    SPACE_RESID,
+    SPACE_VALS,
+    SPACE_WORK,
+    FusedPlan,
+    StepPlan,
+    WorkPlan,
+    fused_selftest,
+    launch_fused,
+    quant_kind,
+    rope_kind,
+)
 from molla.nn.gpu_ops import (
     RopeTables,
     device_add_into,
@@ -78,6 +124,7 @@ from molla.nn.gpu_ops import (
 )
 from molla.nn.model import ModelWeights
 from molla.nn.repack import LAYOUT_PLANAR, unpack_run
+from molla.nn.rope import RopeSpec, corr_range, step_table
 from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
 
 
@@ -125,6 +172,96 @@ def _absent(ctx: DeviceContext) raises -> DeviceVec:
     flag that says whether the weight was there.
     """
     return DeviceVec(ctx, 1)
+
+
+struct LayerArena(Movable):
+    """One layer's small weights, concatenated into a single device vector.
+
+    The fused kernel names an operand as a base and an offset rather than as a
+    pointer, because a pointer rebuilt from an integer address loses its address
+    space on Metal, so the ten or eleven vectors a layer reads have to be one
+    vector for a record to be able to point at any of them. See
+    `molla.nn.gpu_fused`.
+
+    It is built beside the individual gains rather than instead of them, which
+    duplicates about thirty kilobytes a layer. The unfused kernels take a gain
+    as a `DeviceVec` and read its length, so removing the duplication means
+    changing those signatures to a pointer and a width, and that is stage two's
+    work rather than a change to make while the two paths still have to agree
+    with each other.
+    """
+
+    var vec: DeviceVec
+    var attn_norm: Int
+    var ffn_norm: Int
+    var attn_post: Int
+    var ffn_post: Int
+    var q_norm: Int
+    var k_norm: Int
+    var q_bias: Int
+    var k_bias: Int
+    var v_bias: Int
+    var steps: Int
+    var factors: Int
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        spec: BlockSpec,
+        host: LayerWeights,
+        rope: RopeSpec,
+        factors: List[Float32],
+        use_factors: Bool,
+    ) raises:
+        var all = List[Float32]()
+        var head_dim = spec.attn.head_dim
+        self.attn_norm = _append(all, _values(host.attn_norm, spec.width))
+        self.ffn_norm = _append(all, _values(host.ffn_norm, spec.width))
+        self.attn_post = len(all)
+        if host.attn_post_norm.present():
+            self.attn_post = _append(
+                all, _values(host.attn_post_norm, spec.width)
+            )
+        self.ffn_post = len(all)
+        if host.ffn_post_norm.present():
+            self.ffn_post = _append(
+                all, _values(host.ffn_post_norm, spec.width)
+            )
+        self.q_norm = len(all)
+        self.k_norm = len(all)
+        if host.q_norm.present():
+            self.q_norm = _append(all, _values(host.q_norm, head_dim))
+            self.k_norm = _append(all, _values(host.k_norm, head_dim))
+        self.q_bias = len(all)
+        self.k_bias = len(all)
+        self.v_bias = len(all)
+        if spec.qkv_bias:
+            self.q_bias = _append(all, _values(host.q_bias, spec.q_width()))
+            self.k_bias = _append(all, _values(host.k_bias, spec.kv_width()))
+            self.v_bias = _append(all, _values(host.v_bias, spec.kv_width()))
+        self.steps = _append(all, step_table(rope))
+        self.factors = len(all)
+        if use_factors:
+            var pairs = rope.dim // 2
+            var take = List[Float32]()
+            for i in range(pairs):
+                take.append(factors[i])
+            self.factors = _append(all, take)
+        # Never empty and never zero length, because a device buffer of length
+        # zero is not a thing on either vendor and a model with no biases and no
+        # post norms would otherwise reach one.
+        if len(all) == 0:
+            all.append(Float32(0))
+        self.vec = DeviceVec(ctx, len(all))
+        self.vec.copy_in(all)
+
+
+def _append(mut all: List[Float32], values: List[Float32]) -> Int:
+    """Put one small weight at the end of the arena and say where it went."""
+    var at = len(all)
+    for i in range(len(values)):
+        all.append(values[i])
+    return at
 
 
 def _resident(t: Tensor, name: String) raises:
@@ -193,6 +330,9 @@ struct DeviceLayer(Movable):
     """Built per layer rather than per model, because Gemma 3 alternates a local
     and a global rope spec and the tables are a few hundred bytes each."""
 
+    var arena: LayerArena
+    """The same small weights again, in one vector, for the fused kernel."""
+
     def __init__(
         out self,
         ctx: DeviceContext,
@@ -251,6 +391,9 @@ struct DeviceLayer(Movable):
         self.down = dev.down
         self.has_gate = spec.gated
         self.rope = RopeTables(ctx, spec.rope, factors, use_factors)
+        self.arena = LayerArena(
+            ctx, spec, host, spec.rope, factors, use_factors
+        )
 
 
 struct DeviceModel(Movable):
@@ -678,43 +821,494 @@ def device_layer(
     device_mlp(ctx, spec, w, x, s, tokens)
 
 
-def device_forward(
+def _pool_base(m: DeviceModel) raises -> Int:
+    """The address the step table measures every weight offset from.
+
+    The load puts every matrix a kernel reads into one device buffer, so the
+    lowest address any of them has is inside that buffer and every other one is
+    above it. Taking the minimum rather than asking the pool keeps this a
+    property of the model that was actually bound, and it is the same number
+    every time because the addresses are fixed when the model loads.
+    """
+    var base = -1
+    for i in range(m.block_count()):
+        ref w = m.layers[i]
+        _lower(base, w.wq)
+        _lower(base, w.wk)
+        _lower(base, w.wv)
+        _lower(base, w.wo)
+        _lower(base, w.up)
+        _lower(base, w.down)
+        if w.has_gate:
+            _lower(base, w.gate)
+    if base < 0:
+        raise Error("a model with no matrices in it cannot be planned")
+    return base
+
+
+def _lower(mut base: Int, t: Tensor) raises:
+    """Keep the lowest address seen so far, starting from a negative one."""
+    var at = t.device_address()
+    if base < 0 or at < base:
+        base = at
+
+
+def _matvec_record(
+    mut plan: StepPlan,
+    base: Int,
+    w: Tensor,
+    xs: Int,
+    xo: Int,
+    os: Int,
+    oo: Int,
+    ok: Int,
+    epi: Int,
+) raises -> Int:
+    """One projection, as a record.
+
+    The helper operand defaults to the output, which is what the unfused matvec
+    does with an epilogue that reads nothing, so there is no null for the kernel
+    to test for. A caller whose epilogue does read something overwrites it.
+    """
+    var at = w.device_address() - base
+    if at < 0 or at % 4 != 0:
+        raise Error(
+            "a weight sits "
+            + String(at)
+            + " bytes from the pool base, and the scale planes of a planar row"
+            " are read through a float32 view, so the offset has to be positive"
+            " and a multiple of four"
+        )
+    var rec = plan.open(OP_MATVEC)
+    plan.input(rec, xs, xo)
+    plan.output(rec, os, oo, ok)
+    plan.helper(rec, os, oo, ok)
+    plan.set(rec, R_W, at)
+    plan.set(rec, R_COLS, w.cols)
+    plan.set(rec, R_ROWS, w.rows)
+    plan.set(rec, R_STRIDE, w.row_bytes())
+    plan.set(rec, R_EPI, epi)
+    plan.set(rec, R_KIND, quant_kind(w))
+    return rec
+
+
+def _norm_record(
+    mut plan: StepPlan,
+    gain: Int,
+    eps: Float32,
+    n: Int,
+    runs: Int,
+    xs: Int,
+    xo: Int,
+    xk: Int,
+    os: Int,
+    oo: Int,
+    ok: Int,
+) -> Int:
+    """One norm, as a record, over `runs` vectors of `n` laid end to end.
+
+    A whole model width is one run, so one block does it and the rest of the
+    grid waits. Splitting it would make the sum of squares a grid wide reduction
+    and cost two more barriers, which is more than the few microseconds a block
+    spends on four thousand elements. The per head norms are `heads` runs and
+    spread across the grid the way everything else does.
+    """
+    var rec = plan.open(OP_NORM)
+    plan.input(rec, xs, xo, xk)
+    plan.output(rec, os, oo, ok)
+    plan.set(rec, R_N, n)
+    plan.set(rec, R_RUNS, runs)
+    plan.set(rec, R_G, gain)
+    plan.setf(rec, R_EPS, eps)
+    return rec
+
+
+def _rope_record(
+    mut plan: StepPlan,
+    rope: RopeSpec,
+    a: LayerArena,
+    kind: Int,
+    low: Float32,
+    high: Float32,
+    heads: Int,
+    head_dim: Int,
+    space: Int,
+    off: Int,
+    slot_mul: Int,
+) -> Int:
+    """One rotation in place, as a record."""
+    var rec = plan.open(OP_ROPE)
+    plan.input(rec, space, off, slot_mul)
+    plan.output(rec, space, off, slot_mul)
+    plan.set(rec, R_HEADS, heads)
+    plan.set(rec, R_HEAD_DIM, head_dim)
+    plan.set(rec, R_DIM, rope.dim)
+    plan.set(rec, R_KIND, kind)
+    plan.set(rec, R_G, a.steps)
+    plan.set(rec, R_H, a.factors)
+    plan.setf(rec, R_SCALE, rope.scale)
+    plan.setf(rec, R_EXT, rope.ext_factor)
+    plan.setf(rec, R_ATTN, rope.attn_factor)
+    plan.setf(rec, R_LOW, low)
+    plan.setf(rec, R_HIGH, high)
+    return rec
+
+
+def _layer_records(
+    mut plan: StepPlan,
+    base: Int,
+    spec: BlockSpec,
+    w: DeviceLayer,
+    shape: WorkPlan,
+    use_factors: Bool,
+) raises:
+    """One layer, as the records the fused kernel walks.
+
+    The same steps in the same order as `device_attention` and `device_mlp`,
+    with the barrier flag set on eight of them. The six boundaries that do not
+    get one are the three attention projections, which read the same input and
+    write disjoint outputs, the two per head norms and the two rotations, which
+    touch disjoint memory, and the up projection, which the gate reads back off
+    rows the same block owns in both records. See
+    [docs/validation/fused.md](../../../docs/validation/fused.md).
+    """
+    ref a = w.arena
+    var kv_width = spec.kv_width()
+    var head_dim = spec.attn.head_dim
+    var bias_epi = EPI_BIAS if w.has_bias else EPI_NONE
+
+    var rec = _norm_record(
+        plan,
+        a.attn_norm,
+        spec.eps,
+        spec.width,
+        1,
+        SPACE_RESID,
+        0,
+        0,
+        SPACE_WORK,
+        shape.norm,
+        0,
+    )
+    plan.sync(rec)
+
+    # Straight into the cache rather than into scratch and then a copy, which is
+    # what the slot multiplier on the operand is for. The slot is the one thing
+    # here that changes between tokens, so it is a kernel argument and the
+    # record carries what to multiply it by.
+    rec = _matvec_record(
+        plan,
+        base,
+        w.wq,
+        SPACE_WORK,
+        shape.norm,
+        SPACE_WORK,
+        shape.q,
+        0,
+        bias_epi,
+    )
+    if w.has_bias:
+        plan.helper(rec, SPACE_ARENA, a.q_bias)
+    rec = _matvec_record(
+        plan,
+        base,
+        w.wk,
+        SPACE_WORK,
+        shape.norm,
+        SPACE_KEYS,
+        0,
+        kv_width,
+        bias_epi,
+    )
+    if w.has_bias:
+        plan.helper(rec, SPACE_ARENA, a.k_bias)
+    rec = _matvec_record(
+        plan,
+        base,
+        w.wv,
+        SPACE_WORK,
+        shape.norm,
+        SPACE_VALS,
+        0,
+        kv_width,
+        bias_epi,
+    )
+    if w.has_bias:
+        plan.helper(rec, SPACE_ARENA, a.v_bias)
+    plan.sync(rec)
+
+    if w.has_qk_norm:
+        _ = _norm_record(
+            plan,
+            a.q_norm,
+            spec.eps,
+            head_dim,
+            spec.attn.heads,
+            SPACE_WORK,
+            shape.q,
+            0,
+            SPACE_WORK,
+            shape.q,
+            0,
+        )
+        rec = _norm_record(
+            plan,
+            a.k_norm,
+            spec.eps,
+            head_dim,
+            spec.attn.kv_heads,
+            SPACE_KEYS,
+            0,
+            kv_width,
+            SPACE_KEYS,
+            0,
+            kv_width,
+        )
+        plan.sync(rec)
+
+    var low = Float32(0)
+    var high = Float32(0)
+    if spec.rope.ext_factor != 0:
+        var ends = corr_range(spec.rope)
+        low = ends[0]
+        high = ends[1]
+    var kind = rope_kind(spec.rope, use_factors)
+    _ = _rope_record(
+        plan,
+        spec.rope,
+        a,
+        kind,
+        low,
+        high,
+        spec.attn.heads,
+        head_dim,
+        SPACE_WORK,
+        shape.q,
+        0,
+    )
+    rec = _rope_record(
+        plan,
+        spec.rope,
+        a,
+        kind,
+        low,
+        high,
+        spec.attn.kv_heads,
+        head_dim,
+        SPACE_KEYS,
+        0,
+        kv_width,
+    )
+    plan.sync(rec)
+
+    rec = plan.open(OP_ATTEND)
+    plan.input(rec, SPACE_WORK, shape.q)
+    plan.output(rec, SPACE_WORK, shape.heads_out)
+    plan.set(rec, R_HEADS, spec.attn.heads)
+    plan.set(rec, R_HEAD_DIM, head_dim)
+    plan.set(rec, R_KV, kv_width)
+    plan.set(rec, R_GROUP, spec.attn.group())
+    plan.set(rec, R_WINDOW, spec.attn.window)
+    plan.set(rec, R_SINKS, spec.attn.sinks)
+    plan.set(rec, R_ROW, shape.scores)
+    plan.set(rec, R_SPLIT, shape.splits)
+    plan.setf(rec, R_SCALE, spec.attn.scale)
+    plan.setf(rec, R_SOFTCAP, spec.attn.softcap)
+    plan.sync(rec)
+
+    # The residual add rides the output projection's epilogue, so the projected
+    # scratch is only used by the models that put a norm between the two, and
+    # those pay for two more records and two more barriers the way they pay for
+    # two more launches today.
+    if w.has_attn_post:
+        rec = _matvec_record(
+            plan,
+            base,
+            w.wo,
+            SPACE_WORK,
+            shape.heads_out,
+            SPACE_WORK,
+            shape.projected,
+            0,
+            EPI_NONE,
+        )
+        plan.sync(rec)
+        rec = _norm_record(
+            plan,
+            a.attn_post,
+            spec.eps,
+            spec.width,
+            1,
+            SPACE_WORK,
+            shape.projected,
+            0,
+            SPACE_WORK,
+            shape.projected,
+            0,
+        )
+        plan.sync(rec)
+        rec = plan.open(OP_ADD)
+        plan.input(rec, SPACE_WORK, shape.projected)
+        plan.output(rec, SPACE_RESID, 0)
+        plan.set(rec, R_N, spec.width)
+        plan.sync(rec)
+    else:
+        rec = _matvec_record(
+            plan,
+            base,
+            w.wo,
+            SPACE_WORK,
+            shape.heads_out,
+            SPACE_RESID,
+            0,
+            0,
+            EPI_ADD,
+        )
+        plan.sync(rec)
+
+    rec = _norm_record(
+        plan,
+        a.ffn_norm,
+        spec.eps,
+        spec.width,
+        1,
+        SPACE_RESID,
+        0,
+        0,
+        SPACE_WORK,
+        shape.norm,
+        0,
+    )
+    plan.sync(rec)
+
+    var into = shape.up
+    var up = _matvec_record(
+        plan,
+        base,
+        w.up,
+        SPACE_WORK,
+        shape.norm,
+        SPACE_WORK,
+        shape.up,
+        0,
+        EPI_NONE,
+    )
+    if w.has_gate:
+        var glu = EPI_GLU | (0 if spec.act == ACT_SILU else ACT_BIT)
+        rec = _matvec_record(
+            plan,
+            base,
+            w.gate,
+            SPACE_WORK,
+            shape.norm,
+            SPACE_WORK,
+            shape.gate,
+            0,
+            glu,
+        )
+        plan.helper(rec, SPACE_WORK, shape.up)
+        plan.sync(rec)
+        into = shape.gate
+    else:
+        # The gated form needs no barrier between the two projections because
+        # the gate reads the up off rows the same block wrote. The ungated form
+        # has an activation over the whole vector instead, and that one is
+        # partitioned by element rather than by row, so it does.
+        plan.sync(up)
+        rec = plan.open(OP_ACT)
+        plan.input(rec, SPACE_WORK, shape.up)
+        plan.output(rec, SPACE_WORK, shape.up)
+        plan.set(rec, R_N, spec.hidden)
+        plan.set(rec, R_KIND, spec.act)
+        plan.sync(rec)
+
+    if w.has_ffn_post:
+        rec = _matvec_record(
+            plan,
+            base,
+            w.down,
+            SPACE_WORK,
+            into,
+            SPACE_WORK,
+            shape.projected,
+            0,
+            EPI_NONE,
+        )
+        plan.sync(rec)
+        rec = _norm_record(
+            plan,
+            a.ffn_post,
+            spec.eps,
+            spec.width,
+            1,
+            SPACE_WORK,
+            shape.projected,
+            0,
+            SPACE_WORK,
+            shape.projected,
+            0,
+        )
+        plan.sync(rec)
+        rec = plan.open(OP_ADD)
+        plan.input(rec, SPACE_WORK, shape.projected)
+        plan.output(rec, SPACE_RESID, 0)
+        plan.set(rec, R_N, spec.width)
+        plan.sync(rec)
+    else:
+        rec = _matvec_record(
+            plan,
+            base,
+            w.down,
+            SPACE_WORK,
+            into,
+            SPACE_RESID,
+            0,
+            0,
+            EPI_ADD,
+        )
+        plan.sync(rec)
+
+
+def build_fused_plan(
+    ctx: DeviceContext, m: DeviceModel, context: Int, use_factors: Bool
+) raises -> FusedPlan:
+    """The whole model's step table, built once when a session opens.
+
+    The self test runs before this returns, because a grid that is not fully
+    resident deadlocks rather than failing, and a deadlock inside a forward pass
+    is a hung display rather than an error message.
+    """
+    var shape = WorkPlan(m.specs, context)
+    var plan = StepPlan()
+    var starts = List[Int]()
+    var base = _pool_base(m)
+    for i in range(m.block_count()):
+        starts.append(plan.records)
+        _layer_records(plan, base, m.specs[i], m.layers[i], shape, use_factors)
+    starts.append(plan.records)
+    var built = FusedPlan(ctx, plan, starts, shape, base)
+    fused_selftest(ctx, built.blocks)
+    return built^
+
+
+def _embed(
     ctx: DeviceContext,
     m: DeviceModel,
     mut s: DeviceScratch,
     mut x: DeviceVec,
     tokens: List[Int],
     pos: Int,
-    slot: Int,
-    mut keys: List[DeviceVec],
-    mut values: List[DeviceVec],
-) raises:
-    """A run of tokens through the whole stack, logits left on the device.
+) raises -> Int:
+    """Everything a pass does before the first layer, and the checks it needs.
 
-    Queued and not synchronized. Everything here is one stream of launches with
-    no wait between them, which is the thing that makes a token one command
-    buffer rather than several hundred, and the caller waits once when it wants
-    to read the logits.
-
-    `pos` and `slot` are two arguments for the reason the host version gives:
-    they are the same number until something evicts, and the day they stop being
-    the same is the day a single argument becomes a bug in two places. A run
-    occupies `len(tokens)` of each, starting at these.
-
-    Only the last token of the run gets logits, because it is the only one a
-    caller can do anything with and the output head is the largest single
-    projection in the pass. See
-    [docs/validation/prefill.md](../../../docs/validation/prefill.md).
+    Shared by the two forward passes rather than written twice, because the
+    fused path and the unfused one differ in the layer loop and in nothing else,
+    and two copies of the validation is two places for them to stop agreeing.
+    Returns the number of rows the residual stream carries, which is the run
+    rounded up to a whole block of tokens for a chunk and the run itself for a
+    decode.
     """
-    var count = m.block_count()
     var run = len(tokens)
-    if len(keys) != count or len(values) != count:
-        raise Error(
-            "the cache has room for "
-            + String(len(keys))
-            + " layers and the model has "
-            + String(count)
-        )
     if pos < 0:
         raise Error("a position cannot be negative")
     if run < 1:
@@ -769,26 +1363,21 @@ def device_forward(
         device_scale_into(
             ctx, x, Float32(sqrt(Float64(m.width()))), run * m.width()
         )
-
     # The same numbering the host trace uses, so snapshot k is the residual
     # stream layer k was handed and a comparison can say which layer a
     # divergence started in.
     s.record(ctx, x)
-    for i in range(count):
-        device_layer(
-            ctx,
-            m.specs[i],
-            m.layers[i],
-            x,
-            s,
-            keys[i],
-            values[i],
-            slot,
-            pos,
-            run,
-        )
-        s.record(ctx, x)
+    return run
 
+
+def _finish(
+    ctx: DeviceContext,
+    m: DeviceModel,
+    mut s: DeviceScratch,
+    mut x: DeviceVec,
+    run: Int,
+) raises:
+    """The final norm, the output head and the cap, for whichever path ran."""
     device_rms_norm(
         ctx,
         x,
@@ -808,3 +1397,121 @@ def device_forward(
         # written in one call.
         var normed = snapshot(ctx, s.norm)
         s.take(normed)
+
+
+def device_forward_fused(
+    ctx: DeviceContext,
+    m: DeviceModel,
+    p: FusedPlan,
+    mut s: DeviceScratch,
+    mut x: DeviceVec,
+    token: Int,
+    pos: Int,
+    slot: Int,
+    mut keys: List[DeviceVec],
+    mut values: List[DeviceVec],
+) raises:
+    """One token through the whole stack, one launch a layer.
+
+    The same arithmetic in the same order as `device_forward` on a run of one,
+    and it has to agree with it in every digit rather than closely, which is
+    what `tests/test_gpu_fused.mojo` asserts. What is different is the number of
+    commands: a thirty layer token is thirty three launches here where the
+    unfused path is 363, and at 20 microseconds a launch on an M4 that is the
+    difference between 7.3 milliseconds of submission and 0.66.
+
+    One token, because stage one is the decode path. A prefill chunk still goes
+    through `device_forward` and the matmul until stage three.
+    """
+    var count = m.block_count()
+    if len(keys) != count or len(values) != count:
+        raise Error(
+            "the cache has room for "
+            + String(len(keys))
+            + " layers and the model has "
+            + String(count)
+        )
+    if len(p.starts) != count + 1:
+        raise Error(
+            "the step table covers "
+            + String(len(p.starts) - 1)
+            + " layers and the model has "
+            + String(count)
+        )
+    if slot < 0:
+        raise Error("a cache slot cannot be negative")
+
+    var one = List[Int]()
+    one.append(token)
+    _ = _embed(ctx, m, s, x, one, pos)
+    for i in range(count):
+        launch_fused(
+            ctx,
+            p,
+            m.layers[i].arena.vec,
+            x,
+            keys[i],
+            values[i],
+            p.starts[i],
+            p.starts[i + 1],
+            pos,
+            slot,
+            slot + 1,
+        )
+        s.record(ctx, x)
+    _finish(ctx, m, s, x, 1)
+
+
+def device_forward(
+    ctx: DeviceContext,
+    m: DeviceModel,
+    mut s: DeviceScratch,
+    mut x: DeviceVec,
+    tokens: List[Int],
+    pos: Int,
+    slot: Int,
+    mut keys: List[DeviceVec],
+    mut values: List[DeviceVec],
+) raises:
+    """A run of tokens through the whole stack, logits left on the device.
+
+    Queued and not synchronized. Everything here is one stream of launches with
+    no wait between them, which is the thing that makes a token one command
+    buffer rather than several hundred, and the caller waits once when it wants
+    to read the logits.
+
+    `pos` and `slot` are two arguments for the reason the host version gives:
+    they are the same number until something evicts, and the day they stop being
+    the same is the day a single argument becomes a bug in two places. A run
+    occupies `len(tokens)` of each, starting at these.
+
+    Only the last token of the run gets logits, because it is the only one a
+    caller can do anything with and the output head is the largest single
+    projection in the pass. See
+    [docs/validation/prefill.md](../../../docs/validation/prefill.md).
+    """
+    var count = m.block_count()
+    if len(keys) != count or len(values) != count:
+        raise Error(
+            "the cache has room for "
+            + String(len(keys))
+            + " layers and the model has "
+            + String(count)
+        )
+
+    var run = _embed(ctx, m, s, x, tokens, pos)
+    for i in range(count):
+        device_layer(
+            ctx,
+            m.specs[i],
+            m.layers[i],
+            x,
+            s,
+            keys[i],
+            values[i],
+            slot,
+            pos,
+            run,
+        )
+        s.record(ctx, x)
+    _finish(ctx, m, s, x, run)

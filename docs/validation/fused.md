@@ -14,7 +14,7 @@ That is only possible because a barrier across the grid is possible, which was n
 
 A barrier round is cheap on Metal, 2.5 microseconds against a 20.10 microsecond launch, and it is not cheap on CUDA at full residency, 4.59 microseconds at 1536 blocks against a 4.82 microsecond launch. It gets to 1.26 at 384 blocks and 0.75 at 96 and is flat below that, because the cost at the top is 1536 blocks contending on one counter word rather than the rendezvous itself. So the CUDA grid has to be a few hundred blocks and each block has to carry many output rows.
 
-Ordinary global loads and stores are not coherent across a block on Metal. A value written by one block and read by another after a barrier is stale 634 times out of 640, and the barrier does not help, because the problem is that the value never left the core's own cache. Making the store a relaxed device scope atomic fixes it and making the load one does not, so what this costs the kernel is one instruction on each value it writes and nothing at all on the values it reads.
+Ordinary global loads and stores are not coherent across a block on Metal. A value written by one block and read by another after a barrier is stale 634 times out of 640, and the barrier does not help, because the problem is that the value never left the core's own cache. Both sides have to be a relaxed device scope atomic. The probe read this as the store side alone being enough and that was wrong, for a reason the section below sets out.
 
 There is no occupancy query on Metal, so the grid there is chosen by hand rather than asked for. `MULTIPROCESSOR_COUNT` works and gives a floor of one block a multiprocessor.
 
@@ -77,13 +77,15 @@ What this costs is arithmetic width. A 4096 row projection on 96 blocks is each 
 
 ## What crosses a block
 
-On CUDA nothing special. On Metal a value that another block will read has to be written with a relaxed device scope atomic, so a `Float32` store becomes a `bitcast` to `Int32` and an atomic store. The read side stays an ordinary load, which is what the probe found and what makes this affordable.
+On CUDA nothing special. On Metal a value that crosses a barrier has to be written with a relaxed device scope atomic and read with one, so a `Float32` store becomes a `bitcast` to `Int32` and an atomic store, and a load becomes an atomic load and a `bitcast` back.
 
-The two sides are not the same price and it is worth being explicit about why. A matvec block writes one value for each row it owns and reads the whole activation vector once for every one of those rows, so an atomic on the store side is one extra instruction a row and an atomic on the load side would have been one for every column of every row, in the inner loop, on the operand the whole kernel is bound by. Had it gone the other way this design would not have been worth building on Metal.
+The probe read its own table as saying the store side was enough on its own, and stage one does not reproduce that. With an atomic store and an ordinary load the fused layer disagrees with the unfused one from the first layer of the first token, deterministically, in every element of the residual stream, and a barrier after every single record rather than only the eight that need one does not change the answer by a bit. On one block it is exact. That combination is not a missing barrier, and the probe's own four way table has the reason in it: the two configurations that were correct on both devices were atomic store with atomic load and atomic store with plain load, and the second of those was measured on a probe where every block read an address it had never read before.
 
-It is also not every store. A block that writes a row of the up scratch and reads it back in the next record is reading its own write, and that path is ordinary at both ends. What has to be atomic is what crosses a barrier, which is the norm scratch, the query, the heads output, the up and gate scratch, the residual stream and the cache, so in practice it is nearly every store and almost never worth the branch to work out which.
+That is the case the real kernel is not. A block reads the norm scratch at the query projection, again at the key, again at the value, and again at the two projections in the mlp, and it reads the residual stream once a layer for thirty layers. The second read hits a line the block's own L1 already holds from the first, the barrier does not evict it, and what comes back is a round of the plan out of date. The probe never gave a block a chance to hold a stale line because it never gave a block the same address twice.
 
-What the store costs is still unmeasured. It should be close to free, since the value is already in a register and the write is one a row against a dot product over thousands of columns, but that is an expectation and not evidence. It is the first number stage one reports.
+So the price is the one the design most wanted to avoid. A matvec block writes one value for each row it owns and reads the whole activation vector once for every one of those rows, so the store side is one extra instruction a row and the load side is one for every column of every row, in the inner loop, on the operand the whole kernel is bound by. What saves it is that the activation vector is small and hot, a few thousand floats against a weight matrix of millions, so the atomic is on the operand that was already going to be in cache rather than on the one the kernel is bandwidth bound by. That is an argument for it being affordable and not a measurement of it, and the measurement is the first number stage one owes.
+
+It is not every load and not every store. A block that writes a row of the up scratch and reads it back in the next record is reading its own write, and that path is ordinary at both ends. What has to be atomic is what crosses a barrier, which is the norm scratch, the query, the heads output, the up and gate scratch, the residual stream and the cache. In practice that is nearly all of it and almost never worth the branch to work out which, and the one place it will be worth working out is the matvec inner loop if the measurement says the atomic costs anything there.
 
 ## The order it gets built in
 
@@ -108,3 +110,27 @@ A test that asserts the launch count for one token and does not move when the la
 `tests/test_gpu_block.mojo` covers the fused layer against the unfused one on a synthetic model small enough to run on every machine, the way it already covers a chunk against a run of decodes.
 
 The one that is easy to forget: the fused kernel has to deadlock loudly rather than quietly. A grid that is not fully resident hangs the GPU, which on a laptop is the display, so the launch checks the grid against the residency bound and refuses rather than trusting it, and the spin inside the barrier is bounded with a flag the host reads afterwards.
+
+## What stage one measured
+
+The grid width first, because everything else depends on it. On a 4090, SmolLM2 135M decoding 128 tokens takes 451 ms unfused, and fused it takes 366 ms on 96 blocks, 239 on 256, 238 on 384 and 239 on 512. Everything from 256 up is flat and 96 gives away half of what the path is worth. Above that it does not get slower, it stops working: 640 blocks and 768 blocks never finish a token. The shipped constant is 384, clamped by the occupancy query at three blocks a multiprocessor so that a smaller card gets a smaller grid.
+
+On Metal the same sweep on Qwen 2.5 0.5B, in ms a token, is 100 at 10 blocks, 63 at 20, 50 at 40, 49 at 50, 55 at 60, and a collapse at 70. The shipped constant is four blocks a multiprocessor, which is 40 on an M4.
+
+The residency bound cannot be probed with a barrier and nothing else. `fused_selftest` and `scripts/fused_grid_probe.mojo` rendezvous happily at grids where the real kernel deadlocks, 160 blocks against 70 on the M4 and 1024 against 640 on the 4090, because a kernel that holds registers and a shared array is resident at a narrower grid than one that holds neither. The occupancy query is an upper bound and not the answer, for the same reason: an ordinary launch is not a cooperative one.
+
+Then the attention step, which was the one place a block owned a whole head. A model has between nine and thirty two heads, so a grid of 384 blocks put at most thirty two of them to work on the one step whose cost grows with the context, and the rest waited at the next barrier. It did not show up at all at a short prompt and it took the whole advantage away at a long one: Qwen at a 512 token prompt was nine per cent slower fused than unfused. Splitting a head's keys across blocks in the flash attention way, with a fold after one extra barrier a layer, is what the numbers below are measured on.
+
+Decode rate in tokens a second, 4090, 128 tokens generated, through `scripts/bench.py`.
+
+| model | prompt | unfused | fused | ratio |
+| --- | --- | --- | --- | --- |
+| SmolLM2 135M q8_0 | 8 | 310.7 | 483.0 | 1.55 |
+| SmolLM2 135M q8_0 | 512 | 254.0 | 460.4 | 1.81 |
+| Qwen 2.5 0.5B q4_K_M | 8 | 316.8 | 372.1 | 1.17 |
+| Qwen 2.5 0.5B q4_K_M | 512 | 268.9 | 367.8 | 1.37 |
+| Llama 3.1 8B q4_K_M | 512 | 93.7 | 81.8 | 0.87 |
+
+Two things in that table decide the default. The ratios grow with the context rather than shrinking, which says the split did what it was for, and the 8B loses an eighth, which says the path is not free. A token of the 8B reads 5151 MiB of weights and the fused grid is narrower than one block a row, so what it saves in launches it gives back in bandwidth. The default is therefore a question about the model and not about the machine, which is `fused_by_default` in `src/molla/engine/device.mojo`: on when a layer's seven matrices come to a gibibyte a token or less, off above it, and `MOLLA_FUSED` overrides either way.
+
+On Metal it is off whatever the model. At a 721 token context an M4 decodes SmolLM2 at 19 ms a token unfused and 24 fused, and Qwen at 35 against 54. The split helps there too and not by enough, because 40 blocks is a fifth of what the 4090 holds and a barrier across them costs more. Stage two is what changes that, if anything does.

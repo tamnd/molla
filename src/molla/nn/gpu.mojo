@@ -46,6 +46,7 @@ until there is something to keep it there for, a kernel that could only be
 called with device buffers could not be checked against the host at all.
 """
 
+from std.atomic import Atomic, Ordering
 from std.gpu import block_idx, thread_idx
 from std.gpu.primitives.warp import WARP_SIZE, lane_group_sum
 from std.math import exp
@@ -453,42 +454,70 @@ def write_epilogue(
         o[unsafe_offset=out_at] = got
 
 
-def planar_matvec_kernel[
-    tile: Int, group: Int, with_min: Bool, form: Int
+comptime _dev32 = Atomic[DType.int32, scope="device"]
+"""A device scope atomic view of a float, for `coherent_load`."""
+
+
+@always_inline
+def coherent_load[
+    coherent: Bool
+](p: Pointer[Float32, MutAnyOrigin], i: Int) -> Float32:
+    """Read an activation, from a buffer another block may have just written.
+
+    `coherent` is false for every kernel that is launched once per operation,
+    because the launch is the synchronisation and an ordinary load is correct.
+    It is true inside the fused kernel, where the blocks that wrote this vector
+    are the same blocks that are about to read it and the only thing between the
+    two is a grid wide barrier.
+
+    On Metal an ordinary load is not enough in that case, and the reason is not
+    ordering. A block reads the same scratch at every record of every layer, so
+    the second read hits a line its own L1 already holds and the barrier does
+    not evict it, and the value that comes back is one round of the plan out of
+    date. A relaxed device scope atomic load is what gets past that. On CUDA
+    the barrier's release and acquire already cover it and this compiles to the
+    same load either way.
+    """
+    comptime if coherent and CompilationTarget.is_macos():
+        var q = p.unsafe_bitcast[Int32]()
+        return bitcast[DType.float32, 1](
+            _dev32.load[ordering=Ordering.RELAXED](
+                Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset=i])
+            )
+        )
+    else:
+        return p[unsafe_offset=i]
+
+
+@always_inline
+def planar_partial_dot[
+    tile: Int, group: Int, with_min: Bool, form: Int, coherent: Bool = False
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
-    o: Pointer[Float32, MutAnyOrigin],
-    aux: Pointer[Float32, MutAnyOrigin],
-    cols_dev: Int32,
-    stride_dev: Int32,
-    epi_dev: Int32,
-):
-    """`o[r] = dot(planar row r of w, x)`, one thread block per row.
+    row: Int,
+    cols: Int,
+    t: Int,
+) -> Float32:
+    """Thread `t` of `tile`'s share of one planar row against one vector.
 
-    The scales are read through a float32 view of the same bytes rather than
-    assembled a byte at a time. A planar row is a multiple of four bytes long by
-    construction and so is its quant plane at either width, so the scale planes
-    are four byte aligned in every row of every tensor, and a device buffer
-    starts at an alignment far larger than that.
+    Every loop that reads a weight in a decode goes through here, which is the
+    point of it being its own function. It was the body of
+    `planar_matvec_kernel` and a second copy of it lived in the fused kernel,
+    and the copy went stale twice while the layout changed underneath it, in a
+    way that builds and gives wrong answers rather than failing to compile.
 
-    `epi` says what happens to the row once it is reduced, and `aux` is the one
-    other vector that needs, which is a bias plane or the up projection. It is a
-    runtime argument and not a parameter on purpose. One thread of the block
-    runs it, once, after everything else the block does, so making it a
-    parameter would multiply five instantiations of the whole kernel by four to
-    save one predicted branch executed once per block. `aux` is the output
-    pointer when nothing reads it, so there is no null to check for.
+    `tile` is the stride and not a block size. The matvec passes its block
+    width and the fused kernel passes its own, and neither cares what the other
+    uses, because a partial sum is defined by which values this thread took and
+    not by who else is taking the rest.
 
-    Shapes arrive as `Int32` because a kernel argument has to be device
-    passable and `Int` is not. Nothing here is near two billion.
+    The scales are read through a float16 view of the same bytes rather than
+    assembled a byte at a time. A planar row's quant plane is an even number of
+    bytes wide for every row width molla accepts, so the scale planes are two
+    byte aligned in every row of every tensor, and a device buffer starts at an
+    alignment far larger than that.
     """
-    var cols = Int(cols_dev)
-    var stride = Int(stride_dev)
-    var r = Int(block_idx.x)
-    var t = Int(thread_idx.x)
-
-    var row = r * stride
     var groups = cols // group
     # Two views of the same bytes rather than one view and a conversion. Every
     # quant is read as an unsigned byte and turned into a float by
@@ -519,7 +548,7 @@ def planar_matvec_kernel[
                 m = _scale(scales, m_base + gi)
             comptime for k in range(MATVEC_BYTES):
                 var q = byte_float(UInt32(packed[unsafe_offset=at + k]))
-                var a = x[unsafe_offset=i + k]
+                var a = coherent_load[coherent](x, i + k)
                 acc += d * q * a
                 comptime if with_min:
                     acc += m * a
@@ -565,8 +594,8 @@ def planar_matvec_kernel[
                 var b = UInt32(packed[unsafe_offset=at + k])
                 var lo = nibble_float[form](b & 0xF)
                 var hi = nibble_float[form](b >> 4)
-                var a0 = x[unsafe_offset=i + k * 2]
-                var a1 = x[unsafe_offset=i + k * 2 + 1]
+                var a0 = coherent_load[coherent](x, i + k * 2)
+                var a1 = coherent_load[coherent](x, i + k * 2 + 1)
                 acc += d * lo * a0
                 acc += d * hi * a1
                 comptime if with_min:
@@ -618,14 +647,53 @@ def planar_matvec_kernel[
                 var hv = wide_float[form](
                     (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
                 )
-                var a0 = x[unsafe_offset=i + k * 2]
-                var a1 = x[unsafe_offset=i + k * 2 + 1]
+                var a0 = coherent_load[coherent](x, i + k * 2)
+                var a1 = coherent_load[coherent](x, i + k * 2 + 1)
                 acc += d * lo * a0
                 acc += d * hv * a1
                 comptime if with_min:
                     acc += m * a0
                     acc += m * a1
             i += tile * MATVEC_STEP
+    return acc
+
+
+def planar_matvec_kernel[
+    tile: Int, group: Int, with_min: Bool, form: Int
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+    epi_dev: Int32,
+):
+    """`o[r] = dot(planar row r of w, x)`, one thread block per row.
+
+    The row is `planar_partial_dot` and what is here is the reduction over the
+    block and the epilogue.
+
+    `epi` says what happens to the row once it is reduced, and `aux` is the one
+    other vector that needs, which is a bias plane or the up projection. It is a
+    runtime argument and not a parameter on purpose. One thread of the block
+    runs it, once, after everything else the block does, so making it a
+    parameter would multiply five instantiations of the whole kernel by four to
+    save one predicted branch executed once per block. `aux` is the output
+    pointer when nothing reads it, so there is no null to check for.
+
+    Shapes arrive as `Int32` because a kernel argument has to be device
+    passable and `Int` is not. Nothing here is near two billion.
+    """
+    var cols = Int(cols_dev)
+    var stride = Int(stride_dev)
+    var r = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+
+    var row = r * stride
+    var acc = planar_partial_dot[tile, group, with_min, form](
+        w, x, row, cols, t
+    )
 
     # The reduction is over the block rather than over a warp because `tile` is
     # a parameter and the warp width is not the same number on the two vendors.

@@ -36,7 +36,13 @@ from molla.nn.arch import arch_of
 from molla.nn.attention import AttnSpec
 from molla.nn.block import BlockSpec, LayerWeights, Scratch
 from molla.nn.gpu import MM_GROUPS, SPAN, DeviceVec
-from molla.nn.gpu_block import DeviceModel, DeviceScratch, device_forward
+from molla.nn.gpu_block import (
+    DeviceModel,
+    DeviceScratch,
+    build_fused_plan,
+    device_forward,
+    device_forward_fused,
+)
 from molla.nn.model import ModelWeights, forward
 from molla.nn.quant import Q_F32, Q_Q8_0
 from molla.nn.repack import LAYOUT_PLANAR, planar_row_bytes
@@ -303,6 +309,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         var worst = Float32(0)
         var peak = Float32(0)
         var picks = 0
+        var decoded = List[Float32]()
         for step in range(len(tokens)):
             forward(
                 arch,
@@ -333,6 +340,8 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             )
             ctx.synchronize()
             dscratch.logits.download(got)
+            for i in range(VOCAB):
+                decoded.append(got.data[i])
 
             var want_top = 0
             var got_top = 0
@@ -353,6 +362,70 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                     worst = gap
             if want_top == got_top:
                 picks += 1
+
+        # The fused path, over the same tokens, into a cache of its own. Every
+        # record it walks does the same arithmetic in the same order as the
+        # kernel it replaces, so this is an exact comparison rather than a
+        # tolerance. A fused layer that agreed with the unfused one to four
+        # digits would be a fused layer with a barrier in the wrong place, and
+        # a missing barrier reads a stale value, which is a plausible number
+        # rather than an error.
+        #
+        # The first layer of this model has the two post norms and the second
+        # does not, so the pass covers both the projection that carries the
+        # residual add in its epilogue and the one that cannot.
+        var plan = build_fused_plan(ctx, model, CONTEXT, False)
+        var fscratch = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB)
+        var fx = DeviceVec(ctx, WIDTH)
+        var fcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+        fscratch.tracing = True
+        var fused_out = Buffer(VOCAB)
+        var fused_diff = 0
+        for step in range(len(tokens)):
+            device_forward_fused(
+                ctx,
+                model,
+                plan,
+                fscratch,
+                fx,
+                tokens[step],
+                step,
+                step,
+                fcache.keys,
+                fcache.values,
+            )
+            ctx.synchronize()
+            fscratch.logits.download(fused_out)
+            for i in range(VOCAB):
+                if fused_out.data[i] != decoded[step * VOCAB + i]:
+                    fused_diff += 1
+        var fused_stuck = plan.stuck()
+
+        # The trace is one residual stream a layer a token, so this compares
+        # every layer of every step rather than only what came out the end. It
+        # is what says which layer went wrong when one does, and a comparison
+        # of the logits alone would have said only that something did.
+        var fused_trace_diff = 0
+        if len(fscratch.trace) != len(dscratch.trace):
+            raise Error("the two traces are not the same length")
+        for i in range(len(fscratch.trace)):
+            if fscratch.trace[i] != dscratch.trace[i]:
+                fused_trace_diff += 1
+
+        var fused_cache_diff = 0
+        var fused_mine = Buffer(CONTEXT * KV_HEADS * HEAD_DIM)
+        var fused_theirs = Buffer(CONTEXT * KV_HEADS * HEAD_DIM)
+        for l in range(LAYERS):
+            for half in range(2):
+                if half == 0:
+                    cache.keys[l].download(fused_mine)
+                    fcache.keys[l].download(fused_theirs)
+                else:
+                    cache.values[l].download(fused_mine)
+                    fcache.values[l].download(fused_theirs)
+                for i in range(len(tokens) * KV_HEADS * HEAD_DIM):
+                    if fused_theirs.data[i] != fused_mine.data[i]:
+                        fused_cache_diff += 1
 
         # The prefill path, over the same tokens, into a cache of its own. This
         # is the claim #167 makes and it is not implied by anything above: the
@@ -499,6 +572,34 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                 "and the residual stream agrees layer by layer, not only at"
                 " the end"
             ),
+        )
+
+        suite.group("fused layer against unfused")
+        suite.check(
+            plan.records == LAYERS * 12 + 4,
+            (
+                "a plan holds twelve records a layer, and two more for each of"
+                " the two post norms the first layer has"
+            ),
+        )
+        suite.check(
+            fused_stuck == 0,
+            "no block ever gave up at a grid barrier",
+        )
+        suite.check(
+            fused_trace_diff == 0,
+            (
+                "every residual stream it leaves behind a layer matches the"
+                " unfused one in every bit"
+            ),
+        )
+        suite.check(
+            fused_diff == 0,
+            "and so do the logits",
+        )
+        suite.check(
+            fused_cache_diff == 0,
+            "and so do the keys and values",
         )
 
         suite.group("device prefill against device decode")
