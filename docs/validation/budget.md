@@ -4,6 +4,8 @@ Issue #232 was opened on the claim that the 8B decode reads weights at 630 GB/s 
 
 The model is Meta-Llama-3.1-8B-Instruct-Q4_K_M, the machine is gpc, and the command is `generate <model> <tokenizer> <prompt> 128 2048` with the prompt built the way [bench.md](bench.md) describes. Every number here is the median of three runs on an otherwise idle card.
 
+The token was 12.97 ms when this page was written and is 9.16 ms now, because the second of the three terms below turned out to be a grid that was three quarters empty. The measurements are left as they were taken and the section that closed it is at the end.
+
 ## The three terms
 
 A decode token is 12.97 ms at 1121 tokens of context and 8.31 ms at four. Nothing about the model changed between those two runs, so the 4.66 ms of difference is work that scales with how much context there is, and the 8.31 ms is what a token costs before any of that.
@@ -70,6 +72,47 @@ The bytes are not the problem. The key and value cache is float32, 8 key heads o
 Grouped query attention makes the issued figure four times the resident one, because there are 32 query heads over 8 key heads and the grid is one block per query head, so the same key head is read by four blocks. Even counting it that way the rate is 251 GB/s. The distinct keys and values of one layer are 9.7 MB and the card has 72 MB of L2, so those four reads are not four trips to memory, and 63 GB/s is the honest number for what leaves the memory.
 
 This is where the next of the token is, and #204 does not reach it. Halving the cache to float16 halves 296 MiB to 148, and a path running at a twelfth of the memory rate does not get twice as fast when given half as much to read.
+
+## Which it now is, because the grid was the whole of it
+
+`scripts/attend_probe.mojo` measures the kernel rather than subtracting two decodes, and it agrees: 114 microseconds a layer at 1185 keys, which is 3.67 ms over 32 layers. Then it reads the same 1185 keys with a taller grid, by asking for more tokens than a decode has, so that the bytes stay where they are and only the block count moves.
+
+| blocks | time | work |
+| --- | --- | --- |
+| 32 | 111 us | 1 token |
+| 64 | 112 us | 2 tokens |
+| 128 | 112 us | 4 tokens |
+| 256 | 170 us | 8 tokens |
+| 512 | 310 us | 16 tokens |
+
+Four times the work for the same time. The card was three quarters idle and a decode had no way to ask it for more, because a decode has 32 query heads and that was the whole grid.
+
+So `device_attend` now cuts the keys into slices, one block each, and joins them in a second launch. A slice subtracts its own maximum and writes its weighted value sum unnormalised alongside that maximum and its sum, and the join rescales each by the gap between its maximum and the row's. The arithmetic is exact rather than approximate, and 48 greedy tokens at 1122 tokens of context come back byte identical to what the single kernel produced.
+
+| context | one kernel | split | speedup | 32 layers |
+| --- | --- | --- | --- | --- |
+| 64 | 13 us | 14 us | 0.9x | 0.45 ms |
+| 256 | 26 us | 18 us | 1.4x | 0.58 ms |
+| 512 | 49 us | 19 us | 2.5x | 0.61 ms |
+| 1185 | 111 us | 32 us | 3.4x | 1.03 ms |
+| 2048 | 184 us | 45 us | 4.0x | 1.44 ms |
+
+The first row is a context too short to cut, which takes the single kernel unchanged, and the microsecond between the two is noise.
+
+End to end on the 8B at 1121 tokens of context, three alternating runs each, the token goes from 13.03 ms to 9.16. That is 3.87 ms off, and the context term this page measured at 4.94 ms is now 1.03, so the two agree to within a tenth of a millisecond.
+
+| term | at 1121 context | share |
+| --- | --- | --- |
+| the projections | 6.70 ms | 73 per cent |
+| attention over the context | 1.03 ms | 11 per cent |
+| everything else | 1.43 ms | 16 per cent |
+| a token | 9.16 ms | |
+
+The residual has gone from 1.33 ms to 1.43. A split token launches a second kernel per layer, which is 32 more launches at the 4.2 microseconds `scripts/launch_probe.mojo` prices them at, and that is 0.13 ms. The caveat at the top of the page applies to the difference either way.
+
+A target of 256 blocks is what ships. 1024 was tried and is worse at the contexts that matter, 35 microseconds at 1185 against 32 and 47 at 2048 against 45, because past the point where the card is full the only thing more slices buy is a longer join.
+
+The reading has moved back to the first row. The projections were 52 per cent of a token and are now 73, and the 1.24 ms of small grid overhead priced two sections above is now a seventh of a token rather than a tenth.
 
 ## What this page corrects
 
