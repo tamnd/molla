@@ -12,7 +12,7 @@ Launch cost is now measured on both backends. It is 4.82 microseconds on the RTX
 
 Device graph capture is reachable from Mojo. It is also useless here. It raises on Metal by design, and on the fleet's only CUDA machine replaying a captured graph costs the same per node as launching the kernel eagerly. So the launch mechanism is not the lever.
 
-There is no grid wide barrier in MAX and no cooperative launch, and the device wide semaphore that looked like one is a one writer lock and is NVIDIA only. A barrier built by hand out of device scope atomics works on both backends, and a round of it is ten times cheaper than a launch on Metal and no cheaper at all on CUDA unless the grid is kept to a few hundred blocks. On Metal it also does not carry ordinary global traffic across a block, so every value that crosses one has to move through an atomic.
+There is no grid wide barrier in MAX and no cooperative launch, and the device wide semaphore that looked like one is a one writer lock and is NVIDIA only. A barrier built by hand out of device scope atomics works on both backends, and a round of it is ten times cheaper than a launch on Metal and no cheaper at all on CUDA unless the grid is kept to a few hundred blocks. On Metal it also does not carry ordinary global traffic across a block, and the fix is an atomic on the store side only, which is one instruction on a value the kernel already had.
 
 MAX ships tuned kernels for nearly everything molla wrote by hand, in packages that are already on the import path. The exception matters: K quant matmul is CPU only in MAX, and molla's models are q4_K_M, so the one kernel molla most wanted to hand over is the one it has to keep.
 
@@ -80,14 +80,18 @@ What the two backends do not agree on is what carries the ordering. On CUDA it r
 
 An Apple GPU has none of those. `acquire`, `release` and `acquire_release` are all rejected on an atomic there, and a memory fence is worse than rejected: `fence` of every ordering, scoped and unscoped, crashes the Metal pipeline compiler with "Compiler encountered an internal error" rather than failing to compile. What works is `llvm_intrinsic["llvm.air.wg.barrier", NoneType](Int32(3), Int32(1))`, which is the same instruction `barrier` already emits with a different flag word, flag 3 being `mem_device | mem_threadgroup` where the ordinary block barrier passes 2. So on Metal the rendezvous is relaxed atomics with a device flagged threadgroup barrier either side of it.
 
-That gets the blocks to meet. It does not get their data across, and this is the finding that changes the design. The probe has every block write its own slot, wait, and read its neighbour's, sixty four rounds over the grid.
+That gets the blocks to meet. It does not get their data across, and this is the finding that changes the design. The probe has every block write its own slot, wait, and read its neighbour's, sixty four rounds over the grid, with the write and the read made of an ordinary access or a relaxed device scope atomic independently.
 
-| device | plain loads and stores | relaxed device atomics |
-| --- | --- | --- |
-| RTX 4090 through WSL2 | 98304 of 98304 correct | 98304 of 98304 correct |
-| Apple M4 | 634 of 640 wrong | 640 of 640 correct |
+| device | plain, plain | atomic store | atomic load | both |
+| --- | --- | --- | --- | --- |
+| RTX 4090 through WSL2 | all 98304 correct | all correct | all correct | all correct |
+| Apple M4 | 634 of 640 wrong | all 640 correct | 309 of 640 wrong | all correct |
 
-On CUDA ordinary global traffic is coherent across the barrier and nothing special is needed. On Metal it is not, and the barrier makes no difference to that, because the problem is not ordering but that the value never leaves the core's own cache. The same addresses read and written through relaxed device scope atomics are correct every time. So a fused kernel on Metal has to move every value that crosses a block through an atomic load or store, which for float data means a bitcast to and from `int32` at both ends. That is a cost in the arithmetic rather than in the sync, and it is the first thing to measure when the fused kernel is built.
+On CUDA ordinary global traffic is coherent across the barrier and nothing special is needed anywhere.
+
+On Metal it is not, and the barrier makes no difference to that, because the problem is not ordering but that the value never leaves the core that wrote it. Which side has to be the atomic is the whole question, and it is the store. An atomic store followed by an ordinary load is right every time, an ordinary store followed by an atomic load is still wrong about half the time, and the wrong half is the writes that happened not to have drained yet. Repeated three times on the M4 with the same verdicts and the middle column stable to within a few counts.
+
+That is the difference between this design being free and being ruinous. A fused matvec writes one value a row and reads the whole activation vector once for every row, so an atomic on the store side is one instruction a row and an atomic on the load side would have been one for every column of every row. Only the writes have to change, and a `Float32` write becomes a bitcast to `Int32` and a relaxed atomic store.
 
 One more thing the probe found on the way, worth writing down because it costs an afternoon otherwise. A pointer rebuilt from an integer address, `Pointer[Int32, MutAnyOrigin](unsafe_from_address=Int(p) + i * 4)`, crashes the Metal pipeline compiler the moment an atomic touches it, while the same address reached as `Pointer[Int32, MutAnyOrigin](to=p[unsafe_offset=i])` compiles and runs. The address space appears to be lost on the way through the integer. Both forms are fine for ordinary loads and stores, which is why this only shows up once atomics are involved.
 
@@ -225,7 +229,7 @@ Whether 4.82 microseconds is CUDA or whether it is WSL2. This is now the largest
 
 What a persistent kernel's grid should be. The sweep above says the risk is the opposite of the one expected: a grid sized to full residency on a 4090 synchronises at the price of a launch, so the useful grid is a few hundred blocks, and whether the arithmetic of an 8B layer runs well on a few hundred blocks of 128 threads is now the question. A two level barrier would raise that ceiling and has not been written.
 
-What the Metal atomic requirement costs. Every value crossing a block on that backend has to be bitcast through an `int32` atomic load or store, and how much that takes out of a fused layer is unmeasured. It is the first thing the fused kernel should report.
+What the Metal atomic store costs. It is one instruction on a value the kernel had in a register anyway, so the expectation is that it is free, and the expectation is not evidence. It is the first thing the fused kernel should report.
 
 Whether MAX's flash attention and paged cache accept a K quant weight anywhere in their signatures, or whether adopting them forces the whole layer to dequantized activations first. The signatures were read and they take `LayoutTensor` of float32 for the hidden state, which suggests the latter, but reading a signature in a tree that is ahead of the pinned runtime is a lead and not a fact. It gets settled by compiling a call.
 

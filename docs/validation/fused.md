@@ -14,7 +14,7 @@ That is only possible because a barrier across the grid is possible, which was n
 
 A barrier round is cheap on Metal, 2.5 microseconds against a 20.10 microsecond launch, and it is not cheap on CUDA at full residency, 4.59 microseconds at 1536 blocks against a 4.82 microsecond launch. It gets to 1.26 at 384 blocks and 0.75 at 96 and is flat below that, because the cost at the top is 1536 blocks contending on one counter word rather than the rendezvous itself. So the CUDA grid has to be a few hundred blocks and each block has to carry many output rows.
 
-Ordinary global loads and stores are not coherent across a block on Metal. A value written by one block and read by another after a barrier is stale 634 times out of 640, and the barrier does not help, because the problem is that the value never left the core's own cache. Through relaxed device scope atomics it is right every time. So every value that crosses a block on that backend is an atomic load or store with a bitcast at each end.
+Ordinary global loads and stores are not coherent across a block on Metal. A value written by one block and read by another after a barrier is stale 634 times out of 640, and the barrier does not help, because the problem is that the value never left the core's own cache. Making the store a relaxed device scope atomic fixes it and making the load one does not, so what this costs the kernel is one instruction on each value it writes and nothing at all on the values it reads.
 
 There is no occupancy query on Metal, so the grid there is chosen by hand rather than asked for. `MULTIPROCESSOR_COUNT` works and gives a floor of one block a multiprocessor.
 
@@ -77,11 +77,13 @@ What this costs is arithmetic width. A 4096 row projection on 96 blocks is each 
 
 ## What crosses a block
 
-On CUDA nothing special. On Metal every scratch vector read by a block that did not write it has to move through a relaxed device scope atomic, so a `Float32` becomes a `bitcast` to `Int32`, an atomic store, and a `bitcast` back after an atomic load on the other side.
+On CUDA nothing special. On Metal a value that another block will read has to be written with a relaxed device scope atomic, so a `Float32` store becomes a `bitcast` to `Int32` and an atomic store. The read side stays an ordinary load, which is what the probe found and what makes this affordable.
 
-That is not every access. A block that writes a row of the query scratch and reads it back in the same step is reading its own writes and can use ordinary loads. It is only the value that crosses a barrier, which is the norm scratch, the query, the heads output, the up and gate scratch, the residual stream, and the cache. In practice that is nearly all of them, so the honest planning assumption is that every scratch access on Metal is an atomic.
+The two sides are not the same price and it is worth being explicit about why. A matvec block writes one value for each row it owns and reads the whole activation vector once for every one of those rows, so an atomic on the store side is one extra instruction a row and an atomic on the load side would have been one for every column of every row, in the inner loop, on the operand the whole kernel is bound by. Had it gone the other way this design would not have been worth building on Metal.
 
-What that costs is unmeasured. A relaxed atomic load on Apple should be a load that misses the core cache by construction, which is what correctness requires and what a barrier separated stage would have had to do anyway, so the expectation is that it is close to free and the expectation is not evidence. It is the first number stage one reports.
+It is also not every store. A block that writes a row of the up scratch and reads it back in the next record is reading its own write, and that path is ordinary at both ends. What has to be atomic is what crosses a barrier, which is the norm scratch, the query, the heads output, the up and gate scratch, the residual stream and the cache, so in practice it is nearly every store and almost never worth the branch to work out which.
+
+What the store costs is still unmeasured. It should be close to free, since the value is already in a register and the write is one a row against a dot product over thousands of columns, but that is an expectation and not evidence. It is the first number stage one reports.
 
 ## The order it gets built in
 
