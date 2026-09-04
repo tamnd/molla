@@ -66,6 +66,26 @@ into the mantissa of `2^23` instead and subtract `2^23` back off, and the whole
 thing is an integer or and a floating point subtract, both full rate. It is
 exact, it changes no layout and it adds no launch, which is everything the
 integer path is not."""
+comptime V_MAGIC8 = 15
+"""`V_MAGIC4` again with eight, to find where the step width stops paying."""
+comptime V_MAGIC4 = 14
+"""`V_MAGIC` with four values an iteration instead of two, and nothing else.
+
+The control for `V_MASK16`. That variant changes two things at once, the mask
+and the width of a step, and this one changes only the width, so the difference
+between the two of them is what the mask is actually worth."""
+comptime V_MASK16 = 13
+"""The shipped loop with the nibble shifts replaced by masks on a `uint16`.
+
+What #203 asks for, from the Metal q4_K matvec in llama.cpp. Read two bytes at
+once, pull the four nibbles out with `0x000F`, `0x00F0`, `0x0F00` and `0xF000`,
+and let each one come out sixteen, two hundred and fifty six or four thousand
+and ninety six times too large. Nothing corrects it in the loop. Each nibble
+position gets its own accumulator and the correction is one multiply by a power
+of two per position at the end of the row, which is exact.
+
+Against `V_MAGIC` the mask costs the same as the shift, so the only thing this
+can win is the second byte load going away, one load per four values."""
 comptime V_BYTE = 11
 """The shipped loop for a byte wide type, which is a different loop entirely."""
 comptime V_BYTE_MAGIC = 12
@@ -219,6 +239,65 @@ def probe_kernel[
                 acc += m * a0
                 acc += m * a1
             i += tile * 2
+
+    elif variant == V_MAGIC4 or variant == V_MAGIC8:
+        comptime step = 4 if variant == V_MAGIC4 else 8
+        var i = t * step
+        while i < cols:
+            var gi = i >> shift
+            var at = row + (i >> 1)
+            var d = scales[unsafe_offset=d_base + gi]
+            var m = scales[unsafe_offset=m_base + gi] if with_min else Float32(
+                0
+            )
+            comptime for k in range(step // 2):
+                var b = UInt32(packed[unsafe_offset=at + k])
+                var lo = bitcast[DType.float32, 1](
+                    UInt32(0x4B000000) | (b & 0xF)
+                )
+                var hi = bitcast[DType.float32, 1](
+                    UInt32(0x4B000000) | (b >> 4)
+                )
+                var a0 = x[unsafe_offset=i + k * 2]
+                var a1 = x[unsafe_offset=i + k * 2 + 1]
+                acc += d * (lo - Float32(8388608.0)) * a0
+                acc += d * (hi - Float32(8388608.0)) * a1
+                comptime if with_min:
+                    acc += m * (a0 + a1)
+            i += tile * step
+
+    elif variant == V_MASK16:
+        var pairs = w.unsafe_bitcast[UInt16]()
+        var acc1 = Float32(0)
+        var acc2 = Float32(0)
+        var acc3 = Float32(0)
+        var i = t * 4
+        while i < cols:
+            var gi = i >> shift
+            var b = UInt32(pairs[unsafe_offset=(row + (i >> 1)) >> 1])
+            var n0 = bitcast[DType.float32, 1](UInt32(0x4B000000) | (b & 0xF))
+            var n1 = bitcast[DType.float32, 1](UInt32(0x4B000000) | (b & 0xF0))
+            var n2 = bitcast[DType.float32, 1](UInt32(0x4B000000) | (b & 0xF00))
+            var n3 = bitcast[DType.float32, 1](
+                UInt32(0x4B000000) | (b & 0xF000)
+            )
+            var a0 = x[unsafe_offset=i]
+            var a1 = x[unsafe_offset=i + 1]
+            var a2 = x[unsafe_offset=i + 2]
+            var a3 = x[unsafe_offset=i + 3]
+            var d = scales[unsafe_offset=d_base + gi]
+            acc += d * (n0 - Float32(8388608.0)) * a0
+            acc1 += d * (n1 - Float32(8388608.0)) * a1
+            acc2 += d * (n2 - Float32(8388608.0)) * a2
+            acc3 += d * (n3 - Float32(8388608.0)) * a3
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                acc += m * (a0 + a1)
+                acc += m * (a2 + a3)
+            i += tile * 4
+        acc += acc1 * Float32(0.0625)
+        acc += acc2 * Float32(0.00390625)
+        acc += acc3 * Float32(0.000244140625)
 
     elif variant == V_BYTE:
         var quants = w.unsafe_bitcast[Int8]()
@@ -472,6 +551,30 @@ def _sweep[
     _report(
         "  magic cvt ",
         _time[group, with_min, form, V_MAGIC](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  magic x4  ",
+        _time[group, with_min, form, V_MAGIC4](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  magic x8  ",
+        _time[group, with_min, form, V_MAGIC8](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  mask16    ",
+        _time[group, with_min, form, V_MASK16](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,

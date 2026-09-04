@@ -28,6 +28,8 @@ An RTX 4090 with 24564 MiB, reached through WSL2 on a Windows machine, which is 
 
 molla 0.4.5, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-04. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, median, and the load average was between 2.9 and 8.4 before each run. These are the lengths M7 takes its gate at.
 
+The molla rows are still 0.4.5 because nothing since has changed what this backend does. Both versions since were checked against them on this machine rather than assumed: 0.4.6 is Metal only, and #203 sets its step widths per backend and leaves CUDA on the ones it already had. SmolLM2 decode over three runs of each is 243.3, 234.4 and 241.1 on the version in the table against 243.8, 236.6 and 244.7 after, and the 8B is 86.4, 84.1 and 84.2 against 84.0, 85.3 and 85.4. Those two sets are the same set.
+
 llama.cpp reports itself as build 1 on this machine because it was built there from a clone with no tags, and the build number comes from `git describe`. The commit is the identity that matters and it is in the line above.
 
 There are two memory columns and the second one is the one that means anything here. The host column is resident set, which on a card holds whatever the engine happened to leave in host memory and nothing about the model, and it is not comparable between the two engines either, since llama.cpp keeps the model in a mapping whose pages are resident and molla streams the file to the card through a bounded arena. The card column is the most the card held while the engine ran, over what it held before. `CardWatch` in `scripts/bench.py` says what that does and does not measure.
@@ -62,25 +64,38 @@ An M4 with 10 cores, and a shared working machine whose load average is regularl
 
 There is one memory column and not two. Unified memory means the card figure would be the host figure counted twice, and `nvidia-smi` is what the second column is read with anyway.
 
-molla 0.4.5, llama.cpp b10621 c1d0e7a00, Ollama not installed, on 2026-09-04. 512 prompt tokens asked for, 128 generated, 3 runs, median, the same lengths as the gpc tables. The two Metal tables were retaken after #201 and the last row of each is what molla did before it, on the same clone and the same afternoon.
+molla 0.4.7, llama.cpp b10621 c1d0e7a00, Ollama not installed, on 2026-09-04. 512 prompt tokens asked for, 128 generated, 3 runs, median, the same lengths as the gpc tables.
+
+All three Metal tables were retaken together after #203 and the last row of each is what molla did before it, from the same clone on the same afternoon. The load average moved between 3.2 and 10.6 over that sitting, which is why the llama.cpp rows are lower than the ones this page carried a version ago even though llama.cpp did not change. Read the last row against the first and not against anything on an earlier version of this page.
 
 SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 514 prompt tokens, on `--device=metal`.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB |
 | --- | --- | --- | --- | --- |
-| molla | 2141.7 | 48.7 | 240 | 405 |
-| llama.cpp | 9341.0 | 314.3 | 55 | 249 |
+| molla | 1932.3 | 36.5 | 266 | 362 |
+| llama.cpp | 8615.0 | 292.2 | 60 | 246 |
 | ollama | - | - | - | - |
-| molla before #201 | 472.0 | 48.9 | 1089 | 344 |
+| molla before #203 | 1778.5 | 31.1 | 289 | 371 |
 
 Qwen 2.5 0.5B Instruct q4_K_M, digest 74a4da8c9fdb, 514 prompt tokens, on `--device=metal`.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB |
 | --- | --- | --- | --- | --- |
-| molla | 612.6 | 23.9 | 839 | 915 |
-| llama.cpp | 3238.0 | 170.6 | 159 | 596 |
+| molla | 513.5 | 23.9 | 1001 | 912 |
+| llama.cpp | 2541.6 | 129.7 | 202 | 596 |
 | ollama | - | - | - | - |
-| molla before #201 | 169.4 | 23.9 | 3035 | 887 |
+| molla before #203 | 508.4 | 18.1 | 1011 | 914 |
+
+Llama 3.1 8B Instruct q4_K_M, digest 7b064f5842bf, 515 prompt tokens, on `--device=metal`. New to this page. It is the model M7 takes its gate on and it was missing from the Metal side, and it is also the only one of the three that is mostly q4_K, which is the type the decode matvec is written for.
+
+| engine | prefill tok/s | decode tok/s | ttft ms | host MiB |
+| --- | --- | --- | --- | --- |
+| molla | 29.5 | 5.1 | 17430 | 7280 |
+| llama.cpp | 115.2 | 13.7 | 4472 | 4918 |
+| ollama | - | - | - | - |
+| molla before #203 | 22.6 | 2.7 | 22792 | 7279 |
+
+Both engines are slow on that one because a 4.7 GiB model on this laptop does not fit anywhere comfortable, so the row says more about the machine than about either engine. The ratio between the rows is still the thing to read and it is the tightest of the three.
 
 On `--device=cpu`, the same machine and the SmolLM2 file.
 
@@ -116,11 +131,17 @@ Prefill is 3.1 times off on SmolLM2, 8.6 on Qwen and 27.9 on the 8B. That is the
 
 Memory is much closer than this page used to say, and most of what it used to say was a reporting artefact. On the card molla holds 656 MiB against llama.cpp's 694 on SmolLM2 and 1110 against 1120 on Qwen, which is parity or better, and 7404 against 5198 on the 8B, which is 1.42 times. The 8B is the only real gap and it has two known causes: the repack cache is 6474 MiB against a 4693 MiB model file, which #182 and #183 are closing, and the KV cache is f32 where llama.cpp's is f16, which is #204.
 
-Metal prefill was 20.0 times off on SmolLM2 and 19.2 on Qwen, which is nearly the same ratio on two models an order of magnitude apart in size, where the CUDA gap went from 3.1 to 27.9 over the same pair. A flat ratio is a slow kernel and a growing one is a scaling failure, so the two backends were short for different reasons and one fix was never going to close both.
+Metal prefill was 20.0 times off on SmolLM2 and 19.2 on Qwen before #201, which is nearly the same ratio on two models an order of magnitude apart in size, where the CUDA gap went from 3.1 to 27.9 over the same pair. A flat ratio is a slow kernel and a growing one is a scaling failure, so the two backends were short for different reasons and one fix was never going to close both.
 
-The slow kernel is the one #201 replaced, and the ratio is now 4.4 and 5.3. What is left of it is not the instruction. A dense tile of this shape reaches 3.04 TFLOP/s on this M4 and llama.cpp's own prefill here works out at 2.55, so llama.cpp is at 84 per cent of the ceiling and molla at 2141.7 tokens a second is at about a fifth of it. Metal memory went up with it, 344 to 405 MiB and 887 to 915, which is the wider prefill chunk the tile wants and is the trade the numbers say to take.
+The slow kernel is the one #201 replaced, and the ratio is now 4.5 and 4.9, with the 8B at 3.9. What is left of it is not the instruction. A dense tile of this shape reaches 3.04 TFLOP/s on this M4 and llama.cpp's own prefill here works out at 2.55, so llama.cpp is at 84 per cent of the ceiling and molla is at about a fifth of it. Metal memory went up with it, 344 to 405 MiB and 887 to 915, which is the wider prefill chunk the tile wants and is the trade the numbers say to take.
 
-Decode on Metal is untouched, and against the retaken llama.cpp rows it is 6.5 and 7.1 times off, where the card is 3.6 and 2.7. The fixed per launch cost hurts more here.
+Decode on Metal moved for the first time since the device path was written, and what moved it was how many values one thread takes between two reads of the group scale. That number was two. It is eight now on Metal and the three models gained 1.17, 1.32 and 1.89 times, in that order, which is the order of their sizes. #203 asked for a different change to the same loop, the nibble masks from the Metal q4_K matvec in llama.cpp, and `scripts/matvec_probe.mojo` says that one is worth nothing once the step width is held equal. The step width is the whole effect.
+
+The gain growing with the model is the same shape as the launch cost argument two paragraphs up, read from the other side. A wider step only pays on rows long enough to have a loop, and the 8B has rows three and a half times wider than Qwen's and sixteen times wider than SmolLM2's.
+
+What is left on Metal is 8.0, 5.4 and 2.7 times at decode. The 8B is inside three and the gate is one and a half.
+
+Qwen is the odd one of the three and the reason is the file rather than the engine. It is named q4_K_M and 133 of its tensors are q5_0, against 14 that are q4_K. Every five and six bit type is widened to a byte a value in the planar layout today, so that model is read at eight bits a value on the card, which is 60 per cent more bytes a token than it needs and is most of why it holds 912 MiB against llama.cpp's 596. #182 and #183 are that, and this table is the first place the cost of it is visible as a decode number rather than a memory one.
 
 The host path is the worst number on this page and nothing is currently pointed at it. On the same laptop and the same file, `--device=cpu` is 76.6 times off llama.cpp at prefill and 33.9 at decode, and llama.cpp on ten CPU cores beats molla on the GPU of the same machine at decode by a factor of four. That is a scalar loop against a NEON one and it is what a host path costs when every milestone so far has been about accelerators.
 
