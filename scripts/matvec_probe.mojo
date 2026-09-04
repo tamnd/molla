@@ -510,6 +510,129 @@ def _time[
     return best
 
 
+def _time_cold[
+    group: Int, with_min: Bool, form: Int, variant: Int, tile: Int = TILE
+](
+    ctx: DeviceContext,
+    base: Int,
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    rows: Int,
+    cols: Int,
+    stride: Int,
+    slices: Int,
+    reps: Int,
+) raises -> Float64:
+    """`_time`, except every launch reads a slice nothing has read recently.
+
+    The grid is the shape a model actually launches and the bytes behind it are
+    not the same bytes twice, which is the combination a decode has and which
+    neither of the other two sweeps can produce. `_time` reads one tensor
+    sixteen times and a real shape is 35 MiB, so from the second launch on it is
+    reading a cache. Handing each launch its own slice of a pool sixteen times
+    the size keeps the grid where it was and takes the cache away.
+    """
+    var best = Float64(0)
+    var span = rows * stride
+    for rep in range(reps):
+        var at = monotonic()
+        for k in range(16):
+            ctx.enqueue_function[
+                probe_kernel[tile, group, with_min, form, variant]
+            ](
+                Pointer[UInt8, MutAnyOrigin](
+                    unsafe_from_address=base + (k % slices) * span
+                ),
+                x,
+                o,
+                Int32(cols),
+                Int32(stride),
+                grid_dim=(rows, 1, 1),
+                block_dim=(tile, 1, 1),
+            )
+        ctx.synchronize()
+        var took = Float64(monotonic() - at) / 16.0
+        if rep == 0 or took < best:
+            best = took
+    return best
+
+
+def _sweep_cold[
+    kind: Int, group: Int, with_min: Bool, form: Int, tile: Int = TILE
+](ctx: DeviceContext, label: String, rows: Int, cols: Int) raises:
+    """One projection shape at its own grid, with the cache taken away.
+
+    Only the four variants that are still in the running, because this
+    allocates sixteen tensors and the point of it is one comparison rather than
+    a survey: what the shipped loop gets at a shape a model has, against what
+    the same access with no arithmetic in it gets.
+    """
+    comptime slices = 16
+    var stride = planar_row_bytes(kind, cols)
+    var span = rows * stride
+    var wbuf = ctx.enqueue_create_buffer[DType.uint8](span * slices)
+    var xbuf = ctx.enqueue_create_buffer[DType.float32](
+        cols + cols // group + 4
+    )
+    var obuf = ctx.enqueue_create_buffer[DType.float32](rows)
+    ctx.synchronize()
+    var base = Int(wbuf.unsafe_ptr())
+    var x = Pointer[Float32, MutAnyOrigin](
+        unsafe_from_address=Int(xbuf.unsafe_ptr())
+    )
+    var o = Pointer[Float32, MutAnyOrigin](
+        unsafe_from_address=Int(obuf.unsafe_ptr())
+    )
+    var values = Float64(rows * cols)
+    var read = Float64(span)
+    print(
+        label
+        + "  "
+        + String(rows)
+        + " by "
+        + String(cols)
+        + ", row "
+        + String(stride)
+        + " bytes, "
+        + String(Int(read / 1048576.0))
+        + " MiB a launch over "
+        + String(Int(read * slices / 1048576.0))
+        + " MiB"
+    )
+    _report(
+        "  magic cvt",
+        _time_cold[group, with_min, form, V_MAGIC, tile](
+            ctx, base, x, o, rows, cols, stride, slices, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  magic x4 ",
+        _time_cold[group, with_min, form, V_MAGIC4, tile](
+            ctx, base, x, o, rows, cols, stride, slices, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  mask16   ",
+        _time_cold[group, with_min, form, V_MASK16, tile](
+            ctx, base, x, o, rows, cols, stride, slices, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  loads only",
+        _time_cold[group, with_min, form, V_NO_MATH, tile](
+            ctx, base, x, o, rows, cols, stride, slices, 5
+        ),
+        values,
+        read,
+    )
+
+
 def _report(name: String, ns: Float64, values: Float64, bytes: Float64):
     print(
         name
@@ -769,6 +892,14 @@ def main() raises:
     # decode never gets a second pass over anything. 560 MiB is enough to be out
     # of any cache in the fleet and small enough to allocate beside a model.
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k down, cold", 65536, 14336)
+
+    # And the three shapes again at their own grids, with the cache taken away
+    # rather than the grid made enormous to escape it. This is the only reading
+    # on the page that has both of the things a decode has, and it is the one to
+    # compare a token against.
+    _sweep_cold[Q_Q4_K, 32, True, QUANT_U4](ctx, "cold gate", 14336, 4096)
+    _sweep_cold[Q_Q4_K, 32, True, QUANT_U4](ctx, "cold down", 4096, 14336)
+    _sweep_cold[Q_Q4_K, 32, True, QUANT_U4](ctx, "cold attn", 4096, 4096)
 
     # The same three at narrower blocks. TILE has been 128 since the kernel was
     # written and nothing had ever asked what it should be.
