@@ -585,6 +585,9 @@ def _sweep_cold[
     )
     var values = Float64(rows * cols)
     var read = Float64(span)
+    # Hoisted rather than written into the print below, where `mojo format`
+    # rejects a multiply and a divide in the same nested call.
+    var pool = Float64(span * slices) / 1048576.0
     print(
         label
         + "  "
@@ -596,7 +599,7 @@ def _sweep_cold[
         + " bytes, "
         + String(Int(read / 1048576.0))
         + " MiB a launch over "
-        + String(Int(read * slices / 1048576.0))
+        + String(Int(pool))
         + " MiB"
     )
     _report(
