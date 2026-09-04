@@ -11,6 +11,12 @@ what a token pays. The bytes column is the keys and the values one layer holds
 at that context, which is what the kernel has to read, and the rate is that over
 the time.
 
+Three tables. The first is the single kernel over the whole context, which is
+what this measured before the split landed and is kept so the two can be
+compared. The second is the grid depth sweep that said the grid was the problem.
+The third is the split against the single kernel at the same contexts, which is
+the answer to issue #234.
+
 The keys and values are left as allocated. What is in them does not change what
 the kernel reads, and a buffer of zeros scores zero, exponentiates to one and
 sums to the key count, which is a normal float throughout with no denormal stall
@@ -26,7 +32,7 @@ from max.gpu.host import DeviceContext
 
 from molla.nn.attention import AttnSpec
 from molla.nn.gpu import DeviceVec
-from molla.nn.gpu_ops import device_attend
+from molla.nn.gpu_ops import attend_partials, device_attend
 
 comptime REPS = 20
 """Launches in one timed run, averaged. More than the projection probe uses,
@@ -47,6 +53,7 @@ def _time(
     values: DeviceVec,
     mut out: DeviceVec,
     mut scores: DeviceVec,
+    mut partials: DeviceVec,
     count: Int,
     tokens: Int = 1,
 ) raises -> Float64:
@@ -70,6 +77,7 @@ def _time(
                 count - 1,
                 out,
                 scores,
+                partials,
                 tokens,
             )
         ctx.synchronize()
@@ -106,12 +114,21 @@ def main() raises:
         var keys = DeviceVec(ctx, most * kv_width)
         var values = DeviceVec(ctx, most * kv_width)
         var scores = DeviceVec(ctx, spec.heads * most)
+        # One float, which is less room than one slice needs, so `device_attend`
+        # cuts the keys into one piece and launches the single kernel. This is
+        # how the first two tables here measure what the kernel used to do now
+        # that the shipped path does something else.
+        var unsplit = DeviceVec(ctx, 1)
+        var split = DeviceVec(ctx, attend_partials(spec, 1, most))
         ctx.synchronize()
 
+        print("one kernel over the whole context, which is what it used to do")
         print("context   a layer    kv bytes   rate       32 layers")
         for i in range(len(contexts)):
             var count = contexts[i]
-            var ns = _time(ctx, spec, q, keys, values, out, scores, count)
+            var ns = _time(
+                ctx, spec, q, keys, values, out, scores, unsplit, count
+            )
             # Keys and values, float32, over the whole context. What one query
             # head re-reads because four of them share a key head is not in
             # this, because it is not what leaves the memory.
@@ -169,6 +186,7 @@ def main() raises:
                 values,
                 deep_out,
                 deep_scores,
+                unsplit,
                 count,
                 deep,
             )
@@ -185,4 +203,33 @@ def main() raises:
                 + " times one token's cost for "
                 + String(deep)
                 + " of them"
+            )
+
+        print("")
+        print("and what the split does with that, one token over the same keys")
+        print("context   one kernel   split      speedup    32 layers")
+        for i in range(len(contexts)):
+            var ctx_len = contexts[i]
+            var before = _time(
+                ctx, spec, q, keys, values, out, scores, unsplit, ctx_len
+            )
+            var after = _time(
+                ctx, spec, q, keys, values, out, scores, split, ctx_len
+            )
+            var token = after * Float64(LAYERS)
+            print(
+                String(ctx_len)
+                + "\t  "
+                + String(Int(before / 1000.0))
+                + " us\t       "
+                + String(Int(after / 1000.0))
+                + " us\t      "
+                + String(Int(before / after))
+                + "."
+                + String(Int(before * 10.0 / after) % 10)
+                + "x\t      "
+                + String(Int(token / 1000000.0))
+                + "."
+                + String(Int(token / 10000.0) % 100)
+                + " ms"
             )

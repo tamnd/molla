@@ -731,6 +731,249 @@ def attend_kernel[
         d += tile
 
 
+comptime ATTEND_BLOCKS = 256
+"""Blocks a decode's attention aims to launch, once it is allowed to split.
+
+A decode launches `heads` blocks, which is 32 for an 8B, and
+[docs/validation/budget.md](../../../docs/validation/budget.md) measured what
+that costs: the same 1185 keys read by 32, 64 and 128 blocks all took 111 to 112
+microseconds, so the card was doing four times the work for the same time and a
+decode was using a quarter of it. 256 is where that stopped being true and the
+time began to rise, so it is the first grid width that is actually using the
+machine.
+"""
+
+comptime ATTEND_MIN_CHUNK = 128
+"""The fewest keys worth giving a block of its own.
+
+One key per thread at `TILE`. Below this the block spends its life in the two
+reductions and the merge that follows has more chunks to walk than the chunks
+had keys, and a short context is fast already.
+"""
+
+
+def _attend_chunks(heads: Int, tokens: Int, count: Int) -> Int:
+    """How many ways to cut the keys, for a grid of `heads * tokens * chunks`.
+
+    One when the grid is wide enough without cutting, which is what a prefill
+    chunk of any size gives, and one again when the context is too short for the
+    pieces to be worth having. Both of those take the single kernel path.
+    """
+    var wide = heads * tokens
+    var want = (ATTEND_BLOCKS + wide - 1) // wide
+    var most = count // ATTEND_MIN_CHUNK
+    if want > most:
+        want = most
+    if want < 1:
+        return 1
+    return want
+
+
+def attend_partials(spec: AttnSpec, tokens: Int, context: Int) -> Int:
+    """Floats `device_attend` wants for its partials at this geometry.
+
+    A caller sizes a buffer with this once and hands the same one back every
+    call, for the reason `scores` is passed in rather than allocated. A caller
+    that has no interest in the split can hand over anything shorter, including
+    an empty vector: `device_attend` cuts the key count into as many pieces as
+    the buffer it was given has room for, and a buffer with room for one piece
+    is the single kernel path it always took.
+    """
+    return (
+        tokens
+        * spec.heads
+        * _attend_chunks(spec.heads, tokens, context)
+        * (spec.head_dim + 2)
+    )
+
+
+def attend_split_kernel[
+    tile: Int
+](
+    q: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float32, MutAnyOrigin],
+    values: Pointer[Float32, MutAnyOrigin],
+    scores: Pointer[Float32, MutAnyOrigin],
+    partials: Pointer[Float32, MutAnyOrigin],
+    count_dev: Int32,
+    pos_dev: Int32,
+    head_dim_dev: Int32,
+    kv_width_dev: Int32,
+    group_dev: Int32,
+    window_dev: Int32,
+    sinks_dev: Int32,
+    q_row_dev: Int32,
+    score_row_dev: Int32,
+    chunks_dev: Int32,
+    scale: Float32,
+    softcap: Float32,
+):
+    """`attend_kernel` over one slice of the keys, leaving the join to a second.
+
+    The third grid dimension is the slice. Block `c` owns keys `[lo, hi)` and
+    does exactly what `attend_kernel` does to them, except that the maximum it
+    subtracts and the sum it divides by are its own slice's rather than the
+    row's, so what it writes is not the answer. It writes three things per query
+    head instead: the weighted value sum over its slice unnormalised, the
+    maximum it subtracted, and the sum it would have divided by.
+    `attend_merge_kernel` turns those into the row's answer.
+
+    That is the standard trick for making a softmax separable, and the reason it
+    is worth the second launch is that the grid was the whole problem. See
+    `ATTEND_BLOCKS`.
+
+    The scores go to the same scratch at the same offsets the single kernel
+    writes, because the slices are disjoint and between them cover the row.
+    """
+    var ty = Int(block_idx.y)
+    var count = Int(count_dev) + ty
+    var pos = Int(pos_dev) + ty
+    var head_dim = Int(head_dim_dev)
+    var kv_width = Int(kv_width_dev)
+    var group = Int(group_dev)
+    var window = Int(window_dev)
+    var sinks = Int(sinks_dev)
+    var score_row = Int(score_row_dev)
+    var chunks = Int(chunks_dev)
+
+    var h = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var c = Int(block_idx.z)
+    var kvh = h // group
+    var qa = ty * Int(q_row_dev) + h * head_dim
+    var sa = (ty * Int(grid_dim.x) + h) * score_row
+    var pa = ((ty * Int(grid_dim.x) + h) * chunks + c) * (head_dim + 2)
+
+    # Rounding up rather than down, so the last slice is the short one and no
+    # slice is left over past the end of the loop.
+    var per = (count + chunks - 1) // chunks
+    var lo = c * per
+    var hi = lo + per
+    if hi > count:
+        hi = count
+
+    # A slice past the end of a short token's keys. Every thread of the block
+    # agrees, so returning here is not a divergent exit from a barrier.
+    if lo >= hi:
+        if t == 0:
+            partials[unsafe_offset=pa + head_dim] = NEG_INF
+            partials[unsafe_offset=pa + head_dim + 1] = Float32(0)
+        return
+
+    var mine = NEG_INF
+    var j = lo + t
+    while j < hi:
+        var visible = j < sinks or window <= 0 or j > pos - window
+        var s = NEG_INF
+        if visible:
+            var ka = j * kv_width + kvh * head_dim
+            var acc = Float32(0)
+            for d in range(head_dim):
+                acc += q[unsafe_offset=qa + d] * keys[unsafe_offset=ka + d]
+            s = acc * scale
+            if softcap > 0:
+                s = softcap * _tanh(s / softcap)
+        scores[unsafe_offset=sa + j] = s
+        if s > mine:
+            mine = s
+        j += tile
+    var top = _block_max[tile](mine)
+
+    # A slice a window has masked end to end. The single kernel never meets
+    # this, because `device_attend` refuses a position that can see no keys at
+    # all, but a slice of a row that can see some is free to see none. Left in,
+    # it would subtract `NEG_INF` from `NEG_INF`, which is zero rather than the
+    # infinity the name suggests, and every masked key would come back weighted
+    # one.
+    if top == NEG_INF:
+        if t == 0:
+            partials[unsafe_offset=pa + head_dim] = NEG_INF
+            partials[unsafe_offset=pa + head_dim + 1] = Float32(0)
+        return
+
+    var acc_sum = Float32(0)
+    j = lo + t
+    while j < hi:
+        var e = exp(scores[unsafe_offset=sa + j] - top)
+        scores[unsafe_offset=sa + j] = e
+        acc_sum += e
+        j += tile
+    var total = _block_sum[tile](acc_sum)
+
+    var d = t
+    while d < head_dim:
+        var acc = Float32(0)
+        for j2 in range(lo, hi):
+            var va = j2 * kv_width + kvh * head_dim
+            acc += scores[unsafe_offset=sa + j2] * values[unsafe_offset=va + d]
+        partials[unsafe_offset=pa + d] = acc
+        d += tile
+    if t == 0:
+        partials[unsafe_offset=pa + head_dim] = top
+        partials[unsafe_offset=pa + head_dim + 1] = total
+
+
+def attend_merge_kernel[
+    tile: Int
+](
+    partials: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    head_dim_dev: Int32,
+    q_row_dev: Int32,
+    chunks_dev: Int32,
+):
+    """The slices of one query head, joined into the answer.
+
+    Each slice subtracted its own maximum, so a slice's numbers are the row's
+    numbers scaled by `exp(its maximum - the row's)`. Rescale by that and the
+    sums add and the weighted value sums add, which is the whole of the join.
+
+    Every thread works the maximum and the total out for itself rather than
+    reducing them across the block. There are `chunks` of each, which is eight
+    at the shipped grid, and eight adds per thread is cheaper than the two
+    barriers a reduction would cost.
+
+    A slice with a zero sum saw nothing and is skipped. Its partial output was
+    never written and must not be read.
+    """
+    var head_dim = Int(head_dim_dev)
+    var chunks = Int(chunks_dev)
+    var ty = Int(block_idx.y)
+    var h = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var slot = head_dim + 2
+    var base = (ty * Int(grid_dim.x) + h) * chunks * slot
+
+    var top = NEG_INF
+    for c in range(chunks):
+        var m = partials[unsafe_offset=base + c * slot + head_dim]
+        if m > top:
+            top = m
+
+    var total = Float32(0)
+    for c in range(chunks):
+        var s = partials[unsafe_offset=base + c * slot + head_dim + 1]
+        if s > 0:
+            total += s * exp(
+                partials[unsafe_offset=base + c * slot + head_dim] - top
+            )
+    var inv = Float32(1.0) / total
+
+    var qa = ty * Int(q_row_dev) + h * head_dim
+    var d = t
+    while d < head_dim:
+        var acc = Float32(0)
+        for c in range(chunks):
+            var at = base + c * slot
+            var s = partials[unsafe_offset=at + head_dim + 1]
+            if s > 0:
+                acc += partials[unsafe_offset=at + d] * exp(
+                    partials[unsafe_offset=at + head_dim] - top
+                )
+        o[unsafe_offset=qa + d] = acc * inv
+        d += tile
+
+
 def _grid(n: Int) -> Int:
     """Blocks for an elementwise launch, capped.
 
@@ -1440,6 +1683,7 @@ def device_attend(
     pos: Int,
     mut out: DeviceVec,
     mut scores: DeviceVec,
+    mut partials: DeviceVec,
     tokens: Int = 1,
 ) raises:
     """`tokens` queries against `count` keys and up, `heads * head_dim` out each.
@@ -1447,6 +1691,14 @@ def device_attend(
     Token `i` of a chunk sits at position `pos + i` and attends over `count + i`
     keys, so the causal mask is the count rather than a comparison. A decode is
     one token and reads exactly as it did.
+
+    `partials` is scratch for the split path and is sized by `attend_partials`.
+    A long context on a narrow grid is cut into slices, one block each, and
+    joined by a second launch, because a decode's grid of `heads` blocks was
+    using a quarter of the card. How many slices is decided by the grid width
+    and by how much room `partials` has, so a caller that hands over a short
+    buffer or an empty one gets the single kernel it always got. The scores
+    scratch is the same size and holds the same thing either way.
 
     The one thing this refuses that the host version also refuses is a position
     that can see no keys at all, and it is checked here rather than in the
@@ -1506,14 +1758,43 @@ def device_attend(
             + String(spec.sinks)
             + " sinks should never produce"
         )
+    var slot = spec.head_dim + 2
+    var chunks = _attend_chunks(spec.heads, tokens, count)
+    var room = partials.elements() // (tokens * spec.heads * slot)
+    if chunks > room:
+        chunks = room
+    if chunks < 1:
+        chunks = 1
     _need_device()
     comptime if has_accelerator():
-        ctx.enqueue_function[attend_kernel[TILE]](
+        if chunks == 1:
+            ctx.enqueue_function[attend_kernel[TILE]](
+                q.ptr(),
+                keys.ptr(),
+                values.ptr(),
+                scores.ptr(),
+                out.ptr(),
+                Int32(count),
+                Int32(pos),
+                Int32(spec.head_dim),
+                Int32(kv_width),
+                Int32(spec.group()),
+                Int32(spec.window),
+                Int32(spec.sinks),
+                Int32(width),
+                Int32(last),
+                spec.scale,
+                spec.softcap,
+                grid_dim=(spec.heads, tokens, 1),
+                block_dim=(TILE, 1, 1),
+            )
+            return
+        ctx.enqueue_function[attend_split_kernel[TILE]](
             q.ptr(),
             keys.ptr(),
             values.ptr(),
             scores.ptr(),
-            out.ptr(),
+            partials.ptr(),
             Int32(count),
             Int32(pos),
             Int32(spec.head_dim),
@@ -1523,8 +1804,19 @@ def device_attend(
             Int32(spec.sinks),
             Int32(width),
             Int32(last),
+            Int32(chunks),
             spec.scale,
             spec.softcap,
+            grid_dim=(spec.heads, tokens, chunks),
+            block_dim=(TILE, 1, 1),
+        )
+        # Same stream, so the join sees every slice without a synchronize.
+        ctx.enqueue_function[attend_merge_kernel[TILE]](
+            partials.ptr(),
+            out.ptr(),
+            Int32(spec.head_dim),
+            Int32(width),
+            Int32(chunks),
             grid_dim=(spec.heads, tokens, 1),
             block_dim=(TILE, 1, 1),
         )

@@ -30,6 +30,7 @@ from max.gpu.host import DeviceContext
 from molla.nn.attention import AttnSpec, attend
 from molla.nn.gpu import DeviceVec
 from molla.nn.gpu_ops import (
+    attend_partials,
     device_add_into,
     device_argmax,
     device_attend,
@@ -446,10 +447,11 @@ def _attend_case(
     var dv = DeviceVec(ctx, count * kv_width)
     var dout = DeviceVec(ctx, width)
     var dscores = DeviceVec(ctx, spec.heads * count)
+    var dpart = DeviceVec(ctx, attend_partials(spec, 1, count))
     dq.upload(q)
     dk.upload_run(keys, 0, count * kv_width)
     dv.upload_run(values, 0, count * kv_width)
-    device_attend(ctx, spec, dq, dk, dv, count, pos, dout, dscores)
+    device_attend(ctx, spec, dq, dk, dv, count, pos, dout, dscores, dpart)
     ctx.synchronize()
     var got = Buffer(width)
     dout.download(got)

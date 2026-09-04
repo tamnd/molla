@@ -111,6 +111,7 @@ from molla.nn.gpu_ops import (
     RopeTables,
     device_add_into,
     device_add_run,
+    attend_partials,
     device_attend,
     device_gelu,
     device_rms_norm,
@@ -499,6 +500,13 @@ struct DeviceScratch(Movable):
     var gate: DeviceVec
     var up: DeviceVec
     var scores: DeviceVec
+    var partials: DeviceVec
+    """Room for attention to cut the context up and join it back.
+
+    Sized by `attend_partials` at the largest context this scratch is for, which
+    is what decides how many pieces it can be cut into. See `ATTEND_BLOCKS`.
+    """
+
     var logits: DeviceVec
     var ids: DeviceVec
     """The token indices this pass is looking up, one float each.
@@ -559,6 +567,9 @@ struct DeviceScratch(Movable):
         self.gate = DeviceVec(ctx, wide * spec.hidden)
         self.up = DeviceVec(ctx, wide * spec.hidden)
         self.scores = DeviceVec(ctx, chunk * spec.attn.heads * context)
+        self.partials = DeviceVec(
+            ctx, attend_partials(spec.attn, chunk, context)
+        )
         self.logits = DeviceVec(ctx, vocab)
         self.ids = DeviceVec(ctx, chunk)
         self.chunk = chunk
@@ -735,6 +746,7 @@ def device_attention(
         pos,
         s.heads_out,
         s.scores,
+        s.partials,
         tokens,
     )
     # The residual add rides the output projection's epilogue, so `s.projected`
