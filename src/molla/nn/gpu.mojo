@@ -47,6 +47,7 @@ called with device buffers could not be checked against the host at all.
 """
 
 from std.gpu import block_idx, thread_idx
+from std.gpu.primitives.warp import WARP_SIZE, lane_group_sum
 from std.math import exp
 from std.memory import AddressSpace, bitcast, stack_allocation
 from std.sys.info import CompilationTarget, has_accelerator
@@ -604,9 +605,13 @@ def planar_matmul_kernel[
     var live = tokens - base
     if live > SPAN:
         live = SPAN
-    # A group whose whole run is past the end of the chunk still walks the
-    # columns, because it shares the block's barriers and a group that returned
-    # early would leave the others waiting on a barrier it never reaches.
+    # A group whose whole run is past the end of the chunk stops here rather
+    # than walking the columns for nothing. It can, because a group is a warp of
+    # its own and the reduction below is the only thing the lanes of a block
+    # agree on, so there is no barrier left for the ones still working to wait
+    # at. That holds only while a group is exactly a warp wide.
+    if tile == WARP_SIZE and live <= 0:
+        return
 
     # Every loop over `SPAN` below has a constant trip count so that the index
     # into `acc` is a constant after unrolling and the accumulators stay in
@@ -616,11 +621,11 @@ def planar_matmul_kernel[
     # The dead lanes of a tail block read past the last token rather than
     # clamping onto it, which is why every scratch vector a chunk uses is
     # allocated with `SPAN * MM_GROUPS` rows of slack. Clamping would need a
-    # token index per
-    # lane held in a register for the length of the accumulation, which is
-    # `SPAN` registers taken from the accumulators for arithmetic that is thrown
-    # away. Reading slack is an affine offset the address unit folds in for
-    # free, and what it computes is discarded by the `t < live` below.
+    # token index per lane held in a register for the length of the
+    # accumulation, which is
+    # `SPAN` registers taken from the accumulators for arithmetic that is
+    # thrown away. Reading slack is an affine offset the address unit folds in
+    # for free, and what it computes is discarded by the `t < live` below.
     var at0 = base * cols
 
     var acc = InlineArray[Float32, SPAN](fill=0)
@@ -660,31 +665,25 @@ def planar_matmul_kernel[
                     acc[k] += lo * a0 + hi * a1
             i += tile * 2
 
-    # Laid out `[SPAN][tile]` so that a step of the tree reads what consecutive
-    # threads wrote, which is the access the single accumulator version already
-    # had, done `SPAN` times over rather than as `SPAN` tree walks in a row.
-    var part = stack_allocation[
-        tile * SPAN * MM_GROUPS, Float32, address_space=AddressSpace.SHARED
-    ]()
-    var mine = g * SPAN * tile
+    # A lane group reduction and not a tree through shared memory. A group is a
+    # warp wide, so `SPAN` reductions are `SPAN` times five shuffles with no
+    # shared memory, no barrier, and no occupancy given up to a scratch array
+    # that is only touched in the last few instructions of the kernel. The tree
+    # this replaced was more work than the dot product that fed it whenever the
+    # matrix was narrow.
+    #
+    # Every lane ends up holding every total, so each one keeps the total for
+    # the token it is about to write and drops the rest.
+    var got = Float32(0)
     for k in range(SPAN):
-        part[unsafe_offset=mine + k * tile + t] = acc[k]
-    barrier()
-    var step = tile // 2
-    while step > 0:
-        if t < step:
-            for k in range(SPAN):
-                part[unsafe_offset=mine + k * tile + t] = (
-                    part[unsafe_offset=mine + k * tile + t]
-                    + part[unsafe_offset=mine + k * tile + t + step]
-                )
-        barrier()
-        step //= 2
+        var whole = lane_group_sum[num_lanes=tile](acc[k])
+        if t == k:
+            got = whole
 
-    # One thread a token rather than one thread for the whole block, so the
+    # One thread a token rather than one thread for the whole group, so the
     # tail is `SPAN` threads doing one epilogue each.
     if t < live:
-        var v = part[unsafe_offset=mine + t * tile]
+        var v = got
         var epi = Int(epi_dev)
         var out_at = (base + t) * rows + r
         if epi & EPI_BIAS != 0:
