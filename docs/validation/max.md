@@ -12,7 +12,7 @@ Launch cost is now measured on both backends. It is 4.82 microseconds on the RTX
 
 Device graph capture is reachable from Mojo. It is also useless here. It raises on Metal by design, and on the fleet's only CUDA machine replaying a captured graph costs the same per node as launching the kernel eagerly. So the launch mechanism is not the lever.
 
-There is no grid wide barrier in MAX and no cooperative launch. There is a device wide semaphore and an occupancy query, which together are what a persistent kernel would be built out of, and that is enough.
+There is no grid wide barrier in MAX and no cooperative launch, and the device wide semaphore that looked like one is a one writer lock and is NVIDIA only. A barrier built by hand out of device scope atomics works on both backends, and a round of it is ten times cheaper than a launch on Metal and no cheaper at all on CUDA unless the grid is kept to a few hundred blocks. On Metal it also does not carry ordinary global traffic across a block, so every value that crosses one has to move through an atomic.
 
 MAX ships tuned kernels for nearly everything molla wrote by hand, in packages that are already on the import path. The exception matters: K quant matmul is CPU only in MAX, and molla's models are q4_K_M, so the one kernel molla most wanted to hand over is the one it has to keep.
 
@@ -68,13 +68,66 @@ Worth recording for the day that machine exists: `DeviceGraphBuilder.recording_c
 
 Issue #169's other half. `max.gpu.sync` has `barrier`, `named_barrier`, `syncwarp` and the whole `mbarrier_*` family, and every one of them is block level or cluster level. There is no `grid_barrier`. `enqueue_function` takes a `cluster_dim` and a list of `LaunchAttribute`, and there is no cooperative launch flag among them.
 
-So the primitive performance.md hoped for is not there under that name. What is there is enough to build it.
+So the primitive performance.md hoped for is not there under that name, and the first answer to this question named the wrong replacement. `max.gpu.sync.semaphore.Semaphore` is not a rendezvous. It is a one writer lock, `fetch` and `wait` and `release` around a state a single block advances, which is what a split K matmul uses to hand a partial result on and not what a barrier needs. It also opens with `comptime assert is_nvidia_gpu()`, so it is unavailable on half of molla's hardware regardless. Neither fact was checked before it was written down.
 
-`max.gpu.sync.semaphore.Semaphore` is documented as "a device-wide semaphore implementation for GPUs", a lock in global memory that all CTAs synchronise on, with `fetch`, `wait` and `release`. That is a grid wide barrier with the counting written by hand.
+The barrier has to be built out of device scope atomics, so `scripts/gridsync_probe.mojo` builds one and measures it. It is a sense reversing barrier over two `Atomic[DType.int32, scope="device"]` words, an arrival count and a generation. Every block adds one, the block that finds itself last resets the count and moves the generation on, and the rest spin on the generation. The spin is bounded rather than infinite, because a barrier that does not work would otherwise hang the GPU, and on a laptop that is the display.
 
-`ctx.occupancy_max_active_blocks_per_multiprocessor` is the other half. Without a cooperative launch there is no guarantee from the driver that every block in the grid is resident at once, and a barrier across blocks that are not all resident deadlocks. Asking occupancy how many blocks fit and launching exactly that many gives the same guarantee by construction. It is more work than a cooperative launch and it is portable, which a cooperative launch is not, so this is the better answer even where both exist.
+### What each backend needs to make it order memory
 
-That is the whole mechanism a persistent kernel needs, and both pieces compile today.
+The rendezvous itself works on both. No block reached the patience bound on either, at any grid size tried.
+
+What the two backends do not agree on is what carries the ordering. On CUDA it rides the atomic: acquire release on the arrival, release on the generation store, acquire on the generation load, one instruction each.
+
+An Apple GPU has none of those. `acquire`, `release` and `acquire_release` are all rejected on an atomic there, and a memory fence is worse than rejected: `fence` of every ordering, scoped and unscoped, crashes the Metal pipeline compiler with "Compiler encountered an internal error" rather than failing to compile. What works is `llvm_intrinsic["llvm.air.wg.barrier", NoneType](Int32(3), Int32(1))`, which is the same instruction `barrier` already emits with a different flag word, flag 3 being `mem_device | mem_threadgroup` where the ordinary block barrier passes 2. So on Metal the rendezvous is relaxed atomics with a device flagged threadgroup barrier either side of it.
+
+That gets the blocks to meet. It does not get their data across, and this is the finding that changes the design. The probe has every block write its own slot, wait, and read its neighbour's, sixty four rounds over the grid.
+
+| device | plain loads and stores | relaxed device atomics |
+| --- | --- | --- |
+| RTX 4090 through WSL2 | 98304 of 98304 correct | 98304 of 98304 correct |
+| Apple M4 | 634 of 640 wrong | 640 of 640 correct |
+
+On CUDA ordinary global traffic is coherent across the barrier and nothing special is needed. On Metal it is not, and the barrier makes no difference to that, because the problem is not ordering but that the value never leaves the core's own cache. The same addresses read and written through relaxed device scope atomics are correct every time. So a fused kernel on Metal has to move every value that crosses a block through an atomic load or store, which for float data means a bitcast to and from `int32` at both ends. That is a cost in the arithmetic rather than in the sync, and it is the first thing to measure when the fused kernel is built.
+
+One more thing the probe found on the way, worth writing down because it costs an afternoon otherwise. A pointer rebuilt from an integer address, `Pointer[Int32, MutAnyOrigin](unsafe_from_address=Int(p) + i * 4)`, crashes the Metal pipeline compiler the moment an atomic touches it, while the same address reached as `Pointer[Int32, MutAnyOrigin](to=p[unsafe_offset=i])` compiles and runs. The address space appears to be lost on the way through the integer. Both forms are fine for ordinary loads and stores, which is why this only shows up once atomics are involved.
+
+### Sizing the grid
+
+`ctx.occupancy_max_active_blocks_per_multiprocessor` is the other half of the mechanism. Without a cooperative launch there is no guarantee from the driver that every block in the grid is resident at once, and a barrier across blocks that are not all resident deadlocks. Asking occupancy how many blocks fit and launching no more than that gives the same guarantee by construction.
+
+It works on CUDA, where the probe gets 12 blocks a multiprocessor at 128 threads across 128 multiprocessors, so 1536 blocks. It is a `DeviceFunction` method and it is not supported on Metal, which raises `occupancyMaxActiveBlocksPerMultiprocessor is not supported on this device`. `ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)` does work there and reports 10 on the M4, so the floor of one block a multiprocessor is available, and anything above that has to be found by experiment rather than asked for.
+
+### What a round costs
+
+Best of five, a thousand rounds a run, nothing in the kernel but barriers, swept over the grid because a rendezvous costs more the more blocks are in it.
+
+| blocks | RTX 4090 through WSL2 | blocks | Apple M4 |
+| --- | --- | --- | --- |
+| 1536 | 4.59 us | 10 | 2.50 us |
+| 384 | 1.26 us | 2 | 2.30 us |
+| 96 | 0.75 us | 1 | 1.76 us |
+| 24 | 0.75 us | | |
+| 6 | 0.72 us | | |
+| 1 | 0.53 us | | |
+
+Those repeat to three digits across runs. What to compare them against is the launch cost measured at the top of this page, 4.82 microseconds on the 4090 and 20.10 on the M4. The probe times an empty launch itself as a control and agrees with both, loosely: 5.2 to 9.5 microseconds on gpc and 21 to 25 on the M4 across runs, which is the same figure with the noise a 1536 block launch and a loaded laptop respectively add to it.
+
+Metal is the easy read. A round is roughly ten times cheaper than a launch at every grid size, so the persistent kernel is a large win there and the only open question is what the atomic traffic costs.
+
+CUDA is not. At full residency a barrier round costs 4.59 microseconds against a 4.82 microsecond launch, which is a saving of five per cent and not worth building anything for. The saving only appears when the grid is smaller: four times cheaper at 384 blocks, six times at 96, and flat from there down. All 1536 blocks are contending on one counter word, so the cost at the top of the sweep is contention on the arrival rather than the rendezvous itself, which a two level barrier that aggregates within a multiprocessor first would mostly remove.
+
+Taken through the budget, at five stages a layer on a thirty layer model, so about 153 rounds a token.
+
+| device and grid | sync a token | budget | share |
+| --- | --- | --- | --- |
+| 4090 at 1536 blocks | 0.702 ms | 0.639 ms | 110 per cent |
+| 4090 at 384 blocks | 0.193 ms | 0.639 ms | 30 per cent |
+| 4090 at 96 blocks | 0.116 ms | 0.639 ms | 18 per cent |
+| M4 at 10 blocks | 0.383 ms | 1.514 ms | 25 per cent |
+
+So the persistent kernel fits, and it fits with a condition that was not visible before: on CUDA the grid has to be a few hundred blocks rather than everything that is resident. That is a constraint on the fused kernel and not on the barrier, because a few hundred blocks of 128 threads is a small fraction of a 4090 and the arithmetic has to be arranged so that each block carries many output rows. It also means the residency question at the bottom of this page has an answer that cuts the other way from the one expected: the risk is not that the resident grid is too small to be worth it, it is that the resident grid is too large to synchronise cheaply.
+
+Both pieces of the mechanism compile today and one of them is missing on Metal, which is a grid chosen by hand there rather than a blocker.
 
 ## What MAX already has that molla wrote by hand
 
@@ -148,7 +201,7 @@ A persistent kernel spends 0.8 per cent of the CUDA budget and 1.3 per cent of t
 
 performance.md recommended the persistent kernel with graph capture as the fallback. Both halves of that are now wrong in the same direction. Graph capture is not a fallback, because it does not exist on Metal and buys five per cent on the only CUDA machine available. And the persistent kernel is not one option among two, it is the only arrangement where the numbers close.
 
-So the persistent kernel moves from fourth in the order to the thing everything else is arranged around, and its two prerequisites are both confirmed available.
+So the persistent kernel moves from fourth in the order to the thing everything else is arranged around. Its two prerequisites both exist, one of them has to be hand rolled rather than imported, and each backend puts a different condition on it: a small grid on CUDA, atomic traffic on Metal.
 
 Fusion stays, and its justification changes. It was going to be a two times improvement on the way to the goal. It is now the step that proves out the fused arithmetic, the epilogue plumbing and the paged cache in a form that can be tested kernel by kernel against the logit corpus, before the same arithmetic is folded into one kernel where a wrong answer is much harder to localise. Fusion is the rehearsal, and it happens to be worth about three times on its own.
 
@@ -170,7 +223,9 @@ What zero copy is not is a memory win. Issue #166 already took peak resident mem
 
 Whether 4.82 microseconds is CUDA or whether it is WSL2. This is now the largest single uncertainty on the page, because it decides whether graph capture is a dead end or a two times win on Linux CUDA, and it moves every CUDA ceiling in the budget table by roughly two. It needs a native Linux host with an NVIDIA card, which the fleet does not have.
 
-Whether a persistent kernel's occupancy limited grid is large enough to be worth it. Sizing the grid to what fits resident means the whole model's arithmetic runs on fewer blocks than a per kernel launch would use, and on a small model that may be fine while on an 8B it may not. The occupancy query answers it directly and cheaply, so this is a measurement to take early rather than a risk to carry.
+What a persistent kernel's grid should be. The sweep above says the risk is the opposite of the one expected: a grid sized to full residency on a 4090 synchronises at the price of a launch, so the useful grid is a few hundred blocks, and whether the arithmetic of an 8B layer runs well on a few hundred blocks of 128 threads is now the question. A two level barrier would raise that ceiling and has not been written.
+
+What the Metal atomic requirement costs. Every value crossing a block on that backend has to be bitcast through an `int32` atomic load or store, and how much that takes out of a fused layer is unmeasured. It is the first thing the fused kernel should report.
 
 Whether MAX's flash attention and paged cache accept a K quant weight anywhere in their signatures, or whether adopting them forces the whole layer to dequantized activations first. The signatures were read and they take `LayoutTensor` of float32 for the hidden state, which suggests the latter, but reading a signature in a tree that is ahead of the pinned runtime is a lead and not a fact. It gets settled by compiling a call.
 
