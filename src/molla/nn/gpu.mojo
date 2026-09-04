@@ -722,6 +722,243 @@ def planar_matmul_kernel[
             o[unsafe_offset=out_at] = v
 
 
+comptime GEMM_ROWS = 64
+"""Output rows one block of the tiled form covers.
+
+The number that decides how many times the activation is read. A block reads
+the activation tile once and produces `GEMM_ROWS` rows from it, so a chunk's
+activation traffic is `rows / GEMM_ROWS` passes rather than `rows` of them,
+which is the whole difference between this kernel and the one above it.
+
+Sixty four rather than more because the weight tile is `GEMM_ROWS * GEMM_K`
+floats of threadgroup memory and Metal gives a threadgroup 32 KiB of it. At
+sixty four rows and a K step of thirty two that is 8 KiB of weight beside 8 KiB
+of activation, which leaves room for a second block on a core.
+"""
+
+comptime GEMM_TOKS = PREFILL_CHUNK
+"""Tokens one block of the tiled form covers, which is the whole chunk.
+
+The weight tile is read once per block, so the weight traffic for a chunk is
+`ceil(tokens / GEMM_TOKS)` passes over the matrix. At the chunk exactly it is
+one pass, which is what the untiled kernel already achieves and what this must
+not give up while it fixes the activation side.
+"""
+
+comptime GEMM_K = 32
+"""Values of the reduction staged at a time.
+
+The quant group on every type molla compiles a device kernel for, which is not
+a coincidence and is worth one load. A step that covers exactly one group means
+the scale and the minimum for a row are read once for the whole step rather
+than once per value, and the group index is a constant inside the step.
+
+It is also what makes the staging coalesce. A step is thirty two bytes of an
+eight bit row and sixteen of a four bit one, so a warp filling the tile reads
+one contiguous run per row.
+"""
+
+comptime GEMM_MICRO_R = 8
+"""Output rows one thread keeps in registers."""
+
+comptime GEMM_MICRO_T = 4
+"""Output tokens one thread keeps in registers.
+
+`GEMM_MICRO_R` by this is the accumulator block a thread holds, and the product
+is what pays for the loads that feed it. A thread reads `GEMM_MICRO_R` weights
+and `GEMM_MICRO_T` activations out of threadgroup memory and does the product
+of the two in multiplies, so eight by four is thirty two multiplies against
+twelve loads. One by one, which is what a thread of the untiled kernel does, is
+one multiply against two loads, and that ratio is the second half of why this
+kernel exists.
+
+Thirty two accumulators, which is inside what both backends give a thread
+before it spills.
+"""
+
+comptime GEMM_TT = GEMM_TOKS // GEMM_MICRO_T
+comptime GEMM_TR = GEMM_ROWS // GEMM_MICRO_R
+comptime GEMM_THREADS = GEMM_TT * GEMM_TR
+
+
+def planar_gemm_kernel[
+    group: Int, with_min: Bool, form: Int
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+    epi_dev: Int32,
+    rows_dev: Int32,
+    tokens_dev: Int32,
+):
+    """`o[t][r] = dot(row r of w, x[t])` with both operands staged.
+
+    `planar_matmul_kernel` amortizes the weight read across the tokens of a
+    block and does nothing at all for the activation. Its grid is one block per
+    output row, so each of `rows` blocks reads the whole activation tile out of
+    global memory, and the traffic for one matmul is `rows * tokens * cols * 4`
+    bytes of activation against `rows * cols` bytes of weight. The dominant term
+    is multiplied by the output row count, which is the thing that grows when
+    the model grows, and that is why molla's prefill gap against llama.cpp is
+    3.3 times on a 135M model and 27.8 on an 8B.
+
+    This is the same product with a block that covers `GEMM_ROWS` rows and
+    `GEMM_TOKS` tokens, and stages both of its operands in threadgroup memory.
+    The activation tile is read once for sixty four output rows instead of once
+    per row, the weight tile is still read once per chunk, and everything in the
+    accumulation reads threadgroup memory rather than device memory.
+
+    The weight goes into the tile already dequantized, so the nibble unpack, the
+    scale multiply and the minimum add happen once per value per chunk rather
+    than once per value per token. The minimum folds into the staged value,
+    since `(d * q + m) * a` is what the untiled kernel computes as
+    `d * q * a + m * a`, which removes a multiply from the inner loop and is
+    where the `with_min` instantiations stop costing anything.
+
+    Two barriers a step and no more. Stage, wait, accumulate, wait, because the
+    second one is what stops a fast thread refilling the tile while a slow one
+    is still reading it.
+
+    See [docs/validation/engines.md](../../../docs/validation/engines.md).
+    """
+    var cols = Int(cols_dev)
+    var stride = Int(stride_dev)
+    var rows = Int(rows_dev)
+    var tokens = Int(tokens_dev)
+
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var lin = ty * GEMM_TT + tx
+    var tok_base = Int(block_idx.x) * GEMM_TOKS
+    var row_base = Int(block_idx.y) * GEMM_ROWS
+
+    var packed = w
+    var scales = w.unsafe_bitcast[Float32]()
+    var quant_bytes = cols if form == QUANT_I8 else cols // 2
+    var groups = cols // group
+    comptime shift = group_shift(group)
+
+    var a_tile = stack_allocation[
+        GEMM_K * GEMM_TOKS, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var b_tile = stack_allocation[
+        GEMM_K * GEMM_ROWS, Float32, address_space=AddressSpace.SHARED
+    ]()
+
+    # The activation tile is filled with a lane to a value of the reduction and
+    # consecutive lanes on consecutive values, so a warp reads one contiguous
+    # run of a token's row. It is stored transposed, indexed by the reduction
+    # first, because the accumulation walks the reduction and wants a token's
+    # neighbours next to each other when it does.
+    comptime A_PER_PASS = GEMM_THREADS // GEMM_K
+    comptime A_PASSES = GEMM_TOKS // A_PER_PASS
+    var ak = lin % GEMM_K
+    var at = lin // GEMM_K
+
+    # Eight bit rows are a byte a value and four bit rows are a byte a pair, so
+    # a step is thirty two bytes of one and sixteen of the other and the two
+    # want a different number of lanes to a row. Both read one contiguous run.
+    comptime B_WIDTH = GEMM_K if form == QUANT_I8 else GEMM_K // 2
+    comptime B_PER_PASS = GEMM_THREADS // B_WIDTH
+    comptime B_PASSES = GEMM_ROWS // B_PER_PASS
+    var bi = lin % B_WIDTH
+    var br = lin // B_WIDTH
+
+    var acc = InlineArray[Float32, GEMM_MICRO_R * GEMM_MICRO_T](fill=0)
+
+    var k0 = 0
+    while k0 < cols:
+        comptime for s in range(A_PASSES):
+            var t = s * A_PER_PASS + at
+            # The tail block reads past the last token rather than clamping onto
+            # it, for the reason `planar_matmul_kernel` gives: every scratch
+            # vector a chunk uses carries a whole block of slack, and what these
+            # lanes compute is dropped by the bound on the store below.
+            a_tile[unsafe_offset=ak * GEMM_TOKS + t] = x[
+                unsafe_offset=(tok_base + t) * cols + k0 + ak
+            ]
+
+        comptime for s in range(B_PASSES):
+            var r = s * B_PER_PASS + br
+            var live_row = row_base + r < rows
+            var row = (row_base + r) * stride if live_row else 0
+            var d_base = (row + quant_bytes) // 4
+            var m_base = d_base + groups
+            comptime if form == QUANT_I8:
+                var i = k0 + bi
+                var v = Float32(0)
+                if live_row:
+                    var gi = i >> shift
+                    var q = byte_float(UInt32(packed[unsafe_offset=row + i]))
+                    v = scales[unsafe_offset=d_base + gi] * q
+                    comptime if with_min:
+                        v += scales[unsafe_offset=m_base + gi]
+                b_tile[unsafe_offset=bi * GEMM_ROWS + r] = v
+            else:
+                var i = k0 + bi * 2
+                var lo = Float32(0)
+                var hi = Float32(0)
+                if live_row:
+                    var gi = i >> shift
+                    var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+                    var d = scales[unsafe_offset=d_base + gi]
+                    lo = d * nibble_float[form](b & 0xF)
+                    hi = d * nibble_float[form](b >> 4)
+                    comptime if with_min:
+                        var m = scales[unsafe_offset=m_base + gi]
+                        lo += m
+                        hi += m
+                b_tile[unsafe_offset=(bi * 2) * GEMM_ROWS + r] = lo
+                b_tile[unsafe_offset=(bi * 2 + 1) * GEMM_ROWS + r] = hi
+
+        barrier()
+
+        # The reduction step is a runtime loop and everything inside it is not.
+        # `acc` is only ever indexed by a parameter, so it stays in registers,
+        # and unrolling the step as well would be a thousand multiplies of
+        # straight line code for nothing.
+        for k in range(GEMM_K):
+            var av = InlineArray[Float32, GEMM_MICRO_T](fill=0)
+            comptime for j in range(GEMM_MICRO_T):
+                av[j] = a_tile[
+                    unsafe_offset=k * GEMM_TOKS + tx * GEMM_MICRO_T + j
+                ]
+            comptime for i in range(GEMM_MICRO_R):
+                var bv = b_tile[
+                    unsafe_offset=k * GEMM_ROWS + ty * GEMM_MICRO_R + i
+                ]
+                comptime for j in range(GEMM_MICRO_T):
+                    acc[i * GEMM_MICRO_T + j] += bv * av[j]
+
+        barrier()
+        k0 += GEMM_K
+
+    var epi = Int(epi_dev)
+    comptime for i in range(GEMM_MICRO_R):
+        var r = row_base + ty * GEMM_MICRO_R + i
+        if r < rows:
+            comptime for j in range(GEMM_MICRO_T):
+                var t = tok_base + tx * GEMM_MICRO_T + j
+                if t < tokens:
+                    var v = acc[i * GEMM_MICRO_T + j]
+                    var out_at = t * rows + r
+                    if epi & EPI_BIAS != 0:
+                        v += aux[unsafe_offset=r]
+                    elif epi & EPI_GLU != 0:
+                        var g = aux[unsafe_offset=out_at]
+                        if epi & ACT_BIT != 0:
+                            v = activate[ACT_GELU](v) * g
+                        else:
+                            v = activate[ACT_SILU](v) * g
+                    if epi & EPI_ADD != 0:
+                        o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + v
+                    else:
+                        o[unsafe_offset=out_at] = v
+
+
 def device_ready() -> Bool:
     """Whether this build has device code in it at all.
 
@@ -925,6 +1162,43 @@ def _launch_mm[
     )
 
 
+def _launch_gemm[
+    group: Int, with_min: Bool, form: Int
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+    tokens: Int,
+) raises:
+    """One instantiation of the tiled form, launched.
+
+    The grid is `(token blocks, row blocks)` and the token axis is fast, the
+    same way round and for the same reason as the untiled form: blocks that
+    share a weight tile are the ones that differ in the token index, and they
+    have to be co-resident for the cache to serve that tile once.
+    """
+    ctx.enqueue_function[planar_gemm_kernel[group, with_min, form]](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
+        x,
+        o,
+        aux,
+        Int32(w.cols),
+        Int32(w.row_bytes()),
+        Int32(epi),
+        Int32(w.rows),
+        Int32(tokens),
+        grid_dim=(
+            (tokens + GEMM_TOKS - 1) // GEMM_TOKS,
+            (w.rows + GEMM_ROWS - 1) // GEMM_ROWS,
+            1,
+        ),
+        block_dim=(GEMM_TT, GEMM_TR, 1),
+    )
+
+
 def device_matmul_into(
     ctx: DeviceContext,
     w: Tensor,
@@ -983,6 +1257,27 @@ def device_matmul_into(
         var g = group_size(w.kind)
         var carries_min = has_min(w.kind)
         var form = quant_form(w.kind)
+        # The tiled form wants the reduction to divide into whole steps and
+        # wants more than one step's worth of it, and every shape a model of any
+        # size presents satisfies both. A shape that does not falls through to
+        # the untiled kernel below rather than being refused, because the two
+        # compute the same thing and the only difference is how fast.
+        if w.cols % GEMM_K == 0 and w.cols >= GEMM_K:
+            if form == QUANT_U4 and g == 32 and carries_min:
+                _launch_gemm[32, True, QUANT_U4](ctx, w, p, o, a, epi, tokens)
+                return
+            elif form == QUANT_S4 and g == 32 and not carries_min:
+                _launch_gemm[32, False, QUANT_S4](ctx, w, p, o, a, epi, tokens)
+                return
+            elif form == QUANT_I8 and g == 32 and carries_min:
+                _launch_gemm[32, True, QUANT_I8](ctx, w, p, o, a, epi, tokens)
+                return
+            elif form == QUANT_I8 and g == 32:
+                _launch_gemm[32, False, QUANT_I8](ctx, w, p, o, a, epi, tokens)
+                return
+            elif form == QUANT_I8 and g == 16 and not carries_min:
+                _launch_gemm[16, False, QUANT_I8](ctx, w, p, o, a, epi, tokens)
+                return
         if form == QUANT_U4 and g == 32 and carries_min:
             _launch_mm[MM_TILE, 32, True, QUANT_U4](
                 ctx, w, p, o, a, epi, tokens
