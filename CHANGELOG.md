@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Fixed
+
+- A fused session holds 279 MiB of host memory on SmolLM2 rather than 1468. The 1.2 GiB was read as the price of compiling the fused kernel, which 0.4.10 says in as many words, and it was not: it was `enqueue_create_host_buffer`, which allocates pinned memory, and the first pinned allocation in a process costs 1.2 GiB whatever its size. The three words it was allocated for are the ones `fused_selftest` reads back to find out whether the grid reached a barrier, and an ordinary device to host copy into a list reads them for nothing. Compiling once rather than twice and cutting the six inlined quant forms down to one had both left the figure at 1468, which is what said the compile was not where it was going.
+
 ## [0.4.10] - 2026-09-04
 
 A decode runs a layer in one launch on CUDA. A Llama shaped layer used to be twelve launches and a thirty layer token 363 of them, and it is 33 now. On a 4090 at a 512 token prompt and 128 generated, SmolLM2 135M goes from 264.5 to 492.3 tokens a second and Qwen 2.5 0.5B from 304.8 to 367.8, both against llama.cpp at 888.9 and 767.9 and Ollama at 682.0 and 490.8 in the same sitting.
