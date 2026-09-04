@@ -452,15 +452,21 @@ def planar_matvec_kernel[
 
     var acc = Float32(0)
     comptime if form == QUANT_I8:
-        var i = t
+        var i = t * MATVEC_STEP
         while i < cols:
             var gi = i >> shift
-            var q = byte_float(UInt32(packed[unsafe_offset=row + i]))
-            var a = x[unsafe_offset=i]
-            acc += scales[unsafe_offset=d_base + gi] * q * a
-            comptime if with_min:
-                acc += scales[unsafe_offset=m_base + gi] * a
-            i += tile
+            var at = row + i
+            var d = scales[unsafe_offset=d_base + gi]
+            var m = scales[unsafe_offset=m_base + gi] if with_min else Float32(
+                0
+            )
+            comptime for k in range(MATVEC_STEP):
+                var q = byte_float(UInt32(packed[unsafe_offset=at + k]))
+                var a = x[unsafe_offset=i + k]
+                acc += d * q * a
+                comptime if with_min:
+                    acc += m * a
+            i += tile * MATVEC_STEP
     else:
         # A byte to a thread and both of its values, so a warp reads thirty two
         # contiguous bytes and gets sixty four values out of them. Both values
@@ -486,22 +492,30 @@ def planar_matvec_kernel[
         # and the largest thing left after that was the conversion of the quant,
         # which is why `nibble_float` exists.
         # See [docs/validation/layout.md](../../../docs/validation/layout.md).
-        var i = t * 2
+        #
+        # How many values a thread takes in one pass of the loop is
+        # `MATVEC_STEP` and it is not the same number on the two backends. See
+        # the comment on it for the measurement.
+        var i = t * MATVEC_STEP
         while i < cols:
             var gi = i >> shift
-            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
-            var lo = nibble_float[form](b & 0xF)
-            var hi = nibble_float[form](b >> 4)
-            var a0 = x[unsafe_offset=i]
-            var a1 = x[unsafe_offset=i + 1]
+            var at = row + (i >> 1)
             var d = scales[unsafe_offset=d_base + gi]
-            acc += d * lo * a0
-            acc += d * hi * a1
-            comptime if with_min:
-                var m = scales[unsafe_offset=m_base + gi]
-                acc += m * a0
-                acc += m * a1
-            i += tile * 2
+            var m = scales[unsafe_offset=m_base + gi] if with_min else Float32(
+                0
+            )
+            comptime for k in range(MATVEC_STEP // 2):
+                var b = UInt32(packed[unsafe_offset=at + k])
+                var lo = nibble_float[form](b & 0xF)
+                var hi = nibble_float[form](b >> 4)
+                var a0 = x[unsafe_offset=i + k * 2]
+                var a1 = x[unsafe_offset=i + k * 2 + 1]
+                acc += d * lo * a0
+                acc += d * hi * a1
+                comptime if with_min:
+                    acc += m * a0
+                    acc += m * a1
+            i += tile * MATVEC_STEP
 
     # The reduction is over the block rather than over a warp because `tile` is
     # a parameter and the warp width is not the same number on the two vendors.
@@ -526,6 +540,32 @@ def planar_matvec_kernel[
         # there and both are the same read.
         write_epilogue(o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
 
+
+comptime MATVEC_STEP = 8 if CompilationTarget.is_macos() else 2
+"""How many four bit values one thread takes in one pass of the decode matvec.
+
+The other number the two backends disagree about, and the disagreement is
+larger here than anywhere else in this file. `scripts/matvec_probe.mojo` runs
+the same loop at two, four and eight over the three shapes an 8B decode spends
+its matvec time in, against a variant that does the loads and no arithmetic at
+all, which is the floor the shape can reach.
+
+On an M4 the loop goes 1377, 899 and 639 microseconds on the down projection at
+two, four and eight, where the floor is 577. So eight is within ten per cent of
+reading the bytes and doing nothing with them, and the other two shapes move by
+the same fraction. Nothing about the arithmetic changed to get that, only how
+many values a thread carries between two reads of the group scale.
+
+On a 4090 the same three are 37, 37 and 52, so four is neutral and eight is a
+regression of two fifths. A thread there already has enough of the row in
+flight and widening the step costs occupancy instead of buying reuse.
+
+The mask trick from the Metal q4_K matvec in llama.cpp, which #203 asks for and
+which `V_MASK16` in the probe implements, is in that same table. Against the
+loop at the same step width it is worth nothing on Metal and between nothing
+and a fifth on CUDA depending on the shape, so the shifts are not what this
+loop is paying for and the step width is.
+"""
 
 comptime SPAN = 16 if CompilationTarget.is_macos() else 8
 """How many tokens one group of threads in a matmul block carries at once.
