@@ -544,7 +544,7 @@ that fit in cache. A macOS build targets Metal and a build anywhere else
 targets CUDA, which is why the operating system is the thing asked here.
 """
 
-comptime PREFILL_CHUNK = 256
+comptime PREFILL_CHUNK = 256 if CompilationTarget.is_macos() else 64
 """How many prompt tokens go through the stack in one pass.
 
 A prompt is a matrix rather than a run of decodes, and this is how much of it
@@ -554,6 +554,15 @@ thirty two head model at a four thousand context is 2 MiB a token. Sixty four
 is 128 times fewer launches than a token at a time and 33 MiB of scores on an
 8B, and at four passes for a five hundred token prompt the launches are no
 longer what is left.
+
+It is two numbers because the two backends want different ones, and by a lot.
+On Metal the matrix core form covers thirty two tokens a block, so a chunk of
+sixty four is two blocks of the token axis and the GPU runs out of work before
+it runs out of rows: widening the chunk to 256 is 1611 tokens a second against
+2142 on SmolLM2. On CUDA the same widening goes the other way, and not by a
+little, 4990 to 3545 on Qwen and 378 to 181 on the 8B. Whatever the cause
+there, it is not this change's to find, and a chunk picked for the kernel that
+runs on the target is the honest thing to write until it is.
 """
 
 comptime MM_TILE = 32
