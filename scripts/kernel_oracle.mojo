@@ -69,6 +69,32 @@ which are the failures this is looking for and all of which move a result by a
 recognisable fraction of the whole.
 """
 
+comptime K_TOLERANCE = 1e-3
+"""The same thing for the three k types, which do not round trip exactly.
+
+Their scale planes hold a product of a float16 and a small integer and the
+product is rounded back to float16 once, at repack time, so every term of the
+dot product can be off by 2^-11 of itself, which is 4.9e-4. The row's total can
+be smaller than the sum of the magnitudes it is made of, so the error as a
+fraction of the total can be larger than the error in any one term, which is why
+this is two of them rather than one. What the corpus actually produces is in
+docs/validation/logits.md and it is well inside this.
+
+It is still nowhere near loose enough to hide the failures the tighter number is
+looking for. A swapped nibble or a scale read from the wrong group moves a
+result by a fraction of the whole and not by a thousandth of it.
+"""
+
+
+def _lossy(kind: Int) -> Bool:
+    """Whether this type loses anything on the way into the planar layout.
+
+    The three k types do, for the reason `K_TOLERANCE` gives. The other five
+    carry a float16 scale out of the block into a float16 plane and nothing
+    about it moves.
+    """
+    return kind == Q_Q4_K or kind == Q_Q5_K or kind == Q_Q6_K
+
 
 def _names() -> List[String]:
     return [
@@ -194,17 +220,18 @@ def _check(
     var device_gap = _worst(want, on_device)
     var kernel_gap = _worst(on_host, on_device)
     var relative = device_gap / peak if peak > 0 else Float32(0)
+    var tol = Float32(K_TOLERANCE) if _lossy(kind) else Float32(TOLERANCE)
 
     var line = name + "  " + String(rows) + " by " + String(cols)
     line += "  peak " + String(peak)
     line += "  repack " + String(repack_gap)
     line += "  kernel " + String(kernel_gap)
     line += "  device " + String(device_gap)
-    line += " (" + String(relative) + " of peak)"
+    line += " (" + String(relative) + " of peak, allowed " + String(tol) + ")"
     print(line)
 
     raw.close()
-    return relative <= Float32(TOLERANCE)
+    return relative <= tol
 
 
 def main():
@@ -230,7 +257,13 @@ def main():
                 ctx.api(),
                 ctx.name(),
             )
-            print("tolerance", TOLERANCE, "of the peak magnitude")
+            print(
+                "tolerance",
+                TOLERANCE,
+                "of the peak magnitude, and",
+                K_TOLERANCE,
+                "for the k types",
+            )
             var names = _names()
             var kinds = _kinds()
             var bad = 0
