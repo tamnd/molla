@@ -41,6 +41,7 @@ from harness import Suite
 from molla.nn.attention import AttnSpec, attend
 from molla.nn.gpu import DeviceVec
 from molla.nn.gpu_ops import (
+    attend_partials,
     device_add_into,
     device_argmax,
     device_attend,
@@ -536,6 +537,32 @@ def test_attend(mut suite: Suite, ctx: DeviceContext) raises:
     # than by anything about the kernel.
     _attend_case(suite, ctx, capped, 30, 29, "softcapped scores", 1e-5)
 
+    # Long enough that the keys are cut into slices and joined by a second
+    # kernel, which is the path a decode takes at any real context. Four heads
+    # and 512 keys gives four slices. The host reference is unchanged, which is
+    # the point: a softmax split into pieces and put back together is the same
+    # softmax, and this is what says so.
+    var split = AttnSpec(4, 2, 32)
+    _attend_case(suite, ctx, split, 512, 511, "a context split in slices", 3e-6)
+
+    # The same split with a window that masks everything before the last 40
+    # keys, so the first three slices see nothing at all. A slice with no
+    # visible key has no maximum to subtract and has to be dropped rather than
+    # normalised, and getting that wrong weights every masked key at one, which
+    # is a wrong answer rather than a nan.
+    var split_win = AttnSpec(4, 2, 32)
+    split_win.window = 40
+    _attend_case(
+        suite, ctx, split_win, 512, 511, "slices a window empties", 3e-6
+    )
+
+    # And the same again with sinks, where the visible keys are in the first
+    # slice and the last one and the slices between them are empty.
+    var split_sink = AttnSpec(4, 2, 32)
+    split_sink.window = 40
+    split_sink.sinks = 3
+    _attend_case(suite, ctx, split_sink, 512, 511, "slices around sinks", 3e-6)
+
     var raised = False
     try:
         var blind = AttnSpec(4, 2, 32)
@@ -545,7 +572,8 @@ def test_attend(mut suite: Suite, ctx: DeviceContext) raises:
         var v = DeviceVec(ctx, 40 * 2 * 32)
         var o = DeviceVec(ctx, 4 * 32)
         var s = DeviceVec(ctx, 4 * 40)
-        device_attend(ctx, blind, q, k, v, 40, 100, o, s)
+        var part = DeviceVec(ctx, attend_partials(blind, 1, 40))
+        device_attend(ctx, blind, q, k, v, 40, 100, o, s, part)
     except:
         raised = True
     suite.check(
@@ -587,10 +615,16 @@ def _attend_case(
     var dv = DeviceVec(ctx, count * kv_width)
     var dout = DeviceVec(ctx, width)
     var dscores = DeviceVec(ctx, spec.heads * count)
+    # Whatever `attend_partials` asks for, which is what decides whether this
+    # case goes through one kernel or through the split and the join. A case
+    # with a few dozen keys takes the single kernel however wide the grid is,
+    # and the cases with a few hundred take the split, so both paths are checked
+    # against the same host reference by the same code.
+    var dpart = DeviceVec(ctx, attend_partials(spec, 1, count))
     dq.upload(q)
     dk.upload_run(keys, 0, count * kv_width)
     dv.upload_run(values, 0, count * kv_width)
-    device_attend(ctx, spec, dq, dk, dv, count, pos, dout, dscores)
+    device_attend(ctx, spec, dq, dk, dv, count, pos, dout, dscores, dpart)
     ctx.synchronize()
     var got = Buffer(width)
     dout.download(got)
@@ -723,9 +757,10 @@ def test_refusals(mut suite: Suite, ctx: DeviceContext) raises:
     var o = DeviceVec(ctx, 64)
     var kv = DeviceVec(ctx, 4 * 32)
     var scores = DeviceVec(ctx, 2 * 4)
+    var part = DeviceVec(ctx, attend_partials(attn, 1, 4))
     raised = False
     try:
-        device_attend(ctx, attn, q, kv, kv, 8, 7, o, scores)
+        device_attend(ctx, attn, q, kv, kv, 8, 7, o, scores, part)
     except:
         raised = True
     suite.check(
@@ -734,14 +769,14 @@ def test_refusals(mut suite: Suite, ctx: DeviceContext) raises:
 
     raised = False
     try:
-        device_attend(ctx, attn, q, kv, kv, 4, 3, o, one)
+        device_attend(ctx, attn, q, kv, kv, 4, 3, o, one, part)
     except:
         raised = True
     suite.check(raised, "and one with too little room for its scores")
 
     raised = False
     try:
-        device_attend(ctx, attn, q, kv, kv, 0, 0, o, scores)
+        device_attend(ctx, attn, q, kv, kv, 0, 0, o, scores, part)
     except:
         raised = True
     suite.check(raised, "and one with no keys at all")
