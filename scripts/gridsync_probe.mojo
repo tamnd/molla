@@ -111,7 +111,7 @@ def grid_barrier(
 
 
 def ring_kernel[
-    atomic_data: Bool
+    atomic_store: Bool, atomic_load: Bool
 ](
     count: Pointer[Int32, MutAnyOrigin],
     gen: Pointer[Int32, MutAnyOrigin],
@@ -126,13 +126,17 @@ def ring_kernel[
     a value the neighbour has not written yet, so the count of wrong reads is
     the check.
 
-    The parameter is what the write and the read are made of. False is ordinary
-    global traffic, which is what a fused layer would be doing and so the case
-    that decides whether this shape is usable at all. True is a relaxed device
-    scope atomic on the same address, which on a target with no fence is the
-    other thing left to try. Running both says whether a backend that fails the
-    first passes the second, and the difference between the two is the price of
-    making it work there.
+    The two parameters are what the write and the read are made of, separately.
+    False is ordinary global traffic, which is what a fused layer would be doing
+    and so the case that decides whether this shape is usable at all. True is a
+    relaxed device scope atomic on the same address, which on a target with no
+    fence is the other thing left to try.
+
+    They are separate because the price is not. A fused matvec writes one value
+    a row and reads the whole activation vector for every row of it, so an
+    atomic on the store side costs one instruction a row and an atomic on the
+    load side costs one for every column of every row. If one side alone is
+    enough, which side it is decides whether this is free or ruinous.
     """
     var blocks = Int(blocks_dev)
     var b = Int(block_idx.x)
@@ -142,7 +146,7 @@ def ring_kernel[
 
     for r in range(Int(rounds_dev)):
         if thread_idx.x == 0:
-            comptime if atomic_data:
+            comptime if atomic_store:
                 # `Pointer(to=...)` and not a pointer rebuilt from an integer
                 # address. The second form crashes the Metal pipeline compiler
                 # the moment an atomic touches it, presumably because the
@@ -159,7 +163,7 @@ def ring_kernel[
         var nb = (b + 1) % blocks
         if thread_idx.x == 0:
             var saw = Int32(0)
-            comptime if atomic_data:
+            comptime if atomic_load:
                 saw = dev.load[ordering=Ordering.RELAXED](
                     Pointer[Int32, MutAnyOrigin](to=data[unsafe_offset=nb])
                 )
@@ -230,8 +234,10 @@ def main() raises:
         print("multiprocessor count  unavailable, " + String(e))
     print("multiprocessors  " + String(sms))
 
-    var plain = ctx.compile_function[ring_kernel[False]]()
-    var atomic = ctx.compile_function[ring_kernel[True]]()
+    var plain = ctx.compile_function[ring_kernel[False, False]]()
+    var stored = ctx.compile_function[ring_kernel[True, False]]()
+    var loaded = ctx.compile_function[ring_kernel[False, True]]()
+    var both = ctx.compile_function[ring_kernel[True, True]]()
     var spin = ctx.compile_function[spin_kernel]()
 
     var per_sm = 0
@@ -281,42 +287,70 @@ def main() raises:
     comptime rounds = 64
     var host = ctx.enqueue_create_host_buffer[DType.int32](1)
 
-    ctx.enqueue_function(
-        plain,
-        cp,
-        gp,
-        dp,
-        ep,
-        Int32(blocks),
-        Int32(rounds),
-        grid_dim=(blocks, 1, 1),
-        block_dim=(TILE, 1, 1),
-    )
-    ctx.enqueue_copy(host, errs)
-    ctx.synchronize()
-    verdict("plain loads and stores ", Int(host[0]), rounds * blocks)
-
-    # The counters have to go back to zero, because the first kernel left the
+    # All four sides, because if one side alone is enough it decides the design.
+    # The counters go back to zero between runs, since each kernel leaves the
     # generation wherever it finished and every block starts the next one at
     # zero again.
-    ctx.enqueue_memset(count, Int32(0))
-    ctx.enqueue_memset(gen, Int32(0))
-    ctx.enqueue_memset(data, Int32(-1))
-    ctx.enqueue_memset(errs, Int32(0))
-    ctx.enqueue_function(
-        atomic,
-        cp,
-        gp,
-        dp,
-        ep,
-        Int32(blocks),
-        Int32(rounds),
-        grid_dim=(blocks, 1, 1),
-        block_dim=(TILE, 1, 1),
-    )
-    ctx.enqueue_copy(host, errs)
-    ctx.synchronize()
-    verdict("relaxed device atomics", Int(host[0]), rounds * blocks)
+    for which in range(4):
+        ctx.enqueue_memset(count, Int32(0))
+        ctx.enqueue_memset(gen, Int32(0))
+        ctx.enqueue_memset(data, Int32(-1))
+        ctx.enqueue_memset(errs, Int32(0))
+        var label = String("plain store, plain load  ")
+        if which == 0:
+            ctx.enqueue_function(
+                plain,
+                cp,
+                gp,
+                dp,
+                ep,
+                Int32(blocks),
+                Int32(rounds),
+                grid_dim=(blocks, 1, 1),
+                block_dim=(TILE, 1, 1),
+            )
+        elif which == 1:
+            label = "atomic store, plain load "
+            ctx.enqueue_function(
+                stored,
+                cp,
+                gp,
+                dp,
+                ep,
+                Int32(blocks),
+                Int32(rounds),
+                grid_dim=(blocks, 1, 1),
+                block_dim=(TILE, 1, 1),
+            )
+        elif which == 2:
+            label = "plain store, atomic load"
+            ctx.enqueue_function(
+                loaded,
+                cp,
+                gp,
+                dp,
+                ep,
+                Int32(blocks),
+                Int32(rounds),
+                grid_dim=(blocks, 1, 1),
+                block_dim=(TILE, 1, 1),
+            )
+        else:
+            label = "atomic store, atomic load"
+            ctx.enqueue_function(
+                both,
+                cp,
+                gp,
+                dp,
+                ep,
+                Int32(blocks),
+                Int32(rounds),
+                grid_dim=(blocks, 1, 1),
+                block_dim=(TILE, 1, 1),
+            )
+        ctx.enqueue_copy(host, errs)
+        ctx.synchronize()
+        verdict(label, Int(host[0]), rounds * blocks)
 
     # The cost of a round, with nothing else in the kernel. Best of five, so a
     # cold start is not the answer, and against the launch it would replace.
