@@ -107,6 +107,25 @@ Those columns are not merely close, they agree to every digit shown, and the rea
 
 So the three backends disagree with each other by far less than any of them disagrees with llama.cpp, and the gap in the next section is a property of the reference rather than of a backend. It also means a per target tolerance would be three copies of one number, which is why there is not one.
 
+## What the float16 scale planes cost
+
+#182 stores a planar row's group scales as float16 where they were float32, and it is the first change to the layout that is not bit exact. A k type's scale plane holds a product of a float16 out of the block and a small integer, and a product needs more mantissa than either factor, so rounding it back to float16 loses something. The issue said the tolerance for that should be set from what the run produces rather than picked in advance, so here is what the run produces.
+
+Every one of the fourteen cases was run on the host against the same reference files with the scale planes at both widths, and this is the largest movement in each of the four comparisons across all of them.
+
+| Comparison | tolerance | worst case in the corpus | most any case moved |
+| --- | --- | --- | --- |
+| sum | 2e-3 | 5.15e-4 | 1.1e-6 |
+| value | 8e-2 | 3.06e-2 | 3.4e-6 |
+| head | 2e-1 | 9.60e-2 | 1.1e-5 |
+| tail | 2e-1 | 8.40e-2 | 1.6e-5 |
+
+The greedy token is the same token on all fourteen and the swap counts are identical case by case, including the near tie on Llama 3.1 that the harness already reports by name.
+
+The right way to read the last column is against 1.75e-5, which is what the section above measures as the largest disagreement between molla's own three backends on the same case. Halving the width of every scale in the model moves the corpus by less than the difference between running it on a 4090 and running it on an M4, and by four orders of magnitude less than the distance to llama.cpp that neither of those explains.
+
+One detail says where the movement actually comes from, and it is not the scales. The three q8_0 cases moved too, by 4.7e-6 on the head and 1.2e-5 on the tail, and q8_0 cannot lose anything here: its scale is a float16 out of the block written into a float16 plane, and `tests/test_repack.mojo` checks that a q8_0 row decodes bit for bit the same numbers the blocks decode, at both widths. So the weights are identical and what moved is the arithmetic over them. Changing the load at the top of the dot product changes what the compiler does with the loop under it, and a float32 accumulation over four thousand terms is not associative. The float16 scales are worth part of the movement on the k types and none of it anywhere else.
+
 ## What a device run skips
 
 `smollm2-f16-capital` does not run on a device and is reported as a skip with the reason, not as a pass. The device matvecs read the planar form of a quantized weight and there is no planar form of an f16 one, so an unquantized model has nothing on the card for them to read. That is checked off the tensor directory before anything is loaded, by `device_refusal`, which is the same check that makes `--device=metal` on an f16 model an error and `--device=auto` on one a host run with the reason printed under it.

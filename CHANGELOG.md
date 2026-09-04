@@ -4,6 +4,21 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-09-04
+
+The scale planes are float16. A planar row ends in one or two planes of group scales, and until now each of those was a float32, which was four bytes to hold a number that came out of the file as two. For q4_0, q4_1, q5_0, q5_1 and q8_0 the scale is a float16 out of the block, so storing it at float32 was widening a number on the way in and narrowing it back on the way out with nothing in between. For q4_K, q5_K and q6_K the plane holds a product of a float16 and a small integer, and that product is the one thing in the layout that now rounds.
+
+It finishes the layout M2c set out to build. Llama 3.1 8B q4_K_M repacks to 5151 MiB against the 5153 that was predicted for it before any of the three pieces landed, down from 9574 where the milestone started. The file itself is 4685 MiB, so the whole of what molla holds above the weights is now 466 MiB rather than 4889.
+
+The rounding is worth stating precisely, since it is the first lossy step in the layout. A float16 has eleven bits of mantissa, so one rounded scale is off by at most 2.4e-4 of itself and the corpus says the logits move less than that: 1.1e-6 on the summed row, 1.1e-5 on the head and 1.6e-5 on the tail, against the 1.75e-5 the cpu, Metal and CUDA backends already differ from each other by. No greedy token changed anywhere in the corpus.
+
+### Changed
+
+- The scale planes hold float16 rather than float32. `SCALE_BYTES` is 2, `planar_row_bytes` is the quant bytes plus `planes * groups * 2`, and every reader widens on load. `LAYOUT_VERSION` goes to 4, which invalidates existing repack caches.
+- The repack cache for Llama 3.1 8B q4_K_M goes 6108 to 5151 MiB, Qwen 2.5 0.5B goes 512 to 468 and SmolLM2 135M goes 144 to 136. q4_0 and q8_0 now cost exactly what the tensor data costs in the file, because a q8_0 block is 32 bytes of quant and a float16 scale and that is what a planar row of it is. `tests/test_cache.mojo` asserts the two are equal rather than within a bound.
+- On a 4090 at 512 prompt and 128 decoded, both builds in one sitting, the 8B holds 6082 MiB on the card against 7038 and decodes at 95.5 against 88.6 tokens a second. Prefill costs 1.4 per cent, 360.9 against 367.1, which is the widening load on the prefill path where the row is read once per output column rather than once per token.
+- `tests/test_repack.mojo` splits its round trip check in two. The five non-k types are asserted bit for bit, because a float16 widened and narrowed lands on itself. The three k types are asserted within one float16 rounding of the blocks decoded directly. `scripts/kernel_oracle.mojo` does the same split and prints both tolerances in its banner.
+
 ## [0.4.8] - 2026-09-04
 
 The five and six bit types are stored at five and six bits. Before this, `quant_form` widened q5_0, q5_1, q5_K and q6_K to a byte a value, so a file that held six bits was read at eight for the whole life of the process. A planar row for those types is now a nibble plane followed by a high plane of one or two bits a value, which is the shape ggml uses inside a block and the shape the four bit types already had here.

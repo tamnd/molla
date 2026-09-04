@@ -26,11 +26,13 @@ Ollama is asked through `/api/generate` with `stream` off and `raw` on, which re
 
 An RTX 4090 with 24564 MiB, reached through WSL2 on a Windows machine, which is why the harness reports Linux x86_64 with 32 logical cores. It is a WSL2 CUDA result and not a Linux CUDA result, for the reason in [toolchain.md](toolchain.md): the only NVIDIA card in the fleet is in a Windows box. This is the quietest machine in the set and the one where a number is a measurement.
 
-molla 0.4.8, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-04. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, median, and the load average was between 1.4 and 8.4 before each run. These are the lengths M7 takes its gate at.
+molla 0.4.9, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-04. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, median, and the load average was between 1.6 and 8.4 before each run. These are the lengths M7 takes its gate at.
 
-The llama.cpp and Ollama rows were taken against molla 0.4.5 and are unchanged since, because neither engine moved. The molla rows were retaken on #183, which is the first change to reach this backend: 0.4.6 is Metal only, and #203 sets its step widths per backend and leaves CUDA on the ones it already had. The last row of each table is what molla did before #183, both builds in one sitting at a load between 1.4 and 2.0, and it is the row the molla row should be read against.
+The llama.cpp and Ollama rows were taken against molla 0.4.5 and are unchanged since, because neither engine moved. The molla rows were retaken on #182, and the last row of each table is what molla did before it, both builds in one sitting at a load between 1.6 and 2.1. That is the row the molla row should be read against.
 
-The SmolLM2 pair is the one to read for what the noise is worth here. Nothing in #183 can reach a q8_0 model and its decode still moved 4 per cent between the two builds, so a decode difference smaller than that on the two small models is not a measurement. The 8B pair is outside it in both directions and the card column is outside it everywhere.
+The SmolLM2 pair is the one to read for what the noise is worth here. The only thing #182 does to a q8_0 model is halve its scale planes, which is 8 MiB of the 656 on the card, and its decode is the same decode. A difference smaller than a per cent on the two small models is not a measurement on this harness. The 8B is outside that in both directions and the card column is outside it everywhere: 956 MiB, on a model whose weights are 4685.
+
+The two rows before this pair, for anyone tracking where the card figure came from, are 377.3 prefill and 85.8 decode at 7404 MiB on the 8B before #183, and 10489.8 and 275.3 at 656 MiB on SmolLM2. The whole of M2c's layout work is those numbers against the ones in the tables.
 
 llama.cpp reports itself as build 1 on this machine because it was built there from a clone with no tags, and the build number comes from `git describe`. The commit is the identity that matters and it is in the line above.
 
@@ -40,28 +42,28 @@ SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 514 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB | card MiB |
 | --- | --- | --- | --- | --- | --- |
-| molla | 10280.0 | 263.9 | 50 | 286 | 656 |
+| molla | 10280.0 | 264.5 | 50 | 279 | 648 |
 | llama.cpp | 32487.0 | 886.8 | 16 | 443 | 694 |
 | ollama | 15667.9 | 684.4 | 33 | - | - |
-| molla before #183 | 10489.8 | 275.3 | 49 | 287 | 656 |
+| molla before #182 | 10078.4 | 265.0 | 51 | 284 | 656 |
 
 Qwen 2.5 0.5B Instruct q4_K_M, digest 74a4da8c9fdb, 514 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB | card MiB |
 | --- | --- | --- | --- | --- | --- |
-| molla | 4942.3 | 297.7 | 104 | 432 | 960 |
+| molla | 4990.3 | 304.8 | 103 | 431 | 916 |
 | llama.cpp | 43338.7 | 772.6 | 12 | 806 | 1120 |
 | ollama | 7320.8 | 495.1 | 70 | - | - |
-| molla before #183 | 5039.2 | 297.7 | 102 | 554 | 1110 |
+| molla before #182 | 4942.3 | 299.8 | 104 | 505 | 960 |
 
 Llama 3.1 8B Instruct q4_K_M, digest 7b064f5842bf, 515 prompt tokens, 3 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB | card MiB |
 | --- | --- | --- | --- | --- | --- |
-| molla | 366.3 | 89.1 | 1406 | 977 | 7038 |
+| molla | 360.9 | 95.5 | 1427 | 953 | 6082 |
 | llama.cpp | 10548.6 | 161.6 | 49 | 5047 | 5198 |
 | ollama | 5919.2 | 148.1 | 87 | - | - |
-| molla before #183 | 377.3 | 85.8 | 1365 | 1105 | 7404 |
+| molla before #182 | 367.1 | 88.6 | 1403 | 998 | 7038 |
 
 ## macbook, the M4
 
