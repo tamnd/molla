@@ -759,6 +759,17 @@ def main() raises:
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k down", 4096, 14336)
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k attn", 4096, 4096)
 
+    # The same down projection row, sixteen times as many of them, which is the
+    # only shape on this page that a 4090 cannot hold in its last level cache.
+    # Everything above is an instruction measurement on that card and this is a
+    # memory one, and the loads only line of the two is where to look first: if
+    # they agree the cache was not helping, and they do not agree.
+    #
+    # A whole layer of an 8B is 130 MiB and a token reads 4.6 GiB of them, so a
+    # decode never gets a second pass over anything. 560 MiB is enough to be out
+    # of any cache in the fleet and small enough to allocate beside a model.
+    _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k down, cold", 65536, 14336)
+
     # The same three at narrower blocks. TILE has been 128 since the kernel was
     # written and nothing had ever asked what it should be.
     _sweep[Q_Q4_K, 32, True, QUANT_U4, 32](ctx, "q4_k down t32", 4096, 14336)
