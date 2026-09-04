@@ -43,6 +43,8 @@ loaded anyway.
 """
 
 from std.math import sqrt
+from std.os.env import getenv
+from std.sys.info import CompilationTarget
 
 from max.gpu.host import DeviceContext
 
@@ -50,6 +52,7 @@ from molla.nn.arch import Arch
 from molla.nn.block import ACT_GELU, ACT_SILU, BlockSpec, LayerWeights
 from molla.nn.gpu import (
     ACT_BIT,
+    ACT_GROUP,
     EPI_ADD,
     EPI_BIAS,
     EPI_GLU,
@@ -57,9 +60,12 @@ from molla.nn.gpu import (
     MM_GROUPS,
     PREFILL_CHUNK,
     SPAN,
+    DeviceQuantVec,
     DeviceVec,
     device_matmul_into,
     device_matvec_into,
+    device_matvec_q_into,
+    device_quantize,
 )
 from molla.nn.gpu_fused import (
     OP_ACT,
@@ -483,6 +489,64 @@ def snapshot(ctx: DeviceContext, x: DeviceVec) raises -> Buffer:
     return out^
 
 
+comptime INT_ACT_ENV = "MOLLA_INT_ACT"
+"""Set to `0` to keep a decode on the float activation matvec, or to anything
+else to put it on the integer one whatever the machine.
+
+Unset picks by the target, which is `int_act_default`. The knob is here for the
+same reason `MOLLA_FUSED` is: the default below is drawn from two cards and one
+laptop, and a machine that disagrees should be able to say so without a rebuild.
+"""
+
+
+def int_act_default() -> Bool:
+    """Whether this target decodes better against a quantized activation vector.
+
+    A property of the machine rather than of the model, which is why it is asked
+    of the target and not of the weights.
+
+    False on Metal, and that is a measurement. `scripts/matvec_probe.mojo` on an
+    M4 puts the shipped float loop within eleven per cent of a kernel that reads
+    the identical weight bytes and does no arithmetic with them at all, so there
+    is no math left there to remove and the integer path can only lose, which it
+    does by forty four per cent. The MAGIC convert took that win when it landed.
+
+    True on CUDA for the other half of the same reading. The same probe on a 4090
+    puts the shipped convert at 33 microseconds against 19 for loads only on the
+    down projection shape, so about forty per cent of that kernel is arithmetic,
+    and the integer dot takes back a third of it at every shape and every block
+    width in the sweep. See #202.
+    """
+    comptime if CompilationTarget.is_macos():
+        return False
+    else:
+        return True
+
+
+def int_act_ok(spec: BlockSpec, chunk: Int) raises -> Bool:
+    """Whether this pass may quantize its activations, target and shape both.
+
+    Decode only. A chunk of more than one token goes through the matmul, which
+    amortizes the weight read across the chunk and is a different kernel with a
+    different bottleneck, and there is no integer form of it.
+
+    Every width a projection reads has to be a whole number of groups, because a
+    trailing part group has no scale to be read with. Every width in every model
+    molla has run is a multiple of 32, so this is a guard rather than a policy.
+    """
+    if chunk != 1:
+        return False
+    var asked = getenv(INT_ACT_ENV)
+    var on = int_act_default() if asked == "" else asked != "0"
+    if not on:
+        return False
+    return (
+        spec.width % ACT_GROUP == 0
+        and spec.q_width() % ACT_GROUP == 0
+        and spec.hidden % ACT_GROUP == 0
+    )
+
+
 struct DeviceScratch(Movable):
     """The intermediates one layer needs, in device memory, sized once.
 
@@ -506,6 +570,31 @@ struct DeviceScratch(Movable):
     A device vector because the embedding lookup reads its rows from the device
     now that a prefill chunk looks up many at once, and float32 because every
     vocabulary is exact in one. See `device_unpack_rows`.
+    """
+
+    var norm_q: DeviceQuantVec
+    """`norm`, quantized, which is what the projections read when `int_act` is on.
+
+    Three of them, since a layer normalises twice and the second one overwrites
+    the first, so this is filled twice a layer too and never holds both.
+    """
+
+    var heads_q: DeviceQuantVec
+    """`heads_out`, quantized, read by the output projection."""
+
+    var gate_q: DeviceQuantVec
+    """The gated product, quantized, read by the down projection.
+
+    Sized by the hidden width, which is also what `up` is, so the ungated form
+    quantizes into the same buffer from the other vector.
+    """
+
+    var int_act: Bool
+    """Whether the three above are filled and read, decided by `int_act_ok`.
+
+    When it is off they are still allocated, at one group each, because a struct
+    field is not conditional and a few dozen bytes on the card is not worth a
+    variant of this type.
     """
 
     var chunk: Int
@@ -561,6 +650,16 @@ struct DeviceScratch(Movable):
         self.scores = DeviceVec(ctx, chunk * spec.attn.heads * context)
         self.logits = DeviceVec(ctx, vocab)
         self.ids = DeviceVec(ctx, chunk)
+        self.int_act = int_act_ok(spec, chunk)
+        self.norm_q = DeviceQuantVec(
+            ctx, spec.width if self.int_act else ACT_GROUP
+        )
+        self.heads_q = DeviceQuantVec(
+            ctx, spec.q_width() if self.int_act else ACT_GROUP
+        )
+        self.gate_q = DeviceQuantVec(
+            ctx, spec.hidden if self.int_act else ACT_GROUP
+        )
         self.chunk = chunk
         self.tracing = False
         self.trace = List[Float32]()
@@ -617,6 +716,35 @@ def _project(
         device_matvec_into(ctx, w, x, out, at, epi, aux)
     else:
         device_matmul_into(ctx, w, x, out, tokens, at, epi, aux)
+
+
+def _project_q(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    xq: DeviceQuantVec,
+    quantized: Bool,
+    mut out: DeviceVec,
+    tokens: Int,
+    at: Int = 0,
+    epi: Int = EPI_NONE,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
+) raises:
+    """`_project` against an activation that has already been quantized.
+
+    Both vectors are passed because the caller does not know which kernel runs.
+    `quantized` says whether `xq` was filled for this vector on this pass, and
+    when it was not, or when there is more than one token, this is `_project`.
+
+    The epilogue, the offset and the auxiliary pointer are the float kernel's
+    and are not touched by which side the multiply happened on, so a projection
+    still writes its bias, adds itself to the residual stream or finishes a
+    gated element in the same launch it always did.
+    """
+    if tokens == 1 and quantized:
+        device_matvec_q_into(ctx, w, xq, out, at, epi, aux)
+    else:
+        _project(ctx, w, x, out, tokens, at, epi, aux)
 
 
 def device_attention(
@@ -678,10 +806,51 @@ def device_attention(
     # Straight into the cache rather than into scratch and then a copy, which is
     # what the offset on the matvec is for. The cache is where they are needed
     # and this is the only place they are written.
+    #
+    # One quantize for three projections, which is why it is the caller's job
+    # and not the matvec's. The vector is 4096 values on an 8B and the three
+    # matrices behind it are 36 MiB, so the pass over it is not close to being
+    # the cost of anything.
+    var qact = s.int_act and tokens == 1
+    if qact:
+        device_quantize(ctx, s.norm, s.norm_q)
     var bias_epi = EPI_BIAS if w.has_bias else EPI_NONE
-    _project(ctx, w.wq, s.norm, s.q, tokens, 0, bias_epi, w.q_bias.ptr())
-    _project(ctx, w.wk, s.norm, keys, tokens, at, bias_epi, w.k_bias.ptr())
-    _project(ctx, w.wv, s.norm, values, tokens, at, bias_epi, w.v_bias.ptr())
+    _project_q(
+        ctx,
+        w.wq,
+        s.norm,
+        s.norm_q,
+        qact,
+        s.q,
+        tokens,
+        0,
+        bias_epi,
+        w.q_bias.ptr(),
+    )
+    _project_q(
+        ctx,
+        w.wk,
+        s.norm,
+        s.norm_q,
+        qact,
+        keys,
+        tokens,
+        at,
+        bias_epi,
+        w.k_bias.ptr(),
+    )
+    _project_q(
+        ctx,
+        w.wv,
+        s.norm,
+        s.norm_q,
+        qact,
+        values,
+        tokens,
+        at,
+        bias_epi,
+        w.v_bias.ptr(),
+    )
 
     # Every head of every token in the chunk is one launch, because the heads of
     # a token lie end to end and so do the tokens.
@@ -741,14 +910,18 @@ def device_attention(
     # is only used by the models that put a norm between the two. Those still
     # pay for the scratch vector and the two launches, because a norm over the
     # whole projection cannot be computed by a block that owns one row of it.
+    if qact:
+        device_quantize(ctx, s.heads_out, s.heads_q)
     if w.has_attn_post:
-        _project(ctx, w.wo, s.heads_out, s.projected, tokens)
+        _project_q(ctx, w.wo, s.heads_out, s.heads_q, qact, s.projected, tokens)
         device_rms_norm_inplace(
             ctx, s.projected, w.attn_post_norm, spec.eps, tokens
         )
         device_add_run(ctx, x, 0, s.projected, tokens * spec.width)
     else:
-        _project(ctx, w.wo, s.heads_out, x, tokens, 0, EPI_ADD)
+        _project_q(
+            ctx, w.wo, s.heads_out, s.heads_q, qact, x, tokens, 0, EPI_ADD
+        )
 
 
 def device_mlp(
@@ -771,7 +944,10 @@ def device_mlp(
         )
 
     device_rms_norm(ctx, x, w.ffn_norm, s.norm, spec.eps, tokens)
-    _project(ctx, w.up, s.norm, s.up, tokens)
+    var qact = s.int_act and tokens == 1
+    if qact:
+        device_quantize(ctx, s.norm, s.norm_q)
+    _project_q(ctx, w.up, s.norm, s.norm_q, qact, s.up, tokens)
 
     # The gate half of a gated MLP is `act(gate) * up` and the up projection has
     # already been written by the line above, so the gate projection's own
@@ -780,28 +956,45 @@ def device_mlp(
     # activation is still its own launch over `s.up`.
     if w.has_gate:
         var glu = EPI_GLU | (0 if spec.act == ACT_SILU else ACT_BIT)
-        _project(ctx, w.gate, s.norm, s.gate, tokens, 0, glu, s.up.ptr())
+        _project_q(
+            ctx,
+            w.gate,
+            s.norm,
+            s.norm_q,
+            qact,
+            s.gate,
+            tokens,
+            0,
+            glu,
+            s.up.ptr(),
+        )
+        if qact:
+            device_quantize(ctx, s.gate, s.gate_q)
         if w.has_ffn_post:
-            _project(ctx, w.down, s.gate, s.projected, tokens)
+            _project_q(ctx, w.down, s.gate, s.gate_q, qact, s.projected, tokens)
             device_rms_norm_inplace(
                 ctx, s.projected, w.ffn_post_norm, spec.eps, tokens
             )
             device_add_run(ctx, x, 0, s.projected, tokens * spec.width)
         else:
-            _project(ctx, w.down, s.gate, x, tokens, 0, EPI_ADD)
+            _project_q(
+                ctx, w.down, s.gate, s.gate_q, qact, x, tokens, 0, EPI_ADD
+            )
     else:
         if spec.act == ACT_SILU:
             device_silu(ctx, s.up, tokens * spec.hidden)
         else:
             device_gelu(ctx, s.up, tokens * spec.hidden)
+        if qact:
+            device_quantize(ctx, s.up, s.gate_q)
         if w.has_ffn_post:
-            _project(ctx, w.down, s.up, s.projected, tokens)
+            _project_q(ctx, w.down, s.up, s.gate_q, qact, s.projected, tokens)
             device_rms_norm_inplace(
                 ctx, s.projected, w.ffn_post_norm, spec.eps, tokens
             )
             device_add_run(ctx, x, 0, s.projected, tokens * spec.width)
         else:
-            _project(ctx, w.down, s.up, x, tokens, 0, EPI_ADD)
+            _project_q(ctx, w.down, s.up, s.gate_q, qact, x, tokens, 0, EPI_ADD)
 
 
 def device_layer(
