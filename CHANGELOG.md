@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-09-04
+
+The decode matvec on Metal takes eight values a thread instead of two. That is the whole change and it is worth 1.17, 1.32 and 1.89 times on the three models in the bench set, in the order of their sizes. It came out of answering #203, which asked for something else.
+
+#203 asked for the nibble masks from the Metal q4_K matvec in llama.cpp: read four values out of a `uint16`, let them come out sixteen and two hundred and fifty six and four thousand and ninety six times too large, and correct that in the scale so no shift is ever issued. The masks change two things at once, the extraction and how many values a thread carries, and a control that changes only the second one gets everything the masks get and more. So the shifts were never what the loop was paying for.
+
+At eight values a thread the Metal decode matvec is within ten per cent of a variant that does the loads and no arithmetic at all, which is as far as this kernel goes. What is left on that backend is the number of bytes it reads and the number of times it is launched, and both of those are other issues with numbers on them now.
+
 ### Changed
 
 - The decode matvec takes eight values a thread on Metal instead of two, and eight instead of one on the byte wide path. Nothing about the arithmetic changed. On an M4 at 512 prompt and 128 decode, with the version before it measured from the same clone on the same afternoon, decode goes 31.1 to 36.5 on SmolLM2 135M q8_0, 18.1 to 23.9 on Qwen 2.5 0.5B, and 2.7 to 5.1 on Llama 3.1 8B q4_K_M. The gain grows with the model because a wider step only pays on rows long enough to have a loop. CUDA keeps the step widths it had, because there a wider one is neutral on the four bit path and a tenth slower on the byte path, and both backends were rechecked on the hardware rather than assumed.
