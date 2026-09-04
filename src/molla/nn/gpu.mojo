@@ -128,8 +128,10 @@ End to end it is worth about one per cent, because a token there is 2.1 ms and
 the head is 48 us of it. So 32 is very slightly better on both vendors and the
 honest version of this constant keys off the row width rather than the target,
 which is not worth writing without end to end evidence to write it from. The
-reason there is none is #170: on a 4090 a SmolLM2 token is 2.13 ms and 1.80 ms
-of it is launch cost.
+reason there is none is that a SmolLM2 token on that card is 2.16 ms and the
+matvec is not what it is spending it on: the model decodes through the fused
+kernel, whose grid and barriers are about 1.9 ms of that token against 0.22 ms
+of weights and 0.15 ms of submission. See #170.
 """
 
 

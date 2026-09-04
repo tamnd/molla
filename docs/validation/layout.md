@@ -346,17 +346,23 @@ The block width sweep finds the same pattern it found on Metal. The head, 49152 
 
 End to end it is worth about one per cent there, three alternating runs of each binary reading 275, 268, 270 ms at 128 against 269, 269, 267 at 32. That is the probe being right rather than the probe being wrong. A token on that card is 2.1 ms and the head is 48 us of it, so halving the head is one per cent of a token however real the halving is. CUDA keeps 128 on those grounds, and #228 is closed on them.
 
-The fit is the same shape as the Metal one and much cleaner, because the machine is quiet:
+The same fit was attempted on CUDA and it does not work, for a reason worth writing down rather than deleting. `fused_by_default` puts any model under a gibibyte of layer weights on the fused kernel, so on a 4090 SmolLM2 and Qwen decode fused and the 8B does not. Three points on two execution paths make a line whose intercept means nothing, and the first version of this section read that intercept as launch cost and was wrong.
 
-| model | per token | bytes |
-| --- | --- | --- |
-| SmolLM2 135M q8_0 | 2.13 ms | 136 MiB |
-| Qwen 2.5 0.5B q4_K_M | 2.70 ms | about 400 MiB |
-| Llama 3.1 8B q4_K_M | 12.97 ms | 4.6 GiB |
+With the path pinned by `MOLLA_FUSED`, per token:
 
-2.43 ms a GiB, which is 412 GB/s against a card that does about 1000, and an intercept of 1.80 ms a token that does not move with the model. At the 453 launches a token M2c was opened on that is 3.97 us a launch, against the 4.9 us measured directly in #171. The two agree, so on CUDA the intercept is the launches and nothing else. On Metal the same fit gives 13.6 ms against 450 launches at 19.6 us, which is 8.8 ms, so there the launches are most of the intercept but not all of it.
+| model | layers | fused | unfused |
+| --- | --- | --- | --- |
+| SmolLM2 135M q8_0 | 30 | 2.16 ms | 5.58 ms |
+| Qwen 2.5 0.5B q4_K_M | 24 | 2.69 ms | 4.68 ms |
+| Llama 3.1 8B q4_K_M | 32 | 12.4 ms | 13.0 ms |
 
-The intercept is 85 per cent of a SmolLM2 token on a 4090 and 14 per cent of the 8B's. That is the whole picture in one number. Kernel work is finished as a way to move a small model and it is still most of what an 8B is doing, and the two facts point at different issues.
+The unfused path is launch bound and fits as a cost a layer plus bytes over a bandwidth. The two ends give 0.179 ms a layer and 630 GB/s, and Qwen, which is not in the fit, predicts to 4.92 ms against 4.68 measured. Unfused decode being layers times a constant is what a launch bound path looks like, and it is why unfused Qwen at 24 layers beats unfused SmolLM2 at 30 while carrying three times the weights.
+
+The fused path, which is where both small models actually run, is not launch bound. Stage one of #170 already made it one launch a layer, so SmolLM2 is 30 launches and about 0.15 ms of submission out of a 2.16 ms token, and the weights are another 0.22 ms at the bandwidth above. The remaining 1.9 ms is neither. It is the fused kernel itself, which has a few hundred blocks where the unfused matvec has one a row, and a grid wide barrier between every stage of every layer.
+
+So on CUDA the small models are held by the fused kernel's grid and barriers, and the 8B is held by the bus, where fused and unfused are within 5 per cent of each other at 12.4 against 13.0. Neither is held by the matvec, which is what makes the one per cent above the expected answer rather than a disappointing one.
+
+Metal is a single path, since `fused_by_default` is False there whatever the model, so the fit earlier on this page is comparing like with like and stands as written.
 
 ## Order
 
