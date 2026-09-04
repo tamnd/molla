@@ -1307,13 +1307,22 @@ struct FusedPlan(Movable):
         Read when something asks rather than after every token, because reading
         it is a transfer and a synchronize and the thing it detects is a
         property of the grid rather than of the token.
+
+        Into a plain list rather than a host buffer, for the reason
+        `fused_selftest` gives: the first pinned allocation in a process costs
+        1.2 GiB of resident memory and three integers do not need one.
         """
-        var host = self.sync.context().enqueue_create_host_buffer[DType.int32](
-            3
+        var out = List[Int32]()
+        for _ in range(3):
+            out.append(0)
+        self.sync.context().enqueue_copy(
+            Pointer[Int32, MutAnyOrigin](
+                unsafe_from_address=Int(out.unsafe_ptr())
+            ),
+            self.sync,
         )
-        self.sync.context().enqueue_copy(host, self.sync)
         self.sync.context().synchronize()
-        return Int(host[2])
+        return Int(out[2])
 
 
 def fused_selftest(ctx: DeviceContext, blocks: Int) raises:
@@ -1323,6 +1332,15 @@ def fused_selftest(ctx: DeviceContext, blocks: Int) raises:
     grid was not resident and every fused launch after this one would hang or
     answer with whatever the barrier let through, so this raises rather than
     letting a model start.
+
+    The three words come back into a list rather than into a host buffer, and
+    that is not a style choice. `enqueue_create_host_buffer` allocates pinned
+    memory, and the first pinned allocation in a process costs 1.2 GiB of
+    resident host memory whatever its size: on gpc a fused SmolLM2 session was
+    1468 MiB with this line and 279 MiB without it, for three integers. That
+    was the whole of #222, which had been read as the price of compiling the
+    fused kernel and is not. An ordinary device to host copy of three words
+    costs nothing and tells us the same thing.
     """
     if blocks < 1:
         raise Error("a fused launch needs at least one block")
@@ -1338,10 +1356,15 @@ def fused_selftest(ctx: DeviceContext, blocks: Int) raises:
         grid_dim=(blocks, 1, 1),
         block_dim=(FTILE, 1, 1),
     )
-    var host = ctx.enqueue_create_host_buffer[DType.int32](3)
-    ctx.enqueue_copy(host, sync)
+    var out = List[Int32]()
+    for _ in range(3):
+        out.append(0)
+    ctx.enqueue_copy(
+        Pointer[Int32, MutAnyOrigin](unsafe_from_address=Int(out.unsafe_ptr())),
+        sync,
+    )
     ctx.synchronize()
-    if Int(host[2]) != 0:
+    if Int(out[2]) != 0:
         raise Error(
             "a grid of "
             + String(blocks)
