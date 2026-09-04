@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-09-04
+
+A fused session holds a fifth of the host memory it held yesterday. The 1.2 GiB it carried was one pinned allocation made to read three integers back from the grid barrier, not the compile it was blamed on, and reading them the ordinary way takes SmolLM2 on a 4090 from 1468 MiB to 279 and Qwen from 1481 to 550, both of which are under llama.cpp on the same file in the same sitting.
+
 ### Fixed
 
 - A fused session holds 279 MiB of host memory on SmolLM2 rather than 1468. The 1.2 GiB was read as the price of compiling the fused kernel, which 0.4.10 says in as many words, and it was not: it was `enqueue_create_host_buffer`, which allocates pinned memory, and the first pinned allocation in a process costs 1.2 GiB whatever its size. The three words it was allocated for are the ones `fused_selftest` reads back to find out whether the grid reached a barrier, and an ordinary device to host copy into a list reads them for nothing. Compiling once rather than twice and cutting the six inlined quant forms down to one had both left the figure at 1468, which is what said the compile was not where it was going.
