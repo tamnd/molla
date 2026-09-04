@@ -4,6 +4,20 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-09-04
+
+A prompt is a matrix and molla was treating it as a run of decodes. It is a matrix now, and time to first token on a 514 token prompt falls by twenty five times on the smallest model of the three and by nearly four on the largest.
+
+Sixty four prompt tokens go through the whole stack in one pass, so the kernel launches for a chunk are the launches for one token and a 514 token prompt is nine passes rather than 514. Every matvec on that path becomes a matmul, the embedding lookup and the norms and rope and attention all take a token count, and the keys and values for a whole chunk are written into the cache by the projection the way they already were in decode. Decode is untouched and takes the same path it always did.
+
+The matmul is 91 per cent of a prefill pass, so that is where the work went. A block is several groups of a warp, each group carrying eight tokens on CUDA or sixteen on Metal in registers against one weight row, and the groups share the row rather than the registers. The tokens a block carries are a whole chunk, which means the weight matrix is read once a chunk rather than once a token, and that is the entire difference between prefill and a run of decodes.
+
+### Added
+
+- Batched prefill. A 514 token prompt and 64 decoded tokens on an RTX 4090, prefill before and after: SmolLM2 135M q8_0 from 358 tokens per second to 9018, Qwen 2.5 0.5B q4_K_M from 398 to 4673, Llama 3.1 8B q4_K_M from 100 to 369. Time to first token on the same runs: 1434 ms to 57, 1291 ms to 110, 5143 ms to 1397. Decode does not move on any of the three and neither does peak memory, which stays at 282 MiB against llama.cpp's 444 on SmolLM2 and about 1000 MiB against 4900 on the 8B. Greedy output is identical to 0.4.4 on all three models on both backends.
+- [docs/validation/prefill.md](docs/validation/prefill.md) has the chunk arithmetic, the block geometry and the three things inside that block that were worth about a factor of five between them on CUDA. Two of the three are invisible in the shape of the code: the tail lanes of a short chunk read past the last token rather than clamping onto it, because a clamp costs a register per token held for the whole accumulation, and the reduction loop has to be written `comptime for`, because a plain loop indexes the accumulator array with a value the compiler will not fold and the whole array lands in local memory for the entire kernel. The third is a warp butterfly reduction in place of a tree through shared memory, which is worth 41 per cent on the 8B and nothing on the two models that fit in cache.
+- A prefill agreement block in `tests/test_gpu_block.mojo`. The logit corpus does not cover any of this and cannot, because the oracle traces every layer and tracing needs one token's snapshot at a time, so the corpus feeds prompts through the token at a time path and always will. The new checks run a synthetic model both ways in one process: a chunk leaves the same logits and the same cache as the same prompt decoded a token at a time, greedy picks the same token off them, and a prompt split across two chunks reaches the same logits. None of the three runs is a whole number of blocks, because a run that divides evenly is the case that hides the tail.
+
 ## [0.4.4] - 2026-09-04
 
 Three of the kernels a layer launches were doing one flop per element, and every one of them can be done by the kernel in front of it for free.
