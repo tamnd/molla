@@ -4,11 +4,18 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-09-04
+
+A decode runs a layer in one launch on CUDA. A Llama shaped layer used to be twelve launches and a thirty layer token 363 of them, and it is 33 now. On a 4090 at a 512 token prompt and 128 generated, SmolLM2 135M goes from 264.5 to 492.3 tokens a second and Qwen 2.5 0.5B from 304.8 to 367.8, both against llama.cpp at 888.9 and 767.9 and Ollama at 682.0 and 490.8 in the same sitting.
+
+It is off for a large model and off on Metal, and both of those are measurements rather than caution. Llama 3.1 8B decodes at 81.8 tokens a second fused against 93.7 unfused, because a few hundred blocks is narrower than the block a row the unfused matvec launches and a model that reads five gibibytes a token is bound by that rather than by submission.
+
 ### Added
 
 - A decode runs a layer in one launch on the GPU. A Llama shaped layer used to be twelve launches and a thirty layer token 363 of them, which is 1.75 ms of pure submission on a 4090 and 7.30 on an M4 before any arithmetic happens. A layer is now a table of fixed width records in device memory, built once when the model binds, walked by one kernel with a grid wide barrier between the records that depend on each other, which takes a token to 33 launches. On a 4090 at 128 tokens decoded that is 483.0 tokens a second against 310.7 on SmolLM2 135M and 372.1 against 316.8 on Qwen 2.5 0.5B from a short prompt, and 460.4 against 254.0 and 367.8 against 268.9 from a 512 token one.
 - The attention step splits a head's keys across blocks. A block used to own a whole head, so a grid of 384 blocks put at most thirty two of them on the one step whose cost grows with the context, and the fused path lost nine per cent on Qwen at a 512 token prompt while winning fourteen at eight tokens. A head is now cut into slices that reduce against their own maximum in the flash attention way, folded together after one extra barrier a layer, which is why the ratios above grow with the context instead of collapsing.
 - The path is on by default for a model whose layer matrices come to a gibibyte a token or less, and off above that. Llama 3.1 8B reads 5151 MiB a token and decodes at 81.8 tokens a second fused against 93.7 unfused, because a few hundred blocks is narrower than the block a row the unfused matvec launches and a large model is bound by that rather than by submission. It is off on Metal whatever the model, where an M4 holds a fifth of the blocks a 4090 does. `MOLLA_FUSED` overrides the choice either way and `MOLLA_FUSED_BLOCKS` overrides the grid width.
+- A session that is not going to use the fused path does not build a plan for one. Sizing the grid compiles the fused kernel, because the occupancy query is a question about a compiled function, and compiling it costs about 1.2 GiB of host memory. The 8B on gpc holds 900 MiB resident where it held 1493 with the plan built. What the compile costs a session that does use the path is #222.
 
 ### Fixed
 

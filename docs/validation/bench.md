@@ -26,13 +26,15 @@ Ollama is asked through `/api/generate` with `stream` off and `raw` on, which re
 
 An RTX 4090 with 24564 MiB, reached through WSL2 on a Windows machine, which is why the harness reports Linux x86_64 with 32 logical cores. It is a WSL2 CUDA result and not a Linux CUDA result, for the reason in [toolchain.md](toolchain.md): the only NVIDIA card in the fleet is in a Windows box. This is the quietest machine in the set and the one where a number is a measurement.
 
-molla 0.4.9, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-04. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, median, and the load average was between 1.6 and 8.4 before each run. These are the lengths M7 takes its gate at.
+molla 0.4.10, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-04. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, five runs, median, and the load average was 0.6 before each run. These are the lengths M7 takes its gate at.
 
-The llama.cpp and Ollama rows were taken against molla 0.4.5 and are unchanged since, because neither engine moved. The molla rows were retaken on #182, and the last row of each table is what molla did before it, both builds in one sitting at a load between 1.6 and 2.1. That is the row the molla row should be read against.
+Every row in the three tables below was taken in one sitting on this build, rivals included, which is a change from the last version of this page: the llama.cpp and Ollama rows used to be carried forward from molla 0.4.5. The last row of each table is molla 0.4.9, which is the release before the fused kernel landed, and that is the row the molla row should be read against.
 
-The SmolLM2 pair is the one to read for what the noise is worth here. The only thing #182 does to a q8_0 model is halve its scale planes, which is 8 MiB of the 656 on the card, and its decode is the same decode. A difference smaller than a per cent on the two small models is not a measurement on this harness. The 8B is outside that in both directions and the card column is outside it everywhere: 956 MiB, on a model whose weights are 4685.
+What separates the two molla rows is #200, one launch a layer. It is on by default on CUDA for a model whose layer matrices come to a gibibyte a token or less, which is the first two tables, and off for the 8B, which is why that pair is flat and is the control for the other two.
 
-The two rows before this pair, for anyone tracking where the card figure came from, are 377.3 prefill and 85.8 decode at 7404 MiB on the 8B before #183, and 10489.8 and 275.3 at 656 MiB on SmolLM2. The whole of M2c's layout work is those numbers against the ones in the tables.
+The SmolLM2 0.4.9 row was rechecked in the same sitting rather than only carried forward, and it came back at 265.6 decode against the 264.5 in the table, so a difference smaller than a per cent is not a measurement on this harness and everything the fused rows claim is far outside that.
+
+The host column moved a long way on the two fused rows and it is not the model. Compiling the fused kernel costs about 1.2 GiB of host memory, which is #222, and a session that will not launch it no longer pays anything for it, which is why the 8B host figure went down rather than up. The card column is unchanged by any of this.
 
 llama.cpp reports itself as build 1 on this machine because it was built there from a clone with no tags, and the build number comes from `git describe`. The commit is the identity that matters and it is in the line above.
 
@@ -42,28 +44,28 @@ SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 514 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB | card MiB |
 | --- | --- | --- | --- | --- | --- |
-| molla | 10280.0 | 264.5 | 50 | 279 | 648 |
-| llama.cpp | 32487.0 | 886.8 | 16 | 443 | 694 |
-| ollama | 15667.9 | 684.4 | 33 | - | - |
-| molla before #182 | 10078.4 | 265.0 | 51 | 284 | 656 |
+| molla | 10489.8 | 492.3 | 49 | 1468 | 648 |
+| llama.cpp | 41409.2 | 888.9 | 12 | 443 | 602 |
+| ollama | 13351.3 | 682.0 | 38 | - | - |
+| molla 0.4.9 | 10280.0 | 264.5 | 50 | 279 | 648 |
 
 Qwen 2.5 0.5B Instruct q4_K_M, digest 74a4da8c9fdb, 514 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB | card MiB |
 | --- | --- | --- | --- | --- | --- |
-| molla | 4990.3 | 304.8 | 103 | 431 | 916 |
-| llama.cpp | 43338.7 | 772.6 | 12 | 806 | 1120 |
-| ollama | 7320.8 | 495.1 | 70 | - | - |
-| molla before #182 | 4942.3 | 299.8 | 104 | 505 | 960 |
+| molla | 5039.2 | 367.8 | 102 | 1481 | 918 |
+| llama.cpp | 43053.1 | 767.9 | 12 | 805 | 1122 |
+| ollama | 7287.2 | 490.8 | 71 | - | - |
+| molla 0.4.9 | 4990.3 | 304.8 | 103 | 431 | 916 |
 
-Llama 3.1 8B Instruct q4_K_M, digest 7b064f5842bf, 515 prompt tokens, 3 runs.
+Llama 3.1 8B Instruct q4_K_M, digest 7b064f5842bf, 515 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB | card MiB |
 | --- | --- | --- | --- | --- | --- |
-| molla | 360.9 | 95.5 | 1427 | 953 | 6082 |
-| llama.cpp | 10548.6 | 161.6 | 49 | 5047 | 5198 |
-| ollama | 5919.2 | 148.1 | 87 | - | - |
-| molla before #182 | 367.1 | 88.6 | 1403 | 998 | 7038 |
+| molla | 373.7 | 95.6 | 1378 | 900 | 6084 |
+| llama.cpp | 10575.6 | 161.8 | 49 | 5025 | 5198 |
+| ollama | 5950.0 | 148.5 | 87 | - | - |
+| molla 0.4.9 | 360.9 | 95.5 | 1427 | 953 | 6082 |
 
 ## macbook, the M4
 
@@ -132,13 +134,17 @@ The load average was 28.2 on four logical cores before the run, so this row is a
 
 ## What the numbers say
 
-Decode on CUDA is 3.6 times off llama.cpp on SmolLM2, 2.7 times off on Qwen and 1.9 times off on the 8B. The M7 gate is 1.5 times, so the 8B is close to it and the small models are not.
+Decode on CUDA is 1.8 times off llama.cpp on SmolLM2, 2.1 times off on Qwen and 1.7 times off on the 8B, and 1.4, 1.3 and 1.6 times off Ollama. The M7 gate is 1.5 times the other way, so the whole of it is still ahead, and the shape of what is left has changed since the last version of this page.
 
-The decode gap shrinks as the model grows, which says the cost is fixed per layer rather than proportional to the work. molla launches about fifteen kernels per layer and 453 per token on SmolLM2, and an empty kernel on this machine costs 4.9 microseconds to launch, so 453 of them are 2.2 ms before any arithmetic happens. The 8B does more work per launch and gets a better ratio out of the same fixed cost. That reading is right about molla and it is not a reading anyone should generalize from, because llama.cpp on Metal issues about 580 dispatches per decoded token and does not care, which is in [engines.md](engines.md).
+The version before this one said the decode gap shrank as the model grew, and read that as a fixed cost a layer rather than a cost proportional to the work: about fifteen kernels a layer and 453 a token on SmolLM2, at 4.9 microseconds a launch, is 2.2 ms of submission before any arithmetic happens. That reading was right and #200 collected most of what it promised. A layer is one launch now, a token is 33 rather than 453, and SmolLM2 decode went from 264.5 to 492.3 and Qwen from 304.8 to 367.8.
+
+What is left is not launches. 33 launches is 0.16 ms of a 2.03 ms SmolLM2 token, so submission is now eight per cent of it and the 1.8 times gap is somewhere else. Two candidates have numbers behind them already. The fused grid is a few hundred blocks where the unfused matvec launches one a row, which is the whole reason the 8B is faster unfused and is why the 8B row did not move. And the decode matvec still multiplies one weight at a time in float where llama.cpp multiplies four at a time in integers, which is #186 and #202 and is measured in [layout.md](layout.md) rather than here.
 
 Prefill is 3.1 times off on SmolLM2, 8.6 on Qwen and 27.9 on the 8B. That is the only quantity on this page whose gap grows with the model, and a ratio that grows with model size is a scaling failure rather than a slow kernel. The cause is that the prefill matmul stages neither operand, so with a grid of one block per output row the whole activation tile is read from global memory `rows` times. #201 has the details and the fix.
 
-Memory is much closer than this page used to say, and most of what it used to say was a reporting artefact. On the card molla holds 656 MiB against llama.cpp's 694 on SmolLM2 and 1110 against 1120 on Qwen, which is parity or better, and 7404 against 5198 on the 8B, which is 1.42 times. The 8B is the only real gap and it has two known causes: the repack cache is 6474 MiB against a 4693 MiB model file, which #182 and #183 are closing, and the KV cache is f32 where llama.cpp's is f16, which is #204.
+Memory on the card is parity or better on the two small models and 1.17 times on the 8B. molla holds 648 MiB against llama.cpp's 602 on SmolLM2, 918 against 1122 on Qwen and 6084 against 5198 on the 8B. The layout work of M2c is what closed that: the 8B was 7038 MiB before #182 and #183 and its repack cache is now 5151 MiB against a 4685 MiB file. What is left of the 8B gap is the KV cache, which is f32 here and f16 there, and that is #204.
+
+The host column is a different story on this build and it should not be read as a model figure. #200 compiles a large kernel, which costs about 1.2 GiB of host memory whatever the model, and that is #222. It is why the two fused rows read 1468 and 1481 MiB for models that differ by three times in size, and why the 8B, which does not use the path, went the other way to 900.
 
 Metal prefill was 20.0 times off on SmolLM2 and 19.2 on Qwen before #201, which is nearly the same ratio on two models an order of magnitude apart in size, where the CUDA gap went from 3.1 to 27.9 over the same pair. A flat ratio is a slow kernel and a growing one is a scaling failure, so the two backends were short for different reasons and one fix was never going to close both.
 
