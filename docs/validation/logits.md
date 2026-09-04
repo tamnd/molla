@@ -109,7 +109,7 @@ So the three backends disagree with each other by far less than any of them disa
 
 ## What the float16 scale planes cost
 
-#182 stores a planar row's group scales as float16 where they were float32, and it is the first change to the layout that is not bit exact. A k type's scale plane holds a product of a float16 out of the block and a small integer, and a product needs more mantissa than either factor, so rounding it back to float16 loses something. The issue said the tolerance for that should be set from what the run produces rather than picked in advance, so here is what the run produces.
+Issue #182 stores a planar row's group scales as float16 where they were float32, and it is the first change to the layout that is not bit exact. A k type's scale plane holds a product of a float16 out of the block and a small integer, and a product needs more mantissa than either factor, so rounding it back to float16 loses something. The issue said the tolerance for that should be set from what the run produces rather than picked in advance, so here is what the run produces.
 
 Every one of the fourteen cases was run on the host against the same reference files with the scale planes at both widths, and this is the largest movement in each of the four comparisons across all of them.
 
