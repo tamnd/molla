@@ -4,6 +4,25 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-09-05
+
+An 8B decode on a 4090 runs 1.42 times faster because attention over the context stopped launching 32 blocks. The token is 9.16 ms against 13.03, which is 109.2 tokens a second against 86.0, and the output is byte identical.
+
+### Changed
+
+- Decode attention cuts the keys into slices, one block each, and joins them in a second kernel. `device_attend` launched one block per query head, which is 32 on an 8B, and `scripts/attend_probe.mojo` showed that reading the same 1185 keys with 64 or 128 blocks cost the same 112 microseconds it cost with 32. The card was doing four times the work for free and a decode had no way to ask for it, which is why the term was moving bytes at 63 GB/s while the projection kernel beside it moved them at 749. A slice subtracts its own maximum and writes its weighted value sum unnormalised alongside that maximum and its sum, and the join rescales each by the gap between its maximum and the row's, which is exact rather than approximate. That is 3.4 times on the term at 1185 tokens of context and 4.0 at 2048. The fused path has done this since 0.4.10 and the unfused one, which is what every model over a gibibyte a token uses, had not. See [docs/validation/budget.md](docs/validation/budget.md).
+- A prefill chunk takes the single kernel unchanged, because it already launches hundreds of blocks, and so does any context short enough that the slices would not be worth having. Prefill measures the same either way, 3094 ms against 3087 for 1122 tokens on the 8B. How many slices comes from the grid width and from the room the caller gave, so a caller that hands over a buffer with room for one slice gets exactly the kernel it got before, which is what the probe uses to measure the two against each other in the same process.
+- A target of 256 blocks is what ships. 1024 was measured and is worse at the contexts that matter, 35 microseconds at 1185 against 32 and 47 at 2048 against 45, because past the point where the card is full the only thing more slices buy is a longer join.
+
+### Fixed
+
+- A slice that a window has masked end to end is dropped rather than normalised. `NEG_INF` here is a finite float, so subtracting it from itself gives zero and every masked key would have come back weighted one. The single kernel never met this, because `device_attend` refuses a position that can see no keys at all, but a slice of a row that can see some is free to see none. Three cases at 512 keys cover it: a plain split, a window that empties the first three slices, and sinks that leave the middle two empty.
+- The device matvec test wrote its group scales as float32 at a four byte stride into rows sized for float16. Host reference and device kernel read the same wrong bytes and agreed, so the test passed while checking nothing about scales, and the last row wrote three bytes past the pool.
+
+### Removed
+
+- The claim that the 8B decode reads weights at 630 GB/s where the card gives 901. It was never measured. It came out of a fit with two free parameters over two measured points, which will reproduce those two points whatever the parameters mean, and both of its terms are wrong in opposite directions: the fixed term came to 5.73 ms a token where `scripts/launch_probe.mojo` prices the same launches at about 1.9, and the bandwidth term came to 630 where `scripts/proj_probe.mojo` times the shipped kernel at the 8B's own ten shapes and gets 749. The largest of those shapes reads at 929. `docs/validation/layout.md` and `docs/validation/performance.md` carry the correction and the issue it came from is withdrawn.
+
 ## [0.4.12] - 2026-09-04
 
 A Metal decode runs 1.4 to 1.8 times faster because the matvec stopped launching a block four times wider than the row it was reducing. Trying to remove the reduction underneath it as well is worth nothing, which is how this release also establishes that decode on the small models is bound by how many times a token crosses the driver and not by the kernel.
