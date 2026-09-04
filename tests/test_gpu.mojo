@@ -23,7 +23,16 @@ from max.gpu.host import DeviceContext
 from harness import Suite
 
 from molla.model.load import DevicePool
-from molla.nn.gpu import check_matvec, device_matvec, device_ready
+from molla.nn.gpu import (
+    DeviceQuantVec,
+    DeviceVec,
+    check_matvec,
+    device_matvec,
+    device_matvec_into,
+    device_matvec_q_into,
+    device_quantize,
+    device_ready,
+)
 from molla.nn.quant import Q_F32, Q_Q8_0
 from molla.nn.repack import LAYOUT_PLANAR, planar_row_bytes, planar_row_dot
 from molla.nn.tensor import (
@@ -54,6 +63,7 @@ def run(mut suite: Suite) raises:
 
 def run_on_device(mut suite: Suite, ctx: DeviceContext) raises:
     test_matvec(suite, ctx)
+    test_matvec_q(suite, ctx)
     test_pool(suite, ctx)
 
 
@@ -232,6 +242,108 @@ def test_matvec(mut suite: Suite, ctx: DeviceContext) raises:
         suite.check(
             nonzero == rows,
             "every row came back, which a freed pool would not have given",
+        )
+
+
+def test_matvec_q(mut suite: Suite, ctx: DeviceContext) raises:
+    """The integer matvec against the float one, on the same bytes.
+
+    Not against the host reference, because these two are not meant to agree to
+    the last digit: one multiplies floats and the other multiplies a signed byte
+    approximation of the same activations. What the check is worth is that they
+    agree to about a quarter of a per cent, which is the error budget the
+    activation quantizer was designed against, and that a bug in the offset a
+    centred type carries or in which group a scale comes from would move the
+    answer by far more than that rather than by a little.
+    """
+    suite.group("integer device matvec")
+
+    comptime if not has_accelerator():
+        return
+    else:
+        var cols = 256
+        var rows = 5
+        var stride = planar_row_bytes(Q_Q8_0, cols)
+
+        var pool = ctx.enqueue_create_buffer[DType.uint8](stride * rows)
+        with pool.map_to_host() as mapped:
+            var p = RawPtr(unsafe_from_address=Int(mapped.unsafe_ptr()))
+            for r in range(rows):
+                var row = r * stride
+                for i in range(cols):
+                    var q = ((i * 7 + r * 13) % 251) - 125
+                    p.unsafe_store(row + i, UInt8(q & 0xFF))
+                for g in range(cols // 32):
+                    var scale = Float32(0.125) * Float32(g + 1) / Float32(r + 1)
+                    var bits = bitcast[DType.uint16, 1](
+                        scale.cast[DType.float16]()
+                    )
+                    for b in range(2):
+                        p.unsafe_store(
+                            row + cols + g * 2 + b,
+                            UInt8((bits >> UInt16(b * 8)) & 0xFF),
+                        )
+
+        var w = Tensor(
+            Int(pool.unsafe_ptr()),
+            Q_Q8_0,
+            cols,
+            rows,
+            LAYOUT_PLANAR,
+            WHERE_DEVICE,
+        )
+
+        var host = List[Float32]()
+        for i in range(cols):
+            host.append((Float32((i * 11) % 29) - 14.0) / 7.0)
+        var x = DeviceVec(ctx, cols)
+        x.copy_in(host)
+
+        var want = DeviceVec(ctx, rows)
+        device_matvec_into(ctx, w, x, want)
+
+        var xq = DeviceQuantVec(ctx, cols)
+        device_quantize(ctx, x, xq)
+        var got = DeviceVec(ctx, rows)
+        device_matvec_q_into(ctx, w, xq, got)
+        ctx.synchronize()
+        keep(pool)
+
+        var floats = Buffer(rows)
+        var ints = Buffer(rows)
+        want.copy_out(floats)
+        got.copy_out(ints)
+
+        var peak = Float32(0)
+        var worst = Float32(0)
+        for r in range(rows):
+            var m = floats.data[r] if floats.data[r] > 0 else -floats.data[r]
+            if m > peak:
+                peak = m
+            var gap = ints.data[r] - floats.data[r]
+            if gap < 0:
+                gap = -gap
+            if gap > worst:
+                worst = gap
+
+        suite.check(peak > 0, "the float matvec is not all zeros")
+        suite.check(
+            worst <= peak * Float32(4e-3),
+            "and the integer one agrees with it inside the quantizer's error",
+        )
+
+        var raised = False
+        try:
+            var odd = DeviceQuantVec(ctx, cols + 1)
+            keep(odd.elements())
+        except:
+            raised = True
+        suite.check(
+            raised,
+            (
+                "a quantized vector that is not a whole number of groups is"
+                " refused"
+            ),
         )
 
 

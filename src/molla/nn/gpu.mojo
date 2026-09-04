@@ -701,6 +701,296 @@ def planar_partial_dot[
     return acc
 
 
+comptime ACT_GROUP = 32
+"""Activation values that share one quantization scale.
+
+32 and not the weight's own group size, because a q4_K_M model has q4_K weights
+grouped by 32 and q6_K weights grouped by 16 and both read the same activation
+vector. A run of `ACT_RUN` is inside one group of either, since 8 divides both,
+so the dot loop takes one weight scale and one activation scale for a whole run
+whatever the weight type is.
+"""
+
+comptime ACT_RUN = 8
+"""Values a thread multiplies before it converts and scales once.
+
+The run is where the whole saving is. Eight integer multiplies into an `Int32`
+and then one convert, against eight converts and sixteen floating point
+operations for the same values in the float loop. It is a run rather than a
+whole group so that a thread's share of a row stays contiguous and a warp still
+reads consecutive bytes.
+"""
+
+comptime ACT_Q_MAX = 127
+"""The largest magnitude an activation quant takes, which makes it a signed byte.
+"""
+
+
+def act_scale_words(n: Int) -> Int:
+    """Float32 words in from the front of a quantized vector to its scales.
+
+    The quants are one signed byte a value and the scales are one float32 a
+    group, in one allocation, so the scale plane starts at the quant plane
+    rounded up to a word. Every width this is used at is a multiple of 32 and
+    the rounding is there for the widths that are not.
+    """
+    return (n + 3) // 4
+
+
+struct DeviceQuantVec(Movable):
+    """One activation vector as signed bytes and a scale a group, owned.
+
+    The same two plane idea as a planar weight row, at the other end of the
+    multiply. `DeviceVec` holds the float version and this holds what the
+    integer matvec reads: `n` signed bytes, then one `Float32` a group of
+    `ACT_GROUP`, in one buffer so a kernel takes one pointer and an offset
+    rather than two pointers.
+
+    Symmetric and not affine. The weight side already carries a minimum where
+    its type has one, and a second offset here would put a cross term in every
+    dot product that neither side wants to pay for.
+    """
+
+    var buf: DeviceBuffer[DType.uint8]
+    var n: Int
+
+    def __init__(out self, ctx: DeviceContext, n: Int) raises:
+        if n <= 0:
+            raise Error("a quantized vector needs a positive length")
+        if n % ACT_GROUP != 0:
+            raise Error(
+                "a quantized vector is a whole number of groups of "
+                + String(ACT_GROUP)
+                + " and "
+                + String(n)
+                + " is not"
+            )
+        self.buf = ctx.enqueue_create_buffer[DType.uint8](
+            act_scale_words(n) * 4 + (n // ACT_GROUP) * 4
+        )
+        self.n = n
+
+    def elements(self) -> Int:
+        return self.n
+
+    def scale_words(self) -> Int:
+        """Where the scales start, counted in float32 words."""
+        return act_scale_words(self.n)
+
+    def ptr(self) -> Pointer[UInt8, MutAnyOrigin]:
+        return Pointer[UInt8, MutAnyOrigin](
+            unsafe_from_address=Int(self.buf.unsafe_ptr())
+        )
+
+
+def act_quant_kernel(
+    x: Pointer[Float32, MutAnyOrigin],
+    q: Pointer[UInt8, MutAnyOrigin],
+    words_dev: Int32,
+):
+    """One group of activations to a signed byte each and one scale.
+
+    A block a group and a thread a value, so the reduction that finds the
+    group's largest magnitude is a block reduction over `ACT_GROUP` threads and
+    nothing crosses a block. The scale is that magnitude over 127 and the quant
+    is the value over the scale, rounded to nearest, which is what llama.cpp's
+    `quantize_row_q8_1` does and is the arithmetic the error budget in
+    [docs/validation/layout.md](../../../docs/validation/layout.md) is written
+    against.
+
+    A group of all zeros gets a scale of zero and quants of zero, and reads back
+    as exactly zero rather than as a division by nothing.
+    """
+    var g = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var i = g * ACT_GROUP + t
+
+    var v = x[unsafe_offset=i]
+    var mag = v if v >= 0 else -v
+    var part = stack_allocation[
+        ACT_GROUP, Float32, address_space=AddressSpace.SHARED
+    ]()
+    part[unsafe_offset=t] = mag
+    barrier()
+    var step = ACT_GROUP // 2
+    while step > 0:
+        if t < step:
+            var l = part[unsafe_offset=t]
+            var r = part[unsafe_offset=t + step]
+            part[unsafe_offset=t] = l if l > r else r
+        barrier()
+        step //= 2
+    var top = part[unsafe_offset=0]
+
+    var scale = top / Float32(ACT_Q_MAX)
+    var inv = Float32(0) if top == Float32(0) else Float32(ACT_Q_MAX) / top
+    var scaled = v * inv
+    var rounded = scaled + (Float32(0.5) if scaled >= 0 else Float32(-0.5))
+    q.unsafe_bitcast[Int8]()[unsafe_offset=i] = Int8(Int32(rounded))
+    if t == 0:
+        q.unsafe_bitcast[Float32]()[unsafe_offset=Int(words_dev) + g] = scale
+
+
+def planar_partial_dot_q[
+    tile: Int, group: Int, with_min: Bool, form: Int
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    xq: Pointer[UInt8, MutAnyOrigin],
+    row: Int,
+    cols: Int,
+    words: Int,
+    t: Int,
+) -> Float32:
+    """`planar_partial_dot` with both sides integers until a run ends.
+
+    Same row, same order of accumulation over groups, same planes read in the
+    same way. What differs is everything between the load and the accumulator:
+    a weight quant stays the integer the repack wrote, an activation is the
+    signed byte beside it, and their products go into an `Int32` for a run of
+    `ACT_RUN` before anything becomes a float.
+
+    The offset a centred type carries is not paid per value. A value is
+    `raw - bias`, so a run is `sum(raw * a) - bias * sum(a)`, and the plain sum
+    of the activation quants is already being accumulated for the minimum. So a
+    q4_0 or a q6_K run costs one extra integer multiply rather than one extra
+    subtraction a value, and an unsigned type costs nothing at all.
+
+    The minimum is the same algebra. Over a group the value is `d * raw + m` and
+    the sum against `x = dx * q` is `d * dx * sum(raw * q) + m * dx * sum(q)`, so
+    a run converts twice and scales twice at the end instead of multiplying and
+    adding per value. A type with no minimum and no offset drops the second
+    accumulator at compile time.
+
+    Neither accumulator overflows. The widest run is eight six bit quants at 63
+    against activation quants at 127, which is 64008, and a whole 4096 wide row
+    of that would still be inside an `Int32`.
+    """
+    var groups = cols // group
+    var packed = w
+    var scales = w.unsafe_bitcast[Float16]()
+    var d_base = (row + planar_quant_stride[form](cols)) // SCALE_BYTES
+    var m_base = d_base + groups
+
+    var aq = xq.unsafe_bitcast[Int8]()
+    var ad = xq.unsafe_bitcast[Float32]()
+
+    comptime shift = group_shift(group)
+    comptime ashift = group_shift(ACT_GROUP)
+    # What the reader subtracts to get the signed value, which is eight for the
+    # centred nibble type, the type's own bias for the five and six bit ones,
+    # and nothing for the unsigned nibbles or for the byte type, which is loaded
+    # through a signed view and is already the value it means.
+    comptime bias = (
+        8 if form
+        == QUANT_S4 else (
+            0 if (
+                form == QUANT_U4 or form == QUANT_U5 or form == QUANT_I8
+            ) else quant_bias(form)
+        )
+    )
+    comptime needs_sum = with_min or bias != 0
+
+    var acc = Float32(0)
+    var i = t * ACT_RUN
+    while i < cols:
+        var gi = i >> shift
+        var ai = i >> ashift
+        var dot = Int32(0)
+        var qsum = Int32(0)
+
+        comptime if form == QUANT_I8:
+            var at = row + i
+            var quants = w.unsafe_bitcast[Int8]()
+            comptime for k in range(ACT_RUN):
+                var a = Int32(aq[unsafe_offset=i + k])
+                dot += Int32(quants[unsafe_offset=at + k]) * a
+                comptime if needs_sum:
+                    qsum += a
+        elif quant_high_bits(form) == 0:
+            var at = row + (i >> 1)
+            comptime for k in range(ACT_RUN // 2):
+                var b = Int32(packed[unsafe_offset=at + k])
+                var a0 = Int32(aq[unsafe_offset=i + k * 2])
+                var a1 = Int32(aq[unsafe_offset=i + k * 2 + 1])
+                dot += (b & 0xF) * a0 + ((b >> 4) & 0xF) * a1
+                comptime if needs_sum:
+                    qsum += a0 + a1
+        else:
+            comptime hbits = quant_high_bits(form)
+            comptime hshift = high_shift[form]()
+            comptime hper = 1 << hshift
+            comptime hmask = UInt32((1 << hbits) - 1)
+            var high = row + (cols >> 1)
+            var at = row + (i >> 1)
+            comptime for k in range(ACT_RUN // 2):
+                var b = UInt32(packed[unsafe_offset=at + k])
+                var hi_at = (i + k * 2) >> hshift
+                var s0 = UInt32(((i + k * 2) & (hper - 1)) * hbits)
+                var h = UInt32(packed[unsafe_offset=high + hi_at])
+                var v0 = Int32((b & 0xF) | (((h >> s0) & hmask) << 4))
+                var v1 = Int32(
+                    (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
+                )
+                var a0 = Int32(aq[unsafe_offset=i + k * 2])
+                var a1 = Int32(aq[unsafe_offset=i + k * 2 + 1])
+                dot += v0 * a0 + v1 * a1
+                comptime if needs_sum:
+                    qsum += a0 + a1
+
+        comptime if bias != 0:
+            dot -= Int32(bias) * qsum
+
+        var dx = ad[unsafe_offset=words + ai]
+        acc += _scale(scales, d_base + gi) * dx * Float32(dot)
+        comptime if with_min:
+            acc += _scale(scales, m_base + gi) * dx * Float32(qsum)
+        i += tile * ACT_RUN
+    return acc
+
+
+def planar_matvec_q_kernel[
+    tile: Int, group: Int, with_min: Bool, form: Int
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    xq: Pointer[UInt8, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+    words_dev: Int32,
+    epi_dev: Int32,
+):
+    """`planar_matvec_kernel` against a quantized activation vector.
+
+    The reduction and the epilogue are the float kernel's, line for line, so the
+    only thing this instantiation changes is which dot product runs.
+    """
+    var cols = Int(cols_dev)
+    var stride = Int(stride_dev)
+    var r = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+
+    var acc = planar_partial_dot_q[tile, group, with_min, form](
+        w, xq, r * stride, cols, Int(words_dev), t
+    )
+
+    var part = stack_allocation[
+        tile, Float32, address_space=AddressSpace.SHARED
+    ]()
+    part[unsafe_offset=t] = acc
+    barrier()
+    var step = tile // 2
+    while step > 0:
+        if t < step:
+            part[unsafe_offset=t] = (
+                part[unsafe_offset=t] + part[unsafe_offset=t + step]
+            )
+        barrier()
+        step //= 2
+    if t == 0:
+        write_epilogue(o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
+
+
 def planar_matvec_kernel[
     tile: Int, group: Int, with_min: Bool, form: Int
 ](
@@ -1229,6 +1519,137 @@ def device_matvec_into(
         else:
             raise Error(
                 "no device matvec is compiled for quant form "
+                + String(form)
+                + " with a group of "
+                + String(g)
+                + (" and a minimum plane" if carries_min else " and no minimum")
+            )
+
+
+def device_quantize(
+    ctx: DeviceContext, x: DeviceVec, mut out: DeviceQuantVec
+) raises:
+    """One activation vector into signed bytes and a scale a group.
+
+    One launch, a block a group. It is a launch and not part of whatever
+    produced the vector because the thing that produced it is a norm or an
+    activation function that already walks the vector, and folding this into
+    those is worth doing once this is known to pay rather than before.
+    """
+    if x.elements() != out.elements():
+        raise Error(
+            "quantizing "
+            + String(x.elements())
+            + " values into a vector of "
+            + String(out.elements())
+        )
+    comptime if not has_accelerator():
+        raise Error(
+            "this build has no device code in it, so there is nothing to"
+            " quantize an activation vector with"
+        )
+    else:
+        ctx.enqueue_function[act_quant_kernel](
+            x.ptr(),
+            out.ptr(),
+            Int32(out.scale_words()),
+            grid_dim=(out.elements() // ACT_GROUP, 1, 1),
+            block_dim=(ACT_GROUP, 1, 1),
+        )
+
+
+def _launch_q[
+    tile: Int, group: Int, with_min: Bool, form: Int
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceQuantVec,
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+) raises:
+    """One instantiation of the integer matvec, launched."""
+    ctx.enqueue_function[planar_matvec_q_kernel[tile, group, with_min, form]](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
+        x.ptr(),
+        o,
+        aux,
+        Int32(w.cols),
+        Int32(w.row_bytes()),
+        Int32(x.scale_words()),
+        Int32(epi),
+        grid_dim=(w.rows, 1, 1),
+        block_dim=(tile, 1, 1),
+    )
+
+
+def device_matvec_q_into(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceQuantVec,
+    mut out: DeviceVec,
+    at: Int = 0,
+    epi: Int = EPI_NONE,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
+) raises:
+    """`device_matvec_into` against a vector that has already been quantized.
+
+    The same dispatch over the same five shapes of row, because the weight side
+    is untouched by this and a form that has no float kernel should not gain an
+    integer one by accident.
+
+    Quantizing is the caller's because one vector feeds several matvecs: the
+    attention norm feeds three projections and the feed forward norm feeds two,
+    so doing it here would quantize the same values twice and lose most of what
+    this is for.
+    """
+    if at < 0:
+        raise Error("a matvec cannot write at a negative offset")
+    if out.elements() < at + w.rows:
+        raise Error(
+            "the device matvec writes "
+            + String(w.rows)
+            + " rows at offset "
+            + String(at)
+            + " and the output ends at "
+            + String(out.elements())
+        )
+    check_matvec_shapes(w, x.elements(), w.rows)
+    comptime if not has_accelerator():
+        raise Error(
+            "this build has no device code in it, so there is no device matvec"
+            " to run. Accelerator support is decided when molla is compiled,"
+            " not when it is run"
+        )
+    else:
+        var o = out.ptr_at(at)
+        var a = aux.value() if aux and epi != EPI_NONE else o
+        var g = group_size(w.kind)
+        var carries_min = has_min(w.kind)
+        var form = quant_form(w.kind)
+        if w.cols % ACT_RUN != 0:
+            raise Error(
+                "the integer matvec takes a run of "
+                + String(ACT_RUN)
+                + " values a thread and a row of "
+                + String(w.cols)
+                + " is not a whole number of runs"
+            )
+        if form == QUANT_U4 and g == 32 and carries_min:
+            _launch_q[TILE, 32, True, QUANT_U4](ctx, w, x, o, a, epi)
+        elif form == QUANT_S4 and g == 32 and not carries_min:
+            _launch_q[TILE, 32, False, QUANT_S4](ctx, w, x, o, a, epi)
+        elif form == QUANT_U5 and g == 32 and carries_min:
+            _launch_q[TILE, 32, True, QUANT_U5](ctx, w, x, o, a, epi)
+        elif form == QUANT_S5 and g == 32 and not carries_min:
+            _launch_q[TILE, 32, False, QUANT_S5](ctx, w, x, o, a, epi)
+        elif form == QUANT_S6 and g == 16 and not carries_min:
+            _launch_q[TILE, 16, False, QUANT_S6](ctx, w, x, o, a, epi)
+        elif form == QUANT_I8 and g == 32 and not carries_min:
+            _launch_q[TILE, 32, False, QUANT_I8](ctx, w, x, o, a, epi)
+        else:
+            raise Error(
+                "no integer device matvec is compiled for quant form "
                 + String(form)
                 + " with a group of "
                 + String(g)
