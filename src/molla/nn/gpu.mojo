@@ -457,9 +457,9 @@ def planar_matvec_kernel[
             var gi = i >> shift
             var at = row + i
             var d = scales[unsafe_offset=d_base + gi]
-            var m = scales[unsafe_offset=m_base + gi] if with_min else Float32(
-                0
-            )
+            var m = Float32(0)
+            comptime if with_min:
+                m = scales[unsafe_offset=m_base + gi]
             comptime for k in range(MATVEC_STEP):
                 var q = byte_float(UInt32(packed[unsafe_offset=at + k]))
                 var a = x[unsafe_offset=i + k]
@@ -501,9 +501,9 @@ def planar_matvec_kernel[
             var gi = i >> shift
             var at = row + (i >> 1)
             var d = scales[unsafe_offset=d_base + gi]
-            var m = scales[unsafe_offset=m_base + gi] if with_min else Float32(
-                0
-            )
+            var m = Float32(0)
+            comptime if with_min:
+                m = scales[unsafe_offset=m_base + gi]
             comptime for k in range(MATVEC_STEP // 2):
                 var b = UInt32(packed[unsafe_offset=at + k])
                 var lo = nibble_float[form](b & 0xF)
