@@ -39,7 +39,11 @@ A Llama shaped layer today, as twelve launches, with what depends on what:
 | the gate projection with the gated activation | the norm scratch and the up scratch | the gate scratch |
 | the down projection with a residual add | the gate scratch | the residual stream |
 
-Six of those twelve boundaries are not real. The three attention projections read the same input and write three disjoint outputs, so they are one step over a concatenated row space. The two ropes touch disjoint memory, so they are one step. The up and gate projections read the same input and the gate reads the up, which is the only ordering among the four, and it is removed by having the gate step read the up plane it just wrote in the same block, so they are one step over a concatenated row space with the activation applied at the end.
+Six of those twelve boundaries are not real. The three attention projections read the same input and write three disjoint outputs. The two ropes touch disjoint memory. The up and gate projections read the same input, and the gate reading the up is the only ordering among the four.
+
+They do not have to be merged into one step to lose the barrier. Every record in the plan carries a flag saying whether a barrier follows it, and a record with the flag clear runs and falls straight into the next one. So the three projections stay three records with a barrier after the third, the two ropes stay two records with a barrier after the second, and the up and the gate stay two records with a barrier after the gate. A record is still the unit of work and the barrier is a property of the boundary rather than of the record, which is both simpler than merging and more general, since a merged step would have needed a record shape that holds three weight matrices.
+
+The gate reading the up survives that only because the two records walk the same rows in the same order, so the block that reads `up[r]` is the block that wrote it a moment earlier, in its own program order and its own cache. That is a real constraint on the partition and not a coincidence to lean on quietly: two records with no barrier between them may only share data through rows that the same block owns in both.
 
 That leaves eight barriers a layer:
 
@@ -53,7 +57,9 @@ Plus the embedding lookup, the final norm and the output head, so a thirty layer
 
 The kernel cannot call the host between layers, so everything the host currently passes as an argument has to be in device memory before the launch. That is one array of step records, built once when the model is loaded, walked by the kernel.
 
-A record is an opcode, up to three pointers, and the handful of integers the step needs. The pointers are what the host already computes: `w.device_address()` for a weight matrix, a scratch vector's base, a cache layer's base plus the slot offset. The integers are the rows, the columns, the row stride in bytes, the epilogue flags, and the quant descriptor.
+A record is an opcode, a barrier flag, a few pointers and the handful of integers the step needs, in a fixed width slot so that walking the table is an index rather than a parse. The pointers are what the host already computes: `w.device_address()` for a weight matrix, a scratch vector's base, a cache layer's base. The integers are the rows, the columns, the row stride in bytes, the epilogue flags, and the quant descriptor.
+
+What is not in a record is anything that changes between tokens. The position, the cache slot and the token id are the same for every record in a pass, so they are kernel arguments and the table is built once when the model is loaded and never touched again. That is what keeps this from being a host side rebuild and an upload per token, which would have put back a smaller version of the cost this removes.
 
 Two things make this an interpreter rather than a switch. The quant form, the group size and whether there is a minimum plane are comptime parameters on the matvec today, and five combinations are compiled. In the fused kernel they arrive as a runtime triple and the step branches over the same five, which is one uniform branch a step and five copies of the dot product loop in the binary. That is the price of one kernel source for every model, and it is the right price, because the alternative is a kernel instantiated per model shape and a compile on every load.
 
@@ -81,9 +87,11 @@ What that costs is unmeasured. A relaxed atomic load on Apple should be a load t
 
 Three stages, each of which is worth landing on its own and each of which is a test of the stage after it.
 
-Stage one is one kernel a layer. Twelve launches become one, the layer is still launched per layer from the host, and there is no step table because the layer's own steps are written out in the kernel. A thirty layer token goes from 363 launches to 33, which is a ceiling of 6281 tokens a second on the 4090 and 1506 on the M4, and both are above this milestone's target. It uses the grid barrier, it uses the Metal atomic path, it uses the strided row loop, and it answers all three of the open questions above at a fraction of the work of the full thing.
+Stage one is one kernel a layer. Twelve launches become one, and a thirty layer token goes from 363 launches to 33, which is a ceiling of 6281 tokens a second on the 4090 and 1506 on the M4, both above this milestone's target. It uses the grid barrier, it uses the Metal atomic path, and it uses the strided row loop, so it answers all three of the open questions above at a fraction of the work of the full thing.
 
-Stage two is one kernel a token. The step table appears, the layer loop moves inside the kernel, and the launch count becomes one plus whatever the sampler needs. This is where the ceiling stops mattering at all.
+Stage two is one kernel a token, and it is the same kernel. The table is built for the whole model either way and the kernel walks a range of it, so stage one launches the range belonging to one layer and stage two launches the whole range. That is a change to two arguments and not a second kernel, which is the reason the table is built in stage one rather than deferred: writing the layer's steps out by hand in the kernel would have been throwaway work and a second thing to keep correct.
+
+The launch count after stage two is one plus whatever the sampler needs, and the ceiling stops mattering at all.
 
 Stage three is prefill on the same kernel. A chunk is the same steps with a token dimension, which is the matmul rather than the matvec, and the barrier count a chunk is the barrier count a token. This is worth much less than the first two, because prefill is compute bound and already batched by #167, and it is worth doing so that there is one kernel and not two.
 
