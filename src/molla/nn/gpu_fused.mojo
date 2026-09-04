@@ -1,0 +1,1259 @@
+"""A whole decoder layer in one kernel launch, driven by a table in memory.
+
+molla launches a kernel for every step of every layer. A Llama shaped layer is
+twelve of them after #168 and #194 folded the biases, the residual adds and the
+gate into the projections that were already running, so a thirty layer model is
+363 launches for one decoded token. A launch is 4.82 microseconds on a 4090 and
+20.10 on an M4, which is 1.75 ms and 7.30 ms of pure submission per token and a
+ceiling of 571 tokens a second and 137 tokens a second before a single multiply
+happens. That ceiling is the binding constraint on the models this milestone is
+measured on, and no arrangement of kernels per layer clears it.
+
+This is stage one of the answer, which is one kernel a layer. The design and the
+measurements it rests on are
+[docs/validation/fused.md](../../../docs/validation/fused.md) and the grid wide
+sync section of [docs/validation/max.md](../../../docs/validation/max.md), and
+the three findings that shape everything here are worth restating because the
+code looks arbitrary without them.
+
+There is no grid wide barrier in MAX and no cooperative launch. The one built
+here is a sense reversing barrier over two device scope atomic words, and on
+Metal it needs a threadgroup barrier asked for with the device memory flag on
+either side of it because that target has no fence and rejects every ordering on
+an atomic.
+
+Ordinary global loads and stores are not coherent across a block on Metal, and
+both sides need a relaxed device scope atomic. #170's probe said the store side
+was enough on its own and this kernel does not reproduce that, for a reason the
+probe could not have seen: there every block read an address it had never read
+before, and here a block reads the same norm scratch at every record of every
+layer, so the second read hits a line its own L1 already holds and the barrier
+does not evict it. `_put` and `_get` are the two ends of that and neither is
+optional.
+
+A barrier round is not free on CUDA at full residency, 4.59 microseconds over
+1536 blocks against a 4.82 microsecond launch, and it falls to 0.75 at 96 blocks
+and is flat below that. So the grid is a few hundred blocks and each block walks
+many output rows, which is `_grid_for` and is the part of this design most
+likely to be wrong: a bandwidth bound matvec may want more threads in flight
+than a few hundred blocks provide. That is measured rather than assumed.
+
+## Why the steps are data
+
+The kernel cannot call the host between layers, so everything the host passes as
+an argument today has to be in device memory before the launch. That is one
+table of fixed width records, built once when a model binds and walked by the
+kernel, and it is built for the whole model rather than for a layer even though
+stage one launches one layer at a time. Stage two is the same kernel over a
+wider range of the same table, so writing a layer's steps out by hand in the
+kernel would have been throwaway work and a second thing to keep correct.
+
+What is not in a record is anything that changes between tokens. The position,
+the cache slot and the number of keys are the same for every record in a pass,
+so they are kernel arguments, and the table is never touched again after a model
+loads.
+
+A record names its operands as a space and an offset rather than as a pointer.
+That is not a preference: a pointer rebuilt from an integer address loses its
+address space on Metal and crashes the pipeline compiler the moment an atomic
+touches it, which is exactly what `_put` does. So the five bases arrive as
+kernel arguments and a record says which of them and how far in.
+
+## What it agrees with
+
+The same arithmetic in the same order as the kernels it replaces, so the answers
+are identical in every digit rather than close. `tests/test_gpu_block.mojo`
+checks a fused layer against the unfused one on a synthetic model, over the
+logits, over both cache planes and over the residual stream a layer at a time,
+and anything that is merely close there is a bug rather than a tolerance.
+"""
+
+from std.atomic import Atomic, Ordering
+from std.gpu import block_idx, grid_dim, thread_idx
+from std.math import cos, exp, sin, sqrt
+from std.memory import AddressSpace, bitcast, stack_allocation
+from std.sys import llvm_intrinsic
+from std.sys.info import CompilationTarget, has_accelerator
+
+from max.gpu import barrier
+from max.gpu.host import DeviceAttribute, DeviceBuffer, DeviceContext
+
+from molla.nn.attention import AttnSpec
+from molla.nn.block import ACT_GELU, ACT_SILU, BlockSpec
+from molla.nn.gpu import (
+    ACT_BIT,
+    EPI_ADD,
+    EPI_BIAS,
+    EPI_GLU,
+    EPI_NONE,
+    TILE,
+    DeviceVec,
+    activate,
+    byte_float,
+    nibble_float,
+)
+from molla.nn.gpu_ops import NEG_INF, _ramp, _reduce_angle, _tanh
+from molla.nn.repack import (
+    QUANT_I8,
+    QUANT_S4,
+    QUANT_U4,
+    group_shift,
+    group_size,
+    has_min,
+    quant_form,
+)
+from molla.nn.rope import RopeSpec, corr_range
+from molla.nn.tensor import Tensor
+
+comptime FTILE = TILE
+"""Threads a block, which is the matvec's tile and for the matvec's reason.
+
+The same number as the unfused kernels so that a fused layer and an unfused one
+reduce over the same width in the same order and their answers agree bit for
+bit. It is not a free parameter here even though it looks like one.
+"""
+
+comptime PATIENCE = 100000000
+"""Spins at the barrier before a block decides the rendezvous is broken.
+
+A bound rather than forever, because forever is a hung GPU and on a laptop that
+is the display. Nothing that works comes anywhere near it, so reaching it is a
+grid that was not resident, which `fused_selftest` is meant to catch before a
+model ever runs.
+"""
+
+comptime dev32 = Atomic[DType.int32, scope="device"]
+
+comptime RMW = (
+    Ordering.RELAXED if CompilationTarget.is_macos() else Ordering.ACQUIRE_RELEASE
+)
+comptime GET = (
+    Ordering.RELAXED if CompilationTarget.is_macos() else Ordering.ACQUIRE
+)
+comptime PUT = (
+    Ordering.RELAXED if CompilationTarget.is_macos() else Ordering.RELEASE
+)
+"""What carries the ordering at the rendezvous, per backend.
+
+On CUDA it rides the atomic. An Apple GPU rejects `acquire`, `release` and
+`acquire_release` on an atomic and crashes the Metal pipeline compiler on a
+`fence` of every ordering, scoped or not, so there the atomics are relaxed and
+`flush` carries the ordering instead.
+"""
+
+
+def flush():
+    """A block barrier that also orders this block's device memory.
+
+    On Apple this is `threadgroup_barrier(mem_device | mem_threadgroup)`, which
+    is the instruction `barrier` already emits with flag 3 rather than flag 2,
+    and it is the only way to order device memory on that target from here.
+    Everywhere else the ordering is on the atomics and this is `barrier`.
+    """
+    comptime if CompilationTarget.is_macos():
+        llvm_intrinsic["llvm.air.wg.barrier", NoneType](Int32(3), Int32(1))
+    else:
+        barrier()
+
+
+def grid_barrier(
+    count: Pointer[Int32, MutAnyOrigin],
+    gen: Pointer[Int32, MutAnyOrigin],
+    blocks: Int,
+    mut seen: Int32,
+) -> Bool:
+    """Wait until every block in the grid has arrived. False if it gave up.
+
+    Every block adds one to a counter, the block that finds itself last resets
+    the counter and moves the generation on, and everyone else waits for the
+    generation to move. The counter is reset before the generation moves so that
+    the next round starts from zero, which is safe because nobody is past the
+    generation yet.
+
+    One thread does the waiting and the other `FTILE - 1` wait for it at the
+    `flush` on the way out, which is what makes this cost one atomic a block
+    rather than one a thread.
+    """
+    flush()
+    var ok = True
+    if thread_idx.x == 0:
+        var was = dev32.fetch_add[ordering=RMW](count, 1)
+        if was == Int32(blocks - 1):
+            dev32.store[ordering=Ordering.RELAXED](count, Int32(0))
+            dev32.store[ordering=PUT](gen, seen + 1)
+        else:
+            var spins = 0
+            while dev32.load[ordering=GET](gen) == seen:
+                spins += 1
+                if spins > PATIENCE:
+                    ok = False
+                    break
+    flush()
+    seen += 1
+    return ok
+
+
+@always_inline
+def _put(p: Pointer[Float32, MutAnyOrigin], i: Int, v: Float32):
+    """Write a float another block is going to read after a barrier.
+
+    An ordinary store everywhere except Metal, where a plain store is invisible
+    to the rest of the grid: the probe in `scripts/gridsync_probe.mojo` reads
+    stale on 634 of 640 crossings and the barrier makes no difference, because
+    the problem is not ordering but that the value never leaves the core that
+    wrote it. A relaxed device scope atomic store fixes that end of it. `_get`
+    is the other end and both are needed.
+
+    `Pointer(to=...)` and not a pointer rebuilt from an integer address. The
+    second form loses the address space and crashes the Metal pipeline compiler
+    the moment an atomic touches it, which is also why a record names a base and
+    an offset rather than carrying a pointer.
+    """
+    comptime if CompilationTarget.is_macos():
+        var q = p.unsafe_bitcast[Int32]()
+        dev32.store[ordering=Ordering.RELAXED](
+            Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset=i]),
+            bitcast[DType.int32, 1](v),
+        )
+    else:
+        p[unsafe_offset=i] = v
+
+
+@always_inline
+def _get(p: Pointer[Float32, MutAnyOrigin], i: Int) -> Float32:
+    """Read a float another block may have written since the last barrier.
+
+    An ordinary load everywhere except Metal. The probe in
+    `scripts/gridsync_probe.mojo` said the store side was enough on its own, and
+    that was a reading of a case the probe does not cover: there every block read
+    an address it had never read before, and here a block reads the same norm
+    scratch at every record of every layer. The second read hits a line the
+    block's own L1 already holds from the first, the barrier does not evict it,
+    and the value it returns is one round of the plan out of date. So the load
+    goes through the same relaxed device scope atomic as the store.
+
+    What that costs is the thing the design most wanted to avoid, because it is
+    one instruction for every column of every row rather than one a row. See
+    [docs/validation/fused.md](../../../docs/validation/fused.md).
+    """
+    comptime if CompilationTarget.is_macos():
+        var q = p.unsafe_bitcast[Int32]()
+        return bitcast[DType.float32, 1](
+            dev32.load[ordering=Ordering.RELAXED](
+                Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset=i])
+            )
+        )
+    else:
+        return p[unsafe_offset=i]
+
+
+comptime SPACE_WORK = 0
+"""The layer's intermediates: the norm, the query, the heads output, the
+projection scratch, the gate, the up and the attention scores."""
+comptime SPACE_RESID = 1
+"""The residual stream, which is the one buffer a layer both starts from and
+writes back into."""
+comptime SPACE_KEYS = 2
+comptime SPACE_VALS = 3
+comptime SPACE_ARENA = 4
+"""The small per layer weights, uploaded once: the norm gains, the projection
+biases and the rope tables, concatenated so that a record can name one of them
+as an offset."""
+
+comptime OP_NORM = 0
+comptime OP_MATVEC = 1
+comptime OP_ROPE = 2
+comptime OP_ATTEND = 3
+comptime OP_ACT = 4
+comptime OP_ADD = 5
+
+comptime QK_U4 = 0
+"""Unsigned nibbles, groups of 32, with a minimum plane. q4_K and q5_K."""
+comptime QK_S4 = 1
+"""Centred nibbles, groups of 32, no minimum. q4_0."""
+comptime QK_I8M = 2
+"""Bytes, groups of 32, with a minimum. q8_1 shaped types."""
+comptime QK_I8 = 3
+"""Bytes, groups of 32, no minimum. q8_0."""
+comptime QK_I8_16 = 4
+"""Bytes, groups of 16, no minimum. q6_K."""
+
+comptime NEOX_BIT = 1
+"""Set in a rope record's kind when the pairing is neox."""
+comptime FACTOR_BIT = 2
+"""Set when the rope reads a per pair frequency factor."""
+
+comptime R_OP = 0
+comptime R_SYNC = 1
+"""Whether a grid barrier follows this record.
+
+A property of the boundary rather than of the record, which is what lets the
+three attention projections stay three records with one barrier after the third
+and the up and the gate stay two records with one barrier after the gate.
+Merging them into one record instead would have needed a record shape that
+holds three weight matrices.
+"""
+comptime R_XS = 2
+comptime R_XO = 3
+comptime R_XK = 4
+"""What to multiply the cache slot by before adding it to the input offset.
+
+Zero for everything that does not move with the slot, and the key width for the
+records that read or write this position's place in the cache. The slot is a
+kernel argument because it changes every token and the table does not.
+"""
+comptime R_OS = 5
+comptime R_OO = 6
+comptime R_OK = 7
+comptime R_AS = 8
+comptime R_AO = 9
+comptime R_AK = 10
+comptime R_G = 11
+"""Where in the arena this record's gain or rope step table starts."""
+comptime R_H = 12
+"""Where in the arena the rope frequency factors start."""
+comptime R_W = 13
+"""Where in the weight pool this record's matrix starts, in bytes."""
+comptime R_COLS = 14
+comptime R_ROWS = 15
+comptime R_STRIDE = 16
+comptime R_EPI = 17
+comptime R_KIND = 18
+comptime R_HEADS = 19
+comptime R_HEAD_DIM = 20
+comptime R_DIM = 21
+comptime R_GROUP = 22
+comptime R_WINDOW = 23
+comptime R_SINKS = 24
+comptime R_ROW = 25
+comptime R_KV = 26
+comptime R_N = 27
+comptime R_RUNS = 28
+comptime REC_INTS = 32
+"""Fields in a record, rounded up so that a record is a shift rather than a
+multiply. Twenty nine are used and the table is a few tens of kilobytes for the
+largest model in the fleet, so the rounding costs nothing worth counting."""
+
+comptime R_EPS = 0
+comptime R_SCALE = 1
+comptime R_SOFTCAP = 2
+comptime R_EXT = 3
+comptime R_ATTN = 4
+comptime R_LOW = 5
+comptime R_HIGH = 6
+comptime REC_FLOATS = 8
+
+
+@always_inline
+def _fi(plan: Pointer[Int64, MutAnyOrigin], rec: Int, field: Int) -> Int:
+    return Int(plan[unsafe_offset=rec * REC_INTS + field])
+
+
+@always_inline
+def _ff(plan: Pointer[Float32, MutAnyOrigin], rec: Int, field: Int) -> Float32:
+    return plan[unsafe_offset=rec * REC_FLOATS + field]
+
+
+@always_inline
+def _base(
+    space: Int,
+    off: Int,
+    work: Pointer[Float32, MutAnyOrigin],
+    resid: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float32, MutAnyOrigin],
+    values: Pointer[Float32, MutAnyOrigin],
+    arena: Pointer[Float32, MutAnyOrigin],
+) -> Pointer[Float32, MutAnyOrigin]:
+    """One operand of a record, resolved to an address.
+
+    A uniform branch over five bases, taken once a record rather than once an
+    element, and it is a branch rather than an array of pointers because an
+    array would have to live in device memory and a pointer loaded from device
+    memory is the form that loses its address space on Metal.
+    """
+    if space == SPACE_RESID:
+        return Pointer[Float32, MutAnyOrigin](to=resid[unsafe_offset=off])
+    if space == SPACE_KEYS:
+        return Pointer[Float32, MutAnyOrigin](to=keys[unsafe_offset=off])
+    if space == SPACE_VALS:
+        return Pointer[Float32, MutAnyOrigin](to=values[unsafe_offset=off])
+    if space == SPACE_ARENA:
+        return Pointer[Float32, MutAnyOrigin](to=arena[unsafe_offset=off])
+    return Pointer[Float32, MutAnyOrigin](to=work[unsafe_offset=off])
+
+
+@always_inline
+def _row_dot[
+    group: Int, with_min: Bool, form: Int
+](
+    packed: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    row: Int,
+    cols: Int,
+    t: Int,
+) -> Float32:
+    """This thread's share of one planar row against one activation vector.
+
+    Line for line the accumulation loop of `molla.nn.gpu.planar_matvec_kernel`,
+    with the same stride and the same order of operations, because a fused layer
+    that summed the same products in a different order would disagree with the
+    unfused one in the last digit and there would be no way to tell that from a
+    bug. The reduction and the epilogue are the caller's, since a fused record
+    reduces once a row and the caller is already inside the row loop.
+    """
+    var scales = packed.unsafe_bitcast[Float32]()
+    var quant_bytes = cols if form == QUANT_I8 else cols // 2
+    var groups = cols // group
+    var d_base = (row + quant_bytes) // 4
+    var m_base = d_base + groups
+    comptime shift = group_shift(group)
+
+    var acc = Float32(0)
+    comptime if form == QUANT_I8:
+        var i = t
+        while i < cols:
+            var gi = i >> shift
+            var q = byte_float(UInt32(packed[unsafe_offset=row + i]))
+            var a = _get(x, i)
+            acc += scales[unsafe_offset=d_base + gi] * q * a
+            comptime if with_min:
+                acc += scales[unsafe_offset=m_base + gi] * a
+            i += FTILE
+    else:
+        var i = t * 2
+        while i < cols:
+            var gi = i >> shift
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            var lo = nibble_float[form](b & 0xF)
+            var hi = nibble_float[form](b >> 4)
+            var a0 = _get(x, i)
+            var a1 = _get(x, i + 1)
+            var d = scales[unsafe_offset=d_base + gi]
+            acc += d * lo * a0
+            acc += d * hi * a1
+            comptime if with_min:
+                var m = scales[unsafe_offset=m_base + gi]
+                acc += m * a0
+                acc += m * a1
+            i += FTILE * 2
+    return acc
+
+
+@always_inline
+def _tree_sum(value: Float32) -> Float32:
+    """Sum one value a thread across the block, answer in every thread.
+
+    The matvec's reduction and `gpu_ops`' `_block_sum` are the same tree and are
+    written out again here rather than called, because both of those allocate
+    their own shared array and a fused kernel that called all three would hold
+    three of them for the whole launch. One allocation, reached from every
+    record.
+    """
+    var part = stack_allocation[
+        FTILE, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var t = Int(thread_idx.x)
+    part[unsafe_offset=t] = value
+    barrier()
+    var step = FTILE // 2
+    while step > 0:
+        if t < step:
+            part[unsafe_offset=t] = (
+                part[unsafe_offset=t] + part[unsafe_offset=t + step]
+            )
+        barrier()
+        step //= 2
+    var total = part[unsafe_offset=0]
+    # Every thread reads slot zero before anything is allowed to overwrite it,
+    # which matters because these run back to back inside one kernel and the
+    # allocation is the same shared memory each time.
+    barrier()
+    return total
+
+
+@always_inline
+def _tree_max(value: Float32) -> Float32:
+    """The largest value in the block, in every thread."""
+    var part = stack_allocation[
+        FTILE, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var t = Int(thread_idx.x)
+    part[unsafe_offset=t] = value
+    barrier()
+    var step = FTILE // 2
+    while step > 0:
+        if t < step:
+            var other = part[unsafe_offset=t + step]
+            if other > part[unsafe_offset=t]:
+                part[unsafe_offset=t] = other
+        barrier()
+        step //= 2
+    var top = part[unsafe_offset=0]
+    barrier()
+    return top
+
+
+@always_inline
+def _epilogue(
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    r: Int,
+    epi: Int,
+    total: Float32,
+):
+    """What happens to a row once it is reduced, run by one thread.
+
+    The same three cases in the same order as the unfused matvec: a bias, or a
+    gated activation against the up projection, and then a residual add or a
+    plain store. `aux` is the output pointer when nothing reads it, so there is
+    no null to test for.
+    """
+    var v = total
+    if epi & EPI_BIAS != 0:
+        v += aux[unsafe_offset=r]
+    elif epi & EPI_GLU != 0:
+        if epi & ACT_BIT != 0:
+            v = activate[ACT_GELU](v) * _get(aux, r)
+        else:
+            v = activate[ACT_SILU](v) * _get(aux, r)
+    if epi & EPI_ADD != 0:
+        _put(o, r, _get(o, r) + v)
+    else:
+        _put(o, r, v)
+
+
+@always_inline
+def _do_matvec[
+    group: Int, with_min: Bool, form: Int
+](
+    packed: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    w_at: Int,
+    cols: Int,
+    stride: Int,
+    rows: Int,
+    epi: Int,
+    b: Int,
+    blocks: Int,
+):
+    """Every row this block owns, strided across the grid.
+
+    One block per row is what the unfused matvec does and it is not available
+    here, because the grid is sized to synchronise cheaply rather than to the
+    widest step, so a 4096 row projection on 96 blocks is 43 rows a block. The
+    stride is the block count so that the blocks working on adjacent rows at any
+    moment are adjacent, which is what keeps the weight reads of one round of
+    the loop in one region of the pool.
+    """
+    var t = Int(thread_idx.x)
+    var r = b
+    while r < rows:
+        var acc = _row_dot[group, with_min, form](
+            packed, x, w_at + r * stride, cols, t
+        )
+        var total = _tree_sum(acc)
+        if t == 0:
+            _epilogue(o, aux, r, epi, total)
+        r += blocks
+
+
+def fused_kernel(
+    plan_i: Pointer[Int64, MutAnyOrigin],
+    plan_f: Pointer[Float32, MutAnyOrigin],
+    pool: Pointer[UInt8, MutAnyOrigin],
+    arena: Pointer[Float32, MutAnyOrigin],
+    work: Pointer[Float32, MutAnyOrigin],
+    resid: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float32, MutAnyOrigin],
+    values: Pointer[Float32, MutAnyOrigin],
+    sync: Pointer[Int32, MutAnyOrigin],
+    first_dev: Int32,
+    last_dev: Int32,
+    blocks_dev: Int32,
+    pos_dev: Int32,
+    slot_dev: Int32,
+    count_dev: Int32,
+):
+    """Records `first` through `last - 1` of the plan, in order, in one launch.
+
+    `sync` is three words: the barrier's arrival count, its generation, and a
+    flag a block sets if it ever gives up waiting. The first two are left in a
+    state the next launch can start from, which is what the store of zero at the
+    end is for: every block enters with a generation of zero, and a block still
+    spinning when that store lands sees a value that is not the one it is
+    waiting on and leaves, which is the exit it wanted.
+
+    `pos`, `slot` and `count` are the three things that change between tokens
+    and are therefore arguments rather than fields. Everything else a step needs
+    is in the record.
+    """
+    var blocks = Int(blocks_dev)
+    var b = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var pos = Int(pos_dev)
+    var slot = Int(slot_dev)
+    var count = Int(count_dev)
+    var seen = Int32(0)
+    var stuck = False
+
+    var counter = Pointer[Int32, MutAnyOrigin](to=sync[unsafe_offset=0])
+    var gen = Pointer[Int32, MutAnyOrigin](to=sync[unsafe_offset=1])
+
+    for rec in range(Int(first_dev), Int(last_dev)):
+        var op = _fi(plan_i, rec, R_OP)
+        var x = _base(
+            _fi(plan_i, rec, R_XS),
+            _fi(plan_i, rec, R_XO) + slot * _fi(plan_i, rec, R_XK),
+            work,
+            resid,
+            keys,
+            values,
+            arena,
+        )
+        var o = _base(
+            _fi(plan_i, rec, R_OS),
+            _fi(plan_i, rec, R_OO) + slot * _fi(plan_i, rec, R_OK),
+            work,
+            resid,
+            keys,
+            values,
+            arena,
+        )
+        var aux = _base(
+            _fi(plan_i, rec, R_AS),
+            _fi(plan_i, rec, R_AO) + slot * _fi(plan_i, rec, R_AK),
+            work,
+            resid,
+            keys,
+            values,
+            arena,
+        )
+
+        if op == OP_NORM:
+            var n = _fi(plan_i, rec, R_N)
+            var runs = _fi(plan_i, rec, R_RUNS)
+            var gain = Pointer[Float32, MutAnyOrigin](
+                to=arena[unsafe_offset=_fi(plan_i, rec, R_G)]
+            )
+            var eps = _ff(plan_f, rec, R_EPS)
+            var run = b
+            while run < runs:
+                var at = run * n
+                var acc = Float32(0)
+                var i = t
+                while i < n:
+                    var v = _get(x, at + i)
+                    acc += v * v
+                    i += FTILE
+                var total = _tree_sum(acc)
+                var scale = Float32(1.0) / sqrt(total / Float32(n) + eps)
+                i = t
+                while i < n:
+                    _put(
+                        o,
+                        at + i,
+                        _get(x, at + i) * scale * gain[unsafe_offset=i],
+                    )
+                    i += FTILE
+                run += blocks
+
+        elif op == OP_MATVEC:
+            var cols = _fi(plan_i, rec, R_COLS)
+            var rows = _fi(plan_i, rec, R_ROWS)
+            var stride = _fi(plan_i, rec, R_STRIDE)
+            var w_at = _fi(plan_i, rec, R_W)
+            var epi = _fi(plan_i, rec, R_EPI)
+            var kind = _fi(plan_i, rec, R_KIND)
+            # The same five combinations the unfused dispatch compiles, chosen
+            # here by one uniform branch a record rather than by a parameter on
+            # the whole kernel. That is the price of one kernel source for every
+            # model: five copies of the accumulation loop in the binary and a
+            # branch executed once per projection.
+            if kind == QK_U4:
+                _do_matvec[32, True, QUANT_U4](
+                    pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
+                )
+            elif kind == QK_S4:
+                _do_matvec[32, False, QUANT_S4](
+                    pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
+                )
+            elif kind == QK_I8M:
+                _do_matvec[32, True, QUANT_I8](
+                    pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
+                )
+            elif kind == QK_I8:
+                _do_matvec[32, False, QUANT_I8](
+                    pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
+                )
+            else:
+                _do_matvec[16, False, QUANT_I8](
+                    pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
+                )
+
+        elif op == OP_ROPE:
+            var heads = _fi(plan_i, rec, R_HEADS)
+            var head_dim = _fi(plan_i, rec, R_HEAD_DIM)
+            var dim = _fi(plan_i, rec, R_DIM)
+            var kind = _fi(plan_i, rec, R_KIND)
+            var steps = Pointer[Float32, MutAnyOrigin](
+                to=arena[unsafe_offset=_fi(plan_i, rec, R_G)]
+            )
+            var factors = Pointer[Float32, MutAnyOrigin](
+                to=arena[unsafe_offset=_fi(plan_i, rec, R_H)]
+            )
+            var scale = _ff(plan_f, rec, R_SCALE)
+            var ext = _ff(plan_f, rec, R_EXT)
+            var attn = _ff(plan_f, rec, R_ATTN)
+            var low = _ff(plan_f, rec, R_LOW)
+            var high = _ff(plan_f, rec, R_HIGH)
+            var pairs = dim // 2
+            var head = b
+            while head < heads:
+                var at = head * head_dim
+                var pair = t
+                while pair < pairs:
+                    var freq = Float32(1.0)
+                    if kind & FACTOR_BIT != 0:
+                        freq = factors[unsafe_offset=pair]
+                    var step = steps[unsafe_offset=pair]
+                    var extrap = Float32(pos) * step / freq
+                    var interp = scale * extrap
+                    var theta = interp
+                    if ext != 0:
+                        var mix = _ramp(low, high, pair) * ext
+                        theta = interp * (Float32(1.0) - mix) + extrap * mix
+                    var turn = _reduce_angle(theta)
+                    var c = cos(turn) * attn
+                    var s = sin(turn) * attn
+                    var lo = at + pair
+                    var hi = at + pair + pairs
+                    if kind & NEOX_BIT == 0:
+                        lo = at + pair * 2
+                        hi = lo + 1
+                    var a = _get(x, lo)
+                    var bb = _get(x, hi)
+                    _put(o, lo, a * c - bb * s)
+                    _put(o, hi, a * s + bb * c)
+                    pair += FTILE
+                head += blocks
+
+        elif op == OP_ATTEND:
+            var head_dim = _fi(plan_i, rec, R_HEAD_DIM)
+            var kv_width = _fi(plan_i, rec, R_KV)
+            var group = _fi(plan_i, rec, R_GROUP)
+            var window = _fi(plan_i, rec, R_WINDOW)
+            var sinks = _fi(plan_i, rec, R_SINKS)
+            var heads = _fi(plan_i, rec, R_HEADS)
+            var scores = Pointer[Float32, MutAnyOrigin](
+                to=work[unsafe_offset=_fi(plan_i, rec, R_ROW)]
+            )
+            var scale = _ff(plan_f, rec, R_SCALE)
+            var softcap = _ff(plan_f, rec, R_SOFTCAP)
+            var h = b
+            while h < heads:
+                var kvh = h // group
+                var qa = h * head_dim
+                # One row of scores a head, `count` long, which is where the
+                # scratch for a whole layer's attention comes from. The row
+                # moves with the number of keys rather than with the context,
+                # so a short sequence touches a short row.
+                var sa = h * count
+                var mine = NEG_INF
+                var j = t
+                while j < count:
+                    var visible = j < sinks or window <= 0 or j > pos - window
+                    var s = NEG_INF
+                    if visible:
+                        var ka = j * kv_width + kvh * head_dim
+                        var acc = Float32(0)
+                        for d in range(head_dim):
+                            acc += _get(x, qa + d) * _get(keys, ka + d)
+                        s = acc * scale
+                        if softcap > 0:
+                            s = softcap * _tanh(s / softcap)
+                    scores[unsafe_offset=sa + j] = s
+                    if s > mine:
+                        mine = s
+                    j += FTILE
+                var top = _tree_max(mine)
+
+                var acc_sum = Float32(0)
+                j = t
+                while j < count:
+                    var e = exp(scores[unsafe_offset=sa + j] - top)
+                    scores[unsafe_offset=sa + j] = e
+                    acc_sum += e
+                    j += FTILE
+                var total = _tree_sum(acc_sum)
+                var inv = Float32(1.0) / total
+
+                var d = t
+                while d < head_dim:
+                    var acc = Float32(0)
+                    for j2 in range(count):
+                        var va = j2 * kv_width + kvh * head_dim
+                        acc += scores[unsafe_offset=sa + j2] * _get(
+                            values, va + d
+                        )
+                    _put(o, qa + d, acc * inv)
+                    d += FTILE
+                h += blocks
+
+        elif op == OP_ACT:
+            var n = _fi(plan_i, rec, R_N)
+            var kind = _fi(plan_i, rec, R_KIND)
+            var i = b * FTILE + t
+            var stride = blocks * FTILE
+            while i < n:
+                if kind == ACT_GELU:
+                    _put(o, i, activate[ACT_GELU](_get(x, i)))
+                else:
+                    _put(o, i, activate[ACT_SILU](_get(x, i)))
+                i += stride
+
+        else:
+            var n = _fi(plan_i, rec, R_N)
+            var i = b * FTILE + t
+            var stride = blocks * FTILE
+            while i < n:
+                _put(o, i, _get(o, i) + _get(x, i))
+                i += stride
+
+        if _fi(plan_i, rec, R_SYNC) != 0:
+            if not grid_barrier(counter, gen, blocks, seen):
+                stuck = True
+                break
+
+    # One more rendezvous whatever the last record asked for, so that the
+    # generation can be put back to zero for the next launch with nobody left
+    # who could be confused by it. A block that is still spinning when the zero
+    # lands is waiting for a value that is not zero, so it leaves, which is what
+    # it was waiting to do.
+    if not stuck:
+        if not grid_barrier(counter, gen, blocks, seen):
+            stuck = True
+    if b == 0 and t == 0:
+        dev32.store[ordering=Ordering.RELAXED](gen, Int32(0))
+    if stuck and t == 0:
+        _ = dev32.fetch_add(
+            Pointer[Int32, MutAnyOrigin](to=sync[unsafe_offset=2]), Int32(1)
+        )
+
+
+def quant_kind(w: Tensor) raises -> Int:
+    """Which of the five compiled accumulation loops reads this weight.
+
+    Written out in full rather than inferred from the form, for the reason the
+    unfused dispatch gives: a type added later that breaks one of the
+    coincidences between form, group and minimum plane should fail to build a
+    plan and say so, not quietly read the wrong plane.
+    """
+    var g = group_size(w.kind)
+    var carries_min = has_min(w.kind)
+    var form = quant_form(w.kind)
+    if form == QUANT_U4 and g == 32 and carries_min:
+        return QK_U4
+    if form == QUANT_S4 and g == 32 and not carries_min:
+        return QK_S4
+    if form == QUANT_I8 and g == 32 and carries_min:
+        return QK_I8M
+    if form == QUANT_I8 and g == 32:
+        return QK_I8
+    if form == QUANT_I8 and g == 16 and not carries_min:
+        return QK_I8_16
+    raise Error(
+        "no fused matvec is compiled for quant form "
+        + String(form)
+        + " with a group of "
+        + String(g)
+        + (" and a minimum plane" if carries_min else " and no minimum")
+    )
+
+
+def rope_kind(spec: RopeSpec, use_factors: Bool) -> Int:
+    var kind = 0
+    if spec.neox:
+        kind |= NEOX_BIT
+    if use_factors:
+        kind |= FACTOR_BIT
+    return kind
+
+
+struct StepPlan(Movable):
+    """The step table on the host while it is being built, then on the device.
+
+    Built once when a model binds and never touched again, which is what keeps
+    this from being an upload a token. The two planes are separate because one
+    of them holds addresses and counts that need sixty four bits and the other
+    holds epsilons and rope constants that are float32 in the kernels they came
+    from, and packing both into one plane would mean a bitcast at every read.
+    """
+
+    var ints: List[Int64]
+    var floats: List[Float32]
+    var records: Int
+
+    def __init__(out self):
+        self.ints = List[Int64]()
+        self.floats = List[Float32]()
+        self.records = 0
+
+    def open(mut self, op: Int) -> Int:
+        """Start a record, zeroed, and return its index."""
+        for _ in range(REC_INTS):
+            self.ints.append(Int64(0))
+        for _ in range(REC_FLOATS):
+            self.floats.append(Float32(0))
+        var rec = self.records
+        self.records += 1
+        self.set(rec, R_OP, op)
+        return rec
+
+    def set(mut self, rec: Int, field: Int, value: Int):
+        self.ints[rec * REC_INTS + field] = Int64(value)
+
+    def setf(mut self, rec: Int, field: Int, value: Float32):
+        self.floats[rec * REC_FLOATS + field] = value
+
+    def sync(mut self, rec: Int):
+        self.set(rec, R_SYNC, 1)
+
+    def input(mut self, rec: Int, space: Int, off: Int, slot_mul: Int = 0):
+        self.set(rec, R_XS, space)
+        self.set(rec, R_XO, off)
+        self.set(rec, R_XK, slot_mul)
+
+    def output(mut self, rec: Int, space: Int, off: Int, slot_mul: Int = 0):
+        self.set(rec, R_OS, space)
+        self.set(rec, R_OO, off)
+        self.set(rec, R_OK, slot_mul)
+
+    def helper(mut self, rec: Int, space: Int, off: Int, slot_mul: Int = 0):
+        self.set(rec, R_AS, space)
+        self.set(rec, R_AO, off)
+        self.set(rec, R_AK, slot_mul)
+
+
+struct WorkPlan(Copyable, ImplicitlyCopyable, Movable):
+    """Where each of a layer's intermediates sits in the one work vector.
+
+    One allocation rather than seven, because a record names an operand as a
+    base and an offset and the base has to be a kernel argument. Sized for one
+    token, since stage one is a decode path and a chunk goes through the unfused
+    kernels until stage three.
+    """
+
+    var norm: Int
+    var q: Int
+    var heads_out: Int
+    var projected: Int
+    var gate: Int
+    var up: Int
+    var scores: Int
+    var elements: Int
+
+    def __init__(out self, specs: List[BlockSpec], context: Int) raises:
+        """Sized for the widest layer in the model rather than the first.
+
+        They are the same layer in everything anybody ships, and taking the
+        maximum costs one pass over a list at load time and removes a whole
+        class of wrong answer from a model that ever stops being uniform.
+        """
+        if context <= 0:
+            raise Error("a layer needs room for at least one position")
+        if len(specs) == 0:
+            raise Error("a model with no layers has no work to size")
+        var width = 0
+        var q_width = 0
+        var hidden = 0
+        var heads = 0
+        for i in range(len(specs)):
+            if specs[i].width > width:
+                width = specs[i].width
+            if specs[i].q_width() > q_width:
+                q_width = specs[i].q_width()
+            if specs[i].hidden > hidden:
+                hidden = specs[i].hidden
+            if specs[i].attn.heads > heads:
+                heads = specs[i].attn.heads
+        var at = 0
+        self.norm = at
+        at += width
+        self.q = at
+        at += q_width
+        self.heads_out = at
+        at += q_width
+        self.projected = at
+        at += width
+        self.gate = at
+        at += hidden
+        self.up = at
+        at += hidden
+        self.scores = at
+        at += heads * context
+        self.elements = at
+
+
+comptime CUDA_BLOCKS = 96
+"""How many blocks a fused launch uses on a backend with an occupancy query.
+
+The sweep in max.md says a barrier round over 1536 blocks costs 4.59
+microseconds, which is a launch, and that it falls to 1.26 at 384, 0.75 at 96
+and is flat below that. The cost at the top is 1536 blocks contending on one
+counter word rather than the rendezvous itself, so the useful grid is a few
+hundred and this is the bottom of the flat part. It is capped by the occupancy
+bound as well, because a grid that is not resident does not deadlock politely.
+
+What it costs is arithmetic width: a 4096 row projection here is 43 rows a block
+in a strided loop rather than one row a block. That is the number this design is
+most likely to be wrong about on a large model and it is why the fused path is
+measured against the unfused one rather than assumed to win.
+"""
+
+comptime METAL_PER_SM = 1
+"""Blocks a multiprocessor on a backend with no occupancy query.
+
+One, because one block a multiprocessor is the only count every Metal device is
+known to hold, and a grid that is not fully resident hangs the GPU, which on a
+laptop is the display. Raising it is a measurement rather than a guess and
+`fused_selftest` is what would have to say it is safe.
+"""
+
+
+def barrier_probe_kernel(
+    sync: Pointer[Int32, MutAnyOrigin], blocks_dev: Int32, rounds_dev: Int32
+):
+    """Nothing but the rendezvous, so what it proves is the rendezvous.
+
+    Run once when a session opens. A grid that is not resident deadlocks, and a
+    deadlock inside a forward pass is a hung display rather than an error
+    message, so the question is asked before a model runs and at the same grid
+    the model is going to use.
+    """
+    var blocks = Int(blocks_dev)
+    var seen = Int32(0)
+    var counter = Pointer[Int32, MutAnyOrigin](to=sync[unsafe_offset=0])
+    var gen = Pointer[Int32, MutAnyOrigin](to=sync[unsafe_offset=1])
+    for _ in range(Int(rounds_dev)):
+        if not grid_barrier(counter, gen, blocks, seen):
+            if thread_idx.x == 0:
+                _ = dev32.fetch_add(
+                    Pointer[Int32, MutAnyOrigin](to=sync[unsafe_offset=2]),
+                    Int32(1),
+                )
+            return
+    if block_idx.x == 0 and thread_idx.x == 0:
+        dev32.store[ordering=Ordering.RELAXED](gen, Int32(0))
+
+
+def fused_grid(ctx: DeviceContext) raises -> Int:
+    """How many blocks a fused launch gets on this device.
+
+    Two backends and two ways of asking. CUDA answers
+    `occupancy_max_active_blocks_per_multiprocessor`, so the resident bound is
+    known and the grid is the smaller of that and `CUDA_BLOCKS`. Metal raises on
+    the same query, so there the grid is the multiprocessor count times
+    `METAL_PER_SM`, which is the floor every device holds.
+    """
+    var sms: Int
+    try:
+        sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    except:
+        sms = 0
+    if sms <= 0:
+        raise Error(
+            "this device does not report a multiprocessor count, so there is no"
+            " grid size a fused launch could be known to be resident at"
+        )
+    var per_sm: Int
+    try:
+        var f = ctx.compile_function[fused_kernel]()
+        per_sm = f.occupancy_max_active_blocks_per_multiprocessor(FTILE, 0)
+    except:
+        per_sm = 0
+    if per_sm <= 0:
+        return sms * METAL_PER_SM
+    var blocks = sms * per_sm
+    if blocks > CUDA_BLOCKS:
+        blocks = CUDA_BLOCKS
+    return blocks
+
+
+struct FusedPlan(Movable):
+    """A model's step table on the device, plus the memory a launch needs.
+
+    One of these per session, built when the model binds. It owns the two plan
+    planes, the three sync words, the work vector every layer's intermediates
+    live in, and the record range each layer occupies, which is what makes a
+    launch a pair of indices.
+    """
+
+    var ints: DeviceBuffer[DType.int64]
+    var floats: DeviceBuffer[DType.float32]
+    var sync: DeviceBuffer[DType.int32]
+    var work: DeviceVec
+    var starts: List[Int]
+    """Where each layer's records begin, with one past the end appended, so
+    layer `i` is `starts[i]` through `starts[i + 1]`."""
+
+    var pool: Int
+    """The address every `R_W` in the table is measured from.
+
+    A record carries a weight as a byte offset rather than as an address,
+    because a pointer loaded out of device memory loses its address space on
+    Metal, so the base arrives as a kernel argument and the record carries the
+    difference. See `_pool_base` in `molla.nn.gpu_block`.
+    """
+
+    var blocks: Int
+    var records: Int
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        plan: StepPlan,
+        starts: List[Int],
+        shape: WorkPlan,
+        pool: Int,
+    ) raises:
+        if plan.records == 0:
+            raise Error("a fused plan with no steps in it is not a plan")
+        if len(starts) < 2:
+            raise Error("a fused plan needs at least one layer's range")
+        self.pool = pool
+        self.blocks = fused_grid(ctx)
+        self.records = plan.records
+        self.starts = starts.copy()
+        self.work = DeviceVec(ctx, shape.elements)
+        self.ints = ctx.enqueue_create_buffer[DType.int64](len(plan.ints))
+        self.floats = ctx.enqueue_create_buffer[DType.float32](len(plan.floats))
+        self.sync = ctx.enqueue_create_buffer[DType.int32](3)
+        ctx.enqueue_copy(
+            self.ints,
+            Pointer[Int64, MutAnyOrigin](
+                unsafe_from_address=Int(plan.ints.unsafe_ptr())
+            ),
+        )
+        ctx.enqueue_copy(
+            self.floats,
+            Pointer[Float32, MutAnyOrigin](
+                unsafe_from_address=Int(plan.floats.unsafe_ptr())
+            ),
+        )
+        ctx.enqueue_memset(self.sync, Int32(0))
+        ctx.synchronize()
+
+    def stuck(self) raises -> Int:
+        """How many blocks have ever given up at a barrier.
+
+        Read when something asks rather than after every token, because reading
+        it is a transfer and a synchronize and the thing it detects is a
+        property of the grid rather than of the token.
+        """
+        var host = self.sync.context().enqueue_create_host_buffer[DType.int32](
+            3
+        )
+        self.sync.context().enqueue_copy(host, self.sync)
+        self.sync.context().synchronize()
+        return Int(host[2])
+
+
+def fused_selftest(ctx: DeviceContext, blocks: Int) raises:
+    """Prove the grid can rendezvous before a model is asked to run in it.
+
+    Sixteen rounds at the grid the layers will use. If a block gives up, the
+    grid was not resident and every fused launch after this one would hang or
+    answer with whatever the barrier let through, so this raises rather than
+    letting a model start.
+    """
+    if blocks < 1:
+        raise Error("a fused launch needs at least one block")
+    var sync = ctx.enqueue_create_buffer[DType.int32](3)
+    ctx.enqueue_memset(sync, Int32(0))
+    ctx.synchronize()
+    ctx.enqueue_function[barrier_probe_kernel](
+        Pointer[Int32, MutAnyOrigin](
+            unsafe_from_address=Int(sync.unsafe_ptr())
+        ),
+        Int32(blocks),
+        Int32(16),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(FTILE, 1, 1),
+    )
+    var host = ctx.enqueue_create_host_buffer[DType.int32](3)
+    ctx.enqueue_copy(host, sync)
+    ctx.synchronize()
+    if Int(host[2]) != 0:
+        raise Error(
+            "a grid of "
+            + String(blocks)
+            + " blocks of "
+            + String(FTILE)
+            + " threads cannot reach a barrier on this device, which means"
+            " it is"
+            " not fully resident. The fused path needs every block running at"
+            " once"
+        )
+
+
+def launch_fused(
+    ctx: DeviceContext,
+    p: FusedPlan,
+    arena: DeviceVec,
+    mut resid: DeviceVec,
+    mut keys: DeviceVec,
+    mut values: DeviceVec,
+    first: Int,
+    last: Int,
+    pos: Int,
+    slot: Int,
+    count: Int,
+) raises:
+    """One launch over records `first` through `last - 1`.
+
+    Queued and not synchronized, like everything else on a token's path. A layer
+    is one of these where it used to be twelve.
+    """
+    if first < 0 or last > p.records or first >= last:
+        raise Error(
+            "a fused launch was asked for records "
+            + String(first)
+            + " to "
+            + String(last)
+            + " of a plan that holds "
+            + String(p.records)
+        )
+    comptime if not has_accelerator():
+        raise Error(
+            "this build has no device code in it, so there is no fused kernel"
+            " to run. Accelerator support is decided when molla is compiled,"
+            " not when it is run"
+        )
+    else:
+        ctx.enqueue_function[fused_kernel](
+            Pointer[Int64, MutAnyOrigin](
+                unsafe_from_address=Int(p.ints.unsafe_ptr())
+            ),
+            Pointer[Float32, MutAnyOrigin](
+                unsafe_from_address=Int(p.floats.unsafe_ptr())
+            ),
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=p.pool),
+            arena.ptr(),
+            p.work.ptr(),
+            resid.ptr(),
+            keys.ptr(),
+            values.ptr(),
+            Pointer[Int32, MutAnyOrigin](
+                unsafe_from_address=Int(p.sync.unsafe_ptr())
+            ),
+            Int32(first),
+            Int32(last),
+            Int32(p.blocks),
+            Int32(pos),
+            Int32(slot),
+            Int32(count),
+            grid_dim=(p.blocks, 1, 1),
+            block_dim=(FTILE, 1, 1),
+        )

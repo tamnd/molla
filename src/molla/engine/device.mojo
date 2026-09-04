@@ -47,6 +47,7 @@ the build on a machine with no GPU. Three of the five boxes we test on have
 none.
 """
 
+from std.os.env import getenv
 from std.sys.info import has_accelerator
 
 from max.gpu.host import DeviceContext
@@ -61,11 +62,24 @@ from molla.nn.gpu import MM_GROUPS, PREFILL_CHUNK, SPAN, DeviceVec
 from molla.nn.gpu_block import (
     DeviceModel,
     DeviceScratch,
+    build_fused_plan,
     device_forward,
+    device_forward_fused,
 )
+from molla.nn.gpu_fused import FusedPlan
 from molla.nn.model import frequency_factors
 from molla.nn.tensor import Buffer
 from molla.sys.device import Device
+
+comptime FUSED_ENV = "MOLLA_FUSED"
+"""Set to anything to send a decode through the one launch a layer kernel.
+
+Off by default because the two paths have to be shown to agree on every model
+and every backend before one of them stops being the one that ships, and because
+the thing the fused path trades away is arithmetic width, which is a loss on a
+large model and a gain on a small one until somebody measures where the line is.
+See [docs/validation/fused.md](../../../docs/validation/fused.md).
+"""
 
 
 struct DeviceKvCache(Movable):
@@ -174,6 +188,21 @@ struct DeviceSession(Movable):
     """One row, `vocab` long, on the host. The only thing a token brings back,
     and it comes back when somebody asks rather than when a step ends."""
 
+    var fused: FusedPlan
+    """The whole model as a step table, for the one launch a layer decode path.
+
+    Built whether or not the path is on, because building it is a few hundred
+    kilobytes and one probe launch and because a table that is only built when
+    something asks for it is a table that is only wrong when something asks for
+    it. Every quant combination it refuses is one the unfused matvec refuses
+    too, so this cannot fail to build for a model that would otherwise run.
+    """
+
+    var use_fused: Bool
+    """Whether a decode goes through the fused kernel. Off unless `MOLLA_FUSED`
+    says otherwise, until the measurements in #170 say which is faster on which
+    device."""
+
     var pos: Int
     """How many positions this sequence has consumed. The next token is at
     `pos`, and the cache's `filled` agrees with it until something evicts."""
@@ -236,6 +265,13 @@ struct DeviceSession(Movable):
         self.wide = DeviceVec(ctx, rows * dev.width())
         self.x = DeviceVec(ctx, dev.width())
         self.logits = Buffer(dev.vocab())
+        self.fused = build_fused_plan(
+            ctx,
+            self.model,
+            context,
+            len(frequency_factors(host.model)) > 0,
+        )
+        self.use_fused = getenv(FUSED_ENV) != ""
         self.pos = 0
         self.batched = False
 
@@ -260,17 +296,31 @@ struct DeviceSession(Movable):
             raise Error("a forward pass needs at least one token")
         self.cache.reserve(n)
         var slot = self.cache.slot_for(self.pos)
-        device_forward(
-            self.ctx,
-            self.model,
-            self.batch if n > 1 else self.scratch,
-            self.wide if n > 1 else self.x,
-            tokens,
-            self.pos,
-            slot,
-            self.cache.keys,
-            self.cache.values,
-        )
+        if n == 1 and self.use_fused:
+            device_forward_fused(
+                self.ctx,
+                self.model,
+                self.fused,
+                self.scratch,
+                self.x,
+                tokens[0],
+                self.pos,
+                slot,
+                self.cache.keys,
+                self.cache.values,
+            )
+        else:
+            device_forward(
+                self.ctx,
+                self.model,
+                self.batch if n > 1 else self.scratch,
+                self.wide if n > 1 else self.x,
+                tokens,
+                self.pos,
+                slot,
+                self.cache.keys,
+                self.cache.values,
+            )
         self.ctx.synchronize()
         self.batched = n > 1
         self.pos += n
