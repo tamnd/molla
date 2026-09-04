@@ -401,6 +401,29 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                     fused_diff += 1
         var fused_stuck = plan.stuck()
 
+        # The plan a session builds when it has decided against the path, which
+        # is nothing at all. Building one compiles the kernel and that is what
+        # is being avoided, so what this checks is that the empty plan is empty
+        # and that nothing quietly runs against it.
+        var unwanted = build_fused_plan(ctx, model, CONTEXT, False, False)
+        var unwanted_raised = False
+        try:
+            device_forward_fused(
+                ctx,
+                model,
+                unwanted,
+                fscratch,
+                fx,
+                tokens[0],
+                0,
+                0,
+                fcache.keys,
+                fcache.values,
+            )
+            ctx.synchronize()
+        except:
+            unwanted_raised = True
+
         # The trace is one residual stream a layer a token, so this compares
         # every layer of every step rather than only what came out the end. It
         # is what says which layer went wrong when one does, and a comparison
@@ -585,6 +608,14 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         suite.check(
             fused_stuck == 0,
             "no block ever gave up at a grid barrier",
+        )
+        suite.check(
+            unwanted.records == 0,
+            "a session that does not want the path gets a plan with no steps",
+        )
+        suite.check(
+            unwanted_raised,
+            "and a launch against one raises rather than running nothing",
         )
         suite.check(
             fused_trace_diff == 0,
