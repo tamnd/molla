@@ -92,17 +92,17 @@ On `--device=cpu`, the same machine and the SmolLM2 file.
 
 An AMD EPYC with four threads, no GPU, and neither rival installed. It is in the set to prove the harness reports an absent engine as absent rather than dropping the row, and to give the host path a second machine.
 
-molla 0.3.3, on 2026-09-03. SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 134 prompt tokens, 32 generated, 3 runs, median, on `--device=cpu`.
+molla 0.4.5, on 2026-09-04. SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 514 prompt tokens, 128 generated, 3 runs, median, on `--device=cpu`, at the same lengths as every other table here.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | peak MiB |
 | --- | --- | --- | --- | --- |
-| molla | 1.5 | 1.7 | 91092 | 261 |
+| molla | 2.4 | 1.8 | 211952 | 263 |
 | llama.cpp | - | - | - | - |
 | ollama | - | - | - | - |
 
 llama.cpp and Ollama are reported as not on PATH, which is what a machine without them should produce.
 
-1.7 tokens per second on four threads is the slowest host figure in the set, and the laptop's 7.7 is too noisy to divide by it and get anything meaningful. What the row is worth is a floor. Anybody running molla on a small cloud instance today gets roughly a token per second on a 135M model, and that is the number to hold this page against once the host path is worked on.
+The load average was 28.2 on four logical cores before the run, so this row is a ceiling on how bad it gets rather than a measurement. It is here for two things and neither needs precision. One is that the absent engines are reported absent. The other is a floor: anybody running molla on a small cloud instance today gets under two tokens a second on a 135M model, and a 514 token prompt takes three and a half minutes to answer. That is the number to hold this page against once the host path is worked on.
 
 ## What the numbers say
 
