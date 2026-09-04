@@ -119,6 +119,24 @@ reduce over the same width in the same order and their answers agree bit for
 bit. It is not a free parameter here even though it looks like one.
 """
 
+comptime FSPLIT_MAX = 32
+"""Most blocks that may share one head's keys in the attention step.
+
+A head is the only unit of work attention has if a block has to own a whole
+row, and models have between nine and thirty two of them, so a grid of a few
+hundred blocks left almost all of itself idle for the one step whose cost grows
+with the context. That is what made the fused path lose nine per cent on Qwen
+at a 512 token prompt while winning fourteen at eight tokens.
+
+So a head is cut into slices and a block takes one, in the flash attention way:
+a slice reduces over its own keys with its own maximum, writes the running
+total, the maximum and the weighted values, and a second pass over the head
+folds the slices together. The bound is here because the partials are a work
+vector field sized at load time, and thirty two slices is enough that every
+model in the fleet fills the grid: nine heads become 288 blocks, fourteen 384
+and thirty two the whole 1024 a large model would want.
+"""
+
 comptime PATIENCE = 100000000
 """Spins at the barrier before a block decides the rendezvous is broken.
 
@@ -323,9 +341,15 @@ comptime R_ROW = 25
 comptime R_KV = 26
 comptime R_N = 27
 comptime R_RUNS = 28
+comptime R_SPLIT = 29
+"""Where in the work vector the attention partials start.
+
+One row of `head_dim + 2` floats a head a slice, which is what lets more than
+one block work on the same head. See `FSPLIT_MAX`.
+"""
 comptime REC_INTS = 32
 """Fields in a record, rounded up so that a record is a shift rather than a
-multiply. Twenty nine are used and the table is a few tens of kilobytes for the
+multiply. Thirty are used and the table is a few tens of kilobytes for the
 largest model in the fleet, so the rounding costs nothing worth counting."""
 
 comptime R_EPS = 0
@@ -717,20 +741,49 @@ def fused_kernel(
             var scores = Pointer[Float32, MutAnyOrigin](
                 to=work[unsafe_offset=_fi(plan_i, rec, R_ROW)]
             )
+            var parts = Pointer[Float32, MutAnyOrigin](
+                to=work[unsafe_offset=_fi(plan_i, rec, R_SPLIT)]
+            )
             var scale = _ff(plan_f, rec, R_SCALE)
             var softcap = _ff(plan_f, rec, R_SOFTCAP)
-            var h = b
-            while h < heads:
+
+            # How many blocks share a head, and how many keys each of them
+            # takes. Every block computes the same two numbers from the same
+            # three, which is what makes the pair index below agree across the
+            # grid without anybody publishing anything.
+            var splits = blocks // heads
+            if splits < 1:
+                splits = 1
+            if splits > FSPLIT_MAX:
+                splits = FSPLIT_MAX
+            var span = (count + splits - 1) // splits
+            if span < 1:
+                span = 1
+            # A short context does not need every slice, and an empty slice
+            # would still cost the fold below a read, so the count comes back
+            # from the span rather than the other way round.
+            splits = (count + span - 1) // span
+            var roww = head_dim + 2
+
+            var p = b
+            while p < heads * splits:
+                var h = p // splits
                 var kvh = h // group
                 var qa = h * head_dim
                 # One row of scores a head, `count` long, which is where the
                 # scratch for a whole layer's attention comes from. The row
                 # moves with the number of keys rather than with the context,
-                # so a short sequence touches a short row.
+                # so a short sequence touches a short row. A slice only ever
+                # writes and reads its own part of the row, so the row does not
+                # cross a block even though the head does.
                 var sa = h * count
+                var lo = (p % splits) * span
+                var hi = lo + span
+                if hi > count:
+                    hi = count
                 var mine = NEG_INF
-                var j = t
-                while j < count:
+                var j = lo + t
+                while j < hi:
                     var visible = j < sinks or window <= 0 or j > pos - window
                     var s = NEG_INF
                     if visible:
@@ -747,27 +800,71 @@ def fused_kernel(
                     j += FTILE
                 var top = _tree_max(mine)
 
-                var acc_sum = Float32(0)
-                j = t
-                while j < count:
-                    var e = exp(scores[unsafe_offset=sa + j] - top)
-                    scores[unsafe_offset=sa + j] = e
-                    acc_sum += e
-                    j += FTILE
-                var total = _tree_sum(acc_sum)
-                var inv = Float32(1.0) / total
+                # A slice of a windowed model can be entirely outside the
+                # window, and then the maximum is still minus infinity and the
+                # exponent below would be a nan rather than a zero. Such a slice
+                # publishes a total of zero and the fold leaves it out.
+                var total = Float32(0)
+                if top > NEG_INF:
+                    var acc_sum = Float32(0)
+                    j = lo + t
+                    while j < hi:
+                        var e = exp(scores[unsafe_offset=sa + j] - top)
+                        scores[unsafe_offset=sa + j] = e
+                        acc_sum += e
+                        j += FTILE
+                    total = _tree_sum(acc_sum)
 
+                var pa = p * roww
                 var d = t
                 while d < head_dim:
                     var acc = Float32(0)
-                    for j2 in range(count):
-                        var va = j2 * kv_width + kvh * head_dim
-                        acc += scores[unsafe_offset=sa + j2] * _get(
-                            values, va + d
-                        )
-                    _put(o, qa + d, acc * inv)
+                    if total > 0:
+                        for j2 in range(lo, hi):
+                            var va = j2 * kv_width + kvh * head_dim
+                            acc += scores[unsafe_offset=sa + j2] * _get(
+                                values, va + d
+                            )
+                    _put(parts, pa + d, acc)
                     d += FTILE
-                h += blocks
+                if t == 0:
+                    _put(parts, pa + head_dim, top)
+                    _put(parts, pa + head_dim + 1, total)
+                p += blocks
+
+            # The fold reads slices other blocks wrote, so it needs a rendezvous
+            # of its own rather than the one the record boundary carries. It is
+            # the only step in a layer that barriers in the middle, and it is
+            # worth it: the alternative is one block a head.
+            if not grid_barrier(counter, gen, blocks, seen):
+                stuck = True
+                break
+
+            var e = b * FTILE + t
+            var wide = blocks * FTILE
+            while e < heads * head_dim:
+                var at = (e // head_dim) * splits * roww
+                var d2 = e % head_dim
+                var top2 = NEG_INF
+                for s2 in range(splits):
+                    var m = _get(parts, at + s2 * roww + head_dim)
+                    if m > top2:
+                        top2 = m
+                var num = Float32(0)
+                var den = Float32(0)
+                for s2 in range(splits):
+                    var base = at + s2 * roww
+                    var l = _get(parts, base + head_dim + 1)
+                    if l > 0:
+                        # Every slice reduced against its own maximum, so the
+                        # weight here is what it would have had against the
+                        # whole row's maximum, and the same weight scales the
+                        # slice's total and its values.
+                        var wgt = exp(_get(parts, base + head_dim) - top2)
+                        num += wgt * _get(parts, base + d2)
+                        den += wgt * l
+                _put(o, e, num / den)
+                e += wide
 
         elif op == OP_ACT:
             var n = _fi(plan_i, rec, R_N)
@@ -922,6 +1019,9 @@ struct WorkPlan(Copyable, ImplicitlyCopyable, Movable):
     var gate: Int
     var up: Int
     var scores: Int
+    var splits: Int
+    """The attention partials, one row of `head_dim + 2` a head a slice."""
+
     var elements: Int
 
     def __init__(out self, specs: List[BlockSpec], context: Int) raises:
@@ -939,6 +1039,7 @@ struct WorkPlan(Copyable, ImplicitlyCopyable, Movable):
         var q_width = 0
         var hidden = 0
         var heads = 0
+        var head_dim = 0
         for i in range(len(specs)):
             if specs[i].width > width:
                 width = specs[i].width
@@ -948,6 +1049,8 @@ struct WorkPlan(Copyable, ImplicitlyCopyable, Movable):
                 hidden = specs[i].hidden
             if specs[i].attn.heads > heads:
                 heads = specs[i].attn.heads
+            if specs[i].attn.head_dim > head_dim:
+                head_dim = specs[i].attn.head_dim
         var at = 0
         self.norm = at
         at += width
@@ -963,6 +1066,12 @@ struct WorkPlan(Copyable, ImplicitlyCopyable, Movable):
         at += hidden
         self.scores = at
         at += heads * context
+        self.splits = at
+        # Sized for the widest grid rather than for the grid this machine will
+        # pick, because the work vector is allocated at load time and the block
+        # count is a launch argument. It is half a megabyte on an eight billion
+        # parameter model and a few tens of kilobytes on a small one.
+        at += heads * FSPLIT_MAX * (head_dim + 2)
         self.elements = at
 
 

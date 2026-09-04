@@ -90,6 +90,7 @@ from molla.nn.gpu_fused import (
     R_SCALE,
     R_SINKS,
     R_SOFTCAP,
+    R_SPLIT,
     R_STRIDE,
     R_W,
     R_WINDOW,
@@ -1110,6 +1111,7 @@ def _layer_records(
     plan.set(rec, R_WINDOW, spec.attn.window)
     plan.set(rec, R_SINKS, spec.attn.sinks)
     plan.set(rec, R_ROW, shape.scores)
+    plan.set(rec, R_SPLIT, shape.splits)
     plan.setf(rec, R_SCALE, spec.attn.scale)
     plan.setf(rec, R_SOFTCAP, spec.attn.softcap)
     plan.sync(rec)
