@@ -437,10 +437,21 @@ def load_on_device(
             var warm = load(
                 g, plan_load(g, dev, 0, cache), 0, False, model_path
             )
+            # The report is the only thing that knows why a repack did not
+            # happen. Raising with the reopened cache's reason instead describes
+            # whatever file the repack failed to replace, which for a stale
+            # cache and a full disk reads as a layout mismatch and sends the
+            # reader to the wrong problem entirely.
+            var wrote = warm.report.repack_written
+            var note = warm.report.repack_note
             _ = warm^
             cache.close()
             cache = open_cache(model_path, model_key(g))
             if not cache.usable:
+                if not wrote:
+                    raise Error(
+                        "the repack cache could not be written: " + note
+                    )
                 raise Error(
                     "the repack cache was written and still cannot be used: "
                     + cache.reason

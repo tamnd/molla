@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Fixed
+
+- A repack that fails says why. A load that cannot write its cache put the reason in the report and the device path threw the report away, reopened the cache and raised with whatever was wrong with the file the repack did not replace. On a full disk with a stale cache beside the model that read as `the cache is an older weight layout`, which is a true sentence about the wrong file and sends the reader to a layout bug that is not there. The report now carries `repack_written` and the device path raises with the repack's own reason when nothing was published. ENOSPC and EACCES are also spelled out rather than numbered, because a five gibibyte write that fails with a bare 28 reads as a bug in the writer.
+
 ## [0.4.9] - 2026-09-04
 
 The scale planes are float16. A planar row ends in one or two planes of group scales, and until now each of those was a float32, which was four bytes to hold a number that came out of the file as two. For q4_0, q4_1, q5_0, q5_1 and q8_0 the scale is a float16 out of the block, so storing it at float32 was widening a number on the way in and narrowing it back on the way out with nothing in between. For q4_K, q5_K and q6_K the plane holds a product of a float16 and a small integer, and that product is the one thing in the layout that now rounds.

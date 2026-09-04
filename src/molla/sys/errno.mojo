@@ -131,6 +131,24 @@ comptime ETIMEDOUT = _etimedout()
 comptime ECONNREFUSED = _econnrefused()
 
 
+def errno_phrase(code: Int) -> String:
+    """An errno with the sentence a person can act on behind it.
+
+    `errno_name` is for a log line that a program reads back later, this is for
+    a message a person is going to be shown once. Only the codes where the name
+    on its own sends someone to the wrong place get a sentence: ENOSPC on a
+    write that is five gigabytes long reads as a bug in the writer until it is
+    spelled out, and EACCES reads as a corrupt file. Everything else keeps its
+    name, because a reader who has met EAGAIN does not need it explained and a
+    reader who has not is not going to be helped by one clause.
+    """
+    if code == ENOSPC:
+        return String("ENOSPC, no space left on device")
+    if code == EACCES:
+        return String("EACCES, permission denied")
+    return errno_name(code)
+
+
 def errno_name(code: Int) -> String:
     """A short name for the codes we actually branch on.
 

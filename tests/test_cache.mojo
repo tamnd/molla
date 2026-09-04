@@ -241,7 +241,28 @@ def test_hit(mut suite: Suite, path: String) raises:
         weights.report.repack_note == "repack cache written to " + cache,
         "the load says where the cache went",
     )
+    # The flag and the note are separate on purpose. A caller that needs the
+    # cache and finds it unreadable has to be able to tell a repack that never
+    # produced a file from one that produced a file it cannot read, because the
+    # reason it prints comes from a different place in each case.
+    suite.check(
+        weights.report.repack_written,
+        "and says a file was published",
+    )
     _ = weights^
+
+    # A load that was not asked to repack reports the same false flag as one
+    # that tried and failed, which is why the note is what tells them apart.
+    var again = load(g, plan_load(g, _host(), 0), 1, False, "")
+    suite.check(
+        not again.report.repack_written,
+        "a load that was not asked to repack published nothing",
+    )
+    suite.check(
+        again.report.repack_note == "nothing was repacked on this load",
+        "and says that rather than reporting a failure",
+    )
+    _ = again^
 
     var hit = open_cache(path, key)
     suite.check(hit.usable, "the cache the load wrote is usable")
