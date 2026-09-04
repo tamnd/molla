@@ -146,6 +146,25 @@ On the small models it is worth nothing at all, because q8_0 barely moves. Those
 
 The disk win is not nothing either. A repack cache that is 1.1 times the model instead of 2.04 times it is the difference between a cache people tolerate and one they turn off.
 
+## What the bit planes were worth
+
+The five and six bit half of the layout landed after the four bit half and out of the order below, and the reason it moved up is that it stopped being a memory change. #203 measured the Metal matvec against a variant that does the loads and no arithmetic at all and found the shipped loop within ten per cent of that floor, which means on that backend the loop is paid by the byte and the only thing left that removes a byte is this.
+
+Before it, `quant_form` widened every five and six bit type to a byte a value, so q5_0, q5_1, q5_K and q6_K were all stored at eight bits of quant where the file holds five or six. Now they are a nibble plane of `cols / 2` bytes followed by a high plane of `cols / 8` bytes at five bits and `cols / 4` at six, which is the shape the section above describes.
+
+On an M4 laptop, greedy, the same prompt, three runs each of the shipped build and the same tree with the change reverted.
+
+| model | repack cache before | after | decode ms a token before | after |
+| --- | --- | --- | --- | --- |
+| Llama 3.1 8B q4_K_M | 6474 MiB | 6108 MiB | 301, 316, 338 | 195, 205, 208 |
+| Qwen 2.5 0.5B | 663 MiB | 512 MiB | 38, 38, 47 | 30, 37, 39 |
+
+The 8B is the case worth reading. The cache is 5.7 per cent smaller and decode is a third faster, which is not the same number and is not supposed to be. The cache holds `token_embd` and the output head, which a decode token reads one row of and all of, and the tensors this change touches are the thirty three q6_K ones, which in a q4_K_M file are `ffn_down` and `attn_v`. `ffn_down` is the widest matrix in a layer, so the share of the bytes a token actually reads that moved from eight bits to six is much larger than the share of the file that did.
+
+Qwen is the other case and it is there because the file is misnamed. It says q4_K_M and `molla gguf` reports 133 q5_0 tensors against 14 q4_K, so almost the whole model was on the widened path and almost the whole model moved.
+
+This is the change that makes the layout worth what the table above says. It is also the last one that is bit exact: every value the planes assemble is the value the byte held, the offset that makes it signed comes off in the subtraction the magic number was doing anyway, and the corpus logits are the corpus logits. #182, the float16 scale planes, is the one that moves a number.
+
 ## What was in the way, on Metal
 
 The section above is a CUDA answer that was allowed to stand as a general one for a day. `scripts/matvec_probe.mojo` was written because nsys on an 8B is an hour a question: it runs the same kernel over a synthetic planar tensor of a real shape, and it runs five variants of it that each delete one piece of the work so that the piece can be priced.
@@ -230,6 +249,8 @@ Pack the quant plane first and leave the scales at float32. That is 9574 MiB to 
 Narrow the scale planes to float16 second, as its own change, because it is the only part of this that moves a number. It is worth 6475 MiB to 5518 MiB and it needs the corpus run with a tolerance and a statement of what the tolerance is.
 
 Bit plane the five and six bit types third, which takes q6_K from eight bits of quant to six and gets the 8B to 5153 MiB. It is worth 365 MiB on this model and it is the fiddliest part, so it goes after the two that are worth more and are simpler.
+
+That order was written when this was a memory change and it did not survive the measurement above. The bit planes went second and the float16 scales are still to come, because #203 found the Metal matvec at the byte floor and a byte removed there is time and not only space. Swapping the two costs nothing, since they touch different planes of the same row. The 8B landed at 6108 MiB, which is 366 saved against the 365 predicted on this line, so the float16 scales still have their own 957 to give and the end of both is still about 5151.
 
 Fix `scripts/bench.py` to report `phys_footprint` on macOS rather than `ru_maxrss`, before any of the above, so that the Metal numbers in bench.md mean what they say while this work is happening. There is no equivalent problem on Linux, where the CUDA weights are genuinely not host memory and `ru_maxrss` is right.
 

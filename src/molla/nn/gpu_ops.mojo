@@ -48,17 +48,24 @@ from molla.nn.gpu import (
     DeviceVec,
     activate,
     byte_float,
+    high_shift,
     nibble_float,
+    planar_quant_stride,
+    wide_float,
 )
 from molla.nn.repack import (
     LAYOUT_PLANAR,
     QUANT_I8,
     QUANT_S4,
+    QUANT_S5,
+    QUANT_S6,
     QUANT_U4,
+    QUANT_U5,
     group_shift,
     group_size,
     has_min,
     quant_form,
+    quant_high_bits,
 )
 from molla.nn.rope import RopeSpec, corr_range, step_table
 from molla.nn.tensor import WHERE_DEVICE, Tensor
@@ -336,8 +343,7 @@ def planar_row_kernel[
     var packed = w
     var scales = w.unsafe_bitcast[Float32]()
     var groups = cols // group
-    var quant_bytes = cols if form == QUANT_I8 else cols // 2
-    var d_base = (row + quant_bytes) // 4
+    var d_base = (row + planar_quant_stride[form](cols)) // 4
     var m_base = d_base + groups
 
     # A shift and not a divide, for the reason `group_shift` gives. This one is
@@ -352,11 +358,23 @@ def planar_row_kernel[
         var q: Float32
         comptime if form == QUANT_I8:
             q = byte_float(UInt32(packed[unsafe_offset=row + i]))
-        else:
+        elif quant_high_bits(form) == 0:
             # Arithmetic rather than a branch, for the reason `gpu.mojo` gives
             # where the same two lines are.
             var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
             q = nibble_float[form]((b >> UInt32((i & 1) * 4)) & 0xF)
+        else:
+            comptime hbits = quant_high_bits(form)
+            comptime hshift = high_shift[form]()
+            comptime hmask = UInt32((1 << hbits) - 1)
+            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
+            var h = UInt32(
+                packed[unsafe_offset=row + (cols >> 1) + (i >> hshift)]
+            )
+            var s = UInt32((i & ((1 << hshift) - 1)) * hbits)
+            q = wide_float[form](
+                ((b >> UInt32((i & 1) * 4)) & 0xF) | (((h >> s) & hmask) << 4)
+            )
         var v = scales[unsafe_offset=d_base + gi] * q
         comptime if with_min:
             v += scales[unsafe_offset=m_base + gi]
@@ -1115,12 +1133,14 @@ def device_unpack_rows(
             _unpack[32, True, QUANT_U4](ctx, w, out.ptr_at(at), ids, tokens)
         elif form == QUANT_S4 and g == 32 and not carries_min:
             _unpack[32, False, QUANT_S4](ctx, w, out.ptr_at(at), ids, tokens)
-        elif form == QUANT_I8 and g == 32 and carries_min:
-            _unpack[32, True, QUANT_I8](ctx, w, out.ptr_at(at), ids, tokens)
-        elif form == QUANT_I8 and g == 32:
+        elif form == QUANT_U5 and g == 32 and carries_min:
+            _unpack[32, True, QUANT_U5](ctx, w, out.ptr_at(at), ids, tokens)
+        elif form == QUANT_S5 and g == 32 and not carries_min:
+            _unpack[32, False, QUANT_S5](ctx, w, out.ptr_at(at), ids, tokens)
+        elif form == QUANT_S6 and g == 16 and not carries_min:
+            _unpack[16, False, QUANT_S6](ctx, w, out.ptr_at(at), ids, tokens)
+        elif form == QUANT_I8 and g == 32 and not carries_min:
             _unpack[32, False, QUANT_I8](ctx, w, out.ptr_at(at), ids, tokens)
-        elif form == QUANT_I8 and g == 16 and not carries_min:
-            _unpack[16, False, QUANT_I8](ctx, w, out.ptr_at(at), ids, tokens)
         else:
             raise Error(
                 "no device row read is compiled for quant form "

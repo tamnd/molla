@@ -72,6 +72,7 @@ def run_on_device(mut suite: Suite):
             test_gpu.run_on_device(suite, ctx)
             test_gpu_ops.run_on_device(suite, ctx)
             test_gpu_block.run_on_device(suite, ctx)
+            test_repack.run_on_device(suite, ctx)
         except e:
             suite.fail("device tests", String(e))
 
