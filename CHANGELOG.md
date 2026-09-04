@@ -4,6 +4,15 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-09-04
+
+A Metal decode runs 1.4 to 1.8 times faster because the matvec stopped launching a block four times wider than the row it was reducing. Trying to remove the reduction underneath it as well is worth nothing, which is how this release also establishes that decode on the small models is bound by how many times a token crosses the driver and not by the kernel.
+
+### Changed
+
+- The matvec launches 32 threads a row on Metal rather than 128, which is worth 1.4 times on SmolLM2 135M, 1.8 on Qwen 2.5 0.5B and 1.5 on Llama 3.1 8B, measured as both builds a minute apart on an M4. 128 was never the answer to a question, it is the width every other kernel launches at and the matvec took it because it was there. Two things cost at 128 and both get worse as the row gets narrower: the reduction is a tree over the whole block, so what it costs is the block width and not the work in it, and a 576 column row at eight values a thread is 72 threads of work, so 56 of the 128 arrive at that reduction with nothing in them. The output head of a small model, 49152 rows of 576, was running at a tenth of what the same bytes read with no arithmetic on them. CUDA keeps 128 until the same sweep runs on a 4090. The logit corpus passes all thirteen cases on both widths and every figure in it moves in the fifth or sixth significant digit, because the additions happen in a different order.
+- A shuffle reduction over that narrower block was written, measured and reverted. With the block at one simd group the tree through shared memory can be five `lane_group_sum` shuffles with no barriers, which is how the batched matmul has reduced since `MM_TILE` was measured, and on three alternating runs of each binary it is a wash on SmolLM2 and on Qwen. It is not free, since it changes the order the partial sums are added in, so it is not worth taking for nothing. What the negative result says is that the block width was never costing the reduction, it was costing the threads that arrived at a narrow row with no work in them, and that the matvec is no longer where a small model's decode goes. The three models fit a line of 29.4 ms a GiB with a 13.6 ms a token intercept that does not depend on model size, and a thirty layer token is around 450 launches at 19.6 us each. See [docs/validation/layout.md](docs/validation/layout.md).
+
 ## [0.4.11] - 2026-09-04
 
 A fused session holds a fifth of the host memory it held yesterday. The 1.2 GiB it carried was one pinned allocation made to read three integers back from the grid barrier, not the compile it was blamed on, and reading them the ordinary way takes SmolLM2 on a 4090 from 1468 MiB to 279 and Qwen from 1481 to 550, both of which are under llama.cpp on the same file in the same sitting.

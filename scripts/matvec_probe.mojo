@@ -97,6 +97,20 @@ is one convert where the nibble loop's is a mask, a shift, an xor, a subtract
 and a convert. The bit pattern version costs the same three instructions in
 both. So the nibble case has more to win and the byte case might have nothing,
 and q8_0 is the type the smallest model in the bench is in."""
+comptime V_BYTE8 = 16
+"""The byte wide loop as the kernel actually ships it, eight bytes a thread.
+
+`V_BYTE` and `V_BYTE_MAGIC` both read one byte a thread an iteration, which is
+not what `planar_partial_dot` does for `QUANT_I8` on Metal: there
+`MATVEC_BYTES` is eight and the group's scale is read once for the eight. So
+the two of them price a loop nothing runs, and the gap between this variant and
+those two is what the width alone is worth on a byte wide type."""
+comptime V_BYTE_LOADS = 17
+"""The byte wide loads and nothing else, which is the floor that shape reaches.
+
+`V_NO_MATH` is the same idea for a nibble type and there was no byte equivalent,
+so the byte sweep had no ceiling to be read against and its numbers could only
+be compared with each other."""
 comptime V_DOT8_I16 = 9
 """Eight, against an activation quantized to a signed short rather than a byte.
 
@@ -325,6 +339,34 @@ def probe_kernel[
                 acc += scales[unsafe_offset=m_base + gi] * a
             i += tile
 
+    elif variant == V_BYTE8:
+        comptime WIDE = 8
+        var i = t * WIDE
+        while i < cols:
+            var gi = i >> shift
+            var at = row + i
+            var d = scales[unsafe_offset=d_base + gi]
+            var m = scales[unsafe_offset=m_base + gi] if with_min else Float32(
+                0
+            )
+            comptime for k in range(WIDE):
+                var u = UInt32(packed[unsafe_offset=at + k]) ^ 0x80
+                var q = bitcast[DType.float32, 1](UInt32(0x4B000000) | u)
+                var a = x[unsafe_offset=i + k]
+                acc += d * (q - Float32(8388736.0)) * a
+                comptime if with_min:
+                    acc += m * a
+            i += tile * WIDE
+
+    elif variant == V_BYTE_LOADS:
+        comptime WIDE = 8
+        var i = t * WIDE
+        while i < cols:
+            comptime for k in range(WIDE):
+                acc += Float32(Int(packed[unsafe_offset=row + i + k]))
+                acc += x[unsafe_offset=i + k]
+            i += tile * WIDE
+
     elif variant == V_NO_SCALE:
         var i = t * 2
         while i < cols:
@@ -414,7 +456,7 @@ def probe_kernel[
 
 
 def _time[
-    group: Int, with_min: Bool, form: Int, variant: Int
+    group: Int, with_min: Bool, form: Int, variant: Int, tile: Int = TILE
 ](
     ctx: DeviceContext,
     w: Pointer[UInt8, MutAnyOrigin],
@@ -431,7 +473,7 @@ def _time[
         var at = monotonic()
         for _ in range(16):
             ctx.enqueue_function[
-                probe_kernel[TILE, group, with_min, form, variant]
+                probe_kernel[tile, group, with_min, form, variant]
             ](
                 w,
                 x,
@@ -439,7 +481,7 @@ def _time[
                 Int32(cols),
                 Int32(stride),
                 grid_dim=(rows, 1, 1),
-                block_dim=(TILE, 1, 1),
+                block_dim=(tile, 1, 1),
             )
         ctx.synchronize()
         var took = Float64(monotonic() - at) / 16.0
@@ -462,7 +504,7 @@ def _report(name: String, ns: Float64, values: Float64, bytes: Float64):
 
 
 def _sweep[
-    kind: Int, group: Int, with_min: Bool, form: Int
+    kind: Int, group: Int, with_min: Bool, form: Int, tile: Int = TILE
 ](ctx: DeviceContext, label: String, rows: Int, cols: Int) raises:
     var stride = planar_row_bytes(kind, cols)
     var bytes = rows * stride
@@ -502,7 +544,7 @@ def _sweep[
     )
     _report(
         "  divide    ",
-        _time[group, with_min, form, V_DIVIDE](
+        _time[group, with_min, form, V_DIVIDE, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -510,7 +552,7 @@ def _sweep[
     )
     _report(
         "  shift     ",
-        _time[group, with_min, form, V_SHIFT](
+        _time[group, with_min, form, V_SHIFT, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -518,7 +560,7 @@ def _sweep[
     )
     _report(
         "  narrow    ",
-        _time[group, with_min, form, V_NARROW](
+        _time[group, with_min, form, V_NARROW, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -526,7 +568,7 @@ def _sweep[
     )
     _report(
         "  per group ",
-        _time[group, with_min, form, V_PER_GROUP](
+        _time[group, with_min, form, V_PER_GROUP, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -534,7 +576,7 @@ def _sweep[
     )
     _report(
         "  no scale  ",
-        _time[group, with_min, form, V_NO_SCALE](
+        _time[group, with_min, form, V_NO_SCALE, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -542,7 +584,7 @@ def _sweep[
     )
     _report(
         "  loads only",
-        _time[group, with_min, form, V_NO_MATH](
+        _time[group, with_min, form, V_NO_MATH, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -550,7 +592,7 @@ def _sweep[
     )
     _report(
         "  magic cvt ",
-        _time[group, with_min, form, V_MAGIC](
+        _time[group, with_min, form, V_MAGIC, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -558,7 +600,7 @@ def _sweep[
     )
     _report(
         "  magic x4  ",
-        _time[group, with_min, form, V_MAGIC4](
+        _time[group, with_min, form, V_MAGIC4, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -566,7 +608,7 @@ def _sweep[
     )
     _report(
         "  magic x8  ",
-        _time[group, with_min, form, V_MAGIC8](
+        _time[group, with_min, form, V_MAGIC8, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -574,7 +616,7 @@ def _sweep[
     )
     _report(
         "  mask16    ",
-        _time[group, with_min, form, V_MASK16](
+        _time[group, with_min, form, V_MASK16, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -582,7 +624,7 @@ def _sweep[
     )
     _report(
         "  int dot 4 ",
-        _time[group, with_min, form, V_DOT4](
+        _time[group, with_min, form, V_DOT4, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -590,7 +632,7 @@ def _sweep[
     )
     _report(
         "  int dot 8 ",
-        _time[group, with_min, form, V_DOT8](
+        _time[group, with_min, form, V_DOT8, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -598,7 +640,7 @@ def _sweep[
     )
     _report(
         "  int16 dot8",
-        _time[group, with_min, form, V_DOT8_I16](
+        _time[group, with_min, form, V_DOT8_I16, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -606,7 +648,7 @@ def _sweep[
     )
     _report(
         "  int dot 16",
-        _time[group, with_min, form, V_DOT16](
+        _time[group, with_min, form, V_DOT16, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -615,7 +657,7 @@ def _sweep[
 
 
 def _sweep_byte[
-    kind: Int, group: Int, with_min: Bool
+    kind: Int, group: Int, with_min: Bool, tile: Int = TILE
 ](ctx: DeviceContext, label: String, rows: Int, cols: Int) raises:
     """The two byte wide variants, on their own, because they read differently.
     """
@@ -653,7 +695,7 @@ def _sweep_byte[
     )
     _report(
         "  byte cvt  ",
-        _time[group, with_min, form, V_BYTE](
+        _time[group, with_min, form, V_BYTE, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -661,7 +703,23 @@ def _sweep_byte[
     )
     _report(
         "  byte magic",
-        _time[group, with_min, form, V_BYTE_MAGIC](
+        _time[group, with_min, form, V_BYTE_MAGIC, tile](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  byte x8   ",
+        _time[group, with_min, form, V_BYTE8, tile](
+            ctx, w, x, o, rows, cols, stride, 5
+        ),
+        values,
+        read,
+    )
+    _report(
+        "  loads only",
+        _time[group, with_min, form, V_BYTE_LOADS, tile](
             ctx, w, x, o, rows, cols, stride, 5
         ),
         values,
@@ -681,7 +739,32 @@ def main() raises:
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k down", 4096, 14336)
     _sweep[Q_Q4_K, 32, True, QUANT_U4](ctx, "q4_k attn", 4096, 4096)
 
-    # And the byte wide type, at the shape SmolLM2 135M spends its decode in,
-    # because that is the model the milestone is measured on and it is q8_0.
-    _sweep_byte[Q_Q8_0, 32, False](ctx, "q8_0 gate", 1536, 576)
-    _sweep_byte[Q_Q8_0, 32, False](ctx, "q8_0 head", 49152, 576)
+    # The same three at narrower blocks. TILE has been 128 since the kernel was
+    # written and nothing had ever asked what it should be.
+    _sweep[Q_Q4_K, 32, True, QUANT_U4, 32](ctx, "q4_k down t32", 4096, 14336)
+    _sweep[Q_Q4_K, 32, True, QUANT_U4, 64](ctx, "q4_k down t64", 4096, 14336)
+    _sweep[Q_Q4_K, 32, True, QUANT_U4, 32](ctx, "q4_k attn t32", 4096, 4096)
+    _sweep[Q_Q4_K, 32, True, QUANT_U4, 64](ctx, "q4_k attn t64", 4096, 4096)
+
+    # And the byte wide type, at every shape SmolLM2 135M spends its decode in,
+    # because that is the model the milestone is measured on, it is q8_0, and a
+    # rule about the block width has to come from the shapes a model runs rather
+    # than from one big one. The rows column is the grid: a narrow block on a
+    # short grid is the case where the width could go the other way, and the
+    # head is the case where it does not.
+    _sweep_byte[Q_Q8_0, 32, False, 32](ctx, "q8_0 kv    t32", 192, 576)
+    _sweep_byte[Q_Q8_0, 32, False, 128](ctx, "q8_0 kv    t128", 192, 576)
+    _sweep_byte[Q_Q8_0, 32, False, 32](ctx, "q8_0 attn  t32", 576, 576)
+    _sweep_byte[Q_Q8_0, 32, False, 128](ctx, "q8_0 attn  t128", 576, 576)
+    _sweep_byte[Q_Q8_0, 32, False, 32](ctx, "q8_0 gate  t32", 1536, 576)
+    _sweep_byte[Q_Q8_0, 32, False, 128](ctx, "q8_0 gate  t128", 1536, 576)
+    _sweep_byte[Q_Q8_0, 32, False, 32](ctx, "q8_0 down  t32", 576, 1536)
+    _sweep_byte[Q_Q8_0, 32, False, 128](ctx, "q8_0 down  t128", 576, 1536)
+    _sweep_byte[Q_Q8_0, 32, False, 32](ctx, "q8_0 head  t32", 49152, 576)
+    _sweep_byte[Q_Q8_0, 32, False, 128](ctx, "q8_0 head  t128", 49152, 576)
+
+    # And the same type at a wide row, which is the control for all of the
+    # above: if the width mattered because of the arithmetic rather than because
+    # of the shape, it would matter here too, and it does not.
+    _sweep_byte[Q_Q8_0, 32, False, 32](ctx, "q8_0 wide  t32", 4096, 14336)
+    _sweep_byte[Q_Q8_0, 32, False, 128](ctx, "q8_0 wide  t128", 4096, 14336)
