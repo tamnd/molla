@@ -62,23 +62,25 @@ An M4 with 10 cores, and a shared working machine whose load average is regularl
 
 There is one memory column and not two. Unified memory means the card figure would be the host figure counted twice, and `nvidia-smi` is what the second column is read with anyway.
 
-molla 0.4.5, llama.cpp b10621 c1d0e7a00, Ollama not installed, on 2026-09-04. 512 prompt tokens asked for, 128 generated, 3 runs, median, the same lengths as the gpc tables.
+molla 0.4.5, llama.cpp b10621 c1d0e7a00, Ollama not installed, on 2026-09-04. 512 prompt tokens asked for, 128 generated, 3 runs, median, the same lengths as the gpc tables. The two Metal tables were retaken after #201 and the last row of each is what molla did before it, on the same clone and the same afternoon.
 
 SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 514 prompt tokens, on `--device=metal`.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB |
 | --- | --- | --- | --- | --- |
-| molla | 472.0 | 48.9 | 1089 | 344 |
-| llama.cpp | 9454.0 | 288.1 | 54 | 247 |
+| molla | 2141.7 | 48.7 | 240 | 405 |
+| llama.cpp | 9341.0 | 314.3 | 55 | 249 |
 | ollama | - | - | - | - |
+| molla before #201 | 472.0 | 48.9 | 1089 | 344 |
 
 Qwen 2.5 0.5B Instruct q4_K_M, digest 74a4da8c9fdb, 514 prompt tokens, on `--device=metal`.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB |
 | --- | --- | --- | --- | --- |
-| molla | 169.4 | 23.9 | 3035 | 887 |
-| llama.cpp | 3250.2 | 170.3 | 158 | 607 |
+| molla | 612.6 | 23.9 | 839 | 915 |
+| llama.cpp | 3238.0 | 170.6 | 159 | 596 |
 | ollama | - | - | - | - |
+| molla before #201 | 169.4 | 23.9 | 3035 | 887 |
 
 On `--device=cpu`, the same machine and the SmolLM2 file.
 
@@ -114,7 +116,11 @@ Prefill is 3.1 times off on SmolLM2, 8.6 on Qwen and 27.9 on the 8B. That is the
 
 Memory is much closer than this page used to say, and most of what it used to say was a reporting artefact. On the card molla holds 656 MiB against llama.cpp's 694 on SmolLM2 and 1110 against 1120 on Qwen, which is parity or better, and 7404 against 5198 on the 8B, which is 1.42 times. The 8B is the only real gap and it has two known causes: the repack cache is 6474 MiB against a 4693 MiB model file, which #182 and #183 are closing, and the KV cache is f32 where llama.cpp's is f16, which is #204.
 
-Metal is further behind than CUDA and it is behind in a different shape. Prefill is 20.0 times off on SmolLM2 and 19.2 on Qwen, which is nearly the same ratio on two models an order of magnitude apart in size, where the CUDA gap went from 3.1 to 27.9 over the same pair. A flat ratio is a slow kernel and a growing one is a scaling failure, so the two backends are short for different reasons and the same fix will not close both. Decode is 5.9 and 7.1 times off, against 3.6 and 2.7 on the card, so the fixed per launch cost hurts more here.
+Metal prefill was 20.0 times off on SmolLM2 and 19.2 on Qwen, which is nearly the same ratio on two models an order of magnitude apart in size, where the CUDA gap went from 3.1 to 27.9 over the same pair. A flat ratio is a slow kernel and a growing one is a scaling failure, so the two backends were short for different reasons and one fix was never going to close both.
+
+The slow kernel is the one #201 replaced, and the ratio is now 4.4 and 5.3. What is left of it is not the instruction. A dense tile of this shape reaches 3.04 TFLOP/s on this M4 and llama.cpp's own prefill here works out at 2.55, so llama.cpp is at 84 per cent of the ceiling and molla at 2141.7 tokens a second is at about a fifth of it. Metal memory went up with it, 344 to 405 MiB and 887 to 915, which is the wider prefill chunk the tile wants and is the trade the numbers say to take.
+
+Decode on Metal is untouched, and against the retaken llama.cpp rows it is 6.5 and 7.1 times off, where the card is 3.6 and 2.7. The fixed per launch cost hurts more here.
 
 The host path is the worst number on this page and nothing is currently pointed at it. On the same laptop and the same file, `--device=cpu` is 76.6 times off llama.cpp at prefill and 33.9 at decode, and llama.cpp on ten CPU cores beats molla on the GPU of the same machine at decode by a factor of four. That is a scalar loop against a NEON one and it is what a host path costs when every milestone so far has been about accelerators.
 

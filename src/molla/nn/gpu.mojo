@@ -53,6 +53,11 @@ from std.memory import AddressSpace, bitcast, stack_allocation
 from std.sys.info import CompilationTarget, has_accelerator
 
 from max.gpu import barrier
+from max.gpu.compute.arch.mma_apple import (
+    _mma_apple_8x8,
+    apple_mma_load_8x8,
+    apple_mma_store_8x8,
+)
 from max.gpu.host import DeviceBuffer, DeviceContext
 
 from molla.nn.block import ACT_GELU, ACT_SILU
@@ -354,6 +359,42 @@ def byte_float(u: UInt32) -> Float32:
     return bitcast[DType.float32, 1](MAGIC | (u ^ 0x80)) - Float32(8388736.0)
 
 
+@always_inline
+def write_epilogue(
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+    out_at: Int,
+    r: Int,
+    v: Float32,
+):
+    """The tail of every matmul kernel: bias or gate, then store or accumulate.
+
+    One copy rather than one per kernel. There are four kernels sharing this now
+    and the epilogue is the only part of them that has to agree exactly, since
+    a prefill and a decode of the same prompt are checked against each other to
+    a relative 2e-4 and a difference here would be a difference in the answer
+    rather than in the speed.
+
+    `out_at` is the index into the output and `r` is the row, which for a bias
+    is the index into `aux` and for a gate is not, because a gate is a whole
+    other output tensor of the same shape.
+    """
+    var got = v
+    if epi & EPI_BIAS != 0:
+        got += aux[unsafe_offset=r]
+    elif epi & EPI_GLU != 0:
+        var g = aux[unsafe_offset=out_at]
+        if epi & ACT_BIT != 0:
+            got = activate[ACT_GELU](got) * g
+        else:
+            got = activate[ACT_SILU](got) * g
+    if epi & EPI_ADD != 0:
+        o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + got
+    else:
+        o[unsafe_offset=out_at] = got
+
+
 def planar_matvec_kernel[
     tile: Int, group: Int, with_min: Bool, form: Int
 ](
@@ -480,19 +521,10 @@ def planar_matvec_kernel[
         barrier()
         step //= 2
     if t == 0:
-        var v = part[unsafe_offset=0]
-        var epi = Int(epi_dev)
-        if epi & EPI_BIAS != 0:
-            v += aux[unsafe_offset=r]
-        elif epi & EPI_GLU != 0:
-            if epi & ACT_BIT != 0:
-                v = activate[ACT_GELU](v) * aux[unsafe_offset=r]
-            else:
-                v = activate[ACT_SILU](v) * aux[unsafe_offset=r]
-        if epi & EPI_ADD != 0:
-            o[unsafe_offset=r] = o[unsafe_offset=r] + v
-        else:
-            o[unsafe_offset=r] = v
+        # One token, so the index into the output and the row are the same
+        # number, which is why a gate reads `aux[r]` here and `aux[out_at]`
+        # there and both are the same read.
+        write_epilogue(o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
 
 
 comptime SPAN = 16 if CompilationTarget.is_macos() else 8
@@ -512,7 +544,7 @@ that fit in cache. A macOS build targets Metal and a build anywhere else
 targets CUDA, which is why the operating system is the thing asked here.
 """
 
-comptime PREFILL_CHUNK = 64
+comptime PREFILL_CHUNK = 256 if CompilationTarget.is_macos() else 64
 """How many prompt tokens go through the stack in one pass.
 
 A prompt is a matrix rather than a run of decodes, and this is how much of it
@@ -522,6 +554,15 @@ thirty two head model at a four thousand context is 2 MiB a token. Sixty four
 is 128 times fewer launches than a token at a time and 33 MiB of scores on an
 8B, and at four passes for a five hundred token prompt the launches are no
 longer what is left.
+
+It is two numbers because the two backends want different ones, and by a lot.
+On Metal the matrix core form covers thirty two tokens a block, so a chunk of
+sixty four is two blocks of the token axis and the GPU runs out of work before
+it runs out of rows: widening the chunk to 256 is 1611 tokens a second against
+2142 on SmolLM2. On CUDA the same widening goes the other way, and not by a
+little, 4990 to 3545 on Qwen and 378 to 181 on the 8B. That is #213, and a
+chunk picked for the kernel that runs on the target is the honest thing to
+write until it is answered.
 """
 
 comptime MM_TILE = 32
@@ -540,7 +581,16 @@ lets a group of threads whose tokens are all past the end of a short chunk
 leave without stranding the rest of the block.
 """
 
-comptime MM_GROUPS = PREFILL_CHUNK // SPAN
+comptime MM_BLOCK_TOKENS = 64
+"""How many tokens one block of the ordinary matmul carries.
+
+The chunk used to be this by construction and the two came apart when the
+matrix core form arrived, which wants a much wider chunk than the sweeps below
+found for this kernel. Sixty four is what those sweeps landed on and the grid
+grows a block a chunk instead of a block growing with the chunk.
+"""
+
+comptime MM_GROUPS = MM_BLOCK_TOKENS // SPAN
 """How many groups of `SPAN` tokens one matmul block carries.
 
 Amortization the accumulators cannot pay for. A block covers `SPAN` tokens per
@@ -705,21 +755,7 @@ def planar_matmul_kernel[
     # One thread a token rather than one thread for the whole group, so the
     # tail is `SPAN` threads doing one epilogue each.
     if t < live:
-        var v = got
-        var epi = Int(epi_dev)
-        var out_at = (base + t) * rows + r
-        if epi & EPI_BIAS != 0:
-            v += aux[unsafe_offset=r]
-        elif epi & EPI_GLU != 0:
-            var g = aux[unsafe_offset=out_at]
-            if epi & ACT_BIT != 0:
-                v = activate[ACT_GELU](v) * g
-            else:
-                v = activate[ACT_SILU](v) * g
-        if epi & EPI_ADD != 0:
-            o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + v
-        else:
-            o[unsafe_offset=out_at] = v
+        write_epilogue(o, aux, Int(epi_dev), (base + t) * rows + r, r, got)
 
 
 def device_ready() -> Bool:
@@ -894,6 +930,272 @@ def device_matvec_into(
             )
 
 
+comptime MMA_ROWS = 64
+"""Output rows one matrix core block covers."""
+
+comptime MMA_TOKENS = 32
+"""Output tokens one matrix core block covers.
+
+The same sixty four by thirty two `kernel_mul_mm` uses, and the same answer a
+sweep here gives. Sixty four tokens is fewer passes over the weight matrix and
+fewer barriers for the same arithmetic and it measured slower, because a block
+that covers twice as much of the output is half as many blocks and this GPU has
+ten cores to keep busy.
+"""
+
+comptime MMA_K = 32
+"""How far down the reduction one staged tile reaches.
+
+The group size of every quantized type molla repacks, which is what makes the
+scale and the minimum of a row constant for the whole step and turns the
+dequantization into one multiply and one add per value with no per value
+lookup.
+"""
+
+comptime MMA_THREADS = 128
+"""Threads in a matrix core block, which is four simdgroups."""
+
+comptime MMA_SG_ROWS = MMA_ROWS // 2
+comptime MMA_SG_TOKENS = MMA_TOKENS // 2
+comptime MMA_FR = MMA_SG_ROWS // 8
+comptime MMA_FT = MMA_SG_TOKENS // 8
+"""What one simdgroup of the four covers, arranged two by two, in fragments.
+
+Two by two rather than four by one because a square block of the output shares
+both operands between the fragment loads, and `MMA_FR * MMA_FT` accumulators of
+two floats a lane is what it costs.
+"""
+
+comptime MMA_ROW_THREADS = MMA_THREADS // MMA_ROWS
+comptime MMA_KPT = MMA_K // MMA_ROW_THREADS
+"""How the weight staging is split: threads to a row, and values to a thread.
+
+A thread's run has to sit inside one quant group so the scale and the minimum
+are loaded once for it, which holds for every group size and every tile width
+here and is the reason the dequantization is two instructions a value.
+"""
+
+comptime MMA_XV = (MMA_TOKENS * MMA_K) // 8
+"""Vector loads the activation tile takes, at eight floats each.
+
+Staging with vector loads rather than element at a time is a factor of four and
+a half on its own, measured in #201, which is more than the tile is worth
+without it.
+"""
+
+comptime MMA_STAGE = MMA_TOKENS * MMA_K + MMA_K * MMA_ROWS
+comptime MMA_POOL = MMA_STAGE if MMA_STAGE > MMA_TOKENS * MMA_ROWS else MMA_TOKENS * MMA_ROWS
+"""Floats of threadgroup memory a block takes, once.
+
+The two staged operands are live together and the output tile is live after
+both are dead, so all three come out of one allocation with a barrier between
+the phases. Kept apart they are half again as much, and threadgroup memory is
+what decides how many blocks a core can hold at once.
+"""
+
+
+def planar_mma_kernel[
+    group: Int, with_min: Bool, form: Int
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+    epi_dev: Int32,
+    rows_dev: Int32,
+    tokens_dev: Int32,
+):
+    """The same product as `planar_matmul_kernel`, on Apple simdgroup matrices.
+
+    `o[t][r] = dot(row r of w, x[t])`, which is `X` times `W` transposed with
+    the activations as the left operand, because that is the orientation whose
+    result comes out in the order the output is written in.
+
+    The multiply is `_mma_apple_8x8`, an eight by eight by eight fragment
+    multiply accumulate that every Apple GPU since the M1 has. #201 measures a
+    dense version of this tile at 3.04 TFLOP/s on an M4 against the 0.30 the
+    same arrangement reaches with ordinary multiplies, and llama.cpp's Metal
+    prefill on the same machine works out at 2.55, so the instruction is both
+    the whole gap and enough of it.
+
+    Both operands are staged in threadgroup memory and both are staged with
+    vector loads. That second half is not a detail. The same tile with the same
+    traffic loading four bytes at a time rather than thirty two measured 0.30
+    against 1.34, so a scalar staging loop costs more than four times what the
+    tile itself is worth.
+
+    Everything stays float. The instruction takes half precision operands as
+    well and runs them at the same rate on this hardware, 2.95 TFLOP/s against
+    3.04, so half would buy half the threadgroup traffic and nothing else,
+    while costing three orders of magnitude of agreement with the decode path:
+    the same model measured 2.4e-7 of relative error in float and 4.5e-4 in
+    half, against a numerics gate of 2e-4. Half precision activations are what
+    llama.cpp does here and it is not what the rate on this GPU asks for.
+
+    The weight is transposed on the way in, since the fragment multiply has no
+    transposed form at this size and the weight arrives row major over the
+    reduction. A thread takes one row and one quant group of it, so the scale
+    and the minimum are read once for the whole run.
+
+    The result goes to the staging tile before the epilogue rather than
+    straight out. A fragment store writes a lane's two elements at whatever
+    positions the hardware layout puts them, and the epilogue is per element
+    work with a bias index and a gate index in it, so reading the tile back in
+    the obvious order is what keeps the epilogue the same code as the other two
+    kernels rather than a second version of it that depends on a private
+    fragment layout. The staged operands are dead by then, which is why it
+    costs no memory.
+    """
+    var cols = Int(cols_dev)
+    var stride = Int(stride_dev)
+    var rows = Int(rows_dev)
+    var tokens = Int(tokens_dev)
+
+    var pool = stack_allocation[
+        MMA_POOL, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var x_tile = pool
+    var w_tile = pool.unsafe_offset(MMA_TOKENS * MMA_K)
+    var o_tile = pool
+
+    var tid = Int(thread_idx.x)
+    var sg = tid // WARP_SIZE
+    var sg_t = (sg // 2) * MMA_SG_TOKENS
+    var sg_r = (sg % 2) * MMA_SG_ROWS
+
+    var t0 = Int(block_idx.x) * MMA_TOKENS
+    var r0 = Int(block_idx.y) * MMA_ROWS
+
+    var wr = tid // MMA_ROW_THREADS
+    var wk = (tid % MMA_ROW_THREADS) * MMA_KPT
+    var live_row = r0 + wr < rows
+    var row = (r0 + wr) * stride if live_row else 0
+    var groups = cols // group
+    var scales = w.unsafe_bitcast[Float32]()
+    var quant_bytes = cols if form == QUANT_I8 else cols // 2
+    var d_base = (row + quant_bytes) // 4
+    var m_base = d_base + groups
+    comptime shift = group_shift(group)
+
+    var acc = InlineArray[SIMD[DType.float32, 2], MMA_FR * MMA_FT](fill=0)
+
+    for k0 in range(0, cols, MMA_K):
+        # The token tail reads the slack every scratch vector a prefill uses is
+        # allocated with, for the reason `planar_matmul_kernel` gives. The row
+        # tail cannot do that, since past the last row is past the tensor, so
+        # it stages zeros and the epilogue drops them.
+        for v in range(tid, MMA_XV, MMA_THREADS):
+            var xt = v // (MMA_K // 8)
+            var xk = (v % (MMA_K // 8)) * 8
+            x_tile.unsafe_offset(xt * MMA_K + xk).unsafe_store(
+                x.unsafe_offset((t0 + xt) * cols + k0 + xk).unsafe_load[
+                    width=8
+                ]()
+            )
+
+        var gi = (k0 + wk) >> shift
+        var d = scales[unsafe_offset=d_base + gi] if live_row else Float32(0)
+        var m = Float32(0)
+        comptime if with_min:
+            if live_row:
+                m = scales[unsafe_offset=m_base + gi]
+        comptime if form == QUANT_I8:
+            var q = w.unsafe_offset(row + k0 + wk).unsafe_load[
+                width=MMA_KPT
+            ]() if live_row else SIMD[DType.uint8, MMA_KPT](0)
+            comptime for j in range(MMA_KPT):
+                w_tile[unsafe_offset=(wk + j) * MMA_ROWS + wr] = (
+                    d * byte_float(UInt32(q[j])) + m
+                )
+        else:
+            var q = w.unsafe_offset(row + ((k0 + wk) >> 1)).unsafe_load[
+                width=MMA_KPT // 2
+            ]() if live_row else SIMD[DType.uint8, MMA_KPT // 2](0)
+            comptime for j in range(MMA_KPT // 2):
+                var b = UInt32(q[j])
+                w_tile[unsafe_offset=(wk + 2 * j) * MMA_ROWS + wr] = (
+                    d * nibble_float[form](b & 0xF) + m
+                )
+                w_tile[unsafe_offset=(wk + 2 * j + 1) * MMA_ROWS + wr] = (
+                    d * nibble_float[form](b >> 4) + m
+                )
+        barrier()
+
+        comptime for kk in range(0, MMA_K, 8):
+            var af = InlineArray[SIMD[DType.float32, 2], MMA_FT](fill=0)
+            comptime for i in range(MMA_FT):
+                af[i] = apple_mma_load_8x8[DType.float32](
+                    x_tile.unsafe_offset((sg_t + i * 8) * MMA_K + kk), MMA_K
+                )
+            comptime for j in range(MMA_FR):
+                var bf = apple_mma_load_8x8[DType.float32](
+                    w_tile.unsafe_offset(kk * MMA_ROWS + sg_r + j * 8),
+                    MMA_ROWS,
+                )
+                comptime for i in range(MMA_FT):
+                    var got = SIMD[DType.float32, 2](0)
+                    _mma_apple_8x8(got, af[i], bf, acc[i * MMA_FR + j])
+                    acc[i * MMA_FR + j] = got
+        barrier()
+
+    comptime for i in range(MMA_FT):
+        comptime for j in range(MMA_FR):
+            apple_mma_store_8x8[DType.float32](
+                o_tile.unsafe_offset((sg_t + i * 8) * MMA_ROWS + sg_r + j * 8),
+                MMA_ROWS,
+                acc[i * MMA_FR + j],
+            )
+    barrier()
+
+    var epi = Int(epi_dev)
+    for idx in range(tid, MMA_TOKENS * MMA_ROWS, MMA_THREADS):
+        var t = idx // MMA_ROWS
+        var r = idx % MMA_ROWS
+        if t0 + t >= tokens or r0 + r >= rows:
+            continue
+        write_epilogue(
+            o,
+            aux,
+            epi,
+            (t0 + t) * rows + r0 + r,
+            r0 + r,
+            o_tile[unsafe_offset=idx],
+        )
+
+
+def _launch_mma[
+    group: Int, with_min: Bool, form: Int
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+    tokens: Int,
+) raises:
+    """One instantiation of the matrix core form, launched."""
+    ctx.enqueue_function[planar_mma_kernel[group, with_min, form]](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
+        x,
+        o,
+        aux,
+        Int32(w.cols),
+        Int32(w.row_bytes()),
+        Int32(epi),
+        Int32(w.rows),
+        Int32(tokens),
+        grid_dim=(
+            (tokens + MMA_TOKENS - 1) // MMA_TOKENS,
+            (w.rows + MMA_ROWS - 1) // MMA_ROWS,
+            1,
+        ),
+        block_dim=(MMA_THREADS, 1, 1),
+    )
+
+
 def _launch_mm[
     tile: Int, group: Int, with_min: Bool, form: Int
 ](
@@ -983,6 +1285,36 @@ def device_matmul_into(
         var g = group_size(w.kind)
         var carries_min = has_min(w.kind)
         var form = quant_form(w.kind)
+        # The matrix core form first where it exists, which today is Apple only.
+        # `TensorCore` in MAX has no integer case, so the widest thing a 4090
+        # offers here is the half precision tensor core, and #212 has the
+        # measurement that says a tile built on it the same way this one is
+        # loses to the ordinary kernel on two models out of three.
+        #
+        # A group of sixteen stages two groups to a step and is left on the
+        # ordinary form until there is a model that wants it.
+        comptime if CompilationTarget.is_macos():
+            if g == 32:
+                if form == QUANT_U4 and carries_min:
+                    _launch_mma[32, True, QUANT_U4](
+                        ctx, w, p, o, a, epi, tokens
+                    )
+                    return
+                if form == QUANT_S4 and not carries_min:
+                    _launch_mma[32, False, QUANT_S4](
+                        ctx, w, p, o, a, epi, tokens
+                    )
+                    return
+                if form == QUANT_I8 and carries_min:
+                    _launch_mma[32, True, QUANT_I8](
+                        ctx, w, p, o, a, epi, tokens
+                    )
+                    return
+                if form == QUANT_I8:
+                    _launch_mma[32, False, QUANT_I8](
+                        ctx, w, p, o, a, epi, tokens
+                    )
+                    return
         if form == QUANT_U4 and g == 32 and carries_min:
             _launch_mm[MM_TILE, 32, True, QUANT_U4](
                 ctx, w, p, o, a, epi, tokens
