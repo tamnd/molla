@@ -675,7 +675,7 @@ def planar_matmul_kernel[
     # Every lane ends up holding every total, so each one keeps the total for
     # the token it is about to write and drops the rest.
     var got = Float32(0)
-    for k in range(SPAN):
+    comptime for k in range(SPAN):
         var whole = lane_group_sum[num_lanes=tile](acc[k])
         if t == k:
             got = whole
