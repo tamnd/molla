@@ -45,6 +45,14 @@ time to first token, so that column is derived as the prompt divided by the
 prefill rate, which is the same quantity measured a different way rather than a
 second measurement.
 
+On a CUDA run there is a second memory column, because the host one is close to
+meaningless there and it is not comparable between engines either. It is the
+most the card held while the engine ran, over what it held before, sampled from
+`nvidia-smi` while the child is alive. `CardWatch` says what that does and does
+not measure. Ollama has no cell in it, for the same reason it has no host cell:
+the work is inside a server this script did not start, which is already holding
+whatever else it was asked for.
+
 Ollama is asked through `/api/generate` with `stream` off, which returns the
 counts and the durations of both halves. Its prefill is the first run and no
 other, because the server keeps the keys and values of the last prompt it saw
@@ -83,11 +91,13 @@ import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+NVIDIA_SMI = shutil.which("nvidia-smi")
 FILLER = (
     "The history of computing is a history of people deciding what a machine"
     " should be allowed to forget. "
@@ -104,6 +114,7 @@ class Result:
         self.decode_tps: float | None = None
         self.ttft_ms: float | None = None
         self.peak_bytes: int | None = None
+        self.card_bytes: int | None = None
         self.note = ""
 
     def failed(self) -> bool:
@@ -180,8 +191,9 @@ measure of what a process cost the machine, and there is no perfect one, but it
 is the only choice here that does not favour one engine's way of holding a
 model over the other's.
 
-Linux needs none of this. CUDA weights genuinely are not host memory, so the
-resident set is the right number and the only number.
+Linux needs none of this for the host side. CUDA weights genuinely are not host
+memory, so the resident set is the resident set. It does mean the host column
+alone says almost nothing on a card, which is what `CardWatch` is for.
 """
 
 TIME_L_HEAD = re.compile(r"^\s*[\d.]+ real\s", re.M)
@@ -240,6 +252,89 @@ def capture(args: list[str], env: dict | None = None) -> tuple[str, int, int]:
     return out, code, max(footprint, peak_of(usage))
 
 
+def card_used() -> int | None:
+    """Bytes in use on the card right now, or None when there is no card."""
+    if not NVIDIA_SMI:
+        return None
+    try:
+        out = subprocess.run(
+            [
+                NVIDIA_SMI,
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    first = out.stdout.strip().splitlines()
+    if not first or not first[0].strip().isdigit():
+        return None
+    return int(first[0].strip()) * (1 << 20)
+
+
+class CardWatch:
+    """Most the card held while a child was running, over what it held before.
+
+    The host resident set is the whole memory story on a CPU and almost none of
+    it on a card, and a table with only the host column in it says that molla
+    holds 1464, 1480 and 1494 MiB for three models that differ by sixty times in
+    size. That is true and it is not the number anyone wants. It is also not
+    comparable between engines, because llama.cpp holds the model file in a
+    mapping whose pages are resident and molla streams the file to the card
+    through a bounded arena, so the same bytes land in the host column for one
+    engine and in no column at all for the other.
+
+    The whole card rather than the process, because `--query-compute-apps` is
+    empty under WSL2, which is where the only NVIDIA card in the fleet is. That
+    is sound only while nothing else is using the card, which is checked by
+    taking a baseline first and subtracting it, and by running one engine at a
+    time. A machine with a desktop session on the same card will report that
+    session's memory in the baseline and cancel it out, and a machine running
+    two engines at once will report nonsense, which is a reason not to do that
+    rather than a reason not to measure.
+
+    Polling and not a callback, because there is no callback. A hundred
+    milliseconds is short against a load that takes seconds and long enough that
+    the sampler is not a term in the timing.
+    """
+
+    def __init__(self, on: bool):
+        self.on = on and NVIDIA_SMI is not None
+        self.peak = 0
+        self.base = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> CardWatch:
+        if not self.on:
+            return self
+        self.base = card_used() or 0
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _poll(self) -> None:
+        while not self._stop.wait(0.1):
+            now = card_used()
+            if now is not None and now > self.peak:
+                self.peak = now
+
+    def bytes(self) -> int | None:
+        """What the run added to the card, or None when nothing watched."""
+        if not self.on or self.peak == 0:
+            return None
+        return max(0, self.peak - self.base)
+
+
 def prompt_of(tokens: int, molla: str, tokenizer: str) -> tuple[str, int]:
     """Filler repeated until molla counts at least `tokens`, and the count.
 
@@ -287,41 +382,44 @@ def run_molla(
     decodes: list[float] = []
     ttfts: list[float] = []
     peak = 0
-    for i in range(runs):
-        text, code, bytes_used = capture(
-            [
-                molla,
-                "generate",
-                model,
-                tokenizer,
-                prompt,
-                str(decode),
-                "--device=" + device,
-            ]
-        )
-        if code != 0:
-            out.note = first_line(text)
-            return out
-        p = re.search(r"prefill:\s+(\d+) ms for (\d+) tokens", text)
-        d = re.search(r"decode:\s+(\d+) ms for (\d+) tokens", text)
-        if p is None or d is None:
-            out.note = "molla printed no timing lines"
-            return out
-        p_ms, p_n = float(p.group(1)), int(p.group(2))
-        d_ms, d_n = float(d.group(1)), int(d.group(2))
-        if d_n == 0:
-            out.note = "molla generated no tokens"
-            return out
-        if p_ms > 0:
-            prefills.append(p_n * 1000.0 / p_ms)
-        ttfts.append(p_ms)
-        if d_ms > 0:
-            decodes.append(d_n * 1000.0 / d_ms)
-        # The first run is the one that faults the mapping in, so its peak is
-        # the honest one and later runs read a warm page cache.
-        if i == 0:
-            peak = bytes_used
-        peak = max(peak, bytes_used)
+    watch = CardWatch(device == "cuda")
+    with watch:
+        for i in range(runs):
+            text, code, bytes_used = capture(
+                [
+                    molla,
+                    "generate",
+                    model,
+                    tokenizer,
+                    prompt,
+                    str(decode),
+                    "--device=" + device,
+                ]
+            )
+            if code != 0:
+                out.note = first_line(text)
+                return out
+            p = re.search(r"prefill:\s+(\d+) ms for (\d+) tokens", text)
+            d = re.search(r"decode:\s+(\d+) ms for (\d+) tokens", text)
+            if p is None or d is None:
+                out.note = "molla printed no timing lines"
+                return out
+            p_ms, p_n = float(p.group(1)), int(p.group(2))
+            d_ms, d_n = float(d.group(1)), int(d.group(2))
+            if d_n == 0:
+                out.note = "molla generated no tokens"
+                return out
+            if p_ms > 0:
+                prefills.append(p_n * 1000.0 / p_ms)
+            ttfts.append(p_ms)
+            if d_ms > 0:
+                decodes.append(d_n * 1000.0 / d_ms)
+            # The first run is the one that faults the mapping in, so its peak
+            # is the honest one and later runs read a warm page cache.
+            if i == 0:
+                peak = bytes_used
+            peak = max(peak, bytes_used)
+    out.card_bytes = watch.bytes()
     if prefills:
         out.prefill_tps = statistics.median(prefills)
     if decodes:
@@ -345,23 +443,26 @@ def run_llama(
     if binary is None:
         out.note = "llama-bench is not on PATH"
         return out
-    text, code, peak = capture(
-        [
-            binary,
-            "-m",
-            model,
-            "-p",
-            str(prompt_tokens),
-            "-n",
-            str(decode),
-            "-ngl",
-            llama_layers(device),
-            "-r",
-            str(runs),
-            "-o",
-            "json",
-        ]
-    )
+    watch = CardWatch(device == "cuda")
+    with watch:
+        text, code, peak = capture(
+            [
+                binary,
+                "-m",
+                model,
+                "-p",
+                str(prompt_tokens),
+                "-n",
+                str(decode),
+                "-ngl",
+                llama_layers(device),
+                "-r",
+                str(runs),
+                "-o",
+                "json",
+            ]
+        )
+    out.card_bytes = watch.bytes()
     if code != 0:
         out.note = first_line(text)
         return out
@@ -545,7 +646,14 @@ def mib(value: int | None) -> str:
 
 
 def table(results: list[Result], markdown: bool) -> str:
-    head = ["engine", "prefill tok/s", "decode tok/s", "ttft ms", "peak MiB"]
+    head = [
+        "engine",
+        "prefill tok/s",
+        "decode tok/s",
+        "ttft ms",
+        "host MiB",
+        "card MiB",
+    ]
     rows = [
         [
             r.engine,
@@ -553,9 +661,15 @@ def table(results: list[Result], markdown: bool) -> str:
             number(r.decode_tps),
             number(r.ttft_ms, 0),
             mib(r.peak_bytes),
+            mib(r.card_bytes),
         ]
         for r in results
     ]
+    # The card column drops out entirely when nothing was on a card, rather
+    # than standing there as a row of dashes on every CPU and Metal table.
+    if not any(r.card_bytes for r in results):
+        head = head[:-1]
+        rows = [row[:-1] for row in rows]
     if markdown:
         lines = ["| " + " | ".join(head) + " |"]
         lines.append("| " + " | ".join("---" for _ in head) + " |")
