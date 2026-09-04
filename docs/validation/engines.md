@@ -103,19 +103,24 @@ These are the findings that transfer to molla whatever the tile geometry ends up
 
 ## What MAX gives us and what it does not
 
-D7 says to use the dependency where it covers the target. It covers exactly half of this one, and the halves are worth stating precisely because the answer decides the shape of two kernels.
+D7 says to use the dependency where it covers the target. What it covers is not what reading `layout/` first suggested, and the difference decides the shape of both kernels, so this table is what compiled and ran rather than what looked plausible.
 
 | symbol | present | usable here |
 | --- | --- | --- |
-| `layout.tensor_core.TensorCore` | yes | CUDA and ROCm only, `is_nvidia_gpu()` or AMD, no Metal path exists |
+| `layout.tensor_core.TensorCore` | yes | CUDA and ROCm only, and float only: fp32, half, fp8, fp64, with no int8 case anywhere in it |
+| `max.gpu.compute.arch.mma_apple` | yes | Metal simdgroup matrices, and it is in the 26.5.0 molla already pins |
 | `layout.tensor_core_async.TensorCoreAsync` | yes | Hopper wgmma, not the 4090 |
 | `linalg.matmul.matmul` | yes | dense dtypes, would need the weights dequantized first |
 | `quantization.qmatmul_gpu.matmul_gpu_qint4` | yes | NVIDIA only and wants a weight layout that is not molla's |
 | `quantization.qmatmul_k.matmul_Q4_K` | yes | CPU only |
 
-So on CUDA the matrix core path is reachable through `TensorCore`, used inside a kernel of ours that dequantizes the planar weights on the way into shared memory. That keeps the layout molla already has and buys the mma instruction, which is the arrangement llama.cpp arrived at as well.
+Metal is the correction. An earlier draft of this file said no Metal matrix core instruction is reachable from Mojo and that the Metal GEMM would have to use ordinary multiplies. That is wrong. `max.gpu.compute.arch.mma_apple` exports `_mma_apple_8x8`, `_mma_apple_transposable` and fragment loaders and storers for both shapes, and a probe of 8x8x8 with half inputs and a float accumulator ran on this M4 and matched a host reference exactly, in both the f32 and the f16 input forms. That is `simdgroup_float8x8`, which is the instruction `kernel_mul_mm` is built out of. The building block llama.cpp uses on Metal is available today.
 
-On Metal there is nothing. `TensorCore` branches between NVIDIA and AMD and has no third case, and no Metal simdgroup matrix intrinsic is reachable from Mojo today. The Metal GEMM therefore stages both operands in threadgroup memory and multiplies with ordinary fused multiply adds, which still removes the `rows` factor from the activation traffic even though it does not get simdgroup matrices. Whether an `air.simdgroup_matrix` intrinsic can be reached at all is a separate spike and not a blocker for the tile.
+What does not run on an M4 is the 16x16x16 form, in either flavour. Both fail at pipeline creation with `Encountered unlowered function call to air.simdgroup_matrix_16x16x16_multiply_accumulate` for half inputs and the `_widening_` variant for int8 inputs. That is the M5 instruction, and MAX's own Apple matmul says as much by gating on `compute_capability == 5`. So on the reference machine the Metal tile is 8x8 fragments with half inputs and a float accumulator, which is exactly what llama.cpp does, and the 16x16 path is something a later Apple machine unlocks rather than something to design around now.
+
+CUDA is the correction in the other direction. `TensorCore` is real and it works, and it has no integer case at all: `supported_fp32`, `supported_half`, `supported_fp8` and `supported_fp64` are the whole list, `get_shapes` asserts out on anything else, and there is no `dp4a` and no `s8.s8.s32` anywhere in the MAX tree. The int8 instruction llama.cpp's MMQ is built on is not reachable through the dependency. It is reachable through `inlined_assembly`, which is how MAX itself reaches the Apple intrinsics, but that is molla writing the mma by hand and it should be a decision taken on a number rather than by default.
+
+The number is this. llama.cpp's 8B prefill of 10548.6 tokens a second is about 169 TFLOP/s at two flops a parameter. A 4090 does 165.2 TFLOP/s of fp16 with an fp32 accumulator and 660.6 TOPS of int8, so llama.cpp is running at roughly a quarter of the int8 peak, which is a normal number for a real kernel. A half precision tile that hits the same fraction of its own peak lands near 43 TFLOP/s, which is 2700 tokens a second on the 8B: six times what molla does now and still four times short of llama.cpp. Half precision through MAX is most of the distance and it is not all of it, and the last four times is the int8 instruction. So the plan is to build the half precision tile on both backends first, measure it, and let that measurement decide whether hand written int8 mma is worth carrying.
 
 ## Launch count was the wrong suspect
 
@@ -153,15 +158,15 @@ Two ollama ideas are worth taking and neither is about speed. The lazy KV snapsh
 
 In order, largest ratio first.
 
-1. Int8 activations and a matrix core GEMM, as one item rather than two, because the measurement above says a tile with fp32 multiplies in it is worth eleven per cent and the target is a factor of twenty eight. On CUDA that is `layout.tensor_core.TensorCore` fed from a staged tile of int8 weights and int8 activations. It needs the grid to stay wide enough on a small matrix, which the fp32 tile did not.
+1. A half precision matrix core GEMM, on both backends, as one item. The measurement above says a tile with fp32 multiplies in it is worth eleven per cent against a target of a factor of twenty eight, so the instruction is the item and the tile is only the thing that feeds it. On CUDA that is `layout.tensor_core.TensorCore` at 16x8x16 with bf16 or f16 inputs and an f32 accumulator. On Metal it is `_mma_apple_8x8` with f16 inputs and an f32 accumulator, which is the same arrangement `kernel_mul_mm` uses. Both take a staged tile of weights dequantized to half on the way in and activations converted to half once, and both need the grid to stay wide enough on a small matrix, which the fp32 tile did not.
 2. The weight unpack folded into the tile load, with the scale and minimum pre multiplied once per tile, and the nibble shifts replaced by masks with the factor corrected in the scale. The tile makes this free and the fp32 version already showed it costs nothing to fold the minimum in.
 3. An f16 KV cache, then q8_0 behind a flag.
 4. Close the GGUF mapping between the two load passes, which removes the first run double residency.
 5. Make the repack size neutral, or skip it on the device path the way llama.cpp does.
-6. A Metal matrix core instruction, or a written statement that none is reachable from Mojo and what that costs. This blocks the Metal half of the first item and nothing else.
+6. Answered, and it is no longer a spike. The Metal instruction is reachable, it is `_mma_apple_8x8`, and it is inside the first item. What replaces this line is the question the first item's number decides: whether an int8 mma written with `inlined_assembly` is worth carrying on CUDA to close the last four times.
 7. Shape specialized kernel compilation with a pipeline cache.
 
-One through three are one milestone and four and five can run beside them because they touch load and not kernels. Six is a spike. Seven is a milestone of its own. They are #201 through #206 and #208, tracked in M2d, #209.
+One through three are one milestone and four and five can run beside them because they touch load and not kernels. Seven is a milestone of its own. They are #201 through #206 and #208, tracked in M2d, #209.
 
 ## What this milestone has to reach
 
@@ -174,5 +179,7 @@ The standing goal is two times llama.cpp on tokens a second at half its memory. 
 | Qwen 2.5 0.5B Q4_K_M | prefill tok/s | 5039.2 | 43339 |
 | SmolLM2 135M Q8_0 | prefill tok/s | 10489.8 | 32487 |
 | Llama 3.1 8B Q4_K_M | card MiB | 7404 | 5198 |
+
+Half precision matrix cores are not expected to reach that table on their own. The arithmetic two sections up puts the first item near 2700 tokens a second on the 8B, which is a quarter of the way there and six times where molla is. If the tile lands near that number then the rest of the gap is the int8 instruction and the milestone closes or does not on whether hand written mma is taken on. If it lands well below 2700 then the tile is wrong rather than the instruction, and that is worth knowing before any assembly gets written. Either way the gate stays at parity, because a gate set to what the plan already predicts measures nothing.
 
 Every item lands with a run of `scripts/bench.py` on gpc against all three models and all three engines, and the result goes into [bench.md](bench.md) in the same pull request. bench.md is a version stale as of this writing, which is how the 109x number survived long enough to shape a milestone, and refreshing it is the first commit rather than the last.
