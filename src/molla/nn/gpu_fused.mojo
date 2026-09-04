@@ -72,6 +72,7 @@ from std.atomic import Atomic, Ordering
 from std.gpu import block_idx, grid_dim, thread_idx
 from std.math import cos, exp, sin, sqrt
 from std.memory import AddressSpace, bitcast, stack_allocation
+from std.os.env import getenv
 from std.sys import llvm_intrinsic
 from std.sys.info import CompilationTarget, has_accelerator
 
@@ -90,13 +91,18 @@ from molla.nn.gpu import (
     DeviceVec,
     activate,
     byte_float,
+    coherent_load,
     nibble_float,
+    planar_partial_dot,
 )
 from molla.nn.gpu_ops import NEG_INF, _ramp, _reduce_angle, _tanh
 from molla.nn.repack import (
     QUANT_I8,
     QUANT_S4,
+    QUANT_S5,
+    QUANT_S6,
     QUANT_U4,
+    QUANT_U5,
     group_shift,
     group_size,
     has_min,
@@ -223,28 +229,14 @@ def _put(p: Pointer[Float32, MutAnyOrigin], i: Int, v: Float32):
 def _get(p: Pointer[Float32, MutAnyOrigin], i: Int) -> Float32:
     """Read a float another block may have written since the last barrier.
 
-    An ordinary load everywhere except Metal. The probe in
-    `scripts/gridsync_probe.mojo` said the store side was enough on its own, and
-    that was a reading of a case the probe does not cover: there every block read
-    an address it had never read before, and here a block reads the same norm
-    scratch at every record of every layer. The second read hits a line the
-    block's own L1 already holds from the first, the barrier does not evict it,
-    and the value it returns is one round of the plan out of date. So the load
-    goes through the same relaxed device scope atomic as the store.
-
-    What that costs is the thing the design most wanted to avoid, because it is
-    one instruction for every column of every row rather than one a row. See
+    `coherent_load` in `molla.nn.gpu` is the whole of it, and the reason it
+    lives there rather than here is that the matvec loop is shared with the
+    unfused path and takes this as a parameter. What it costs is the thing the
+    design most wanted to avoid, because it is one instruction for every column
+    of every row rather than one a row. See
     [docs/validation/fused.md](../../../docs/validation/fused.md).
     """
-    comptime if CompilationTarget.is_macos():
-        var q = p.unsafe_bitcast[Int32]()
-        return bitcast[DType.float32, 1](
-            dev32.load[ordering=Ordering.RELAXED](
-                Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset=i])
-            )
-        )
-    else:
-        return p[unsafe_offset=i]
+    return coherent_load[True](p, i)
 
 
 comptime SPACE_WORK = 0
@@ -268,15 +260,17 @@ comptime OP_ACT = 4
 comptime OP_ADD = 5
 
 comptime QK_U4 = 0
-"""Unsigned nibbles, groups of 32, with a minimum plane. q4_K and q5_K."""
+"""Unsigned nibbles, groups of 32, with a minimum plane. q4_1 and q4_K."""
 comptime QK_S4 = 1
 """Centred nibbles, groups of 32, no minimum. q4_0."""
-comptime QK_I8M = 2
-"""Bytes, groups of 32, with a minimum. q8_1 shaped types."""
-comptime QK_I8 = 3
+comptime QK_U5 = 2
+"""Five bits in two planes, groups of 32, with a minimum. q5_1 and q5_K."""
+comptime QK_S5 = 3
+"""Centred five bits in two planes, groups of 32, no minimum. q5_0."""
+comptime QK_S6 = 4
+"""Centred six bits in two planes, groups of 16, no minimum. q6_K."""
+comptime QK_I8 = 5
 """Bytes, groups of 32, no minimum. q8_0."""
-comptime QK_I8_16 = 4
-"""Bytes, groups of 16, no minimum. q6_K."""
 
 comptime NEOX_BIT = 1
 """Set in a rope record's kind when the pairing is neox."""
@@ -394,49 +388,19 @@ def _row_dot[
 ) -> Float32:
     """This thread's share of one planar row against one activation vector.
 
-    Line for line the accumulation loop of `molla.nn.gpu.planar_matvec_kernel`,
-    with the same stride and the same order of operations, because a fused layer
-    that summed the same products in a different order would disagree with the
-    unfused one in the last digit and there would be no way to tell that from a
-    bug. The reduction and the epilogue are the caller's, since a fused record
+    The unfused matvec's own loop, called rather than copied. It used to be
+    copied, and the copy went stale twice while the layout changed underneath
+    it, both times in the way that builds and returns wrong numbers. The only
+    difference between the two callers is how they read the activation, which
+    is a parameter of the loop now, and the fused one is the coherent read
+    because the vector it is reading was written by other blocks a barrier ago.
+
+    The reduction and the epilogue are the caller's, since a fused record
     reduces once a row and the caller is already inside the row loop.
     """
-    var scales = packed.unsafe_bitcast[Float32]()
-    var quant_bytes = cols if form == QUANT_I8 else cols // 2
-    var groups = cols // group
-    var d_base = (row + quant_bytes) // 4
-    var m_base = d_base + groups
-    comptime shift = group_shift(group)
-
-    var acc = Float32(0)
-    comptime if form == QUANT_I8:
-        var i = t
-        while i < cols:
-            var gi = i >> shift
-            var q = byte_float(UInt32(packed[unsafe_offset=row + i]))
-            var a = _get(x, i)
-            acc += scales[unsafe_offset=d_base + gi] * q * a
-            comptime if with_min:
-                acc += scales[unsafe_offset=m_base + gi] * a
-            i += FTILE
-    else:
-        var i = t * 2
-        while i < cols:
-            var gi = i >> shift
-            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
-            var lo = nibble_float[form](b & 0xF)
-            var hi = nibble_float[form](b >> 4)
-            var a0 = _get(x, i)
-            var a1 = _get(x, i + 1)
-            var d = scales[unsafe_offset=d_base + gi]
-            acc += d * lo * a0
-            acc += d * hi * a1
-            comptime if with_min:
-                var m = scales[unsafe_offset=m_base + gi]
-                acc += m * a0
-                acc += m * a1
-            i += FTILE * 2
-    return acc
+    return planar_partial_dot[FTILE, group, with_min, form, coherent=True](
+        packed, x, row, cols, t
+    )
 
 
 @always_inline
@@ -666,10 +630,10 @@ def fused_kernel(
             var w_at = _fi(plan_i, rec, R_W)
             var epi = _fi(plan_i, rec, R_EPI)
             var kind = _fi(plan_i, rec, R_KIND)
-            # The same five combinations the unfused dispatch compiles, chosen
+            # The same six combinations the unfused dispatch compiles, chosen
             # here by one uniform branch a record rather than by a parameter on
             # the whole kernel. That is the price of one kernel source for every
-            # model: five copies of the accumulation loop in the binary and a
+            # model: six copies of the accumulation loop in the binary and a
             # branch executed once per projection.
             if kind == QK_U4:
                 _do_matvec[32, True, QUANT_U4](
@@ -679,16 +643,20 @@ def fused_kernel(
                 _do_matvec[32, False, QUANT_S4](
                     pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
                 )
-            elif kind == QK_I8M:
-                _do_matvec[32, True, QUANT_I8](
+            elif kind == QK_U5:
+                _do_matvec[32, True, QUANT_U5](
                     pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
                 )
-            elif kind == QK_I8:
-                _do_matvec[32, False, QUANT_I8](
+            elif kind == QK_S5:
+                _do_matvec[32, False, QUANT_S5](
+                    pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
+                )
+            elif kind == QK_S6:
+                _do_matvec[16, False, QUANT_S6](
                     pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
                 )
             else:
-                _do_matvec[16, False, QUANT_I8](
+                _do_matvec[32, False, QUANT_I8](
                     pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
                 )
 
@@ -843,7 +811,7 @@ def fused_kernel(
 
 
 def quant_kind(w: Tensor) raises -> Int:
-    """Which of the five compiled accumulation loops reads this weight.
+    """Which of the six compiled accumulation loops reads this weight.
 
     Written out in full rather than inferred from the form, for the reason the
     unfused dispatch gives: a type added later that breaks one of the
@@ -857,12 +825,14 @@ def quant_kind(w: Tensor) raises -> Int:
         return QK_U4
     if form == QUANT_S4 and g == 32 and not carries_min:
         return QK_S4
-    if form == QUANT_I8 and g == 32 and carries_min:
-        return QK_I8M
-    if form == QUANT_I8 and g == 32:
+    if form == QUANT_U5 and g == 32 and carries_min:
+        return QK_U5
+    if form == QUANT_S5 and g == 32 and not carries_min:
+        return QK_S5
+    if form == QUANT_S6 and g == 16 and not carries_min:
+        return QK_S6
+    if form == QUANT_I8 and g == 32 and not carries_min:
         return QK_I8
-    if form == QUANT_I8 and g == 16 and not carries_min:
-        return QK_I8_16
     raise Error(
         "no fused matvec is compiled for quant form "
         + String(form)
@@ -1048,6 +1018,17 @@ def barrier_probe_kernel(
         dev32.store[ordering=Ordering.RELAXED](gen, Int32(0))
 
 
+comptime BLOCKS_ENV = "MOLLA_FUSED_BLOCKS"
+"""An explicit fused grid width, for sweeping one.
+
+The width is the whole trade this path makes, and the two ways of arriving at it
+are a query on one backend and a constant on the other, so measuring what it is
+worth means overriding both. `fused_selftest` still runs at whatever comes out
+of here, so an override that is not resident refuses to start rather than
+hanging, which is what makes this safe to hand to somebody sweeping it.
+"""
+
+
 def fused_grid(ctx: DeviceContext) raises -> Int:
     """How many blocks a fused launch gets on this device.
 
@@ -1056,7 +1037,22 @@ def fused_grid(ctx: DeviceContext) raises -> Int:
     known and the grid is the smaller of that and `CUDA_BLOCKS`. Metal raises on
     the same query, so there the grid is the multiprocessor count times
     `METAL_PER_SM`, which is the floor every device holds.
+
+    `MOLLA_FUSED_BLOCKS` overrides both.
     """
+    var asked = getenv(BLOCKS_ENV)
+    if asked != "":
+        var n = 0
+        var digits = asked.as_bytes()
+        for i in range(len(digits)):
+            var c = Int(digits[i])
+            if c < 48 or c > 57:
+                raise Error(BLOCKS_ENV + " is not a number: " + String(asked))
+            n = n * 10 + (c - 48)
+        if n < 1:
+            raise Error("a fused launch needs at least one block")
+        return n
+
     var sms: Int
     try:
         sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
