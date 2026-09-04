@@ -95,11 +95,17 @@ launches at the 4.9 microseconds a 4090 charges for one is 1.8 ms of submission.
 Around a gibibyte those are the same number, and either side of it one of them
 is most of the token.
 
-Measured on a 4090, decoding, against the unfused path: SmolLM2 135M at 136 MiB
-a token is 1.89 times faster fused, Qwen 2.5 0.5B at 468 MiB is 1.55 times, and
-Llama 3.1 8B at 5151 MiB is 0.79 times, which is a loss of a fifth. The
-threshold sits between the second and the third and the arithmetic above says
-where in that gap, which is why it is a round number and not a fitted one.
+Measured on a 4090 through `scripts/bench.py`, 128 tokens decoded, against the
+unfused path. SmolLM2 135M at 136 MiB a token is 1.55 times faster fused from an
+eight token prompt and 1.81 times from a five hundred token one, Qwen 2.5 0.5B
+at 468 MiB is 1.17 and 1.37 times, and Llama 3.1 8B at 5151 MiB is 0.87 times,
+which is a loss of an eighth. The threshold sits between the second and the
+third and the arithmetic above says where in that gap, which is why it is a
+round number and not a fitted one.
+
+The ratios grow with the context rather than shrinking, which is the whole point
+of the split attention step: the unfused path pays a launch for a step that has
+got longer, and the fused path spreads the same step over more of the grid.
 """
 
 
@@ -188,10 +194,11 @@ def fused_by_default(m: DeviceModel) raises -> Bool:
     the same way.
 
     False on Metal whatever the model, and that is a measurement rather than a
-    caution. The fused path is slower there on both models it has been run on,
-    28 ms a token against 22 on SmolLM2 135M and 49 against 31 on Qwen 2.5 0.5B,
-    because an M4 holds a fifth of the blocks a 4090 does and charges more for a
-    barrier across them. Stage two is what changes that, if anything does.
+    caution. The fused path is slower there on every model it has been run on,
+    24 ms a token against 19 on SmolLM2 135M and 54 against 35 on Qwen 2.5 0.5B
+    at a seven hundred token context, because an M4 holds a fifth of the blocks
+    a 4090 does and charges more for a barrier across them. Stage two is what
+    changes that, if anything does.
     """
     comptime if CompilationTarget.is_macos():
         return False

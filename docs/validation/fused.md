@@ -110,3 +110,27 @@ A test that asserts the launch count for one token and does not move when the la
 `tests/test_gpu_block.mojo` covers the fused layer against the unfused one on a synthetic model small enough to run on every machine, the way it already covers a chunk against a run of decodes.
 
 The one that is easy to forget: the fused kernel has to deadlock loudly rather than quietly. A grid that is not fully resident hangs the GPU, which on a laptop is the display, so the launch checks the grid against the residency bound and refuses rather than trusting it, and the spin inside the barrier is bounded with a flag the host reads afterwards.
+
+## What stage one measured
+
+The grid width first, because everything else depends on it. On a 4090, SmolLM2 135M decoding 128 tokens takes 451 ms unfused, and fused it takes 366 ms on 96 blocks, 239 on 256, 238 on 384 and 239 on 512. Everything from 256 up is flat and 96 gives away half of what the path is worth. Above that it does not get slower, it stops working: 640 blocks and 768 blocks never finish a token. The shipped constant is 384, clamped by the occupancy query at three blocks a multiprocessor so that a smaller card gets a smaller grid.
+
+On Metal the same sweep on Qwen 2.5 0.5B, in ms a token, is 100 at 10 blocks, 63 at 20, 50 at 40, 49 at 50, 55 at 60, and a collapse at 70. The shipped constant is four blocks a multiprocessor, which is 40 on an M4.
+
+The residency bound cannot be probed with a barrier and nothing else. `fused_selftest` and `scripts/fused_grid_probe.mojo` rendezvous happily at grids where the real kernel deadlocks, 160 blocks against 70 on the M4 and 1024 against 640 on the 4090, because a kernel that holds registers and a shared array is resident at a narrower grid than one that holds neither. The occupancy query is an upper bound and not the answer, for the same reason: an ordinary launch is not a cooperative one.
+
+Then the attention step, which was the one place a block owned a whole head. A model has between nine and thirty two heads, so a grid of 384 blocks put at most thirty two of them to work on the one step whose cost grows with the context, and the rest waited at the next barrier. It did not show up at all at a short prompt and it took the whole advantage away at a long one: Qwen at a 512 token prompt was nine per cent slower fused than unfused. Splitting a head's keys across blocks in the flash attention way, with a fold after one extra barrier a layer, is what the numbers below are measured on.
+
+Decode rate in tokens a second, 4090, 128 tokens generated, through `scripts/bench.py`.
+
+| model | prompt | unfused | fused | ratio |
+| --- | --- | --- | --- | --- |
+| SmolLM2 135M q8_0 | 8 | 310.7 | 483.0 | 1.55 |
+| SmolLM2 135M q8_0 | 512 | 254.0 | 460.4 | 1.81 |
+| Qwen 2.5 0.5B q4_K_M | 8 | 316.8 | 372.1 | 1.17 |
+| Qwen 2.5 0.5B q4_K_M | 512 | 268.9 | 367.8 | 1.37 |
+| Llama 3.1 8B q4_K_M | 512 | 93.7 | 81.8 | 0.87 |
+
+Two things in that table decide the default. The ratios grow with the context rather than shrinking, which says the split did what it was for, and the 8B loses an eighth, which says the path is not free. A token of the 8B reads 5151 MiB of weights and the fused grid is narrower than one block a row, so what it saves in launches it gives back in bandwidth. The default is therefore a question about the model and not about the machine, which is `fused_by_default` in `src/molla/engine/device.mojo`: on when a layer's seven matrices come to a gibibyte a token or less, off above it, and `MOLLA_FUSED` overrides either way.
+
+On Metal it is off whatever the model. At a 721 token context an M4 decodes SmolLM2 at 19 ms a token unfused and 24 fused, and Qwen at 35 against 54. The split helps there too and not by enough, because 40 blocks is a fifth of what the 4090 holds and a barrier across them costs more. Stage two is what changes that, if anything does.
