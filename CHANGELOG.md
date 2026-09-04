@@ -4,6 +4,29 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-09-04
+
+Prefill on Metal was multiplying one number at a time and the GPU has an instruction that multiplies an eight by eight matrix. Using it takes a 514 token prompt through SmolLM2 from 472 tokens a second to 2142, and through Qwen 2.5 0.5B from 169 to 613.
+
+`_mma_apple_8x8` is the simdgroup matrix multiply accumulate every Apple GPU since the M1 has, and it is the instruction llama.cpp's `kernel_mul_mm` is built on. It is reachable from Mojo through `max.gpu.compute.arch.mma_apple` in the max-core release molla already pins. The measurement that made it worth doing is a dense tile of the shape `kernel_mul_mm` uses, timed on an M4: 0.30 TFLOP/s with ordinary multiplies, 3.04 through the instruction, against llama.cpp's own Metal prefill on the same machine working out at 2.55. So the instruction was both the whole gap and enough of it, and the tile is only the thing that feeds it.
+
+The prefill against decode agreement is unchanged at a relative 2.4e-7, because both operands are staged as float. Half precision runs at the same rate on this hardware, 2.95 against 3.04, so it would buy threadgroup traffic and nothing else, while taking that agreement to 4.5e-4 against a gate of 2e-4. llama.cpp stages activations as half here and on this GPU that is not what the rate asks for.
+
+### Added
+
+- A matrix core prefill matmul on Metal. Sixty four output rows by thirty two tokens, four simdgroups two by two, a reduction step of thirty two because that is the group size of every type molla repacks, and the weight dequantized straight into the staged tile in transposed order since the instruction has no transposed form at this size. Measured on an M4 at 512 prompt and 128 decode with all three engines on the same afternoon: SmolLM2 135M q8_0 prefill 472.0 to 2141.7 against llama.cpp's 9341.0, and Qwen 2.5 0.5B q4_K_M 169.4 to 612.6 against 3238.0, so the gap goes from 20.0 to 4.4 and from 19.2 to 5.3. Decode is untouched. Memory goes 344 to 405 MiB and 887 to 915, which is the wider prefill chunk the tile wants.
+- `write_epilogue`, one copy of the bias, gate, store or accumulate tail that all three matmul kernels had their own copy of. It is the only part of them that has to agree exactly, since a prefill and a decode of the same prompt are checked against each other.
+
+### Changed
+
+- `PREFILL_CHUNK` is 256 on Metal and stays 64 elsewhere. The tile covers thirty two tokens, so a chunk of sixty four gives the GPU two blocks of the token axis to fill ten cores with, and widening it is 1611 tokens a second against 2142. On CUDA the same widening with no kernel change at all goes the other way and by more, 4990 to 3545 on Qwen 2.5 0.5B and 378 to 181 on Llama 3.1 8B. That is not understood yet and it is filed.
+- [docs/validation/bench.md](docs/validation/bench.md) is retaken against 0.4.5 on all three machines at the same 512 and 128, where the laptop and server1 tables used to be 134 and 32 and could not be read against the card. The readings that came out of it: decode on CUDA is a constant 3.6, 2.7 and 1.9 times off llama.cpp as the model grows, prefill was 3.1, 8.6 and 27.9 over the same three, and a ratio that grows with model size is a scaling failure rather than a slow kernel. Memory on the card is at parity except on the 8B. The worst number on the page is the host path, which is 76.6 times off at prefill and 33.9 at decode on the same laptop and the same file, and nothing is currently pointed at it.
+- [docs/validation/engines.md](docs/validation/engines.md) records what llama.cpp and Ollama actually do, read at `llama.cpp` commit `f9f09f02cc44` and `ollama` commit `b68365a`, with a file and a line behind every claim. The correction that mattered most is what MAX covers: `layout.tensor_core.TensorCore` is float only, with no integer case and no `dp4a` and no `s8.s8.s32` anywhere in the tree, and `max.gpu.compute.arch.mma_apple` does exist and is what this release landed on. The previous reading had both halves the other way round.
+
+### Known issues
+
+- The same tile on CUDA loses to the kernel it replaces on two models out of three, so it is not in this release. An Apple simdgroup matrix is about ten times its own GPU's scalar rate and an NVIDIA half precision tensor core is two times its own fused multiply add rate, so the same tile buys ten times on one machine and two on the other before anything is spent on feeding it. What the numbers say is missing there is `ld_matrix` for the fragments, a swizzled shared layout and a K loop that stages ahead.
+
 ## [0.4.5] - 2026-09-04
 
 A prompt is a matrix and molla was treating it as a run of decodes. It is a matrix now, and time to first token on a 514 token prompt falls by twenty five times on the smallest model of the three and by nearly four on the largest.
