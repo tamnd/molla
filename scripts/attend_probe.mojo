@@ -48,6 +48,7 @@ def _time(
     mut out: DeviceVec,
     mut scores: DeviceVec,
     count: Int,
+    tokens: Int = 1,
 ) raises -> Float64:
     """Nanoseconds one call takes, best of five runs of `REPS`.
 
@@ -60,7 +61,16 @@ def _time(
         var began = monotonic()
         for _ in range(REPS):
             device_attend(
-                ctx, spec, q, keys, values, count, count - 1, out, scores
+                ctx,
+                spec,
+                q,
+                keys,
+                values,
+                count,
+                count - 1,
+                out,
+                scores,
+                tokens,
             )
         ctx.synchronize()
         var took = Float64(monotonic() - began) / Float64(REPS)
@@ -128,3 +138,51 @@ def main() raises:
             " ms at 1185 by"
         )
         print("subtracting two decodes, and this arrives at it directly.")
+        print("")
+
+        # The same keys and values, read by a taller grid. A decode launches
+        # `heads` blocks and a prefill chunk launches `heads * tokens`, and
+        # every one of those blocks reads the same keys, so if the kernel were
+        # bound by what it reads then eight times the blocks over the same bytes
+        # would cost eight times as much. Whatever it does instead is how much
+        # of the decode number is the grid being 32 blocks wide.
+        print("the same 1185 keys, read by a taller grid")
+        var count = 1185
+        var deep_q = DeviceVec(ctx, 16 * width)
+        var deep_out = DeviceVec(ctx, 16 * width)
+        var deep_scores = DeviceVec(ctx, 16 * spec.heads * (count + 16))
+        ctx.synchronize()
+        var one = Float64(0)
+        var depths = List[Int]()
+        depths.append(1)
+        depths.append(2)
+        depths.append(4)
+        depths.append(8)
+        depths.append(16)
+        for i in range(len(depths)):
+            var deep = depths[i]
+            var ns = _time(
+                ctx,
+                spec,
+                deep_q,
+                keys,
+                values,
+                deep_out,
+                deep_scores,
+                count,
+                deep,
+            )
+            if i == 0:
+                one = ns
+            print(
+                String(spec.heads * deep)
+                + " blocks\t  "
+                + String(Int(ns / 1000.0))
+                + " us\t   "
+                + String(Int(ns / one))
+                + "."
+                + String(Int(ns * 10.0 / one) % 10)
+                + " times one token's cost for "
+                + String(deep)
+                + " of them"
+            )
