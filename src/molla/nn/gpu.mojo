@@ -452,7 +452,7 @@ def planar_matvec_kernel[
 
     var acc = Float32(0)
     comptime if form == QUANT_I8:
-        var i = t * MATVEC_STEP
+        var i = t * MATVEC_BYTES
         while i < cols:
             var gi = i >> shift
             var at = row + i
@@ -460,13 +460,13 @@ def planar_matvec_kernel[
             var m = Float32(0)
             comptime if with_min:
                 m = scales[unsafe_offset=m_base + gi]
-            comptime for k in range(MATVEC_STEP):
+            comptime for k in range(MATVEC_BYTES):
                 var q = byte_float(UInt32(packed[unsafe_offset=at + k]))
                 var a = x[unsafe_offset=i + k]
                 acc += d * q * a
                 comptime if with_min:
                     acc += m * a
-            i += tile * MATVEC_STEP
+            i += tile * MATVEC_BYTES
     else:
         # A byte to a thread and both of its values, so a warp reads thirty two
         # contiguous bytes and gets sixty four values out of them. Both values
@@ -540,6 +540,15 @@ def planar_matvec_kernel[
         # there and both are the same read.
         write_epilogue(o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
 
+
+comptime MATVEC_BYTES = 8 if CompilationTarget.is_macos() else 1
+"""The same number for the byte wide path, where CUDA wants a narrower one.
+
+Metal takes the widening here as well as on the nibble path. CUDA does not: at
+two values a thread SmolLM2 135M, which is q8_0 and so is all of it, decoded
+236.6 tokens a second against 262.3 at one, on a 4090 with everything else
+equal. So this one stays where it was on that backend.
+"""
 
 comptime MATVEC_STEP = 8 if CompilationTarget.is_macos() else 2
 """How many four bit values one thread takes in one pass of the decode matvec.
