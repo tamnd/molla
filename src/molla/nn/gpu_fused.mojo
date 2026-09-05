@@ -70,6 +70,7 @@ and anything that is merely close there is a bug rather than a tolerance.
 
 from std.atomic import Atomic, Ordering
 from std.gpu import block_idx, grid_dim, thread_idx
+from std.gpu.primitives.warp import lane_group_max, lane_group_sum
 from std.math import cos, exp, sin, sqrt
 from std.memory import AddressSpace, bitcast, stack_allocation
 from std.os.env import getenv
@@ -850,19 +851,44 @@ def fused_kernel(
                 stuck = True
                 break
 
-            var e = b * FTILE + t
-            var wide = blocks * FTILE
+            # A warp to an answer rather than a thread to one. There are only
+            # `heads * head_dim` answers here, 576 on a small model against a
+            # grid of `blocks * FTILE`, so a thread apiece left eighteen warps
+            # on five blocks doing two serial passes over `splits` while the
+            # other three hundred and seventy nine blocks waited at the barrier
+            # below. Handing the slices to the lanes turns those passes into two
+            # rounds and puts a hundred and forty four blocks to work.
+            #
+            # The lanes read `parts` a `roww` apart, which is the wrong stride
+            # for a load and the opposite of what `key_dot` wants. It is still
+            # the right trade here because `parts` is `heads * splits * roww`
+            # floats, tens of kilobytes, and stays in L2 across the whole fold.
+            # What this step was paying for was latency, not traffic.
+            var flane = t % ALANES
+            var fteams = FTILE // ALANES
+            var e = b * fteams + t // ALANES
+            var wide = blocks * fteams
             while e < heads * head_dim:
                 var at = (e // head_dim) * splits * roww
                 var d2 = e % head_dim
                 var top2 = NEG_INF
-                for s2 in range(splits):
+                var s2 = flane
+                while s2 < splits:
                     var m = _get(parts, at + s2 * roww + head_dim)
                     if m > top2:
                         top2 = m
+                    s2 += ALANES
+                # A lane with no slice of its own brings minus infinity to the
+                # maximum and zero to the sums, which is what makes a single
+                # slice come back through here unchanged in every bit. The
+                # unfused `attend_merge_kernel` still folds one thread at a
+                # time, and `tests/test_gpu_block.mojo` holds the two to an
+                # exact match on a case that comes out at one slice.
+                top2 = lane_group_max[num_lanes=ALANES](top2)
                 var num = Float32(0)
                 var den = Float32(0)
-                for s2 in range(splits):
+                s2 = flane
+                while s2 < splits:
                     var base = at + s2 * roww
                     var l = _get(parts, base + head_dim + 1)
                     if l > 0:
@@ -873,7 +899,11 @@ def fused_kernel(
                         var wgt = exp(_get(parts, base + head_dim) - top2)
                         num += wgt * _get(parts, base + d2)
                         den += wgt * l
-                _put(o, e, num / den)
+                    s2 += ALANES
+                num = lane_group_sum[num_lanes=ALANES](num)
+                den = lane_group_sum[num_lanes=ALANES](den)
+                if flane == 0:
+                    _put(o, e, num / den)
                 e += wide
 
         elif op == OP_ACT:
