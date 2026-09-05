@@ -532,6 +532,62 @@ def coherent_load[
         return p[unsafe_offset=i]
 
 
+comptime ALANES = 32
+"""Threads that share one key in an attention dot product.
+
+A warp on both vendors, which is what makes this a shuffle reduction with no
+shared memory and no block barrier under it, and what makes the branch a
+masked key takes uniform across the group.
+
+The number is not a tuning parameter and every attention kernel has to use the
+same one. `lane_group_sum` reduces in a tree, so the order the sixty four or
+hundred and twenty eight products of a key are added in is a function of this
+constant, and the fused path and the unfused one have to agree with each other
+in every bit rather than closely. See `key_dot`.
+"""
+
+
+@always_inline
+def key_dot[
+    coherent: Bool
+](
+    q: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float32, MutAnyOrigin],
+    qa: Int,
+    ka: Int,
+    head_dim: Int,
+    lane: Int,
+) -> Float32:
+    """One query against one key, a warp to the key.
+
+    The obvious way to write attention is one thread to a key, and it is the
+    wrong way twice over. A decode has a few thousand keys to score across a
+    grid of tens of thousands of threads, so at one key a thread most of the
+    machine has nothing to do, and the addresses the threads that do have a key
+    touch at any one moment are a row of the cache apart, so no two lanes of a
+    warp are in the same sector and every load fetches thirty two bytes to use
+    four. Measured together at 42 GB/s on a card that gives 1040, which is a
+    third of a SmolLM2 layer. See the fused token section of
+    [docs/validation/fused.md](../../../docs/validation/fused.md) and #239.
+
+    A warp to a key inverts both. The lanes walk the head dimension, so a key's
+    floats are one coalesced read by thirty two lanes doing a couple each, and
+    a block of `TILE` threads scores `TILE / ALANES` keys at once with all of
+    itself awake.
+
+    `coherent` is `coherent_load`'s, false everywhere except inside the fused
+    kernel.
+    """
+    var part = Float32(0)
+    var d = lane
+    while d < head_dim:
+        part += coherent_load[coherent](q, qa + d) * coherent_load[coherent](
+            keys, ka + d
+        )
+        d += ALANES
+    return lane_group_sum[num_lanes=ALANES](part)
+
+
 @always_inline
 def planar_partial_dot[
     tile: Int, group: Int, with_min: Bool, form: Int, coherent: Bool = False

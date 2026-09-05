@@ -44,12 +44,14 @@ from molla.nn.attention import AttnSpec
 from molla.nn.gpu import (
     ACT_GELU,
     ACT_SILU,
+    ALANES,
     TILE,
     DeviceVec,
     _scale,
     activate,
     byte_float,
     high_shift,
+    key_dot,
     nibble_float,
     planar_quant_stride,
     wide_float,
@@ -689,23 +691,28 @@ def attend_kernel[
     var qa = ty * Int(q_row_dev) + h * head_dim
     var sa = (ty * Int(grid_dim.x) + h) * score_row
 
+    # A warp to a key rather than a thread to a key, which is `key_dot`. Only
+    # the lane that holds the answer writes the score and tracks the maximum,
+    # so the other lanes come to `_block_max` with `NEG_INF`, which a maximum
+    # ignores.
+    var lane = t % ALANES
+    var team = t // ALANES
+    var teams = tile // ALANES
     var mine = NEG_INF
-    var j = t
+    var j = team
     while j < count:
         var visible = j < sinks or window <= 0 or j > pos - window
         var s = NEG_INF
         if visible:
             var ka = j * kv_width + kvh * head_dim
-            var acc = Float32(0)
-            for d in range(head_dim):
-                acc += q[unsafe_offset=qa + d] * keys[unsafe_offset=ka + d]
-            s = acc * scale
+            s = key_dot[False](q, keys, qa, ka, head_dim, lane) * scale
             if softcap > 0:
                 s = softcap * _tanh(s / softcap)
-        scores[unsafe_offset=sa + j] = s
-        if s > mine:
-            mine = s
-        j += tile
+        if lane == 0:
+            scores[unsafe_offset=sa + j] = s
+            if s > mine:
+                mine = s
+        j += teams
     var top = _block_max[tile](mine)
 
     var acc_sum = Float32(0)
@@ -862,23 +869,26 @@ def attend_split_kernel[
             partials[unsafe_offset=pa + head_dim + 1] = Float32(0)
         return
 
+    # A warp to a key, the same way `attend_kernel` does it and for the same
+    # reasons. See `key_dot`.
+    var lane = t % ALANES
+    var team = t // ALANES
+    var teams = tile // ALANES
     var mine = NEG_INF
-    var j = lo + t
+    var j = lo + team
     while j < hi:
         var visible = j < sinks or window <= 0 or j > pos - window
         var s = NEG_INF
         if visible:
             var ka = j * kv_width + kvh * head_dim
-            var acc = Float32(0)
-            for d in range(head_dim):
-                acc += q[unsafe_offset=qa + d] * keys[unsafe_offset=ka + d]
-            s = acc * scale
+            s = key_dot[False](q, keys, qa, ka, head_dim, lane) * scale
             if softcap > 0:
                 s = softcap * _tanh(s / softcap)
-        scores[unsafe_offset=sa + j] = s
-        if s > mine:
-            mine = s
-        j += tile
+        if lane == 0:
+            scores[unsafe_offset=sa + j] = s
+            if s > mine:
+                mine = s
+        j += teams
     var top = _block_max[tile](mine)
 
     # A slice a window has masked end to end. The single kernel never meets
