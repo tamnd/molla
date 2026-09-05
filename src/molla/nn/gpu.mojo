@@ -1116,7 +1116,7 @@ def planar_matmul_kernel[
     var rowb = InlineArray[Int, MM_ROWS](fill=0)
     var d_base = InlineArray[Int, MM_ROWS](fill=0)
     var m_base = InlineArray[Int, MM_ROWS](fill=0)
-    for rr in range(MM_ROWS):
+    comptime for rr in range(MM_ROWS):
         var rq = r0 + rr
         if rq >= rows:
             rq = rows - 1
@@ -1160,17 +1160,17 @@ def planar_matmul_kernel[
             # Hoisted out of the row loop, which is the whole point of the row
             # loop. One load a token here feeds `MM_ROWS` multiplies below.
             var a = InlineArray[Float32, SPAN](fill=0)
-            for k in range(SPAN):
+            comptime for k in range(SPAN):
                 a[k] = x[unsafe_offset=at0 + k * cols + i]
-            for rr in range(MM_ROWS):
+            comptime for rr in range(MM_ROWS):
                 var q = byte_float(UInt32(packed[unsafe_offset=rowb[rr] + i]))
                 var d = _scale(scales, d_base[rr] + gi) * q
                 comptime if with_min:
                     var m = _scale(scales, m_base[rr] + gi)
-                    for k in range(SPAN):
+                    comptime for k in range(SPAN):
                         acc[rr * SPAN + k] += d * a[k] + m * a[k]
                 else:
-                    for k in range(SPAN):
+                    comptime for k in range(SPAN):
                         acc[rr * SPAN + k] += d * a[k]
             i += tile
     elif quant_high_bits(form) == 0:
@@ -1179,22 +1179,22 @@ def planar_matmul_kernel[
             var gi = i >> shift
             var a0 = InlineArray[Float32, SPAN](fill=0)
             var a1 = InlineArray[Float32, SPAN](fill=0)
-            for k in range(SPAN):
+            comptime for k in range(SPAN):
                 a0[k] = x[unsafe_offset=at0 + k * cols + i]
                 a1[k] = x[unsafe_offset=at0 + k * cols + i + 1]
-            for rr in range(MM_ROWS):
+            comptime for rr in range(MM_ROWS):
                 var b = UInt32(packed[unsafe_offset=rowb[rr] + (i >> 1)])
                 var d = _scale(scales, d_base[rr] + gi)
                 var lo = d * nibble_float[form](b & 0xF)
                 var hi = d * nibble_float[form](b >> 4)
                 comptime if with_min:
                     var m = _scale(scales, m_base[rr] + gi)
-                    for k in range(SPAN):
+                    comptime for k in range(SPAN):
                         acc[rr * SPAN + k] += (
                             lo * a0[k] + hi * a1[k] + m * (a0[k] + a1[k])
                         )
                 else:
-                    for k in range(SPAN):
+                    comptime for k in range(SPAN):
                         acc[rr * SPAN + k] += lo * a0[k] + hi * a1[k]
             i += tile * 2
     else:
@@ -1212,10 +1212,10 @@ def planar_matmul_kernel[
             var s0 = UInt32((i & (hper - 1)) * hbits)
             var a0 = InlineArray[Float32, SPAN](fill=0)
             var a1 = InlineArray[Float32, SPAN](fill=0)
-            for k in range(SPAN):
+            comptime for k in range(SPAN):
                 a0[k] = x[unsafe_offset=at0 + k * cols + i]
                 a1[k] = x[unsafe_offset=at0 + k * cols + i + 1]
-            for rr in range(MM_ROWS):
+            comptime for rr in range(MM_ROWS):
                 var b = UInt32(packed[unsafe_offset=rowb[rr] + (i >> 1)])
                 var h = UInt32(
                     packed[unsafe_offset=rowb[rr] + (cols >> 1) + (i >> hshift)]
@@ -1229,12 +1229,12 @@ def planar_matmul_kernel[
                 )
                 comptime if with_min:
                     var m = _scale(scales, m_base[rr] + gi)
-                    for k in range(SPAN):
+                    comptime for k in range(SPAN):
                         acc[rr * SPAN + k] += (
                             lo * a0[k] + hv * a1[k] + m * (a0[k] + a1[k])
                         )
                 else:
-                    for k in range(SPAN):
+                    comptime for k in range(SPAN):
                         acc[rr * SPAN + k] += lo * a0[k] + hv * a1[k]
             i += tile * 2
 
