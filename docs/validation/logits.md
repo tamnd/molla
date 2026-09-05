@@ -126,6 +126,14 @@ The right way to read the last column is against 1.75e-5, which is what the sect
 
 One detail says where the movement actually comes from, and it is not the scales. The three q8_0 cases moved too, by 4.7e-6 on the head and 1.2e-5 on the tail, and q8_0 cannot lose anything here: its scale is a float16 out of the block written into a float16 plane, and `tests/test_repack.mojo` checks that a q8_0 row decodes bit for bit the same numbers the blocks decode, at both widths. So the weights are identical and what moved is the arithmetic over them. Changing the load at the top of the dot product changes what the compiler does with the loop under it, and a float32 accumulation over four thousand terms is not associative. The float16 scales are worth part of the movement on the k types and none of it anywhere else.
 
+## The rounding this section was about is gone
+
+Issue #206 removes it. A k type's group scale is a small integer, six bits unsigned for q4_k and q5_k and a signed byte for q6_k, so it fits a byte and there was never a reason to hold it as the product of two things. It is now a byte a group and one float16 a 256 value block, and the two exact factors are multiplied in float32 at read time in the same association the reference dequantizer uses.
+
+So the change the section above priced no longer exists. All eight quantized types round trip bit for bit, `tests/test_repack.mojo` asserts an exact match rather than a tolerance, and there is no lossy step anywhere in the repack. The tolerances in this file stay where they are, because they were set from the distance to llama.cpp and not from the layout, and the corpus still agrees with llama.cpp on all thirteen device cases on both backends with the greedy picks unchanged.
+
+The last column of the table above keeps its point even so. It is the record of what halving a scale width was actually worth, and the answer was less than the difference between two of molla's own backends, which is the calibration to reach for the next time a layout change needs a tolerance argued for it.
+
 ## What a device run skips
 
 `smollm2-f16-capital` does not run on a device and is reported as a skip with the reason, not as a pass. The device matvecs read the planar form of a quantized weight and there is no planar form of an f16 one, so an unquantized model has nothing on the card for them to read. That is checked off the tensor directory before anything is loaded, by `device_refusal`, which is the same check that makes `--device=metal` on an f16 model an error and `--device=auto` on one a host run with the reason printed under it.

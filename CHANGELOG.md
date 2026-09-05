@@ -4,6 +4,16 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Changed
+
+- The three k types keep a group scale in a byte rather than a float16. A planar group scale was a float16 because that is what q4_1 and q5_1 have, and a k type does not have that: its group scale is a small integer against one float16 for the whole 256 value block, six bits unsigned for q4_k and q5_k and a signed byte for q6_k, and every one of those fits a byte exactly. Storing it wide was the whole of the k type overhead and it is why those three were the only forms that were not size neutral against the file. They now hold the integer a byte a group and the float16 once a block, so a q4_k block is 148 bytes against 160, q5_k is 180 against 192, and q6_k is 210, which is what the file itself costs. The 8B repack cache is 4781 MiB against 5151.
+- The k type repack is lossless. The old writer formed the product of the block scale and the group scale and rounded it into a float16. The two exact factors are now kept apart and multiplied in float32 at read time, in the same association the reference dequantizer uses, so all eight quantized types round trip bit for bit and the round trip test asserts an exact match rather than a tolerance.
+- A block scaled form takes twice as many values a pass of the decode matvec on CUDA. What a thread does between two reads of the group scale is what the step buys, and a block scaled form reads a byte and a block factor where a plain form reads one float16, so at the old step of two an 8B decode cost eighteen per cent: 1226 ms for 128 tokens against 1042. At four it is 1065 and at eight it is 1226 again, because by then the occupancy the wider step costs has caught up with the reuse it buys. Two probes with one of the two loads deleted say why: either load on its own is free and the pair is not, which is what an issue bound kernel looks like. Raising it for every form is not free either, since Qwen 2.5 0.5B is almost all q5_0 and goes from 260 ms to 291 at four, so the step is asked per form. Metal is already at eight for everything and needs no change.
+
+### Fixed
+
+- A planar row is rounded up to sixteen bytes with the pad zeroed. The matrix core kernel stages a row with a sixteen byte vector load for q8_0 and an eight byte one for the nibble forms at an address derived from the row start, and `unsafe_load[width=N]` assumes natural alignment. The old k strides happened to be aligned and the new narrower ones are not, but neither was q8_0 at 896 columns, which is Qwen2.5 0.5B, so this fixes a case that was already there. The cost is at most fifteen bytes a row.
+
 ## [0.4.16] - 2026-09-06
 
 The KV cache is half the size it was, so an 8B at a context of 2048 holds 256 MiB of it rather than 512, and a long context decode on a 4090 is one per cent faster for it rather than slower. The logit corpus agrees with llama.cpp on both backends and the greedy picks are unchanged.

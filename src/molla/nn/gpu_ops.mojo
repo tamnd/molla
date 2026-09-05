@@ -48,24 +48,25 @@ from molla.nn.gpu import (
     TILE,
     DeviceHalf,
     DeviceVec,
-    _scale,
+    _group_scale,
+    _scale_bases,
     activate,
     byte_float,
     high_shift,
     key_dot,
     nibble_float,
-    planar_quant_stride,
     wide_float,
 )
 from molla.nn.repack import (
     LAYOUT_PLANAR,
     QUANT_I8,
+    QUANT_K4,
+    QUANT_K5,
     QUANT_S4,
     QUANT_S5,
     QUANT_S6,
     QUANT_U4,
     QUANT_U5,
-    SCALE_BYTES,
     group_shift,
     group_size,
     has_min,
@@ -389,8 +390,7 @@ def planar_row_kernel[
     var packed = w
     var scales = w.unsafe_bitcast[Float16]()
     var groups = cols // group
-    var d_base = (row + planar_quant_stride[form](cols)) // SCALE_BYTES
-    var m_base = d_base + groups
+    var base = _scale_bases[form, with_min](row, cols, groups)
 
     # A shift and not a divide, for the reason `group_shift` gives. This one is
     # a row a token rather than the hot loop, and it is here so that the two
@@ -421,9 +421,9 @@ def planar_row_kernel[
             q = wide_float[form](
                 ((b >> UInt32((i & 1) * 4)) & 0xF) | (((h >> s) & hmask) << 4)
             )
-        var v = _scale(scales, d_base + gi) * q
+        var v = _group_scale[form](scales, packed, base[0], base[2], gi) * q
         comptime if with_min:
-            v += _scale(scales, m_base + gi)
+            v += _group_scale[form](scales, packed, base[1], base[3], gi)
         o[unsafe_offset=out_at + i] = v
         i += stride
 
@@ -1479,6 +1479,10 @@ def device_unpack_rows(
         var form = quant_form(w.kind)
         if form == QUANT_U4 and g == 32 and carries_min:
             _unpack[32, True, QUANT_U4](ctx, w, out.ptr_at(at), ids, tokens)
+        elif form == QUANT_K4 and g == 32 and carries_min:
+            _unpack[32, True, QUANT_K4](ctx, w, out.ptr_at(at), ids, tokens)
+        elif form == QUANT_K5 and g == 32 and carries_min:
+            _unpack[32, True, QUANT_K5](ctx, w, out.ptr_at(at), ids, tokens)
         elif form == QUANT_S4 and g == 32 and not carries_min:
             _unpack[32, False, QUANT_S4](ctx, w, out.ptr_at(at), ids, tokens)
         elif form == QUANT_U5 and g == 32 and carries_min:

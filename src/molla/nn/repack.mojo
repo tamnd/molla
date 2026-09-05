@@ -18,6 +18,22 @@ with the mscale plane there only for the types that carry a minimum. A value is
 `dscale[g] * q[i] + mscale[g]` where `g` is `i // group_size`, and that is the
 whole format. The group is 32 values for everything except q6_k, which is 16.
 
+The three k types keep the same two scales in a narrower pair of planes, because
+what they have is not a float16 a group. A k type's group scale is a small
+integer against one float16 for the whole 256 value block, six bits unsigned for
+q4_k and q5_k and a signed byte for q6_k, and every one of those fits a byte
+exactly. So they store the integer a byte a group and the float16 once a block:
+
+    row = [ quants ][ groups dscale ][ groups mscale ]
+          [ blocks float16 dfactor ][ blocks float16 mfactor ]
+
+and a value is `dfactor[b] * dscale[g] * q[i] + mfactor[b] * mscale[g]` where
+`b` is `g // block_groups`. That is a byte a group rather than two plus a
+sixteenth, so a 4096 wide q4_k row is 2368 bytes against 2560, and it is
+lossless where the float16 plane was not: the product that used to be rounded
+into a float16 at repack time is now formed in float32 at read time out of the
+two exact factors the file had.
+
 A quant is stored at the width the file stores it, which `quant_form` decides
 and nothing else does. The four bit plane is two values a byte, low nibble first
 in the order the values appear, so position `i` is in byte `i // 2` and in the
@@ -51,11 +67,10 @@ measurement.
 
 The scale planes are float16, which is the width the file's own scales are, so
 what a group costs here is a scale and no more. They were float32 until the
-measurement said what that was worth, and unlike everything else in this module
-that change is not bit exact: a k type's scale is a product of a float16 and a
-small integer, and a product needs more mantissa than either factor. What it
-costs is in `docs/validation/logits.md` as a measured number rather than an
-argument.
+measurement said what that was worth. That change was not bit exact for the k
+types, because a k type's scale is a product of a float16 and a small integer
+and a product needs more mantissa than either factor, and storing the two
+factors apart is what took the rounding back out.
 
 Nothing here reads a file or knows what a model is. It takes packed bytes at an
 address and writes unpacked bytes at another one, which is what lets
@@ -95,10 +110,10 @@ comptime LAYOUT_PLANAR = 1
 """Quants in one plane and scales in another, as described above."""
 
 comptime QUANT_I8 = 0
-"""One signed byte a value. q5_0, q5_1, q5_k, q6_k and q8_0."""
+"""One signed byte a value. q8_0 alone."""
 
 comptime QUANT_U4 = 1
-"""Two unsigned nibbles a byte, values 0 to 15. q4_1 and q4_k."""
+"""Two unsigned nibbles a byte, values 0 to 15. q4_1 alone."""
 
 comptime QUANT_S4 = 2
 """Two two's complement nibbles a byte, values -8 to 7. q4_0 alone.
@@ -111,7 +126,7 @@ point is that the numbers do not move.
 """
 
 comptime QUANT_U5 = 3
-"""Five bits a value in two planes, values 0 to 31. q5_1 and q5_k."""
+"""Five bits a value in two planes, values 0 to 31. q5_1 alone."""
 
 comptime QUANT_S5 = 4
 """The same two planes, read sixteen lower, values -16 to 15. q5_0 alone."""
@@ -125,15 +140,38 @@ so in every index into it, and a parameter that changes an index is a runtime
 shift where a separate form is a constant.
 """
 
-comptime SCALE_BYTES = 2
-"""Bytes one group scale takes in a planar row.
+comptime QUANT_K4 = 6
+"""`QUANT_U4`'s quant plane with block scaled scale planes. q4_k alone."""
 
-A float16. What a scale plane holds is a product rather than a number read out
-of the file, and the argument for storing the product at half the width is in
-`_put_scale` and measured in docs/validation/layout.md.
+comptime QUANT_K5 = 7
+"""`QUANT_U5`'s quant planes with block scaled scale planes. q5_k alone.
+
+q4_k and q5_k read their quants exactly the way q4_1 and q5_1 do and differ
+only in where the scale of a group comes from, and a form of their own is how
+that gets said. The alternative was a second parameter on every kernel, which
+would double the instantiations of all six forms to distinguish three, where
+this adds two cases to a dispatch that already has six.
 """
 
-comptime LAYOUT_VERSION = 4
+comptime SCALE_BYTES = 2
+"""Bytes one float16 scale takes in a planar row.
+
+The width of every scale plane except the byte wide ones a block scaled form
+keeps, and the width of those forms' block factors. The argument for it being
+two rather than four is in `_put_scale` and measured in
+docs/validation/layout.md.
+"""
+
+comptime ROW_ALIGN = 16
+"""Bytes a planar row is rounded up to.
+
+The width of the widest load any kernel makes over a row, which is the sixteen
+bytes of the quant plane one thread stages in the Apple matrix core path. Rows
+are laid out back to back, so this is the alignment of every row and not just
+the first.
+"""
+
+comptime LAYOUT_VERSION = 5
 """Bumped whenever the meaning of a planar byte changes.
 
 A cache file records this and a load that finds a different number treats the
@@ -220,14 +258,18 @@ def quant_form(kind: Int) -> Int:
     this function and a case in the two readers, rather than a constant to find
     in six files.
     """
-    if kind == Q_Q4_1 or kind == Q_Q4_K:
+    if kind == Q_Q4_1:
         return QUANT_U4
     if kind == Q_Q4_0:
         return QUANT_S4
-    if kind == Q_Q5_1 or kind == Q_Q5_K:
+    if kind == Q_Q5_1:
         return QUANT_U5
     if kind == Q_Q5_0:
         return QUANT_S5
+    if kind == Q_Q4_K:
+        return QUANT_K4
+    if kind == Q_Q5_K:
+        return QUANT_K5
     if kind == Q_Q6_K:
         return QUANT_S6
     return QUANT_I8
@@ -240,7 +282,7 @@ def quant_bits(kind: Int) -> Int:
         return 8
     if form == QUANT_S6:
         return 6
-    if form == QUANT_U5 or form == QUANT_S5:
+    if form == QUANT_U5 or form == QUANT_S5 or form == QUANT_K5:
         return 5
     return 4
 
@@ -256,7 +298,7 @@ def quant_high_bits(form: Int) -> Int:
     """
     if form == QUANT_S6:
         return 2
-    if form == QUANT_U5 or form == QUANT_S5:
+    if form == QUANT_U5 or form == QUANT_S5 or form == QUANT_K5:
         return 1
     return 0
 
@@ -276,6 +318,53 @@ def quant_bias(form: Int) -> Int:
     if form == QUANT_S6:
         return 32
     return 0
+
+
+def block_scaled(form: Int) -> Bool:
+    """Whether this form keeps a group scale in a byte and a factor per block.
+
+    True for the three k types and false for everything else, which is not a
+    property of the quant plane at all but of what the file stores a scale as.
+    The five non k types have a float16 a block and no per group integer, so
+    there is nothing to split and their group scale is that float16 unchanged.
+    """
+    return form == QUANT_K4 or form == QUANT_K5 or form == QUANT_S6
+
+
+def scale_signed(form: Int) -> Bool:
+    """Whether a byte of a block scaled scale plane is two's complement.
+
+    q6_k's group scales are signed bytes in the file and q4_k's and q5_k's are
+    six bit unsigned integers, so the plane is written at the file's own
+    signedness and read back the same way. Biasing q6_k into an unsigned plane
+    would work and would cost a subtraction per group to undo, for nothing: a
+    byte holds either range and the reader knows which form it has.
+    """
+    return form == QUANT_S6
+
+
+def block_groups(form: Int) -> Int:
+    """Groups sharing one float16 factor, or zero for a form with no factor.
+
+    A k quant block is 256 values however wide its groups are, so this is 256
+    over the group size: eight for q4_k and q5_k and sixteen for q6_k.
+    """
+    if form == QUANT_K4 or form == QUANT_K5:
+        return 8
+    if form == QUANT_S6:
+        return 16
+    return 0
+
+
+def block_shift(form: Int) -> Int:
+    """The right shift from a group index to a block index, or 0 for no factor.
+
+    A shift for the reason `group_shift` gives, and it is one here because both
+    counts are powers of two.
+    """
+    if not block_scaled(form):
+        return 0
+    return group_shift(block_groups(form))
 
 
 def planar_low_bytes(kind: Int, cols: Int) raises -> Int:
@@ -341,24 +430,61 @@ def planar_groups(kind: Int, cols: Int) raises -> Int:
     return cols // g
 
 
-def planar_row_bytes(kind: Int, cols: Int) raises -> Int:
-    """Bytes one planar row occupies.
+def planar_blocks(kind: Int, cols: Int) raises -> Int:
+    """Groups of groups sharing one float16 factor, or zero for a plain form.
 
-    Even, because the quant planes are a multiple of four and a scale is two
-    bytes. That matters more than it looks: rows sit back to back, so if one row
-    were odd then every row after the first would put its scale planes at an
-    address a float16 load cannot be aligned to.
-
-    The quant planes are a multiple of four at every width. At a byte a value
-    that is `cols`, which is a multiple of the group size and so of 16. At a
-    nibble it is `cols // 2`, a multiple of 8, because a four bit type blocks by
-    32 or 256 and a row is whole blocks. Five and six bits add an eighth and a
-    quarter of `cols` on top of the half, which are whole multiples of four for
-    the same reason.
+    Checked rather than assumed, for the reason `planar_groups` checks: a row
+    that is not a whole number of blocks would give the last block a factor
+    covering fewer groups than the reader is going to read with it.
     """
+    var form = quant_form(kind)
+    var per = block_groups(form)
+    if per == 0:
+        return 0
     var groups = planar_groups(kind, cols)
+    if groups % per != 0:
+        raise Error(
+            "a row of "
+            + String(groups)
+            + " groups is not a whole number of "
+            + String(per)
+            + " group blocks"
+        )
+    return groups // per
+
+
+def planar_scale_bytes(kind: Int, cols: Int) raises -> Int:
+    """Bytes one row's scale planes occupy, block factors included.
+
+    Two bytes a group for a plain form. One byte a group plus two bytes a block
+    for a block scaled one, in both planes where the type carries a minimum.
+    """
     var planes = 2 if has_min(kind) else 1
-    return planar_quant_bytes(kind, cols) + planes * groups * SCALE_BYTES
+    var groups = planar_groups(kind, cols)
+    if not block_scaled(quant_form(kind)):
+        return planes * groups * SCALE_BYTES
+    return planes * (groups + planar_blocks(kind, cols) * SCALE_BYTES)
+
+
+def planar_row_bytes(kind: Int, cols: Int) raises -> Int:
+    """Bytes one planar row occupies, rounded up to `ROW_ALIGN`.
+
+    Rows sit back to back, so a row length is the alignment every row after the
+    first gets, and the widest load a kernel makes over a row is sixteen bytes
+    of the quant plane. Rounding up is how that is guaranteed rather than
+    arrived at. It used to be arrived at: every combination of type and width in
+    the models molla is run against happened to land on a multiple of sixteen
+    except q8_0 at 896 columns, which is Qwen2.5 0.5B and which was reading a
+    misaligned vector on the Apple matrix core path. The block scaled k types
+    made that worse, since a q4_k row is 148 bytes a block and 148 is not a
+    multiple of eight.
+
+    What it costs is at most fifteen bytes a row against rows that are hundreds
+    or thousands, and nothing at all for the shapes that were already aligned,
+    which is most of them.
+    """
+    var used = planar_quant_bytes(kind, cols) + planar_scale_bytes(kind, cols)
+    return (used + ROW_ALIGN - 1) & ~(ROW_ALIGN - 1)
 
 
 def _put_scale(p: RawPtr, at: Int, value: Float32):
@@ -369,15 +495,25 @@ def _put_scale(p: RawPtr, at: Int, value: Float32):
     reinterpreted pointer would be an alignment assumption this code has not
     earned, and this runs once per group at repack time rather than per token.
 
-    Rounding happens here and nowhere else. For q4_0, q4_1, q5_0, q5_1 and q8_0
-    it does not happen at all, because what goes in is a float16 out of the
-    block widened on the way past and it lands back on itself. The k types are
-    the ones that round, because what they store is a product of a float16 and
-    a small integer and the product needs more mantissa than either factor.
+    Nothing rounds here any more. Every value this is handed is a float16 out
+    of a block widened on the way past, so it lands back on itself: for the
+    five plain types that is the group's scale and for the three k types it is
+    the block's factor, whose integer half goes to `_put_scale_byte` instead of
+    being multiplied in.
     """
     var bits = bitcast[DType.uint16, 1](value.cast[DType.float16]())
     p.unsafe_store(at, UInt8(bits & 0xFF))
     p.unsafe_store(at + 1, UInt8((bits >> 8) & 0xFF))
+
+
+def _put_scale_byte(p: RawPtr, at: Int, value: Int):
+    """One group scale of a block scaled form, in a byte.
+
+    Six bits unsigned for q4_k and q5_k and a signed byte for q6_k, and the mask
+    is what lets one function write both: it is the two's complement of the
+    signed one and does nothing at all to the other.
+    """
+    p.unsafe_store(at, UInt8(value & 0xFF))
 
 
 def _put_i8(p: RawPtr, at: Int, value: Int):
@@ -493,16 +629,37 @@ def repack_row(
     var stride = block_bytes(kind)
     var per_groups = per // g
     var h_at = to + planar_low_bytes(kind, cols)
-    var d_at = to + planar_quant_bytes(kind, cols)
-    var m_at = d_at + groups * SCALE_BYTES
+    var s_at = to + planar_quant_bytes(kind, cols)
+    # A group scale is a float16 in a plain form and a byte in a block scaled
+    # one, and the two planes sit back to back either way, so one width is all
+    # it takes to place both.
+    var each = 1 if block_scaled(quant_form(kind)) else SCALE_BYTES
+    var d_at = s_at
+    var m_at = s_at + groups * each
+    # The factor planes, which a plain form has none of and never indexes.
+    var planes = 2 if has_min(kind) else 1
+    var fd_at = s_at + planes * groups * each
+    var fm_at = fd_at + planar_blocks(kind, cols) * SCALE_BYTES
+    # The bytes `ROW_ALIGN` rounded the row up by, which no plane covers. The
+    # scratch buffer this writes into is reused row after row and is never
+    # cleared, so leaving them would put whatever the last row left there into
+    # the cache file. Nothing reads them, but a cache that is not a function of
+    # the model is one that cannot be compared between two runs.
+    var used = planar_quant_bytes(kind, cols) + planar_scale_bytes(kind, cols)
+    for i in range(used, planar_row_bytes(kind, cols)):
+        dst.unsafe_store(to + i, UInt8(0))
     # `q` counts values and not bytes, because the two stopped being the same
     # number when the four bit types started packing two to a byte. Every
     # packer takes the plane's base separately and adds its own offsets to it.
     for b in range(cols // per):
         var block = at + b * stride
         var q = b * per
-        var d = d_at + b * per_groups * SCALE_BYTES
-        var m = m_at + b * per_groups * SCALE_BYTES
+        var d = d_at + b * per_groups * each
+        var m = m_at + b * per_groups * each
+        # One block of the type is one block of the factor planes, because the
+        # factor is exactly the float16 the block already had.
+        var fd = fd_at + b * SCALE_BYTES
+        var fm = fm_at + b * SCALE_BYTES
         if kind == Q_Q4_0:
             _pack_q4_0(src, block, dst, to, q, d)
         elif kind == Q_Q4_1:
@@ -514,11 +671,11 @@ def repack_row(
         elif kind == Q_Q8_0:
             _pack_q8_0(src, block, dst, to, q, d)
         elif kind == Q_Q4_K:
-            _pack_q4_k(src, block, dst, to, q, d, m)
+            _pack_q4_k(src, block, dst, to, q, d, m, fd, fm)
         elif kind == Q_Q5_K:
-            _pack_q5_k(src, block, dst, to, h_at, q, d, m)
+            _pack_q5_k(src, block, dst, to, h_at, q, d, m, fd, fm)
         else:
-            _pack_q6_k(src, block, dst, to, h_at, q, d)
+            _pack_q6_k(src, block, dst, to, h_at, q, d, fd)
 
 
 def _pack_q4_0(src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int):
@@ -604,14 +761,24 @@ def _pack_q8_0(src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int):
 
 
 def _pack_q4_k(
-    src: RawPtr, at: Int, dst: RawPtr, to: Int, q: Int, d: Int, m: Int
+    src: RawPtr,
+    at: Int,
+    dst: RawPtr,
+    to: Int,
+    q: Int,
+    d: Int,
+    m: Int,
+    fd: Int,
+    fm: Int,
 ):
-    """Eight groups out of one 256 value block, with the two scales folded.
+    """Eight groups out of one 256 value block, with the two scales split.
 
-    A q4_k value is `d * sc * v - dmin * mn`, so the group's dscale is `d * sc`
-    and its mscale is `-(dmin * mn)`. Folding the negation into the stored
-    number rather than keeping a subtract in the kernel is what lets the planar
-    dot product be one shape for every type that has a minimum.
+    A q4_k value is `d * sc * v - dmin * mn`, so the block's dfactor is `d` and
+    its mfactor is `-dmin`, and the group's two bytes are the six bit `sc` and
+    `mn` the file has. Folding the negation into the block factor rather than
+    keeping a subtract in the kernel is what lets the planar dot product be one
+    shape for every type that has a minimum, and folding it there rather than
+    into each group's byte is what keeps that byte the file's own integer.
 
     The group index needs checking rather than assuming, because this loop
     writes in halves of sixty four and the planes are indexed in groups of
@@ -620,19 +787,17 @@ def _pack_q4_k(
     `half * 2 + 1`, which is exactly the pair of groups this iteration has the
     scales for.
     """
-    var d0 = f16_at(src, at)
-    var dmin = f16_at(src, at + 2)
+    _put_scale(dst, fd, f16_at(src, at))
+    _put_scale(dst, fm, -f16_at(src, at + 2))
     var scales = at + 4
     var qs = at + 16
     for half in range(4):
         var lo = _k_scale(src, scales, half * 2)
         var hi = _k_scale(src, scales, half * 2 + 1)
-        _put_scale(dst, d + half * SCALE_BYTES * 2, d0 * lo[0])
-        _put_scale(dst, m + half * SCALE_BYTES * 2, -(dmin * lo[1]))
-        _put_scale(dst, d + half * SCALE_BYTES * 2 + SCALE_BYTES, d0 * hi[0])
-        _put_scale(
-            dst, m + half * SCALE_BYTES * 2 + SCALE_BYTES, -(dmin * hi[1])
-        )
+        _put_scale_byte(dst, d + half * 2, Int(lo[0]))
+        _put_scale_byte(dst, m + half * 2, Int(lo[1]))
+        _put_scale_byte(dst, d + half * 2 + 1, Int(hi[0]))
+        _put_scale_byte(dst, m + half * 2 + 1, Int(hi[1]))
         var b_at = qs + half * 32
         var base = q + half * 64
         for l in range(32):
@@ -642,7 +807,16 @@ def _pack_q4_k(
 
 
 def _pack_q5_k(
-    src: RawPtr, at: Int, dst: RawPtr, to: Int, up: Int, q: Int, d: Int, m: Int
+    src: RawPtr,
+    at: Int,
+    dst: RawPtr,
+    to: Int,
+    up: Int,
+    q: Int,
+    d: Int,
+    m: Int,
+    fd: Int,
+    fm: Int,
 ):
     """q4_k with the fifth bit plane merged into the byte.
 
@@ -650,20 +824,18 @@ def _pack_q5_k(
     in a different plane at a bit position that advances by two every sixty four
     values. Merging it here means the per token cost of that plane is zero.
     """
-    var d0 = f16_at(src, at)
-    var dmin = f16_at(src, at + 2)
+    _put_scale(dst, fd, f16_at(src, at))
+    _put_scale(dst, fm, -f16_at(src, at + 2))
     var scales = at + 4
     var qh = at + 16
     var qs = at + 48
     for half in range(4):
         var lo = _k_scale(src, scales, half * 2)
         var hi = _k_scale(src, scales, half * 2 + 1)
-        _put_scale(dst, d + half * SCALE_BYTES * 2, d0 * lo[0])
-        _put_scale(dst, m + half * SCALE_BYTES * 2, -(dmin * lo[1]))
-        _put_scale(dst, d + half * SCALE_BYTES * 2 + SCALE_BYTES, d0 * hi[0])
-        _put_scale(
-            dst, m + half * SCALE_BYTES * 2 + SCALE_BYTES, -(dmin * hi[1])
-        )
+        _put_scale_byte(dst, d + half * 2, Int(lo[0]))
+        _put_scale_byte(dst, m + half * 2, Int(lo[1]))
+        _put_scale_byte(dst, d + half * 2 + 1, Int(hi[0]))
+        _put_scale_byte(dst, m + half * 2 + 1, Int(hi[1]))
         var u1 = 1 << (half * 2)
         var u2 = u1 << 1
         var b_at = qs + half * 32
@@ -672,7 +844,7 @@ def _pack_q5_k(
             var b = _u8(src, b_at + l)
             var h = _u8(src, qh + l)
             _put_quant(
-                QUANT_U5,
+                QUANT_K5,
                 dst,
                 to,
                 up,
@@ -680,7 +852,7 @@ def _pack_q5_k(
                 (b & 0xF) + (16 if (h & u1) != 0 else 0),
             )
             _put_quant(
-                QUANT_U5,
+                QUANT_K5,
                 dst,
                 to,
                 up,
@@ -690,7 +862,7 @@ def _pack_q5_k(
 
 
 def _pack_q6_k(
-    src: RawPtr, at: Int, dst: RawPtr, to: Int, up: Int, q: Int, d: Int
+    src: RawPtr, at: Int, dst: RawPtr, to: Int, up: Int, q: Int, d: Int, fd: Int
 ):
     """Sixteen groups of sixteen, and the awkward interleave paid off once.
 
@@ -700,12 +872,12 @@ def _pack_q6_k(
     bytes are read at in `molla.nn.quant`. That the two agree is why the group
     index can be the plain `i // 16` the kernel assumes.
     """
-    var d0 = f16_at(src, at + 208)
+    _put_scale(dst, fd, f16_at(src, at + 208))
     var ql = at
     var qh = at + 128
     var sc = at + 192
     for gi in range(16):
-        _put_scale(dst, d + gi * SCALE_BYTES, d0 * Float32(_i8(src, sc + gi)))
+        _put_scale_byte(dst, d + gi, _i8(src, sc + gi))
     for n in range(2):
         var lo = ql + n * 64
         var hb = qh + n * 32
@@ -746,6 +918,48 @@ def _pack_q6_k(
             )
 
 
+def _scale_planes(kind: Int, at: Int, cols: Int) raises -> Tuple[Int, Int]:
+    """Where one planar row keeps its dscale plane and its mscale plane.
+
+    Byte offsets into the mapping and not group counts, because the two planes
+    are a float16 a group in a plain form and a byte a group in a block scaled
+    one and the callers should not have to know which.
+    """
+    var groups = planar_groups(kind, cols)
+    var each = 1 if block_scaled(quant_form(kind)) else SCALE_BYTES
+    var d_at = at + planar_quant_bytes(kind, cols)
+    return (d_at, d_at + groups * each)
+
+
+def _factor_planes(kind: Int, at: Int, cols: Int) raises -> Tuple[Int, Int]:
+    """Where it keeps the two float16 factor planes, if it has any.
+
+    Zeroes for a plain form, which never asks: `_group_scale` reads a factor
+    only where `block_scaled` said there is one.
+    """
+    if not block_scaled(quant_form(kind)):
+        return (0, 0)
+    var planes = 2 if has_min(kind) else 1
+    var fd_at = (
+        at + planar_quant_bytes(kind, cols) + planes * planar_groups(kind, cols)
+    )
+    return (fd_at, fd_at + planar_blocks(kind, cols) * SCALE_BYTES)
+
+
+def _group_scale(kind: Int, p: RawPtr, base: Int, fac: Int, gi: Int) -> Float32:
+    """One group's scale, out of whichever planes this form keeps it in.
+
+    The float32 multiply is the whole of what a block scaled form costs to
+    read, and it happens once a group rather than once a value.
+    """
+    var form = quant_form(kind)
+    if not block_scaled(form):
+        return f16_at(p, base + gi * SCALE_BYTES)
+    var q = _i8(p, base + gi) if scale_signed(form) else _u8(p, base + gi)
+    var b = gi >> block_shift(form)
+    return f16_at(p, fac + b * SCALE_BYTES) * Float32(q)
+
+
 def planar_row_dot(
     kind: Int, p: RawPtr, at: Int, x: List[Float32], to: Int, n: Int
 ) raises -> Float32:
@@ -776,8 +990,8 @@ def planar_row_dot(
     var groups = n // g
     var form = quant_form(kind)
     var h_at = at + planar_low_bytes(kind, n)
-    var d_at = at + planar_quant_bytes(kind, n)
-    var m_at = d_at + groups * SCALE_BYTES
+    var planes = _scale_planes(kind, at, n)
+    var facs = _factor_planes(kind, at, n)
     var total = Float32(0)
     if has_min(kind):
         for gi in range(groups):
@@ -789,8 +1003,8 @@ def planar_row_dot(
                 var a = x[xb + l]
                 qx += Float32(_quant_at(form, p, at, h_at, qb + l)) * a
                 sx += a
-            total += f16_at(p, d_at + gi * SCALE_BYTES) * qx
-            total += f16_at(p, m_at + gi * SCALE_BYTES) * sx
+            total += _group_scale(kind, p, planes[0], facs[0], gi) * qx
+            total += _group_scale(kind, p, planes[1], facs[1], gi) * sx
         return total
     for gi in range(groups):
         var qb = gi * g
@@ -798,7 +1012,7 @@ def planar_row_dot(
         var qx = Float32(0)
         for l in range(g):
             qx += Float32(_quant_at(form, p, at, h_at, qb + l)) * x[xb + l]
-        total += f16_at(p, d_at + gi * SCALE_BYTES) * qx
+        total += _group_scale(kind, p, planes[0], facs[0], gi) * qx
     return total
 
 
@@ -829,14 +1043,14 @@ def planar_run(
     var groups = count // g
     var form = quant_form(kind)
     var h_at = at + planar_low_bytes(kind, count)
-    var d_at = at + planar_quant_bytes(kind, count)
-    var m_at = d_at + groups * SCALE_BYTES
+    var planes = _scale_planes(kind, at, count)
+    var facs = _factor_planes(kind, at, count)
     var carries_min = has_min(kind)
     for gi in range(groups):
-        var d = f16_at(p, d_at + gi * SCALE_BYTES)
-        var m = f16_at(p, m_at + gi * SCALE_BYTES) if carries_min else Float32(
-            0
-        )
+        var d = _group_scale(kind, p, planes[0], facs[0], gi)
+        var m = _group_scale(
+            kind, p, planes[1], facs[1], gi
+        ) if carries_min else Float32(0)
         var qb = gi * g
         var ob = to + gi * g
         for l in range(g):

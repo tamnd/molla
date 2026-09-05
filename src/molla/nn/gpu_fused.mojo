@@ -106,6 +106,8 @@ from molla.nn.gpu import (
 from molla.nn.gpu_ops import NEG_INF, _ramp, _reduce_angle, _tanh
 from molla.nn.repack import (
     QUANT_I8,
+    QUANT_K4,
+    QUANT_K5,
     QUANT_S4,
     QUANT_S5,
     QUANT_S6,
@@ -357,17 +359,21 @@ comptime OP_ACT = 4
 comptime OP_ADD = 5
 
 comptime QK_U4 = 0
-"""Unsigned nibbles, groups of 32, with a minimum plane. q4_1 and q4_K."""
+"""Unsigned nibbles, groups of 32, with a minimum plane. q4_1."""
 comptime QK_S4 = 1
 """Centred nibbles, groups of 32, no minimum. q4_0."""
 comptime QK_U5 = 2
-"""Five bits in two planes, groups of 32, with a minimum. q5_1 and q5_K."""
+"""Five bits in two planes, groups of 32, with a minimum. q5_1."""
 comptime QK_S5 = 3
 """Centred five bits in two planes, groups of 32, no minimum. q5_0."""
 comptime QK_S6 = 4
-"""Centred six bits in two planes, groups of 16, no minimum. q6_K."""
+"""Centred six bits in two planes, groups of 16, block scaled. q6_K."""
 comptime QK_I8 = 5
 """Bytes, groups of 32, no minimum. q8_0."""
+comptime QK_K4 = 6
+"""`QK_U4` with block scaled scale planes. q4_K."""
+comptime QK_K5 = 7
+"""`QK_U5` with block scaled scale planes. q5_K."""
 
 comptime NEOX_BIT = 1
 """Set in a rope record's kind when the pairing is neox."""
@@ -875,11 +881,11 @@ def fused_kernel(
             var w_at = _fi(plan_i, rec, R_W)
             var epi = _fi(plan_i, rec, R_EPI)
             var kind = _fi(plan_i, rec, R_KIND)
-            # The same six combinations the unfused dispatch compiles, chosen
-            # here by one uniform branch a record rather than by a parameter on
-            # the whole kernel. That is the price of one kernel source for every
-            # model: six copies of the accumulation loop in the binary and a
-            # branch executed once per projection.
+            # The same eight combinations the unfused dispatch compiles,
+            # chosen here by one uniform branch a record rather than by a
+            # parameter on the whole kernel. That is the price of one kernel
+            # source for every model: eight copies of the accumulation loop in
+            # the binary and a branch executed once per projection.
             if kind == QK_U4:
                 _do_matvec[32, True, QUANT_U4](
                     pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
@@ -898,6 +904,14 @@ def fused_kernel(
                 )
             elif kind == QK_S6:
                 _do_matvec[16, False, QUANT_S6](
+                    pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
+                )
+            elif kind == QK_K4:
+                _do_matvec[32, True, QUANT_K4](
+                    pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
+                )
+            elif kind == QK_K5:
+                _do_matvec[32, True, QUANT_K5](
                     pool, x, o, aux, w_at, cols, stride, rows, epi, b, blocks
                 )
             else:
@@ -1258,7 +1272,7 @@ def fused_kernel(
 
 
 def quant_kind(w: Tensor) raises -> Int:
-    """Which of the six compiled accumulation loops reads this weight.
+    """Which of the eight compiled accumulation loops reads this weight.
 
     Written out in full rather than inferred from the form, for the reason the
     unfused dispatch gives: a type added later that breaks one of the
@@ -1278,6 +1292,10 @@ def quant_kind(w: Tensor) raises -> Int:
         return QK_S5
     if form == QUANT_S6 and g == 16 and not carries_min:
         return QK_S6
+    if form == QUANT_K4 and g == 32 and carries_min:
+        return QK_K4
+    if form == QUANT_K5 and g == 32 and carries_min:
+        return QK_K5
     if form == QUANT_I8 and g == 32 and not carries_min:
         return QK_I8
     raise Error(

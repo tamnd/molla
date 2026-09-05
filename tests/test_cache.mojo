@@ -35,7 +35,15 @@ from molla.nn.repack import LAYOUT_PLANAR, unpack_run
 from molla.sys.device import DEV_CPU, Device
 from molla.sys.mmap import RawPtr
 
-comptime COLS = 64
+comptime COLS = 256
+"""Width of the fixture's two quantized tensors.
+
+Wide enough that a planar row lands on `ROW_ALIGN` with nothing to round up,
+which is what lets the neutrality check below say the layout costs these two
+types nothing. Every real model is wider than this and lands there too. A
+narrower fixture would be measuring the rounding rather than the layout.
+"""
+
 comptime ROWS = 4
 
 
