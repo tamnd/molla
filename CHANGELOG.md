@@ -4,6 +4,20 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.16] - 2026-09-06
+
+The KV cache is half the size it was, so an 8B at a context of 2048 holds 256 MiB of it rather than 512, and a long context decode on a 4090 is one per cent faster for it rather than slower. The logit corpus agrees with llama.cpp on both backends and the greedy picks are unchanged.
+
+### Changed
+
+- The device KV cache is held in half precision. It is the one buffer that grows with the conversation rather than with the model, and every key and value an attention read was twice the traffic it needed to be. llama.cpp has defaulted to a half cache for years, which is the strongest evidence available that it costs no accuracy worth having, and the corpus run here says the same: thirteen cases against llama.cpp on a 4090 and thirteen on an M4, moving in the fourth decimal place and nowhere above it. The standalone kernels needed almost nothing, because a launch boundary publishes what the launch before it wrote. The fused kernel needed a design, because Metal has no coherent sixteen bit store, so each of the three writers of the cache inside that one launch owns a whole aligned thirty two bit word: the projections walk their rows two at a time and pack a pair, the per head key norm owns a word and touches only its own two elements, and the rotation owns two adjacent rotation pairs so its four reads are exactly its two writes. CUDA has none of that constraint and pairing there anyway cost 3.8 per cent of a decode, so `PAIRED` decides and where it is false the three writers go back to one element a thread.
+- The width of a projection's output store is a compile time parameter rather than a bit of the epilogue word. It began as a bit, which put a branch into a store that every matvec and matmul in the engine shares, and `scripts/proj_probe.mojo` priced it at 6.6 ms a token going to 7.1 on projections that never ask for a half at all. Two instantiations and no branch inside either gives it back. See #249 for the other half of that measurement, which is that the prefill matmul is 14 per cent faster with the dead branch left in it.
+
+### Fixed
+
+- The block test fixture writes its planar scales at two bytes rather than four. A four byte store there wrote over the next group's scale and the start of the next row's quants, so the fixture built a matrix nothing else in the file thought it had built, with weights near a hundred instead of near a hundredth and a two layer stack reaching activations of 6.29e7. The strongest test in the repository had been comparing two paths on numbers where a float32 ulp was larger than the differences it was looking for.
+- The fused and unfused decode paths are compared on a tolerance rather than bit for bit where they add their keys up in different orders. The unfused kernel gives a head to a block and walks the whole key row, and the fused one cuts the row into slices and folds them the way flash decoding does, so the sums are the same sum in a different order and float addition is not associative. The cache comparison stays exact, because that is the one that catches a barrier in the wrong place.
+
 ## [0.4.15] - 2026-09-05
 
 Prefill on a 4090 runs 1.75 times faster on the two small models and 1.34 times on an 8B, and decode 1.08 to 1.15 times, because a thread of the batched matmul was issuing one load for every multiply and a narrow matvec row was reduced through eight barriers. A 1121 token prompt prefills in 67 ms against 126 on SmolLM2 and 2118 against 2925 on the 8B, and time to first token on the 8B is 987 ms against 1319. The output is unchanged.
