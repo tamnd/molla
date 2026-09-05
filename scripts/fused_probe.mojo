@@ -47,6 +47,7 @@ from molla.nn.gpu_fused import (
     OP_MATVEC,
     OP_NORM,
     OP_ROPE,
+    OP_STORE,
     R_COLS,
     R_N,
     R_OP,
@@ -94,6 +95,8 @@ def _name(op: Int) -> String:
         return "act"
     if op == OP_ADD:
         return "add"
+    if op == OP_STORE:
+        return "store"
     return "op " + String(op)
 
 
