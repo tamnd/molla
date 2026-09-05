@@ -277,13 +277,13 @@ def _put_pair(
     elements it covers are `2 * j` and `2 * j + 1`, `a` goes in the low one and
     `b` in the high one.
 
-    Every writer of the cache in this kernel therefore owns whole pairs. The
-    projections do it by taking rows two at a time and the rotations by owning a
-    pair of dimensions rather than a pair of angles, and both are free to do so
-    because a cache row is `kv_width` elements and every model molla accepts has
-    an even one. Two threads owning the two halves of a word would be a read
-    modify write on a value another core is holding, and there is no sixteen bit
-    atomic on either backend to make that safe.
+    Where `PAIRED` is true every writer of the cache in this kernel therefore
+    owns whole pairs. The projections do it by taking rows two at a time and the
+    rotations by owning a pair of dimensions rather than a pair of angles, and
+    both are free to do so because a cache row is `kv_width` elements and every
+    model molla accepts has an even one. Two threads owning the two halves of a
+    word would be a read modify write on a value another core is holding, and
+    there is no sixteen bit atomic on either backend to make that safe.
     """
     var word = bitcast[DType.int32, 1](
         SIMD[DType.float16, 2](Float16(a), Float16(b))
@@ -295,6 +295,33 @@ def _put_pair(
         )
     else:
         q[unsafe_offset=j] = word
+
+
+comptime PAIRED = CompilationTarget.is_macos()
+"""Whether a writer of the cache inside this kernel has to own an aligned pair.
+
+Metal, and only Metal. `_put` needs a thirty two bit atomic to get a value off
+the core that wrote it and a half is sixteen wide, so there the unit a writer
+owns is the pair. Everywhere else a plain store is already visible to the rest
+of the grid and a writer owns one element.
+
+The difference is worth having rather than writing one path for both. Taking
+rows two at a time gives half the warps nothing to do and the other half twice
+as much, and the record is one grid wide step either way, so it costs the step
+its whole second half. On an 8B on CUDA that measured 3.8 percent of a decode
+for nothing at all.
+"""
+
+
+@always_inline
+def _put_half(p: Pointer[Float32, MutAnyOrigin], i: Int, v: Float32):
+    """Write element `i` of the cache, narrowed on the way in.
+
+    The counterpart of `_put_pair` for a backend where the pair is not needed,
+    which is what `PAIRED` decides. There is no atomic here because there is no
+    backend that both needs one and has one this wide.
+    """
+    p.unsafe_bitcast[Float16]()[unsafe_offset=i] = Float16(v)
 
 
 @always_inline
@@ -585,12 +612,18 @@ def _epilogue(
 ):
     """What happens to a row once it is reduced, run by one thread.
 
-    The same three cases in the same order as the unfused matvec: a bias, or a
-    gated activation against the up projection, and then a residual add or a
-    plain store.
+    The same four cases in the same order as the unfused matvec: a bias, or a
+    gated activation against the up projection, and then a narrowing store to
+    the cache, a residual add, or a plain store.
+
+    The cache case is reached only where `PAIRED` is false. Where it is true a
+    row bound for the cache never comes here, because it is stored with its
+    neighbour by `_put_pair` and this writes one row at a time.
     """
     var v = _epi_value(aux, r, epi, total)
-    if epi & EPI_ADD != 0:
+    if epi & EPI_HALF != 0:
+        _put_half(o, r, v)
+    elif epi & EPI_ADD != 0:
         _put(o, r, _get(o, r) + v)
     else:
         _put(o, r, v)
@@ -627,14 +660,15 @@ def _do_matvec[
     weight reads of one round of the loop in one region of the pool.
 
     A projection whose output is the cache walks the same rows in the same
-    order and takes them two at a time, because a half is written as the aligned
-    pair it sits in and `_put_pair` says why. The reduction of a row is untouched
-    by that: which warp or which block adds a row up does not change the order
-    the columns come in, so the value is the same one the unfused matvec gets
-    and `tests/test_gpu_fused.mojo` still holds the two to every digit.
+    order and, where `PAIRED` says it must, takes them two at a time, because a
+    half is written as the aligned pair it sits in and `_put_pair` says why. The
+    reduction of a row is untouched by that: which warp or which block adds a row
+    up does not change the order the columns come in, so the value is the same
+    one the unfused matvec gets and `tests/test_gpu_fused.mojo` still holds the
+    two to every digit.
     """
     var t = Int(thread_idx.x)
-    var half = epi & EPI_HALF != 0
+    var half = PAIRED and epi & EPI_HALF != 0
     if row_takes_a_warp(cols):
         var lane = t % ALANES
         var warps = FTILE // ALANES
@@ -798,7 +832,7 @@ def fused_kernel(
                     i += FTILE
                 var total = _tree_sum(acc)
                 var scale = Float32(1.0) / sqrt(total / Float32(n) + eps)
-                if half:
+                if half and PAIRED:
                     var wj = t
                     while wj * 2 + 1 < n:
                         var e = at + wj * 2
@@ -817,11 +851,20 @@ def fused_kernel(
                     continue
                 i = t
                 while i < n:
-                    _put(
-                        o,
-                        at + i,
-                        _get(x, at + i) * scale * gain[unsafe_offset=i],
-                    )
+                    if half:
+                        _put_half(
+                            o,
+                            at + i,
+                            _get_half(x, at + i)
+                            * scale
+                            * gain[unsafe_offset=i],
+                        )
+                    else:
+                        _put(
+                            o,
+                            at + i,
+                            _get(x, at + i) * scale * gain[unsafe_offset=i],
+                        )
                     i += FTILE
                 run += blocks
 
@@ -887,7 +930,7 @@ def fused_kernel(
             var head = b
             while head < heads:
                 var at = head * head_dim
-                if half:
+                if half and PAIRED:
                     # Two rotations a thread rather than one, which makes the
                     # four elements it reads exactly the two words it writes.
                     # One rotation a thread would have it writing halves of two
@@ -988,10 +1031,16 @@ def fused_kernel(
                     if kind & NEOX_BIT == 0:
                         lo = at + pair * 2
                         hi = lo + 1
-                    var a = _get(x, lo)
-                    var bb = _get(x, hi)
-                    _put(o, lo, a * c - bb * s)
-                    _put(o, hi, a * s + bb * c)
+                    if half:
+                        var ha = _get_half(x, lo)
+                        var hb = _get_half(x, hi)
+                        _put_half(o, lo, ha * c - hb * s)
+                        _put_half(o, hi, ha * s + hb * c)
+                    else:
+                        var a = _get(x, lo)
+                        var bb = _get(x, hi)
+                        _put(o, lo, a * c - bb * s)
+                        _put(o, hi, a * s + bb * c)
                     pair += FTILE
                 head += blocks
 

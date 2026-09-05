@@ -66,6 +66,7 @@ from molla.nn.gpu import (
     device_matvec_into_half,
 )
 from molla.nn.gpu_fused import (
+    PAIRED,
     OP_ACT,
     OP_ADD,
     OP_ATTEND,
@@ -980,13 +981,14 @@ def _rope_record(
 ) raises -> Int:
     """One rotation in place, as a record.
 
-    A rotation on the cache is the one that runs on halves, and the fused kernel
-    gives a thread two rotations there so that what it writes is whole words.
-    That needs an even number of rotations in a head, which every model molla
-    has met has, and this is where the day one does not turns into a message
-    rather than into two threads writing over each other.
+    A rotation on the cache is the one that runs on halves, and where the fused
+    kernel has to write whole words it gives a thread two rotations so that what
+    it reads is what it writes. That needs an even number of rotations in a
+    head, which every model molla has met has, and this is where the day one
+    does not turns into a message rather than into two threads writing over each
+    other. It is asked only where the pairing is, which is `PAIRED`.
     """
-    if space == SPACE_KEYS and rope.dim % 4 != 0:
+    if PAIRED and space == SPACE_KEYS and rope.dim % 4 != 0:
         raise Error(
             "a rotation over "
             + String(rope.dim)
