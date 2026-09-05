@@ -83,6 +83,7 @@ from molla.nn.attention import AttnSpec
 from molla.nn.block import ACT_GELU, ACT_SILU, BlockSpec
 from molla.nn.gpu import (
     ACT_BIT,
+    ALANES,
     EPI_ADD,
     EPI_BIAS,
     EPI_GLU,
@@ -92,6 +93,7 @@ from molla.nn.gpu import (
     activate,
     byte_float,
     coherent_load,
+    key_dot,
     nibble_float,
     planar_partial_dot,
 )
@@ -781,23 +783,31 @@ def fused_kernel(
                 var hi = lo + span
                 if hi > count:
                     hi = count
+                # A warp to a key, the same `key_dot` the unfused kernels
+                # call, with the coherent load the rest of this kernel uses.
+                # The two paths have to agree in every bit and the reduction
+                # order is part of that, so this is one function and not two.
+                var lane = t % ALANES
+                var team = t // ALANES
+                var teams = FTILE // ALANES
                 var mine = NEG_INF
-                var j = lo + t
+                var j = lo + team
                 while j < hi:
                     var visible = j < sinks or window <= 0 or j > pos - window
                     var s = NEG_INF
                     if visible:
                         var ka = j * kv_width + kvh * head_dim
-                        var acc = Float32(0)
-                        for d in range(head_dim):
-                            acc += _get(x, qa + d) * _get(keys, ka + d)
-                        s = acc * scale
+                        s = (
+                            key_dot[True](x, keys, qa, ka, head_dim, lane)
+                            * scale
+                        )
                         if softcap > 0:
                             s = softcap * _tanh(s / softcap)
-                    scores[unsafe_offset=sa + j] = s
-                    if s > mine:
-                        mine = s
-                    j += FTILE
+                    if lane == 0:
+                        scores[unsafe_offset=sa + j] = s
+                        if s > mine:
+                            mine = s
+                    j += teams
                 var top = _tree_max(mine)
 
                 # A slice of a windowed model can be entirely outside the
