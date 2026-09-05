@@ -955,25 +955,28 @@ that fit in cache. A macOS build targets Metal and a build anywhere else
 targets CUDA, which is why the operating system is the thing asked here.
 """
 
-comptime PREFILL_CHUNK = 256 if CompilationTarget.is_macos() else 64
+comptime PREFILL_CHUNK = 256
 """How many prompt tokens go through the stack in one pass.
 
 A prompt is a matrix rather than a run of decodes, and this is how much of it
 is in flight at once. It trades launches against scratch: the launches for a
 prompt fall by this factor, and the attention scores grow by it, which on a
-thirty two head model at a four thousand context is 2 MiB a token. Sixty four
-is 128 times fewer launches than a token at a time and 33 MiB of scores on an
-8B, and at four passes for a five hundred token prompt the launches are no
-longer what is left.
+thirty two head model at a four thousand context is 2 MiB a token.
 
-It is two numbers because the two backends want different ones, and by a lot.
-On Metal the matrix core form covers thirty two tokens a block, so a chunk of
-sixty four is two blocks of the token axis and the GPU runs out of work before
-it runs out of rows: widening the chunk to 256 is 1611 tokens a second against
-2142 on SmolLM2. On CUDA the same widening goes the other way, and not by a
-little, 4990 to 3545 on Qwen and 378 to 181 on the 8B. That is #213, and a
-chunk picked for the kernel that runs on the target is the honest thing to
-write until it is answered.
+It was two numbers, 256 on Metal and 64 on CUDA, because widening it there cost
+the 8B half its prefill and Qwen a third. That was #213 and the cause was
+`MM_ROWS`, or rather its absence. A thread held one row, so a wider chunk bought
+nothing on the row axis and the extra token blocks contended for the same rows,
+and the scratch grew four times for it. With four rows a thread the same
+widening is a gain on every model: on a 4090 a 1121 token prompt prefills in 67
+ms against 119 on SmolLM2, 130 against 153 on Qwen, and 2118 against 2109 on the
+8B, which is flat rather than twice as slow.
+
+It keeps gaining past here and the scratch is why it stops. SmolLM2 prefills in
+60 ms at 512 and 56 at 1024, and a chunk of 1024 on a thirty two head 8B is 268
+MiB of scores at a two thousand context and 537 at four thousand, which is a
+larger share of a card than the whole of a small model. 256 takes most of the
+gain for a quarter of that.
 """
 
 comptime MM_TILE = 32
@@ -1042,8 +1045,27 @@ feeding `SPAN * MM_ROWS` multiplies. Four rows and eight tokens is sixty four
 multiplies for twenty four loads where it was sixteen for sixteen.
 
 It costs `SPAN * MM_ROWS` accumulators plus the activations, which is the reason
-it is four and not more. Metal keeps one, because a group of thirty two goes to
-`simd_matmul_kernel` there and this kernel is the six bit fallback.
+it is four and not more. Swept on a 4090 at a 1121 token prompt, milliseconds to
+prefill, against 126, 226 and 2925 for one row a thread:
+
+| rows | SmolLM2 | Qwen | 8B |
+| --- | --- | --- | --- |
+| 2 | 138 | 164 | 2552 |
+| 4 | 119 | 153 | 2109 |
+| 8 | 136 | 170 | 1654 |
+| 16 | 387 | 722 | 8270 |
+
+Sixteen is the register file giving out, and the loss there is the same shape as
+the loss this change started as: an array indexed by a loop the compiler did not
+unroll goes to local memory and every read of it becomes a load. That is why
+every loop over `SPAN` and `MM_ROWS` in the kernel is a `comptime for`.
+
+Four is the number because it wins on all three. Eight is better on the 8B by a
+further fifth and worse on SmolLM2, which is the row count of the matrix showing
+through, and picking on that is #244.
+
+Metal keeps one, because a group of thirty two goes to `simd_matmul_kernel`
+there and this kernel is the six bit fallback.
 """
 
 
