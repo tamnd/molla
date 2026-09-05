@@ -4,6 +4,20 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.15] - 2026-09-05
+
+Prefill on a 4090 runs 1.75 times faster on the two small models and 1.34 times on an 8B, and decode 1.08 to 1.15 times, because a thread of the batched matmul was issuing one load for every multiply and a narrow matvec row was reduced through eight barriers. A 1121 token prompt prefills in 67 ms against 126 on SmolLM2 and 2118 against 2925 on the 8B, and time to first token on the 8B is 987 ms against 1319. The output is unchanged.
+
+### Changed
+
+- A prefill thread carries four output rows rather than one. `SPAN` already amortized a weight read over tokens and nothing was doing the other half, so a step of the column loop was `SPAN` activation loads feeding `SPAN` multiplies, one load an operation, on a card that issues four times as many multiplies a cycle as loads. All three models prefilled between three and six TFLOP/s against a card that does eighty two in float, whatever their size, which is the shape of a kernel waiting on its load unit. Hoisting the activations out of a loop over four rows makes a step sixty four multiplies for twenty four loads. Sixteen rows is slower than one, because the accumulators stop fitting in registers, and so was four until the row loop was made to unroll.
+- The prefill chunk is 256 on both backends rather than 256 on Metal and 64 on CUDA. Widening it used to cost the 8B half its prefill, which was the row count above: a thread held one row, so a wider chunk bought nothing on the row axis while the extra token blocks contended for the same rows and the scratch grew four times for it. It now gains on every model. It keeps gaining past 256 and the scratch is why it stops there, since the scores are `chunk * heads * context` floats and a chunk of 1024 on a thirty two head 8B is 268 MiB of them.
+- A matvec row goes to a warp when it is narrow and to a block when it is wide, rather than always to a block. A 576 wide row over a block of 128 gives a thread four and a half values to carry eight barriers, and the probe measured the two 576 by 1536 projections of a SmolLM2 layer at 124 GB/s against 454 for the 1536 by 576 beside them, which is the same weights in the other orientation. A warp per row takes SmolLM2's decode from 238 ms to 220 for 128 tokens and Qwen's from 317.7 to 275.3. Doing it to every row instead cost the 8B 21 per cent, because a 4096 wide row already gives a thread thirty two values and the barriers were being paid for, so both matvecs ask `row_takes_a_warp` which of the two they are running. They have to agree: the two mappings add a row up in different orders and the fused path is held to a bit for bit match against the unfused one.
+
+### Fixed
+
+- The prefill chunk no longer has to be one number per backend. That was a workaround for a cause that is now understood and removed.
+
 ## [0.4.14] - 2026-09-05
 
 A SmolLM2 decode on a 4090 runs 1.20 times faster and Qwen2.5 0.5B 1.09 times, because the fold at the end of attention stopped running on five blocks out of three hundred and eighty four. SmolLM2 is 571.4 tokens a second against 476 and Qwen is 414.2 against 363, and both now decode faster than ollama. The output is byte identical.
