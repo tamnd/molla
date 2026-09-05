@@ -585,7 +585,9 @@ def planar_quant_stride[form: Int](cols: Int) -> Int:
 
 
 @always_inline
-def write_epilogue(
+def write_epilogue[
+    half: Bool
+](
     o: Pointer[Float32, MutAnyOrigin],
     aux: Pointer[Float32, MutAnyOrigin],
     epi: Int,
@@ -604,6 +606,14 @@ def write_epilogue(
     `out_at` is the index into the output and `r` is the row, which for a bias
     is the index into `aux` and for a gate is not, because a gate is a whole
     other output tensor of the same shape.
+
+    `half` is a parameter and not a bit of `epi` for a reason worth writing down.
+    It began as a bit, and the projections of an 8B went from 6.6 ms a token to
+    7.1 in `scripts/proj_probe.mojo`, which never asks for a half at all: the
+    feed forward projections lost twelve to twenty percent each because the
+    kernel they share now had a store the compiler could not see through. A
+    parameter puts the two stores in two kernels and gives the float one its
+    code back. The dispatch reads the bit once on the host and picks.
     """
     var got = v
     if epi & EPI_BIAS != 0:
@@ -614,15 +624,16 @@ def write_epilogue(
             got = activate[ACT_GELU](got) * g
         else:
             got = activate[ACT_SILU](got) * g
-    if epi & EPI_HALF != 0:
+    comptime if half:
         # The cache, narrowed on the way in. Everything above this point is the
         # same arithmetic in float that any other row gets, so the only
         # difference a half cache makes to a projection is the last store.
         o.unsafe_bitcast[Float16]()[unsafe_offset=out_at] = Float16(got)
-    elif epi & EPI_ADD != 0:
-        o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + got
     else:
-        o[unsafe_offset=out_at] = got
+        if epi & EPI_ADD != 0:
+            o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + got
+        else:
+            o[unsafe_offset=out_at] = got
 
 
 comptime _dev32 = Atomic[DType.int32, scope="device"]
@@ -982,7 +993,7 @@ def planar_row_sum[
 
 
 def planar_matvec_kernel[
-    tile: Int, group: Int, with_min: Bool, form: Int
+    tile: Int, group: Int, with_min: Bool, form: Int, half: Bool
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
@@ -1029,7 +1040,7 @@ def planar_matvec_kernel[
                 w, x, rw * stride, cols, lane
             )
             if lane == 0:
-                write_epilogue(o, aux, Int(epi_dev), rw, rw, total)
+                write_epilogue[half](o, aux, Int(epi_dev), rw, rw, total)
         return
 
     var r = Int(block_idx.x)
@@ -1058,7 +1069,7 @@ def planar_matvec_kernel[
         # One token, so the index into the output and the row are the same
         # number, which is why a gate reads `aux[r]` here and `aux[out_at]`
         # there and both are the same read.
-        write_epilogue(o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
+        write_epilogue[half](o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
 
 
 comptime MATVEC_BYTES = 8 if CompilationTarget.is_macos() else 1
@@ -1228,7 +1239,7 @@ there and this kernel is the six bit fallback.
 
 
 def planar_matmul_kernel[
-    tile: Int, group: Int, with_min: Bool, form: Int
+    tile: Int, group: Int, with_min: Bool, form: Int, half: Bool
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
@@ -1439,7 +1450,9 @@ def planar_matmul_kernel[
         # tail block is dropped here, which is the only place it has to be.
         var r = r0 + rr
         if t < live and r < rows:
-            write_epilogue(o, aux, Int(epi_dev), (base + t) * rows + r, r, got)
+            write_epilogue[half](
+                o, aux, Int(epi_dev), (base + t) * rows + r, r, got
+            )
 
 
 def device_ready() -> Bool:
@@ -1510,7 +1523,7 @@ def check_matvec_shapes(w: Tensor, in_elements: Int, out_elements: Int) raises:
 
 
 def _launch[
-    tile: Int, group: Int, with_min: Bool, form: Int
+    tile: Int, group: Int, with_min: Bool, form: Int, half: Bool
 ](
     ctx: DeviceContext,
     w: Tensor,
@@ -1520,7 +1533,9 @@ def _launch[
     epi: Int,
 ) raises:
     """One instantiation, launched. No transfer either side of it."""
-    ctx.enqueue_function[planar_matvec_kernel[tile, group, with_min, form]](
+    ctx.enqueue_function[
+        planar_matvec_kernel[tile, group, with_min, form, half]
+    ](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x.ptr(),
         o,
@@ -1644,30 +1659,47 @@ def _matvec_dispatch(
         # No null to check for inside the kernel, so a caller that asked for
         # nothing gets the output pointer and a kernel that reads it is one that
         # was asked to.
-        var a = aux.value() if aux and epi != EPI_NONE else o
-        var g = group_size(w.kind)
-        var carries_min = has_min(w.kind)
-        var form = quant_form(w.kind)
-        if form == QUANT_U4 and g == 32 and carries_min:
-            _launch[MATVEC_TILE, 32, True, QUANT_U4](ctx, w, x, o, a, epi)
-        elif form == QUANT_S4 and g == 32 and not carries_min:
-            _launch[MATVEC_TILE, 32, False, QUANT_S4](ctx, w, x, o, a, epi)
-        elif form == QUANT_U5 and g == 32 and carries_min:
-            _launch[MATVEC_TILE, 32, True, QUANT_U5](ctx, w, x, o, a, epi)
-        elif form == QUANT_S5 and g == 32 and not carries_min:
-            _launch[MATVEC_TILE, 32, False, QUANT_S5](ctx, w, x, o, a, epi)
-        elif form == QUANT_S6 and g == 16 and not carries_min:
-            _launch[MATVEC_TILE, 16, False, QUANT_S6](ctx, w, x, o, a, epi)
-        elif form == QUANT_I8 and g == 32 and not carries_min:
-            _launch[MATVEC_TILE, 32, False, QUANT_I8](ctx, w, x, o, a, epi)
+        var a = aux.value() if aux and epi & (EPI_BIAS | EPI_GLU) != 0 else o
+        if epi & EPI_HALF != 0:
+            _matvec_forms[True](ctx, w, x, o, a, epi)
         else:
-            raise Error(
-                "no device matvec is compiled for quant form "
-                + String(form)
-                + " with a group of "
-                + String(g)
-                + (" and a minimum plane" if carries_min else " and no minimum")
-            )
+            _matvec_forms[False](ctx, w, x, o, a, epi)
+
+
+def _matvec_forms[
+    half: Bool
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    o: Pointer[Float32, MutAnyOrigin],
+    a: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+) raises:
+    """The six quant forms, at one of the two widths the output can be."""
+    var g = group_size(w.kind)
+    var carries_min = has_min(w.kind)
+    var form = quant_form(w.kind)
+    if form == QUANT_U4 and g == 32 and carries_min:
+        _launch[MATVEC_TILE, 32, True, QUANT_U4, half](ctx, w, x, o, a, epi)
+    elif form == QUANT_S4 and g == 32 and not carries_min:
+        _launch[MATVEC_TILE, 32, False, QUANT_S4, half](ctx, w, x, o, a, epi)
+    elif form == QUANT_U5 and g == 32 and carries_min:
+        _launch[MATVEC_TILE, 32, True, QUANT_U5, half](ctx, w, x, o, a, epi)
+    elif form == QUANT_S5 and g == 32 and not carries_min:
+        _launch[MATVEC_TILE, 32, False, QUANT_S5, half](ctx, w, x, o, a, epi)
+    elif form == QUANT_S6 and g == 16 and not carries_min:
+        _launch[MATVEC_TILE, 16, False, QUANT_S6, half](ctx, w, x, o, a, epi)
+    elif form == QUANT_I8 and g == 32 and not carries_min:
+        _launch[MATVEC_TILE, 32, False, QUANT_I8, half](ctx, w, x, o, a, epi)
+    else:
+        raise Error(
+            "no device matvec is compiled for quant form "
+            + String(form)
+            + " with a group of "
+            + String(g)
+            + (" and a minimum plane" if carries_min else " and no minimum")
+        )
 
 
 comptime MMA_ROWS = 64
@@ -1735,7 +1767,7 @@ what decides how many blocks a core can hold at once.
 
 
 def planar_mma_kernel[
-    group: Int, with_min: Bool, form: Int
+    group: Int, with_min: Bool, form: Int, half: Bool
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
@@ -1929,7 +1961,7 @@ def planar_mma_kernel[
         var r = idx % MMA_ROWS
         if t0 + t >= tokens or r0 + r >= rows:
             continue
-        write_epilogue(
+        write_epilogue[half](
             o,
             aux,
             epi,
@@ -1940,7 +1972,7 @@ def planar_mma_kernel[
 
 
 def _launch_mma[
-    group: Int, with_min: Bool, form: Int
+    group: Int, with_min: Bool, form: Int, half: Bool
 ](
     ctx: DeviceContext,
     w: Tensor,
@@ -1951,7 +1983,7 @@ def _launch_mma[
     tokens: Int,
 ) raises:
     """One instantiation of the matrix core form, launched."""
-    ctx.enqueue_function[planar_mma_kernel[group, with_min, form]](
+    ctx.enqueue_function[planar_mma_kernel[group, with_min, form, half]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x,
         o,
@@ -1971,7 +2003,7 @@ def _launch_mma[
 
 
 def _launch_mm[
-    tile: Int, group: Int, with_min: Bool, form: Int
+    tile: Int, group: Int, with_min: Bool, form: Int, half: Bool
 ](
     ctx: DeviceContext,
     w: Tensor,
@@ -1982,7 +2014,9 @@ def _launch_mm[
     tokens: Int,
 ) raises:
     """One instantiation of the batched form, launched."""
-    ctx.enqueue_function[planar_matmul_kernel[tile, group, with_min, form]](
+    ctx.enqueue_function[
+        planar_matmul_kernel[tile, group, with_min, form, half]
+    ](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x,
         o,
@@ -2112,78 +2146,99 @@ def _matmul_dispatch(
             " not when it is run"
         )
     else:
-        var a = aux.value() if aux and epi != EPI_NONE else o
-        var p = x.ptr()
-        var g = group_size(w.kind)
-        var carries_min = has_min(w.kind)
-        var form = quant_form(w.kind)
-        # The matrix core form first where it exists, which today is Apple only.
-        # `TensorCore` in MAX has no integer case, so the widest thing a 4090
-        # offers here is the half precision tensor core, and #212 has the
-        # measurement that says a tile built on it the same way this one is
-        # loses to the ordinary kernel on two models out of three.
-        #
-        # A group of sixteen stages two groups to a step and is left on the
-        # ordinary form until there is a model that wants it.
-        comptime if CompilationTarget.is_macos():
-            if g == 32:
-                if form == QUANT_U4 and carries_min:
-                    _launch_mma[32, True, QUANT_U4](
-                        ctx, w, p, o, a, epi, tokens
-                    )
-                    return
-                if form == QUANT_S4 and not carries_min:
-                    _launch_mma[32, False, QUANT_S4](
-                        ctx, w, p, o, a, epi, tokens
-                    )
-                    return
-                if form == QUANT_U5 and carries_min:
-                    _launch_mma[32, True, QUANT_U5](
-                        ctx, w, p, o, a, epi, tokens
-                    )
-                    return
-                if form == QUANT_S5 and not carries_min:
-                    _launch_mma[32, False, QUANT_S5](
-                        ctx, w, p, o, a, epi, tokens
-                    )
-                    return
-                if form == QUANT_I8 and not carries_min:
-                    _launch_mma[32, False, QUANT_I8](
-                        ctx, w, p, o, a, epi, tokens
-                    )
-                    return
-        if form == QUANT_U4 and g == 32 and carries_min:
-            _launch_mm[MM_TILE, 32, True, QUANT_U4](
-                ctx, w, p, o, a, epi, tokens
-            )
-        elif form == QUANT_S4 and g == 32 and not carries_min:
-            _launch_mm[MM_TILE, 32, False, QUANT_S4](
-                ctx, w, p, o, a, epi, tokens
-            )
-        elif form == QUANT_U5 and g == 32 and carries_min:
-            _launch_mm[MM_TILE, 32, True, QUANT_U5](
-                ctx, w, p, o, a, epi, tokens
-            )
-        elif form == QUANT_S5 and g == 32 and not carries_min:
-            _launch_mm[MM_TILE, 32, False, QUANT_S5](
-                ctx, w, p, o, a, epi, tokens
-            )
-        elif form == QUANT_S6 and g == 16 and not carries_min:
-            _launch_mm[MM_TILE, 16, False, QUANT_S6](
-                ctx, w, p, o, a, epi, tokens
-            )
-        elif form == QUANT_I8 and g == 32 and not carries_min:
-            _launch_mm[MM_TILE, 32, False, QUANT_I8](
-                ctx, w, p, o, a, epi, tokens
-            )
+        var a = aux.value() if aux and epi & (EPI_BIAS | EPI_GLU) != 0 else o
+        if epi & EPI_HALF != 0:
+            _matmul_forms[True](ctx, w, x.ptr(), o, a, epi, tokens)
         else:
-            raise Error(
-                "no device matmul is compiled for quant form "
-                + String(form)
-                + " with a group of "
-                + String(g)
-                + (" and a minimum plane" if carries_min else " and no minimum")
-            )
+            _matmul_forms[False](ctx, w, x.ptr(), o, a, epi, tokens)
+
+
+def _matmul_forms[
+    half: Bool
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    p: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    a: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+    tokens: Int,
+) raises:
+    """The six quant forms, at one of the two widths the output can be.
+
+    Split from the dispatch above it for the reason `write_epilogue` gives:
+    a store the compiler can see through is worth two kernels.
+    """
+    var g = group_size(w.kind)
+    var carries_min = has_min(w.kind)
+    var form = quant_form(w.kind)
+    # The matrix core form first where it exists, which today is Apple only.
+    # `TensorCore` in MAX has no integer case, so the widest thing a 4090
+    # offers here is the half precision tensor core, and #212 has the
+    # measurement that says a tile built on it the same way this one is
+    # loses to the ordinary kernel on two models out of three.
+    #
+    # A group of sixteen stages two groups to a step and is left on the
+    # ordinary form until there is a model that wants it.
+    comptime if CompilationTarget.is_macos():
+        if g == 32:
+            if form == QUANT_U4 and carries_min:
+                _launch_mma[32, True, QUANT_U4, half](
+                    ctx, w, p, o, a, epi, tokens
+                )
+                return
+            if form == QUANT_S4 and not carries_min:
+                _launch_mma[32, False, QUANT_S4, half](
+                    ctx, w, p, o, a, epi, tokens
+                )
+                return
+            if form == QUANT_U5 and carries_min:
+                _launch_mma[32, True, QUANT_U5, half](
+                    ctx, w, p, o, a, epi, tokens
+                )
+                return
+            if form == QUANT_S5 and not carries_min:
+                _launch_mma[32, False, QUANT_S5, half](
+                    ctx, w, p, o, a, epi, tokens
+                )
+                return
+            if form == QUANT_I8 and not carries_min:
+                _launch_mma[32, False, QUANT_I8, half](
+                    ctx, w, p, o, a, epi, tokens
+                )
+                return
+    if form == QUANT_U4 and g == 32 and carries_min:
+        _launch_mm[MM_TILE, 32, True, QUANT_U4, half](
+            ctx, w, p, o, a, epi, tokens
+        )
+    elif form == QUANT_S4 and g == 32 and not carries_min:
+        _launch_mm[MM_TILE, 32, False, QUANT_S4, half](
+            ctx, w, p, o, a, epi, tokens
+        )
+    elif form == QUANT_U5 and g == 32 and carries_min:
+        _launch_mm[MM_TILE, 32, True, QUANT_U5, half](
+            ctx, w, p, o, a, epi, tokens
+        )
+    elif form == QUANT_S5 and g == 32 and not carries_min:
+        _launch_mm[MM_TILE, 32, False, QUANT_S5, half](
+            ctx, w, p, o, a, epi, tokens
+        )
+    elif form == QUANT_S6 and g == 16 and not carries_min:
+        _launch_mm[MM_TILE, 16, False, QUANT_S6, half](
+            ctx, w, p, o, a, epi, tokens
+        )
+    elif form == QUANT_I8 and g == 32 and not carries_min:
+        _launch_mm[MM_TILE, 32, False, QUANT_I8, half](
+            ctx, w, p, o, a, epi, tokens
+        )
+    else:
+        raise Error(
+            "no device matmul is compiled for quant form "
+            + String(form)
+            + " with a group of "
+            + String(g)
+            + (" and a minimum plane" if carries_min else " and no minimum")
+        )
 
 
 def device_matvec(
