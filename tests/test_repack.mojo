@@ -43,16 +43,23 @@ from molla.nn.repack import (
     LAYOUT_PLANAR,
     LAYOUT_VERSION,
     QUANT_I8,
+    QUANT_K4,
+    QUANT_K5,
     QUANT_S4,
     QUANT_S5,
     QUANT_S6,
     QUANT_U4,
     QUANT_U5,
+    ROW_ALIGN,
+    block_groups,
+    block_scaled,
+    block_shift,
     group_size,
     has_min,
     planar_groups,
     planar_quant_bytes,
     planar_row_bytes,
+    planar_scale_bytes,
     planar_row_dot,
     planar_run,
     quant_bits,
@@ -61,6 +68,7 @@ from molla.nn.repack import (
     repack_row,
     group_shift,
     repackable,
+    scale_signed,
     unpack_run,
 )
 from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
@@ -252,15 +260,42 @@ def test_geometry(mut suite: Suite) raises:
     suite.check(
         quant_form(Q_Q4_1) == QUANT_U4, "q4_1 keeps its nibbles unsigned"
     )
-    suite.check(quant_form(Q_Q4_K) == QUANT_U4, "and so does q4_k")
     suite.check(
-        quant_form(Q_Q5_K) == QUANT_U5,
+        quant_form(Q_Q5_1) == QUANT_U5,
         "an unsigned five bit type is two planes",
     )
     suite.check(
         quant_form(Q_Q5_0) == QUANT_S5, "and q5_0 is the same two read lower"
     )
     suite.check(quant_form(Q_Q6_K) == QUANT_S6, "q6_k is the six bit form")
+    suite.check(
+        quant_form(Q_Q4_K) == QUANT_K4,
+        "q4_k reads q4_1's nibbles out of its own form",
+    )
+    suite.check(
+        quant_form(Q_Q5_K) == QUANT_K5, "and q5_k reads q5_1's two planes"
+    )
+    for i in range(len(kinds)):
+        var kind = kinds[i]
+        var k = kind == Q_Q4_K or kind == Q_Q5_K or kind == Q_Q6_K
+        suite.check(
+            block_scaled(quant_form(kind)) == k,
+            "the three k types are the block scaled ones, and "
+            + _label(kind)
+            + (" is" if k else " is not"),
+        )
+    suite.check(
+        scale_signed(QUANT_S6) and not scale_signed(QUANT_K4),
+        "q6_k's group scales are signed and q4_k's are not",
+    )
+    suite.check(
+        block_groups(QUANT_K4) == 8 and block_groups(QUANT_S6) == 16,
+        "a 256 value block is eight groups at q4_k and sixteen at q6_k",
+    )
+    suite.check(
+        block_shift(QUANT_K4) == 3 and block_shift(QUANT_U4) == 0,
+        "a block index is a shift, and a plain form has no block",
+    )
     suite.check(quant_form(Q_Q8_0) == QUANT_I8, "an eight bit one takes a byte")
     suite.check(quant_bits(Q_Q4_K) == 4, "four bit types are four bits wide")
     suite.check(quant_bits(Q_Q5_0) == 5, "five bit types are five")
@@ -272,6 +307,10 @@ def test_geometry(mut suite: Suite) raises:
     )
     suite.check(quant_high_bits(QUANT_S5) == 1, "a five bit form carries one")
     suite.check(quant_high_bits(QUANT_S6) == 2, "and a six bit form two")
+    suite.check(
+        quant_high_bits(QUANT_K4) == 0 and quant_high_bits(QUANT_K5) == 1,
+        "a k form reads its quants at the width the plain form does",
+    )
 
     suite.check(
         planar_quant_bytes(Q_Q8_0, 256) == 256,
@@ -291,24 +330,46 @@ def test_geometry(mut suite: Suite) raises:
     )
 
     # The quant plane at the type's own width, plus one float16 scale plane, or
-    # two planes when there is a minimum.
+    # two planes when there is a minimum, and a byte a group plus a float16 a
+    # block for the three k types.
     suite.check(
-        planar_row_bytes(Q_Q8_0, 256) == 256 + 8 * 2,
+        planar_scale_bytes(Q_Q8_0, 256) == 8 * 2,
         "a centred row is the quants and one scale plane",
     )
     suite.check(
-        planar_row_bytes(Q_Q4_K, 256) == 128 + 8 * 2 + 8 * 2,
+        planar_scale_bytes(Q_Q4_1, 256) == 8 * 2 + 8 * 2,
         "and a row with a minimum carries a second plane",
     )
     suite.check(
-        planar_row_bytes(Q_Q6_K, 256) == 128 + 64 + 16 * 2,
-        "q6_k has twice the scales and no minimum",
+        planar_scale_bytes(Q_Q4_K, 256) == 2 * (8 + 2),
+        "a k type with a minimum is a byte a group and a float16 a block",
+    )
+    suite.check(
+        planar_scale_bytes(Q_Q6_K, 256) == 16 + 2,
+        "q6_k has twice the groups in a block and no minimum",
+    )
+    # The block for block figures the issue this came from is judged on. ggml
+    # is 144, 176 and 210 bytes for the same three.
+    suite.check(
+        planar_quant_bytes(Q_Q4_K, 256) + planar_scale_bytes(Q_Q4_K, 256)
+        == 148,
+        "a q4_k block is 148 bytes planar against 144 in the file",
+    )
+    suite.check(
+        planar_quant_bytes(Q_Q5_K, 256) + planar_scale_bytes(Q_Q5_K, 256)
+        == 180,
+        "a q5_k block is 180 against 176",
+    )
+    suite.check(
+        planar_quant_bytes(Q_Q6_K, 256) + planar_scale_bytes(Q_Q6_K, 256)
+        == 210,
+        "and a q6_k block is 210 against 210, which is neutral",
     )
     for i in range(len(kinds)):
         var kind = kinds[i]
         suite.check(
-            planar_row_bytes(kind, 512) % 4 == 0,
-            _label(kind) + " rows are a multiple of four bytes long",
+            planar_row_bytes(kind, 512) % ROW_ALIGN == 0,
+            _label(kind) + " rows are a whole number of alignments long",
         )
 
     var raised = False
@@ -319,28 +380,20 @@ def test_geometry(mut suite: Suite) raises:
     suite.check(raised, "a row that is not whole groups has no planar size")
 
 
-def _exact(kind: Int) -> Bool:
-    """Whether this type round trips through the planar layout bit for bit.
-
-    Five of the eight do. Their scale is a float16 out of the block and it goes
-    into a float16 plane, so nothing about it moves. The three k types do not,
-    because what their planes hold is a product of that float16 and a small
-    integer, and a product needs more mantissa than either factor. That is the
-    one lossy step in the whole module and this is where it is named.
-    """
-    return kind != Q_Q4_K and kind != Q_Q5_K and kind != Q_Q6_K
-
-
 def test_round_trip(mut suite: Suite) raises:
-    """Repack and decode gives back what the blocks decode to.
+    """Repack and decode gives back what the blocks decode to, bit for bit.
 
-    Exactly for the five types `_exact` names, because every step of their fold
-    is an integer operation or a float32 multiply of the same two numbers the
-    decoder multiplies. Within a bound for the three k types, whose scale is
-    rounded to float16 once at repack time. The bound is 2^-11 of the largest
-    magnitude in the run, which is what one rounding of one factor can be worth,
-    and the observed worst case is well inside it: see docs/validation/logits.md
-    for the same question asked of a whole model.
+    All eight types, because every step of the fold is an integer operation or
+    a float32 multiply of the same two numbers the decoder multiplies. The five
+    plain types keep their scale as the float16 the block had. The three k types
+    keep the float16 and the small integer apart and form the product on the
+    read, which is what the decoder does with the same two factors in the same
+    order, so there is nothing left to round.
+
+    That was not true until the k types moved to a byte a group. Their scale
+    plane held the rounded product and this test carried a tolerance of 2^-11 of
+    the largest magnitude in the run for them. docs/validation/logits.md has
+    what that was worth over a whole model.
     """
     suite.group("nn.repack decodes to the same numbers")
 
@@ -358,13 +411,9 @@ def test_round_trip(mut suite: Suite) raises:
         var got = _floats(n)
         planar_run(kind, _ptr(planar), 0, n, got, 0)
 
-        var peak = Float32(0)
         var worst = Float32(0)
         var first = -1
         for j in range(n):
-            var a = want[j] if want[j] >= 0 else -want[j]
-            if a > peak:
-                peak = a
             var gap = got[j] - want[j]
             if gap < 0:
                 gap = -gap
@@ -372,15 +421,10 @@ def test_round_trip(mut suite: Suite) raises:
                 worst = gap
             if gap != 0 and first < 0:
                 first = j
-        var bound = Float32(0) if _exact(kind) else peak / 2048.0
         suite.check(
-            worst <= bound,
+            worst == 0,
             _label(kind)
-            + (
-                " repacked and decoded is bit for bit the blocks decoded" if _exact(
-                    kind
-                ) else " repacked and decoded is within one float16 rounding"
-            )
+            + " repacked and decoded is bit for bit the blocks decoded"
             + ("" if first < 0 else ", first differs at " + String(first)),
         )
 

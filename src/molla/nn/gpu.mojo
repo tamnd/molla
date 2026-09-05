@@ -65,18 +65,23 @@ from molla.nn.block import ACT_GELU, ACT_SILU
 from molla.nn.repack import (
     LAYOUT_PLANAR,
     QUANT_I8,
+    QUANT_K4,
+    QUANT_K5,
     QUANT_S4,
     QUANT_S5,
     QUANT_S6,
     QUANT_U4,
     QUANT_U5,
     SCALE_BYTES,
+    block_scaled,
+    block_shift,
     group_shift,
     group_size,
     has_min,
     quant_bias,
     quant_form,
     quant_high_bits,
+    scale_signed,
 )
 from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
 
@@ -548,7 +553,7 @@ def wide_float[form: Int](u: UInt32) -> Float32:
 
 @always_inline
 def _scale(s: Pointer[Float16, MutAnyOrigin], at: Int) -> Float32:
-    """One group scale, widened on load.
+    """One float16 out of a scale plane, widened on load.
 
     The plane is float16 and everything downstream of this is float32, and every
     GPU in the fleet widens in the load instruction rather than in an
@@ -557,6 +562,79 @@ def _scale(s: Pointer[Float16, MutAnyOrigin], at: Int) -> Float32:
     width of a scale is one decision and it should read as one.
     """
     return s[unsafe_offset=at].cast[DType.float32]()
+
+
+@always_inline
+def ubyte_float(u: UInt32) -> Float32:
+    """One unsigned byte, as a float, without a convert.
+
+    `byte_float` without the flip, since a value that is already 0 to 255 is
+    already in the range the mantissa holds. Used for the group scale bytes of
+    q4_k and q5_k, which are six bit unsigned integers out of the file.
+    """
+    return bitcast[DType.float32, 1](MAGIC | u) - Float32(8388608.0)
+
+
+@always_inline
+def _group_scale[
+    form: Int
+](
+    s: Pointer[Float16, MutAnyOrigin],
+    b: Pointer[UInt8, MutAnyOrigin],
+    at: Int,
+    fac: Int,
+    gi: Int,
+) -> Float32:
+    """Group `gi`'s scale, out of whichever planes this form keeps it in.
+
+    `at` is the plane's base and it is not the same unit in the two cases: a
+    float16 index for a plain form and a byte offset for a block scaled one,
+    because that is what each plane is indexed in and converting one to the
+    other at every call site would be a shift to undo a shift. `fac` is the
+    float16 index of the factor plane and a plain form does not have one.
+
+    What a block scaled form costs to read is the byte load and the multiply
+    here, once a group, against half the bytes in the plane the multiply
+    replaced. The factor load is not a third cost worth counting: eight or
+    sixteen consecutive groups share one, so it is in cache by the second of
+    them and it is two bytes for a whole block either way.
+    """
+    comptime if block_scaled(form):
+        comptime shift = block_shift(form)
+        var q = UInt32(b[unsafe_offset=at + gi])
+        comptime if scale_signed(form):
+            return _scale(s, fac + (gi >> shift)) * byte_float(q)
+        else:
+            return _scale(s, fac + (gi >> shift)) * ubyte_float(q)
+    else:
+        return _scale(s, at + gi)
+
+
+@always_inline
+def _scale_bases[
+    form: Int, with_min: Bool
+](row: Int, cols: Int, groups: Int) -> InlineArray[Int, 4]:
+    """The four plane bases one row's scales are read through.
+
+    In order: the dscale plane, the mscale plane, and the two factor planes,
+    at the units `_group_scale` wants them in. A plain form leaves the last two
+    at zero and never reads them, and a form with no minimum leaves the second
+    and the fourth pointing at the plane after, which nothing reads either.
+    """
+    var at = row + planar_quant_stride[form](cols)
+    var out = InlineArray[Int, 4](fill=0)
+    comptime if block_scaled(form):
+        comptime planes = 2 if with_min else 1
+        var blocks = groups >> block_shift(form)
+        var fd = (at + planes * groups) // SCALE_BYTES
+        out[0] = at
+        out[1] = at + groups
+        out[2] = fd
+        out[3] = fd + blocks
+    else:
+        out[0] = at // SCALE_BYTES
+        out[1] = out[0] + groups
+    return out^
 
 
 @always_inline
@@ -797,8 +875,7 @@ def planar_partial_dot[
     # way.
     var packed = w
     var scales = w.unsafe_bitcast[Float16]()
-    var d_base = (row + planar_quant_stride[form](cols)) // SCALE_BYTES
-    var m_base = d_base + groups
+    var base = _scale_bases[form, with_min](row, cols, groups)
 
     # A shift and not `i // group`, which is a signed divide and which Metal
     # keeps. See `group_shift` for what it costs there.
@@ -810,10 +887,10 @@ def planar_partial_dot[
         while i < cols:
             var gi = i >> shift
             var at = row + i
-            var d = _scale(scales, d_base + gi)
+            var d = _group_scale[form](scales, packed, base[0], base[2], gi)
             var m = Float32(0)
             comptime if with_min:
-                m = _scale(scales, m_base + gi)
+                m = _group_scale[form](scales, packed, base[1], base[3], gi)
             comptime for k in range(MATVEC_BYTES):
                 var q = byte_float(UInt32(packed[unsafe_offset=at + k]))
                 var a = coherent_load[coherent](x, i + k)
@@ -854,10 +931,10 @@ def planar_partial_dot[
         while i < cols:
             var gi = i >> shift
             var at = row + (i >> 1)
-            var d = _scale(scales, d_base + gi)
+            var d = _group_scale[form](scales, packed, base[0], base[2], gi)
             var m = Float32(0)
             comptime if with_min:
-                m = _scale(scales, m_base + gi)
+                m = _group_scale[form](scales, packed, base[1], base[3], gi)
             comptime for k in range(MATVEC_STEP // 2):
                 var b = UInt32(packed[unsafe_offset=at + k])
                 var lo = nibble_float[form](b & 0xF)
@@ -895,10 +972,10 @@ def planar_partial_dot[
         while i < cols:
             var gi = i >> shift
             var at = row + (i >> 1)
-            var d = _scale(scales, d_base + gi)
+            var d = _group_scale[form](scales, packed, base[0], base[2], gi)
             var m = Float32(0)
             comptime if with_min:
-                m = _scale(scales, m_base + gi)
+                m = _group_scale[form](scales, packed, base[1], base[3], gi)
             comptime for k in range(MATVEC_STEP // 2):
                 var b = UInt32(packed[unsafe_offset=at + k])
                 # `i` is a multiple of the step, so when the step covers a whole
@@ -1305,15 +1382,23 @@ def planar_matmul_kernel[
     # clamp is arithmetic done once before the loop, a test would be inside it,
     # and what the clamped row computes is thrown away by the store below.
     var rowb = InlineArray[Int, MM_ROWS](fill=0)
+    # Four bases a row rather than two, because a block scaled form reads its
+    # group scale out of a byte plane and its block factor out of a float16
+    # one. The two a plain form does not have are zero and nothing reads them.
     var d_base = InlineArray[Int, MM_ROWS](fill=0)
     var m_base = InlineArray[Int, MM_ROWS](fill=0)
+    var fd_base = InlineArray[Int, MM_ROWS](fill=0)
+    var fm_base = InlineArray[Int, MM_ROWS](fill=0)
     comptime for rr in range(MM_ROWS):
         var rq = r0 + rr
         if rq >= rows:
             rq = rows - 1
         rowb[rr] = rq * stride
-        d_base[rr] = (rowb[rr] + planar_quant_stride[form](cols)) // SCALE_BYTES
-        m_base[rr] = d_base[rr] + groups
+        var b = _scale_bases[form, with_min](rowb[rr], cols, groups)
+        d_base[rr] = b[0]
+        m_base[rr] = b[1]
+        fd_base[rr] = b[2]
+        fm_base[rr] = b[3]
 
     comptime shift = group_shift(group)
 
@@ -1355,9 +1440,16 @@ def planar_matmul_kernel[
                 a[k] = x[unsafe_offset=at0 + k * cols + i]
             comptime for rr in range(MM_ROWS):
                 var q = byte_float(UInt32(packed[unsafe_offset=rowb[rr] + i]))
-                var d = _scale(scales, d_base[rr] + gi) * q
+                var d = (
+                    _group_scale[form](
+                        scales, packed, d_base[rr], fd_base[rr], gi
+                    )
+                    * q
+                )
                 comptime if with_min:
-                    var m = _scale(scales, m_base[rr] + gi)
+                    var m = _group_scale[form](
+                        scales, packed, m_base[rr], fm_base[rr], gi
+                    )
                     comptime for k in range(SPAN):
                         acc[rr * SPAN + k] += d * a[k] + m * a[k]
                 else:
@@ -1375,11 +1467,15 @@ def planar_matmul_kernel[
                 a1[k] = x[unsafe_offset=at0 + k * cols + i + 1]
             comptime for rr in range(MM_ROWS):
                 var b = UInt32(packed[unsafe_offset=rowb[rr] + (i >> 1)])
-                var d = _scale(scales, d_base[rr] + gi)
+                var d = _group_scale[form](
+                    scales, packed, d_base[rr], fd_base[rr], gi
+                )
                 var lo = d * nibble_float[form](b & 0xF)
                 var hi = d * nibble_float[form](b >> 4)
                 comptime if with_min:
-                    var m = _scale(scales, m_base[rr] + gi)
+                    var m = _group_scale[form](
+                        scales, packed, m_base[rr], fm_base[rr], gi
+                    )
                     comptime for k in range(SPAN):
                         acc[rr * SPAN + k] += (
                             lo * a0[k] + hi * a1[k] + m * (a0[k] + a1[k])
@@ -1411,7 +1507,9 @@ def planar_matmul_kernel[
                 var h = UInt32(
                     packed[unsafe_offset=rowb[rr] + (cols >> 1) + (i >> hshift)]
                 )
-                var d = _scale(scales, d_base[rr] + gi)
+                var d = _group_scale[form](
+                    scales, packed, d_base[rr], fd_base[rr], gi
+                )
                 var lo = d * wide_float[form](
                     (b & 0xF) | (((h >> s0) & hmask) << 4)
                 )
@@ -1419,7 +1517,9 @@ def planar_matmul_kernel[
                     (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
                 )
                 comptime if with_min:
-                    var m = _scale(scales, m_base[rr] + gi)
+                    var m = _group_scale[form](
+                        scales, packed, m_base[rr], fm_base[rr], gi
+                    )
                     comptime for k in range(SPAN):
                         acc[rr * SPAN + k] += (
                             lo * a0[k] + hv * a1[k] + m * (a0[k] + a1[k])
@@ -1676,7 +1776,7 @@ def _matvec_forms[
     a: Pointer[Float32, MutAnyOrigin],
     epi: Int,
 ) raises:
-    """The six quant forms, at one of the two widths the output can be."""
+    """The eight quant forms, at one of the two widths the output can be."""
     var g = group_size(w.kind)
     var carries_min = has_min(w.kind)
     var form = quant_form(w.kind)
@@ -1690,6 +1790,10 @@ def _matvec_forms[
         _launch[MATVEC_TILE, 32, False, QUANT_S5, half](ctx, w, x, o, a, epi)
     elif form == QUANT_S6 and g == 16 and not carries_min:
         _launch[MATVEC_TILE, 16, False, QUANT_S6, half](ctx, w, x, o, a, epi)
+    elif form == QUANT_K4 and g == 32 and carries_min:
+        _launch[MATVEC_TILE, 32, True, QUANT_K4, half](ctx, w, x, o, a, epi)
+    elif form == QUANT_K5 and g == 32 and carries_min:
+        _launch[MATVEC_TILE, 32, True, QUANT_K5, half](ctx, w, x, o, a, epi)
     elif form == QUANT_I8 and g == 32 and not carries_min:
         _launch[MATVEC_TILE, 32, False, QUANT_I8, half](ctx, w, x, o, a, epi)
     else:
@@ -1846,8 +1950,7 @@ def planar_mma_kernel[
     var row = (r0 + wr) * stride if live_row else 0
     var groups = cols // group
     var scales = w.unsafe_bitcast[Float16]()
-    var d_base = (row + planar_quant_stride[form](cols)) // SCALE_BYTES
-    var m_base = d_base + groups
+    var base = _scale_bases[form, with_min](row, cols, groups)
     comptime shift = group_shift(group)
 
     var acc = InlineArray[SIMD[DType.float32, 2], MMA_FR * MMA_FT](fill=0)
@@ -1867,11 +1970,13 @@ def planar_mma_kernel[
             )
 
         var gi = (k0 + wk) >> shift
-        var d = _scale(scales, d_base + gi) if live_row else Float32(0)
+        var d = _group_scale[form](
+            scales, w, base[0], base[2], gi
+        ) if live_row else Float32(0)
         var m = Float32(0)
         comptime if with_min:
             if live_row:
-                m = _scale(scales, m_base + gi)
+                m = _group_scale[form](scales, w, base[1], base[3], gi)
         comptime if form == QUANT_I8:
             var q = w.unsafe_offset(row + k0 + wk).unsafe_load[
                 width=MMA_KPT
@@ -2202,6 +2307,16 @@ def _matmul_forms[
                     ctx, w, p, o, a, epi, tokens
                 )
                 return
+            if form == QUANT_K4 and carries_min:
+                _launch_mma[32, True, QUANT_K4, half](
+                    ctx, w, p, o, a, epi, tokens
+                )
+                return
+            if form == QUANT_K5 and carries_min:
+                _launch_mma[32, True, QUANT_K5, half](
+                    ctx, w, p, o, a, epi, tokens
+                )
+                return
             if form == QUANT_I8 and not carries_min:
                 _launch_mma[32, False, QUANT_I8, half](
                     ctx, w, p, o, a, epi, tokens
@@ -2225,6 +2340,14 @@ def _matmul_forms[
         )
     elif form == QUANT_S6 and g == 16 and not carries_min:
         _launch_mm[MM_TILE, 16, False, QUANT_S6, half](
+            ctx, w, p, o, a, epi, tokens
+        )
+    elif form == QUANT_K4 and g == 32 and carries_min:
+        _launch_mm[MM_TILE, 32, True, QUANT_K4, half](
+            ctx, w, p, o, a, epi, tokens
+        )
+    elif form == QUANT_K5 and g == 32 and carries_min:
+        _launch_mm[MM_TILE, 32, True, QUANT_K5, half](
             ctx, w, p, o, a, epi, tokens
         )
     elif form == QUANT_I8 and g == 32 and not carries_min:
