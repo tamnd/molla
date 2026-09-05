@@ -97,6 +97,8 @@ from molla.nn.gpu import (
     key_dot,
     nibble_float,
     planar_partial_dot,
+    planar_row_sum,
+    row_takes_a_warp,
 )
 from molla.nn.gpu_ops import NEG_INF, _ramp, _reduce_angle, _tanh
 from molla.nn.repack import (
@@ -404,33 +406,6 @@ def _base(
 
 
 @always_inline
-def _row_dot[
-    group: Int, with_min: Bool, form: Int
-](
-    packed: Pointer[UInt8, MutAnyOrigin],
-    x: Pointer[Float32, MutAnyOrigin],
-    row: Int,
-    cols: Int,
-    t: Int,
-) -> Float32:
-    """This thread's share of one planar row against one activation vector.
-
-    The unfused matvec's own loop, called rather than copied. It used to be
-    copied, and the copy went stale twice while the layout changed underneath
-    it, both times in the way that builds and returns wrong numbers. The only
-    difference between the two callers is how they read the activation, which
-    is a parameter of the loop now, and the fused one is the coherent read
-    because the vector it is reading was written by other blocks a barrier ago.
-
-    The reduction and the epilogue are the caller's, since a fused record
-    reduces once a row and the caller is already inside the row loop.
-    """
-    return planar_partial_dot[FTILE, group, with_min, form, coherent=True](
-        packed, x, row, cols, t
-    )
-
-
-@always_inline
 def _tree_sum(value: Float32) -> Float32:
     """Sum one value a thread across the block, answer in every thread.
 
@@ -531,19 +506,37 @@ def _do_matvec[
 ):
     """Every row this block owns, strided across the grid.
 
-    One block per row is what the unfused matvec does and it is not available
-    here, because the grid is sized to synchronise cheaply rather than to the
-    widest step, so a 4096 row projection on 96 blocks is 43 rows a block. The
-    stride is the block count so that the blocks working on adjacent rows at any
-    moment are adjacent, which is what keeps the weight reads of one round of
-    the loop in one region of the pool.
+    A narrow row goes to a warp and a wide one to the whole block, which is
+    `row_takes_a_warp`, and the unfused matvec asks the same question of the same
+    weight so that the two keep adding a row up in the same order. `cols` is a
+    property of the weight, so a record is all of one or all of the other and the
+    barriers in the block half are still reached by all of a block or by none.
+
+    Either way the rows are walked in a loop, because the grid is sized to
+    synchronise cheaply rather than to the widest step: a 4096 row projection on
+    96 blocks is 43 rows a block. The stride is the whole grid so that the
+    workers on adjacent rows at any moment are adjacent, which is what keeps the
+    weight reads of one round of the loop in one region of the pool.
     """
     var t = Int(thread_idx.x)
+    if row_takes_a_warp(cols):
+        var lane = t % ALANES
+        var warps = FTILE // ALANES
+        var rw = b * warps + t // ALANES
+        while rw < rows:
+            var total = planar_row_sum[group, with_min, form, coherent=True](
+                packed, x, w_at + rw * stride, cols, lane
+            )
+            if lane == 0:
+                _epilogue(o, aux, rw, epi, total)
+            rw += blocks * warps
+        return
+
     var r = b
     while r < rows:
-        var acc = _row_dot[group, with_min, form](
-            packed, x, w_at + r * stride, cols, t
-        )
+        var acc = planar_partial_dot[
+            FTILE, group, with_min, form, coherent=True
+        ](packed, x, w_at + r * stride, cols, t)
         var total = _tree_sum(acc)
         if t == 0:
             _epilogue(o, aux, r, epi, total)

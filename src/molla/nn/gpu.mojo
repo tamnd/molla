@@ -757,6 +757,72 @@ def planar_partial_dot[
     return acc
 
 
+comptime ROW_BLOCK_VALUES = 8
+"""How much of a row a thread wants before a block is worth reducing over.
+
+A block reduction costs `log2(TILE)` barriers however wide the row is, so what
+decides between a block and a warp is how much work those barriers are being
+carried by. Below this many values a thread the barriers cost more than the
+extra threads bring. See `row_takes_a_warp`.
+"""
+
+
+@always_inline
+def row_takes_a_warp(cols: Int) -> Bool:
+    """Whether a row this wide is better served by a warp than by a block.
+
+    Both matvecs ask this and they have to get the same answer, which is why it
+    reads `TILE` and not either caller's own width. `tests/test_gpu_block.mojo`
+    holds the fused path and the unfused one to an exact match, and the two
+    mappings add a row up in different orders, so a shape that took a warp in one
+    and a block in the other would come out as a wrong answer rather than as a
+    slow one.
+
+    The line is where it is because that is where it was measured on an RTX 4090
+    against a SmolLM2. Every 576 wide row of that model got faster on a warp, the
+    1536 wide one got slower, and on an 8B, whose rows are 4096 and 14336 wide,
+    a warp everywhere cost 21 per cent of the decode. A 576 wide row over a block
+    of 128 is four and a half values a thread, which is not enough to carry eight
+    barriers, and a 4096 wide one is thirty two, which is.
+    """
+    return cols < TILE * ROW_BLOCK_VALUES
+
+
+@always_inline
+def planar_row_sum[
+    group: Int, with_min: Bool, form: Int, coherent: Bool = False
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    row: Int,
+    cols: Int,
+    lane: Int,
+) -> Float32:
+    """One whole planar row against one vector, a warp to the row.
+
+    A narrow row used to be a block, reduced through shared memory in seven
+    rounds with a barrier under each. That is a poor trade at the shapes a decode
+    actually runs: the probe in #238 measured the two 576 by 1536 projections of
+    a SmolLM2 layer at 124 GB/s against 454 for the 1536 by 576 beside them,
+    which is the same weights in the other orientation and four times the rate.
+
+    A warp instead, for the rows `row_takes_a_warp` picks out. The lanes take the
+    row a stride of `ALANES` apart, the reduction is a shuffle with no shared
+    memory and no barrier, and a block of `tile` threads does `tile // ALANES`
+    rows at once rather than one.
+
+    Both matvecs call this, and that is not tidiness. `tests/test_gpu_block.mojo`
+    holds the fused path and the unfused one to an exact match, and which lane
+    took which column decides the order the products are added in, so the two
+    only stay equal while there is one function deciding it. See `ALANES`.
+    """
+    return lane_group_sum[num_lanes=ALANES](
+        planar_partial_dot[ALANES, group, with_min, form, coherent](
+            w, x, row, cols, lane
+        )
+    )
+
+
 def planar_matvec_kernel[
     tile: Int, group: Int, with_min: Bool, form: Int
 ](
@@ -766,12 +832,13 @@ def planar_matvec_kernel[
     aux: Pointer[Float32, MutAnyOrigin],
     cols_dev: Int32,
     stride_dev: Int32,
+    rows_dev: Int32,
     epi_dev: Int32,
 ):
-    """`o[r] = dot(planar row r of w, x)`, one thread block per row.
+    """`o[r] = dot(planar row r of w, x)`, a warp or a block to the row.
 
-    The row is `planar_partial_dot` and what is here is the reduction over the
-    block and the epilogue.
+    The row is `planar_partial_dot` and what is here is the reduction over
+    whichever of the two `row_takes_a_warp` asks for, and the epilogue.
 
     `epi` says what happens to the row once it is reduced, and `aux` is the one
     other vector that needs, which is a bias plane or the up projection. It is a
@@ -786,12 +853,30 @@ def planar_matvec_kernel[
     """
     var cols = Int(cols_dev)
     var stride = Int(stride_dev)
-    var r = Int(block_idx.x)
+    var rows = Int(rows_dev)
     var t = Int(thread_idx.x)
 
-    var row = r * stride
+    # `cols` is a property of the weight and not of the thread, so every block in
+    # the grid takes the same side of this and the barriers below are still
+    # reached by all of a block or by none of it. The launch reads the same
+    # predicate to size the grid, which is why the two shapes of grid are here
+    # rather than one.
+    if row_takes_a_warp(cols):
+        var lane = t % ALANES
+        var rw = Int(block_idx.x) * (tile // ALANES) + t // ALANES
+        if rw < rows:
+            # A block whose last warps ran off the end. Every lane of a warp
+            # agrees, so this is not a divergent skip of a reduction.
+            var total = planar_row_sum[group, with_min, form](
+                w, x, rw * stride, cols, lane
+            )
+            if lane == 0:
+                write_epilogue(o, aux, Int(epi_dev), rw, rw, total)
+        return
+
+    var r = Int(block_idx.x)
     var acc = planar_partial_dot[tile, group, with_min, form](
-        w, x, row, cols, t
+        w, x, r * stride, cols, t
     )
 
     # The reduction is over the block rather than over a warp because `tile` is
@@ -1203,8 +1288,18 @@ def _launch[
         aux,
         Int32(w.cols),
         Int32(w.row_bytes()),
+        Int32(w.rows),
         Int32(epi),
-        grid_dim=(w.rows, 1, 1),
+        # A block to a row, or a block to `tile // ALANES` of them and a warp to
+        # each. The kernel reads the same predicate to decide which of the two it
+        # is running, so these have to stay the same two answers.
+        grid_dim=(
+            (
+                (w.rows + tile // ALANES - 1) // (tile // ALANES)
+            ) if row_takes_a_warp(w.cols) else w.rows,
+            1,
+            1,
+        ),
         block_dim=(tile, 1, 1),
     )
 
