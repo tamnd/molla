@@ -921,6 +921,7 @@ def load(
     stream: Bool = True,
     repack_for: StringSpan = "",
     ctx: Optional[DeviceContext] = None,
+    transient: Bool = False,
 ) raises -> Weights:
     """Run the plan. Reads on a thread pool, copies on this thread.
 
@@ -947,6 +948,14 @@ def load(
     rather than let this make a second one behind it. Nothing means this makes
     its own, which is right for a load that is the only thing in the process
     talking to the device, and that is what `molla load` is.
+
+    `transient` says the caller is throwing these weights away and only wants
+    the repack cache, so a tensor that has been written to the cache can have
+    its pages given back the moment it is drained. Without it the pass that
+    writes the cache leaves the whole model resident and the pass that follows
+    loads it again beside it, which on a first run is two copies of the model
+    for a peak that has nothing to do with the steady state. Off by default,
+    because every other caller reads the mapping after this returns.
     """
     var started = monotonic_ms()
     var count = plan.count()
@@ -1009,6 +1018,13 @@ def load(
                 temp = String("")
                 report.repacked = 0
                 report.repack_note = String("no cache written: ") + String(e)
+
+    # Only where there is a cache being written, because that is the only thing
+    # a transient load leaves behind and a tensor with no repacked form has to
+    # stay readable for the pass that comes next.
+    var dropping = transient and job.repacking()
+    if dropping:
+        job.bounded = True
 
     var out = Weights(plan^, report)
 
@@ -1089,6 +1105,13 @@ def load(
                         window.clear()
                         window_bytes = 0
             copy_ms += monotonic_ms() - at
+        elif dropping and job.repack_kind[index] >= 0:
+            # The worker repacked this tensor before it pushed the index, so
+            # the cache has the bytes and nothing in this process is going to
+            # read the ggml ones again. No window and no wait, because there is
+            # no asynchronous copy here to outlive the pages: the write to the
+            # cache file has already returned.
+            _ = drop_pages(one.source, one.length)
         if not held:
             _ = released.add(one.length)
         drained += 1
