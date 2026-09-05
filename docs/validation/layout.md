@@ -392,6 +392,40 @@ So #202 is answered rather than implemented, the same way #203 was, and for a st
 
 This section originally ended by saying the 8B's matvec runs at 630 GB/s against the 901 the same access shape reaches from a buffer too large to cache, so a third of the bandwidth was missing and worth chasing. That was wrong and the error is worth keeping written down. The 630 was not a measurement. It came out of the two parameter fit two sections above, and a fit with two free parameters will reproduce two measured points whatever the parameters mean. `scripts/proj_probe.mojo` times the shipped kernel at the 8B's own shapes with the cache defeated and gets 749 GB/s over a whole token, and the largest projection reaches 929, so there is no missing third. [budget.md](budget.md) has the replacement and what it found instead.
 
+## What the byte scales were worth
+
+The three k types were the only forms left that were not size neutral against the file, and the reason is one line of the layout. A planar group scale is a float16 because that is what q4_1 and q5_1 have, one float16 a group and one more for the minimum. A k type does not have that. Its group scale is a small integer against one float16 for the whole 256 value block, six bits unsigned for q4_k and q5_k and a signed byte for q6_k, and every one of those fits a byte exactly. Storing it wide is the whole of the overhead.
+
+So a k type now holds the integer a byte a group and the float16 once a block, and a value is `dfactor[b] * dscale[g] * q[i] + mfactor[b] * mscale[g]`.
+
+| type | file | before | after |
+| --- | --- | --- | --- |
+| q4_k | 144 B | 160 B | 148 B |
+| q5_k | 176 B | 192 B | 180 B |
+| q6_k | 210 B | 224 B | 210 B |
+
+The 8B repack cache goes 5151 MiB to 4781 MiB against a 4693 MiB file, so the layout costs 1.9 per cent over the file where it cost ten per cent before this and twice the file when this page was written. On a 4090 the card holds 5540 MiB at a context of 2048 against 5910, sampled every hundred milliseconds over a whole run and taken over a baseline of 50.
+
+It is also the first step of this layout that removes a rounding rather than adding one. The old writer formed the product of the block scale and the group scale and put it in a float16. The two exact factors are now kept apart and multiplied in float32 at read time, in the same association the reference dequantizer uses, so all eight quantized types round trip bit for bit and `tests/test_repack.mojo` asserts an exact match where it used to carry a tolerance.
+
+The cost is that the read is two loads a group where it was one, and on CUDA that turned out to be the whole story of the change.
+
+| build | 8B decode, 128 tokens |
+| --- | --- |
+| before | 1050, 1039, 1038 ms |
+| after, step 2 | 1224, 1227, 1228 ms |
+| after, step 4 | 1072, 1065, 1067 ms |
+
+Eighteen per cent for 370 MiB is not a trade worth taking and the second row is what the first cut measured. Two probes say where it went, both of them the shipped kernel with one of the two loads deleted and the wrong answer computed. Reading only the block factor and not the group byte is 966, 963, 967 ms, which is faster than the layout it replaces, because the factor plane is an eighth the size and a warp pass hits one cache line where it used to hit two. Reading only the group byte and not the factor is 1034, 1031, 1025 ms, which is the same as before. Either load on its own is free and both together cost eighteen per cent, which is what an issue bound kernel looks like and is the same finding as "What it was actually worth" further up this page.
+
+The fix is the step and not the layout. A thread reads a group scale and then does the step's worth of values with it, so the step is how far that read is amortized, and a form that pays twice as much for a scale needs twice as many values to pay it over. On CUDA the step was two, which is one byte of quant against two scale loads, and at four the 8B is 1065 ms. At eight it is 1226 again, because by then the occupancy the wider step costs has caught up with the reuse it buys.
+
+Raising it for every form is not free, which is why it is asked per form. Qwen 2.5 0.5B is 133 q5_0 tensors against 14 q4_K, so almost all of it is a plain form that gained nothing from the narrower scales, and the same build decodes 260 ms at a step of two and 291 at four. With the step asked per form it is 266, which is the number it had.
+
+Metal needs none of this. The step there is already eight, four times what a CUDA pass carries, so the second scale read is amortized before it is asked, and `matvec_step` returns the same number for every form on that backend. The 8B could not be timed on the laptop the day this landed: the load average went past eighty during the run and produced 278 ms a token on a build that had measured 159 to 182 in a quiet hour, so the series says what the machine was doing and nothing about the layout. What is not in doubt there is the 4781 MiB, because a repack cache is a file and a file has a size.
+
+Net, on a 4090: 370 MiB off the card and 2.5 per cent off decode. The corpus agrees with llama.cpp on all thirteen device cases on both backends and the greedy picks are unchanged.
+
 ## Order
 
 Pack the quant plane first and leave the scales at float32. That is 9574 MiB to 6475 MiB on the 8B, it is bit exact against the current layout because the integers written are the same integers, and it can be verified by running the corpus with the old cache and the new one and comparing logits with no tolerance at all.
@@ -400,7 +434,7 @@ Narrow the scale planes to float16 second, as its own change, because it is the 
 
 Bit plane the five and six bit types third, which takes q6_K from eight bits of quant to six and gets the 8B to 5153 MiB. It is worth 365 MiB on this model and it is the fiddliest part, so it goes after the two that are worth more and are simpler.
 
-That order was written when this was a memory change and it did not survive the measurement above. The bit planes went second and the float16 scales third, because #203 found the Metal matvec at the byte floor and a byte removed there is time and not only space. Swapping the two cost nothing, since they touch different planes of the same row. All three have landed and the 8B is at 5151 MiB against the 5153 this section predicted, so the arithmetic at the top of the page was right about every step of it and the only thing the measurement changed was which step went first.
+That order was written when this was a memory change and it did not survive the measurement above. The bit planes went second and the float16 scales third, because #203 found the Metal matvec at the byte floor and a byte removed there is time and not only space. Swapping the two cost nothing, since they touch different planes of the same row. All three have landed and the 8B is at 5151 MiB against the 5153 this section predicted, so the arithmetic at the top of the page was right about every step of it and the only thing the measurement changed was which step went first. A fourth step that this section did not propose took it to 4781, and it is the section above.
 
 Fix `scripts/bench.py` to report `phys_footprint` on macOS rather than `ru_maxrss`, before any of the above, so that the Metal numbers in bench.md mean what they say while this work is happening. There is no equivalent problem on Linux, where the CUDA weights are genuinely not host memory and `ru_maxrss` is right.
 
