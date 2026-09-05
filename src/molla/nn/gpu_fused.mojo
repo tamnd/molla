@@ -96,7 +96,7 @@ from molla.nn.gpu import (
     coherent_load,
     key_dot,
     nibble_float,
-    planar_partial_dot,
+    planar_row_sum,
 )
 from molla.nn.gpu_ops import NEG_INF, _ramp, _reduce_angle, _tanh
 from molla.nn.repack import (
@@ -404,33 +404,6 @@ def _base(
 
 
 @always_inline
-def _row_dot[
-    group: Int, with_min: Bool, form: Int
-](
-    packed: Pointer[UInt8, MutAnyOrigin],
-    x: Pointer[Float32, MutAnyOrigin],
-    row: Int,
-    cols: Int,
-    t: Int,
-) -> Float32:
-    """This thread's share of one planar row against one activation vector.
-
-    The unfused matvec's own loop, called rather than copied. It used to be
-    copied, and the copy went stale twice while the layout changed underneath
-    it, both times in the way that builds and returns wrong numbers. The only
-    difference between the two callers is how they read the activation, which
-    is a parameter of the loop now, and the fused one is the coherent read
-    because the vector it is reading was written by other blocks a barrier ago.
-
-    The reduction and the epilogue are the caller's, since a fused record
-    reduces once a row and the caller is already inside the row loop.
-    """
-    return planar_partial_dot[FTILE, group, with_min, form, coherent=True](
-        packed, x, row, cols, t
-    )
-
-
-@always_inline
 def _tree_sum(value: Float32) -> Float32:
     """Sum one value a thread across the block, answer in every thread.
 
@@ -529,25 +502,29 @@ def _do_matvec[
     b: Int,
     blocks: Int,
 ):
-    """Every row this block owns, strided across the grid.
+    """Every row this block's warps own, strided across the grid.
 
-    One block per row is what the unfused matvec does and it is not available
-    here, because the grid is sized to synchronise cheaply rather than to the
-    widest step, so a 4096 row projection on 96 blocks is 43 rows a block. The
-    stride is the block count so that the blocks working on adjacent rows at any
-    moment are adjacent, which is what keeps the weight reads of one round of
-    the loop in one region of the pool.
+    A row is a warp and not a block, which is `planar_row_sum`, and the same
+    function the unfused matvec calls so that the two keep adding a row up in
+    the same order. The grid here is sized to synchronise cheaply rather than to
+    the widest step, so the rows still have to be walked in a loop: a 4096 row
+    projection over 384 blocks of four warps is three rows a warp.
+
+    The stride is every warp in the grid so that the warps working on adjacent
+    rows at any moment are adjacent, which is what keeps the weight reads of one
+    round of the loop in one region of the pool.
     """
     var t = Int(thread_idx.x)
-    var r = b
+    var lane = t % ALANES
+    var warps = FTILE // ALANES
+    var r = b * warps + t // ALANES
     while r < rows:
-        var acc = _row_dot[group, with_min, form](
-            packed, x, w_at + r * stride, cols, t
+        var total = planar_row_sum[group, with_min, form, coherent=True](
+            packed, x, w_at + r * stride, cols, lane
         )
-        var total = _tree_sum(acc)
-        if t == 0:
+        if lane == 0:
             _epilogue(o, aux, r, epi, total)
-        r += blocks
+        r += blocks * warps
 
 
 def fused_kernel(

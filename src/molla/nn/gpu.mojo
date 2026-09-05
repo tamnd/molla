@@ -757,6 +757,42 @@ def planar_partial_dot[
     return acc
 
 
+@always_inline
+def planar_row_sum[
+    group: Int, with_min: Bool, form: Int, coherent: Bool = False
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    row: Int,
+    cols: Int,
+    lane: Int,
+) -> Float32:
+    """One whole planar row against one vector, a warp to the row.
+
+    A row used to be a block, reduced through shared memory in seven rounds with
+    a barrier under each. That is a poor trade at the shapes a decode actually
+    runs: a 576 wide row over a block of 128 gives each thread four and a half
+    bytes of work to carry eight barriers, and the probe in #238 measured the
+    two 576 by 1536 projections of a SmolLM2 layer at 124 GB/s against 454 for
+    the 1536 by 576 beside them, which is the same weights in the other
+    orientation and four times the rate.
+
+    A warp instead. The lanes take the row a stride of `ALANES` apart, the
+    reduction is a shuffle with no shared memory and no barrier, and a block of
+    `tile` threads does `tile // ALANES` rows at once rather than one.
+
+    Both matvecs call this, and that is not tidiness. `tests/test_gpu_block.mojo`
+    holds the fused path and the unfused one to an exact match, and which lane
+    took which column decides the order the products are added in, so the two
+    only stay equal while there is one function deciding it. See `ALANES`.
+    """
+    return lane_group_sum[num_lanes=ALANES](
+        planar_partial_dot[ALANES, group, with_min, form, coherent](
+            w, x, row, cols, lane
+        )
+    )
+
+
 def planar_matvec_kernel[
     tile: Int, group: Int, with_min: Bool, form: Int
 ](
@@ -766,12 +802,13 @@ def planar_matvec_kernel[
     aux: Pointer[Float32, MutAnyOrigin],
     cols_dev: Int32,
     stride_dev: Int32,
+    rows_dev: Int32,
     epi_dev: Int32,
 ):
-    """`o[r] = dot(planar row r of w, x)`, one thread block per row.
+    """`o[r] = dot(planar row r of w, x)`, one warp per row.
 
     The row is `planar_partial_dot` and what is here is the reduction over the
-    block and the epilogue.
+    warp and the epilogue.
 
     `epi` says what happens to the row once it is reduced, and `aux` is the one
     other vector that needs, which is a bias plane or the up projection. It is a
@@ -786,36 +823,23 @@ def planar_matvec_kernel[
     """
     var cols = Int(cols_dev)
     var stride = Int(stride_dev)
-    var r = Int(block_idx.x)
+    var rows = Int(rows_dev)
     var t = Int(thread_idx.x)
+    var lane = t % ALANES
+    var r = Int(block_idx.x) * (tile // ALANES) + t // ALANES
+    if r >= rows:
+        # A block whose last warps ran off the end. Every lane of a warp agrees,
+        # so this is not a divergent exit from the reduction below.
+        return
 
-    var row = r * stride
-    var acc = planar_partial_dot[tile, group, with_min, form](
-        w, x, row, cols, t
+    var total = planar_row_sum[group, with_min, form](
+        w, x, r * stride, cols, lane
     )
-
-    # The reduction is over the block rather than over a warp because `tile` is
-    # a parameter and the warp width is not the same number on the two vendors.
-    # A shuffle based version would be faster and would put a target specific
-    # constant in the one place D7 says not to put one.
-    var part = stack_allocation[
-        tile, Float32, address_space=AddressSpace.SHARED
-    ]()
-    part[unsafe_offset=t] = acc
-    barrier()
-    var step = tile // 2
-    while step > 0:
-        if t < step:
-            part[unsafe_offset=t] = (
-                part[unsafe_offset=t] + part[unsafe_offset=t + step]
-            )
-        barrier()
-        step //= 2
-    if t == 0:
+    if lane == 0:
         # One token, so the index into the output and the row are the same
         # number, which is why a gate reads `aux[r]` here and `aux[out_at]`
         # there and both are the same read.
-        write_epilogue(o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
+        write_epilogue(o, aux, Int(epi_dev), r, r, total)
 
 
 comptime MATVEC_BYTES = 8 if CompilationTarget.is_macos() else 1
@@ -1203,8 +1227,9 @@ def _launch[
         aux,
         Int32(w.cols),
         Int32(w.row_bytes()),
+        Int32(w.rows),
         Int32(epi),
-        grid_dim=(w.rows, 1, 1),
+        grid_dim=((w.rows + tile // ALANES - 1) // (tile // ALANES), 1, 1),
         block_dim=(tile, 1, 1),
     )
 
