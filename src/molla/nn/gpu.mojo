@@ -955,25 +955,28 @@ that fit in cache. A macOS build targets Metal and a build anywhere else
 targets CUDA, which is why the operating system is the thing asked here.
 """
 
-comptime PREFILL_CHUNK = 256 if CompilationTarget.is_macos() else 64
+comptime PREFILL_CHUNK = 256
 """How many prompt tokens go through the stack in one pass.
 
 A prompt is a matrix rather than a run of decodes, and this is how much of it
 is in flight at once. It trades launches against scratch: the launches for a
 prompt fall by this factor, and the attention scores grow by it, which on a
-thirty two head model at a four thousand context is 2 MiB a token. Sixty four
-is 128 times fewer launches than a token at a time and 33 MiB of scores on an
-8B, and at four passes for a five hundred token prompt the launches are no
-longer what is left.
+thirty two head model at a four thousand context is 2 MiB a token.
 
-It is two numbers because the two backends want different ones, and by a lot.
-On Metal the matrix core form covers thirty two tokens a block, so a chunk of
-sixty four is two blocks of the token axis and the GPU runs out of work before
-it runs out of rows: widening the chunk to 256 is 1611 tokens a second against
-2142 on SmolLM2. On CUDA the same widening goes the other way, and not by a
-little, 4990 to 3545 on Qwen and 378 to 181 on the 8B. That is #213, and a
-chunk picked for the kernel that runs on the target is the honest thing to
-write until it is answered.
+It was two numbers, 256 on Metal and 64 on CUDA, because widening it there cost
+the 8B half its prefill and Qwen a third. That was #213 and the cause was
+`MM_ROWS`, or rather its absence. A thread held one row, so a wider chunk bought
+nothing on the row axis and the extra token blocks contended for the same rows,
+and the scratch grew four times for it. With four rows a thread the same
+widening is a gain on every model: on a 4090 a 1121 token prompt prefills in 67
+ms against 119 on SmolLM2, 130 against 153 on Qwen, and 2118 against 2109 on the
+8B, which is flat rather than twice as slow.
+
+It keeps gaining past here and the scratch is why it stops. SmolLM2 prefills in
+60 ms at 512 and 56 at 1024, and a chunk of 1024 on a thirty two head 8B is 268
+MiB of scores at a two thousand context and 537 at four thousand, which is a
+larger share of a card than the whole of a small model. 256 takes most of the
+gain for a quarter of that.
 """
 
 comptime MM_TILE = 32
@@ -1024,6 +1027,48 @@ row and the weight matrix is read once a chunk rather than once a block.
 """
 
 
+comptime MM_ROWS = 1 if CompilationTarget.is_macos() else 4
+"""How many output rows one thread carries at once.
+
+`SPAN` amortizes the weight read over tokens and this amortizes the activation
+read over rows, and until it existed there was nothing doing the second half. A
+thread held one weight value and `SPAN` accumulators, so a step of the loop was
+`SPAN` activation loads feeding `SPAN` multiplies, one load an operation, and a
+4090 issues four times as many multiplies a cycle as it does loads. All three
+models measured between three and six TFLOP/s of prefill against a card that
+does eighty two in float, which is the shape of a kernel waiting on its load
+unit rather than one waiting on its arithmetic.
+
+With `MM_ROWS` rows a thread the activations are loaded once and multiplied into
+every row, so a step is `SPAN` activation loads and `MM_ROWS` weight loads
+feeding `SPAN * MM_ROWS` multiplies. Four rows and eight tokens is sixty four
+multiplies for twenty four loads where it was sixteen for sixteen.
+
+It costs `SPAN * MM_ROWS` accumulators plus the activations, which is the reason
+it is four and not more. Swept on a 4090 at a 1121 token prompt, milliseconds to
+prefill, against 126, 226 and 2925 for one row a thread:
+
+| rows | SmolLM2 | Qwen | 8B |
+| --- | --- | --- | --- |
+| 2 | 138 | 164 | 2552 |
+| 4 | 119 | 153 | 2109 |
+| 8 | 136 | 170 | 1654 |
+| 16 | 387 | 722 | 8270 |
+
+Sixteen is the register file giving out, and the loss there is the same shape as
+the loss this change started as: an array indexed by a loop the compiler did not
+unroll goes to local memory and every read of it becomes a load. That is why
+every loop over `SPAN` and `MM_ROWS` in the kernel is a `comptime for`.
+
+Four is the number because it wins on all three. Eight is better on the 8B by a
+further fifth and worse on SmolLM2, which is the row count of the matrix showing
+through, and picking on that is #244.
+
+Metal keeps one, because a group of thirty two goes to `simd_matmul_kernel`
+there and this kernel is the six bit fallback.
+"""
+
+
 def planar_matmul_kernel[
     tile: Int, group: Int, with_min: Bool, form: Int
 ](
@@ -1052,8 +1097,14 @@ def planar_matmul_kernel[
     the weights. That is the difference between reading an 8B eight times a
     chunk and reading it twice.
 
-    The grid is `(ceil(tokens / (SPAN * MM_GROUPS)), rows)` and the order is
-    deliberate. Blocks that share an output row differ only in the token index,
+    A thread carries `MM_ROWS` of those rows rather than one, which is the other
+    half of the same idea: `SPAN` amortizes a weight read over tokens and
+    `MM_ROWS` amortizes an activation read over rows. The two loops are nested
+    with the activations hoisted out of the row loop, so a step of the column
+    loop loads each activation once and multiplies it into every row.
+
+    The grid is `(ceil(tokens / (SPAN * MM_GROUPS)), ceil(rows / MM_ROWS))` and
+    the order is deliberate. Blocks that share an output row differ only in the token index,
     and they have to be co-resident for the L2 to serve that row once rather
     than once each, so the token index is the fast axis.
 
@@ -1070,17 +1121,30 @@ def planar_matmul_kernel[
     var stride = Int(stride_dev)
     var rows = Int(rows_dev)
     var tokens = Int(tokens_dev)
-    var r = Int(block_idx.y)
+    var r0 = Int(block_idx.y) * MM_ROWS
     var g = Int(thread_idx.y)
     var base = (Int(block_idx.x) * MM_GROUPS + g) * SPAN
     var t = Int(thread_idx.x)
 
-    var row = r * stride
     var groups = cols // group
     var packed = w
     var scales = w.unsafe_bitcast[Float16]()
-    var d_base = (row + planar_quant_stride[form](cols)) // SCALE_BYTES
-    var m_base = d_base + groups
+
+    # The last block of the row axis when `rows` is not a multiple of `MM_ROWS`.
+    # Its dead rows are clamped onto the last real one rather than branched
+    # around, the same trade the dead lanes of a tail token block make: the
+    # clamp is arithmetic done once before the loop, a test would be inside it,
+    # and what the clamped row computes is thrown away by the store below.
+    var rowb = InlineArray[Int, MM_ROWS](fill=0)
+    var d_base = InlineArray[Int, MM_ROWS](fill=0)
+    var m_base = InlineArray[Int, MM_ROWS](fill=0)
+    comptime for rr in range(MM_ROWS):
+        var rq = r0 + rr
+        if rq >= rows:
+            rq = rows - 1
+        rowb[rr] = rq * stride
+        d_base[rr] = (rowb[rr] + planar_quant_stride[form](cols)) // SCALE_BYTES
+        m_base[rr] = d_base[rr] + groups
 
     comptime shift = group_shift(group)
 
@@ -1110,41 +1174,50 @@ def planar_matmul_kernel[
     # for free, and what it computes is discarded by the `t < live` below.
     var at0 = base * cols
 
-    var acc = InlineArray[Float32, SPAN](fill=0)
+    var acc = InlineArray[Float32, SPAN * MM_ROWS](fill=0)
     comptime if form == QUANT_I8:
         var i = t
         while i < cols:
             var gi = i >> shift
-            var q = byte_float(UInt32(packed[unsafe_offset=row + i]))
-            var d = _scale(scales, d_base + gi) * q
-            comptime if with_min:
-                var m = _scale(scales, m_base + gi)
-                for k in range(SPAN):
-                    var a = x[unsafe_offset=at0 + k * cols + i]
-                    acc[k] += d * a + m * a
-            else:
-                for k in range(SPAN):
-                    acc[k] += d * x[unsafe_offset=at0 + k * cols + i]
+            # Hoisted out of the row loop, which is the whole point of the row
+            # loop. One load a token here feeds `MM_ROWS` multiplies below.
+            var a = InlineArray[Float32, SPAN](fill=0)
+            comptime for k in range(SPAN):
+                a[k] = x[unsafe_offset=at0 + k * cols + i]
+            comptime for rr in range(MM_ROWS):
+                var q = byte_float(UInt32(packed[unsafe_offset=rowb[rr] + i]))
+                var d = _scale(scales, d_base[rr] + gi) * q
+                comptime if with_min:
+                    var m = _scale(scales, m_base[rr] + gi)
+                    comptime for k in range(SPAN):
+                        acc[rr * SPAN + k] += d * a[k] + m * a[k]
+                else:
+                    comptime for k in range(SPAN):
+                        acc[rr * SPAN + k] += d * a[k]
             i += tile
     elif quant_high_bits(form) == 0:
         var i = t * 2
         while i < cols:
             var gi = i >> shift
-            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
-            var d = _scale(scales, d_base + gi)
-            var lo = d * nibble_float[form](b & 0xF)
-            var hi = d * nibble_float[form](b >> 4)
-            comptime if with_min:
-                var m = _scale(scales, m_base + gi)
-                for k in range(SPAN):
-                    var a0 = x[unsafe_offset=at0 + k * cols + i]
-                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
-                    acc[k] += lo * a0 + hi * a1 + m * (a0 + a1)
-            else:
-                for k in range(SPAN):
-                    var a0 = x[unsafe_offset=at0 + k * cols + i]
-                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
-                    acc[k] += lo * a0 + hi * a1
+            var a0 = InlineArray[Float32, SPAN](fill=0)
+            var a1 = InlineArray[Float32, SPAN](fill=0)
+            comptime for k in range(SPAN):
+                a0[k] = x[unsafe_offset=at0 + k * cols + i]
+                a1[k] = x[unsafe_offset=at0 + k * cols + i + 1]
+            comptime for rr in range(MM_ROWS):
+                var b = UInt32(packed[unsafe_offset=rowb[rr] + (i >> 1)])
+                var d = _scale(scales, d_base[rr] + gi)
+                var lo = d * nibble_float[form](b & 0xF)
+                var hi = d * nibble_float[form](b >> 4)
+                comptime if with_min:
+                    var m = _scale(scales, m_base[rr] + gi)
+                    comptime for k in range(SPAN):
+                        acc[rr * SPAN + k] += (
+                            lo * a0[k] + hi * a1[k] + m * (a0[k] + a1[k])
+                        )
+                else:
+                    comptime for k in range(SPAN):
+                        acc[rr * SPAN + k] += lo * a0[k] + hi * a1[k]
             i += tile * 2
     else:
         # The five and six bit forms, joined the same way the matvec joins them.
@@ -1155,31 +1228,36 @@ def planar_matmul_kernel[
         comptime hshift = high_shift[form]()
         comptime hper = 1 << hshift
         comptime hmask = UInt32((1 << hbits) - 1)
-        var high = row + (cols >> 1)
         var i = t * 2
         while i < cols:
             var gi = i >> shift
-            var b = UInt32(packed[unsafe_offset=row + (i >> 1)])
-            var h = UInt32(packed[unsafe_offset=high + (i >> hshift)])
             var s0 = UInt32((i & (hper - 1)) * hbits)
-            var d = _scale(scales, d_base + gi)
-            var lo = d * wide_float[form](
-                (b & 0xF) | (((h >> s0) & hmask) << 4)
-            )
-            var hv = d * wide_float[form](
-                (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
-            )
-            comptime if with_min:
-                var m = _scale(scales, m_base + gi)
-                for k in range(SPAN):
-                    var a0 = x[unsafe_offset=at0 + k * cols + i]
-                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
-                    acc[k] += lo * a0 + hv * a1 + m * (a0 + a1)
-            else:
-                for k in range(SPAN):
-                    var a0 = x[unsafe_offset=at0 + k * cols + i]
-                    var a1 = x[unsafe_offset=at0 + k * cols + i + 1]
-                    acc[k] += lo * a0 + hv * a1
+            var a0 = InlineArray[Float32, SPAN](fill=0)
+            var a1 = InlineArray[Float32, SPAN](fill=0)
+            comptime for k in range(SPAN):
+                a0[k] = x[unsafe_offset=at0 + k * cols + i]
+                a1[k] = x[unsafe_offset=at0 + k * cols + i + 1]
+            comptime for rr in range(MM_ROWS):
+                var b = UInt32(packed[unsafe_offset=rowb[rr] + (i >> 1)])
+                var h = UInt32(
+                    packed[unsafe_offset=rowb[rr] + (cols >> 1) + (i >> hshift)]
+                )
+                var d = _scale(scales, d_base[rr] + gi)
+                var lo = d * wide_float[form](
+                    (b & 0xF) | (((h >> s0) & hmask) << 4)
+                )
+                var hv = d * wide_float[form](
+                    (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
+                )
+                comptime if with_min:
+                    var m = _scale(scales, m_base[rr] + gi)
+                    comptime for k in range(SPAN):
+                        acc[rr * SPAN + k] += (
+                            lo * a0[k] + hv * a1[k] + m * (a0[k] + a1[k])
+                        )
+                else:
+                    comptime for k in range(SPAN):
+                        acc[rr * SPAN + k] += lo * a0[k] + hv * a1[k]
             i += tile * 2
 
     # A lane group reduction and not a tree through shared memory. A group is a
@@ -1191,16 +1269,19 @@ def planar_matmul_kernel[
     #
     # Every lane ends up holding every total, so each one keeps the total for
     # the token it is about to write and drops the rest.
-    var got = Float32(0)
-    comptime for k in range(SPAN):
-        var whole = lane_group_sum[num_lanes=tile](acc[k])
-        if t == k:
-            got = whole
+    comptime for rr in range(MM_ROWS):
+        var got = Float32(0)
+        comptime for k in range(SPAN):
+            var whole = lane_group_sum[num_lanes=tile](acc[rr * SPAN + k])
+            if t == k:
+                got = whole
 
-    # One thread a token rather than one thread for the whole group, so the
-    # tail is `SPAN` threads doing one epilogue each.
-    if t < live:
-        write_epilogue(o, aux, Int(epi_dev), (base + t) * rows + r, r, got)
+        # One thread a token rather than one thread for the whole group, so the
+        # tail is `SPAN` threads doing one epilogue each. A clamped row of a
+        # tail block is dropped here, which is the only place it has to be.
+        var r = r0 + rr
+        if t < live and r < rows:
+            write_epilogue(o, aux, Int(epi_dev), (base + t) * rows + r, r, got)
 
 
 def device_ready() -> Bool:
@@ -1711,7 +1792,7 @@ def _launch_mm[
         Int32(tokens),
         grid_dim=(
             (tokens + SPAN * MM_GROUPS - 1) // (SPAN * MM_GROUPS),
-            w.rows,
+            (w.rows + MM_ROWS - 1) // MM_ROWS,
             1,
         ),
         block_dim=(tile, MM_GROUPS, 1),
