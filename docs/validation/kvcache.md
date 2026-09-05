@@ -37,15 +37,17 @@ The value side is the same with no norm and no rotation, because a value is proj
 
 That adds one record and one grid wide barrier a layer, and `chunk * kv_width` floats of workspace for each of the key and the value, which for an 8B decode is 4096 floats a layer and is nothing against the scores.
 
-## What the shape is worth on its own, before any quantization
+This landed in 0.4.18 with the cache still f16, as `OP_STORE` in the fused plan and `device_store_kv` on the unfused path. A layer's plan went from twelve records to fourteen.
 
-Three things, and they are the reason this is worth landing as its own change with the cache still f16.
+## What the shape was worth on its own, before any quantization
 
-The pairing goes away from three writers. Metal has no coherent sixteen bit store, so every writer of the cache inside the fused launch has to own an aligned thirty two bit word, which is `PAIRED` and which each of the three solves differently: the projections take rows two at a time, the key norm owns a word and touches only its own two elements, and the rotation owns two adjacent rotation pairs. With the transforms in a float32 workspace none of them is writing the cache at all, so all three go back to one element a thread and the store is the only writer that has to think about it.
+Three things, and they are why it was worth landing as its own change.
 
-The constraint at `_rope_record` goes away with it. A rotation over a head whose `rope.dim` is not a multiple of four is refused today, because the rotation owns two rotations at once so that what it reads is what it writes. No model molla has met has one, and the day one does it should be a rotation and not an error.
+The pairing went away from three writers. Metal has no coherent sixteen bit store, so every writer of the cache inside the fused launch has to own an aligned thirty two bit word, which is `PAIRED` and which each of the three solved differently: the projections took rows two at a time, the key norm owned a word and touched only its own two elements, and the rotation owned two adjacent rotation pairs. With the transforms in a float32 workspace none of them writes the cache at all, so all three went back to one element a thread and the store is the only writer that has to think about it.
 
-And the projections stop needing an `EPI_HALF` epilogue, which is the compile time store width parameter #249 is about. Two instantiations of the epilogue become one on this path.
+The constraint at `_rope_record` went with it. A rotation over a head whose `rope.dim` was not a multiple of four was refused, because the rotation owned two rotations at once so that what it read was what it wrote. No model molla has met has one, and the day one does it is now a rotation rather than an error.
+
+And the projections stopped needing an `EPI_HALF` epilogue, which is the compile time store width parameter #249 is about. That parameter had reached four kernels, so it was eight instantiations of the matvec, the matmul and the mma against four, and it is four now. The same deletion took the float16 rope kernel, the float16 norm kernel and the two half projection entry points with it, because the one thing that wanted them was a cache written in place.
 
 The cost is the extra barrier and the extra pass. The pass is `kv_width` elements a layer against the projections that produced them, which are `kv_width` rows of a `cols` wide matrix, so it is one part in `cols`. The barrier is the term to watch and it is what the measurement below is for.
 
