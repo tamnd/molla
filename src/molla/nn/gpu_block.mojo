@@ -53,15 +53,20 @@ from molla.nn.gpu import (
     EPI_ADD,
     EPI_BIAS,
     EPI_GLU,
+    EPI_HALF,
     EPI_NONE,
     MM_GROUPS,
     PREFILL_CHUNK,
     SPAN,
+    DeviceHalf,
     DeviceVec,
     device_matmul_into,
+    device_matmul_into_half,
     device_matvec_into,
+    device_matvec_into_half,
 )
 from molla.nn.gpu_fused import (
+    PAIRED,
     OP_ACT,
     OP_ADD,
     OP_ATTEND,
@@ -115,9 +120,11 @@ from molla.nn.gpu_ops import (
     device_attend,
     device_gelu,
     device_rms_norm,
+    device_rms_norm_half,
     device_rms_norm_inplace,
     device_rms_norm_run,
     device_rope,
+    device_rope_half,
     device_scale_into,
     device_silu,
     device_softcap,
@@ -630,14 +637,36 @@ def _project(
         device_matmul_into(ctx, w, x, out, tokens, at, epi, aux)
 
 
+def _project_half(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    mut out: DeviceHalf,
+    tokens: Int,
+    at: Int = 0,
+    epi: Int = EPI_NONE,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
+) raises:
+    """`_project` with the key or value cache as its output.
+
+    The same two kernels and the same dividing line between them. What the cache
+    changes is the last store of a row and nothing above it, so the two
+    projections that write one come through here and the other five do not.
+    """
+    if tokens == 1:
+        device_matvec_into_half(ctx, w, x, out, at, epi, aux)
+    else:
+        device_matmul_into_half(ctx, w, x, out, tokens, at, epi, aux)
+
+
 def device_attention(
     ctx: DeviceContext,
     spec: BlockSpec,
     w: DeviceLayer,
     mut x: DeviceVec,
     mut s: DeviceScratch,
-    mut keys: DeviceVec,
-    mut values: DeviceVec,
+    mut keys: DeviceHalf,
+    mut values: DeviceHalf,
     slot: Int,
     pos: Int,
     tokens: Int = 1,
@@ -691,8 +720,10 @@ def device_attention(
     # and this is the only place they are written.
     var bias_epi = EPI_BIAS if w.has_bias else EPI_NONE
     _project(ctx, w.wq, s.norm, s.q, tokens, 0, bias_epi, w.q_bias.ptr())
-    _project(ctx, w.wk, s.norm, keys, tokens, at, bias_epi, w.k_bias.ptr())
-    _project(ctx, w.wv, s.norm, values, tokens, at, bias_epi, w.v_bias.ptr())
+    _project_half(ctx, w.wk, s.norm, keys, tokens, at, bias_epi, w.k_bias.ptr())
+    _project_half(
+        ctx, w.wv, s.norm, values, tokens, at, bias_epi, w.v_bias.ptr()
+    )
 
     # Every head of every token in the chunk is one launch, because the heads of
     # a token lie end to end and so do the tokens.
@@ -701,7 +732,7 @@ def device_attention(
         device_rms_norm_run(
             ctx, s.q, 0, head_dim, w.q_norm, spec.eps, tokens * spec.attn.heads
         )
-        device_rms_norm_run(
+        device_rms_norm_half(
             ctx,
             keys,
             at,
@@ -723,7 +754,7 @@ def device_attention(
         tokens,
         spec.q_width(),
     )
-    device_rope(
+    device_rope_half(
         ctx,
         spec.rope,
         keys,
@@ -822,8 +853,8 @@ def device_layer(
     w: DeviceLayer,
     mut x: DeviceVec,
     mut s: DeviceScratch,
-    mut keys: DeviceVec,
-    mut values: DeviceVec,
+    mut keys: DeviceHalf,
+    mut values: DeviceHalf,
     slot: Int,
     pos: Int,
     tokens: Int = 1,
@@ -947,8 +978,23 @@ def _rope_record(
     space: Int,
     off: Int,
     slot_mul: Int,
-) -> Int:
-    """One rotation in place, as a record."""
+) raises -> Int:
+    """One rotation in place, as a record.
+
+    A rotation on the cache is the one that runs on halves, and where the fused
+    kernel has to write whole words it gives a thread two rotations so that what
+    it reads is what it writes. That needs an even number of rotations in a
+    head, which every model molla has met has, and this is where the day one
+    does not turns into a message rather than into two threads writing over each
+    other. It is asked only where the pairing is, which is `PAIRED`.
+    """
+    if PAIRED and space == SPACE_KEYS and rope.dim % 4 != 0:
+        raise Error(
+            "a rotation over "
+            + String(rope.dim)
+            + " dimensions of a head does not divide into pairs of rotations,"
+            " and the key cache is written a pair at a time"
+        )
     var rec = plan.open(OP_ROPE)
     plan.input(rec, space, off, slot_mul)
     plan.output(rec, space, off, slot_mul)
@@ -1030,7 +1076,7 @@ def _layer_records(
         SPACE_KEYS,
         0,
         kv_width,
-        bias_epi,
+        bias_epi | EPI_HALF,
     )
     if w.has_bias:
         plan.helper(rec, SPACE_ARENA, a.k_bias)
@@ -1043,7 +1089,7 @@ def _layer_records(
         SPACE_VALS,
         0,
         kv_width,
-        bias_epi,
+        bias_epi | EPI_HALF,
     )
     if w.has_bias:
         plan.helper(rec, SPACE_ARENA, a.v_bias)
@@ -1433,8 +1479,8 @@ def device_forward_fused(
     token: Int,
     pos: Int,
     slot: Int,
-    mut keys: List[DeviceVec],
-    mut values: List[DeviceVec],
+    mut keys: List[DeviceHalf],
+    mut values: List[DeviceHalf],
 ) raises:
     """One token through the whole stack, one launch a layer.
 
@@ -1495,8 +1541,8 @@ def device_forward(
     tokens: List[Int],
     pos: Int,
     slot: Int,
-    mut keys: List[DeviceVec],
-    mut values: List[DeviceVec],
+    mut keys: List[DeviceHalf],
+    mut values: List[DeviceHalf],
 ) raises:
     """A run of tokens through the whole stack, logits left on the device.
 
