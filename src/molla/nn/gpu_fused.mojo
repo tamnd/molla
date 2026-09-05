@@ -96,7 +96,9 @@ from molla.nn.gpu import (
     coherent_load,
     key_dot,
     nibble_float,
+    planar_partial_dot,
     planar_row_sum,
+    row_takes_a_warp,
 )
 from molla.nn.gpu_ops import NEG_INF, _ramp, _reduce_angle, _tanh
 from molla.nn.repack import (
@@ -502,29 +504,43 @@ def _do_matvec[
     b: Int,
     blocks: Int,
 ):
-    """Every row this block's warps own, strided across the grid.
+    """Every row this block owns, strided across the grid.
 
-    A row is a warp and not a block, which is `planar_row_sum`, and the same
-    function the unfused matvec calls so that the two keep adding a row up in
-    the same order. The grid here is sized to synchronise cheaply rather than to
-    the widest step, so the rows still have to be walked in a loop: a 4096 row
-    projection over 384 blocks of four warps is three rows a warp.
+    A narrow row goes to a warp and a wide one to the whole block, which is
+    `row_takes_a_warp`, and the unfused matvec asks the same question of the same
+    weight so that the two keep adding a row up in the same order. `cols` is a
+    property of the weight, so a record is all of one or all of the other and the
+    barriers in the block half are still reached by all of a block or by none.
 
-    The stride is every warp in the grid so that the warps working on adjacent
-    rows at any moment are adjacent, which is what keeps the weight reads of one
-    round of the loop in one region of the pool.
+    Either way the rows are walked in a loop, because the grid is sized to
+    synchronise cheaply rather than to the widest step: a 4096 row projection on
+    96 blocks is 43 rows a block. The stride is the whole grid so that the
+    workers on adjacent rows at any moment are adjacent, which is what keeps the
+    weight reads of one round of the loop in one region of the pool.
     """
     var t = Int(thread_idx.x)
-    var lane = t % ALANES
-    var warps = FTILE // ALANES
-    var r = b * warps + t // ALANES
+    if row_takes_a_warp(cols):
+        var lane = t % ALANES
+        var warps = FTILE // ALANES
+        var rw = b * warps + t // ALANES
+        while rw < rows:
+            var total = planar_row_sum[group, with_min, form, coherent=True](
+                packed, x, w_at + rw * stride, cols, lane
+            )
+            if lane == 0:
+                _epilogue(o, aux, rw, epi, total)
+            rw += blocks * warps
+        return
+
+    var r = b
     while r < rows:
-        var total = planar_row_sum[group, with_min, form, coherent=True](
-            packed, x, w_at + r * stride, cols, lane
-        )
-        if lane == 0:
+        var acc = planar_partial_dot[
+            FTILE, group, with_min, form, coherent=True
+        ](packed, x, w_at + r * stride, cols, t)
+        var total = _tree_sum(acc)
+        if t == 0:
             _epilogue(o, aux, r, epi, total)
-        r += blocks * warps
+        r += blocks
 
 
 def fused_kernel(

@@ -757,6 +757,37 @@ def planar_partial_dot[
     return acc
 
 
+comptime ROW_BLOCK_VALUES = 8
+"""How much of a row a thread wants before a block is worth reducing over.
+
+A block reduction costs `log2(TILE)` barriers however wide the row is, so what
+decides between a block and a warp is how much work those barriers are being
+carried by. Below this many values a thread the barriers cost more than the
+extra threads bring. See `row_takes_a_warp`.
+"""
+
+
+@always_inline
+def row_takes_a_warp(cols: Int) -> Bool:
+    """Whether a row this wide is better served by a warp than by a block.
+
+    Both matvecs ask this and they have to get the same answer, which is why it
+    reads `TILE` and not either caller's own width. `tests/test_gpu_block.mojo`
+    holds the fused path and the unfused one to an exact match, and the two
+    mappings add a row up in different orders, so a shape that took a warp in one
+    and a block in the other would come out as a wrong answer rather than as a
+    slow one.
+
+    The line is where it is because that is where it was measured on an RTX 4090
+    against a SmolLM2. Every 576 wide row of that model got faster on a warp, the
+    1536 wide one got slower, and on an 8B, whose rows are 4096 and 14336 wide,
+    a warp everywhere cost 21 per cent of the decode. A 576 wide row over a block
+    of 128 is four and a half values a thread, which is not enough to carry eight
+    barriers, and a 4096 wide one is thirty two, which is.
+    """
+    return cols < TILE * ROW_BLOCK_VALUES
+
+
 @always_inline
 def planar_row_sum[
     group: Int, with_min: Bool, form: Int, coherent: Bool = False
@@ -769,17 +800,16 @@ def planar_row_sum[
 ) -> Float32:
     """One whole planar row against one vector, a warp to the row.
 
-    A row used to be a block, reduced through shared memory in seven rounds with
-    a barrier under each. That is a poor trade at the shapes a decode actually
-    runs: a 576 wide row over a block of 128 gives each thread four and a half
-    bytes of work to carry eight barriers, and the probe in #238 measured the
-    two 576 by 1536 projections of a SmolLM2 layer at 124 GB/s against 454 for
-    the 1536 by 576 beside them, which is the same weights in the other
-    orientation and four times the rate.
+    A narrow row used to be a block, reduced through shared memory in seven
+    rounds with a barrier under each. That is a poor trade at the shapes a decode
+    actually runs: the probe in #238 measured the two 576 by 1536 projections of
+    a SmolLM2 layer at 124 GB/s against 454 for the 1536 by 576 beside them,
+    which is the same weights in the other orientation and four times the rate.
 
-    A warp instead. The lanes take the row a stride of `ALANES` apart, the
-    reduction is a shuffle with no shared memory and no barrier, and a block of
-    `tile` threads does `tile // ALANES` rows at once rather than one.
+    A warp instead, for the rows `row_takes_a_warp` picks out. The lanes take the
+    row a stride of `ALANES` apart, the reduction is a shuffle with no shared
+    memory and no barrier, and a block of `tile` threads does `tile // ALANES`
+    rows at once rather than one.
 
     Both matvecs call this, and that is not tidiness. `tests/test_gpu_block.mojo`
     holds the fused path and the unfused one to an exact match, and which lane
@@ -805,10 +835,10 @@ def planar_matvec_kernel[
     rows_dev: Int32,
     epi_dev: Int32,
 ):
-    """`o[r] = dot(planar row r of w, x)`, one warp per row.
+    """`o[r] = dot(planar row r of w, x)`, a warp or a block to the row.
 
-    The row is `planar_partial_dot` and what is here is the reduction over the
-    warp and the epilogue.
+    The row is `planar_partial_dot` and what is here is the reduction over
+    whichever of the two `row_takes_a_warp` asks for, and the epilogue.
 
     `epi` says what happens to the row once it is reduced, and `aux` is the one
     other vector that needs, which is a bias plane or the up projection. It is a
@@ -825,21 +855,52 @@ def planar_matvec_kernel[
     var stride = Int(stride_dev)
     var rows = Int(rows_dev)
     var t = Int(thread_idx.x)
-    var lane = t % ALANES
-    var r = Int(block_idx.x) * (tile // ALANES) + t // ALANES
-    if r >= rows:
-        # A block whose last warps ran off the end. Every lane of a warp agrees,
-        # so this is not a divergent exit from the reduction below.
+
+    # `cols` is a property of the weight and not of the thread, so every block in
+    # the grid takes the same side of this and the barriers below are still
+    # reached by all of a block or by none of it. The launch reads the same
+    # predicate to size the grid, which is why the two shapes of grid are here
+    # rather than one.
+    if row_takes_a_warp(cols):
+        var lane = t % ALANES
+        var rw = Int(block_idx.x) * (tile // ALANES) + t // ALANES
+        if rw < rows:
+            # A block whose last warps ran off the end. Every lane of a warp
+            # agrees, so this is not a divergent skip of a reduction.
+            var total = planar_row_sum[group, with_min, form](
+                w, x, rw * stride, cols, lane
+            )
+            if lane == 0:
+                write_epilogue(o, aux, Int(epi_dev), rw, rw, total)
         return
 
-    var total = planar_row_sum[group, with_min, form](
-        w, x, r * stride, cols, lane
+    var r = Int(block_idx.x)
+    var acc = planar_partial_dot[tile, group, with_min, form](
+        w, x, r * stride, cols, t
     )
-    if lane == 0:
+
+    # The reduction is over the block rather than over a warp because `tile` is
+    # a parameter and the warp width is not the same number on the two vendors.
+    # A shuffle based version would be faster and would put a target specific
+    # constant in the one place D7 says not to put one.
+    var part = stack_allocation[
+        tile, Float32, address_space=AddressSpace.SHARED
+    ]()
+    part[unsafe_offset=t] = acc
+    barrier()
+    var step = tile // 2
+    while step > 0:
+        if t < step:
+            part[unsafe_offset=t] = (
+                part[unsafe_offset=t] + part[unsafe_offset=t + step]
+            )
+        barrier()
+        step //= 2
+    if t == 0:
         # One token, so the index into the output and the row are the same
         # number, which is why a gate reads `aux[r]` here and `aux[out_at]`
         # there and both are the same read.
-        write_epilogue(o, aux, Int(epi_dev), r, r, total)
+        write_epilogue(o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
 
 
 comptime MATVEC_BYTES = 8 if CompilationTarget.is_macos() else 1
@@ -1229,7 +1290,16 @@ def _launch[
         Int32(w.row_bytes()),
         Int32(w.rows),
         Int32(epi),
-        grid_dim=((w.rows + tile // ALANES - 1) // (tile // ALANES), 1, 1),
+        # A block to a row, or a block to `tile // ALANES` of them and a warp to
+        # each. The kernel reads the same predicate to decide which of the two it
+        # is running, so these have to stay the same two answers.
+        grid_dim=(
+            (
+                (w.rows + tile // ALANES - 1) // (tile // ALANES)
+            ) if row_takes_a_warp(w.cols) else w.rows,
+            1,
+            1,
+        ),
         block_dim=(tile, 1, 1),
     )
 
