@@ -45,7 +45,7 @@ from molla.nn.gpu_block import (
 )
 from molla.nn.model import ModelWeights, forward
 from molla.nn.quant import Q_F32, Q_Q8_0
-from molla.nn.repack import LAYOUT_PLANAR, planar_row_bytes
+from molla.nn.repack import LAYOUT_PLANAR, SCALE_BYTES, planar_row_bytes
 from molla.nn.rope import RopeSpec
 from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
 from molla.sys.device import default_device
@@ -115,10 +115,18 @@ def _align(n: Int, to: Int) -> Int:
     return ((n + to - 1) // to) * to
 
 
-def _store_f32(p: RawPtr, at: Int, value: Float32):
-    var bits = bitcast[DType.uint32, 1](value)
-    for b in range(4):
-        p.unsafe_store(at + b, UInt8((bits >> UInt32(b * 8)) & 0xFF))
+def _store_f16(p: RawPtr, at: Int, value: Float32):
+    """A little endian float16, which is the width a planar scale is stored at.
+
+    A float32 store here would be two bytes too wide, and the two bytes past the
+    end of a group's scale are the next group's scale and then the next row's
+    quants, so a four byte store builds a matrix nothing else in the file thinks
+    it built. It read as scales near a hundred rather than near a hundredth,
+    which a two layer stack turns into activations in the tens of millions.
+    """
+    var bits = bitcast[DType.uint16, 1](value.cast[DType.float16]())
+    p.unsafe_store(at, UInt8(bits & 0xFF))
+    p.unsafe_store(at + 1, UInt8((bits >> 8) & 0xFF))
 
 
 def _fill(p: RawPtr, base: Int, m: Int, cols: Int, rows: Int) raises:
@@ -136,7 +144,7 @@ def _fill(p: RawPtr, base: Int, m: Int, cols: Int, rows: Int) raises:
             p.unsafe_store(row + i, UInt8(q & 0xFF))
         for gi in range(cols // 32):
             var scale = Float32(0.01) + Float32((gi + m + r) % 7) * 0.002
-            _store_f32(p, row + cols + gi * 4, scale)
+            _store_f16(p, row + cols + gi * SCALE_BYTES, scale)
 
 
 def _gains(mut out: List[Float32], m: Int):
@@ -364,12 +372,12 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                 picks += 1
 
         # The fused path, over the same tokens, into a cache of its own. Every
-        # record it walks does the same arithmetic in the same order as the
-        # kernel it replaces, so this is an exact comparison rather than a
-        # tolerance. A fused layer that agreed with the unfused one to four
-        # digits would be a fused layer with a barrier in the wrong place, and
-        # a missing barrier reads a stale value, which is a plausible number
-        # rather than an error.
+        # record it walks does the same arithmetic as the kernel it replaces,
+        # and everywhere outside the attention it does it in the same order, so
+        # the cache below is compared bit for bit and the residual stream to a
+        # tolerance. The comparison that catches a barrier in the wrong place is
+        # either one: a missing barrier reads a value from before a write, which
+        # is a plausible number and not a number one bit off.
         #
         # The first layer of this model has the two post norms and the second
         # does not, so the pass covers both the projection that carries the
@@ -380,7 +388,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         var fcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
         fscratch.tracing = True
         var fused_out = Buffer(VOCAB)
-        var fused_diff = 0
+        var fused_worst = Float32(0)
         for step in range(len(tokens)):
             device_forward_fused(
                 ctx,
@@ -397,8 +405,11 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             ctx.synchronize()
             fscratch.logits.download(fused_out)
             for i in range(VOCAB):
-                if fused_out.data[i] != decoded[step * VOCAB + i]:
-                    fused_diff += 1
+                var gap = fused_out.data[i] - decoded[step * VOCAB + i]
+                if gap < 0:
+                    gap = -gap
+                if gap > fused_worst:
+                    fused_worst = gap
         var fused_stuck = plan.stuck()
 
         # The plan a session builds when it has decided against the path, which
@@ -428,13 +439,33 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         # every layer of every step rather than only what came out the end. It
         # is what says which layer went wrong when one does, and a comparison
         # of the logits alone would have said only that something did.
-        var fused_trace_diff = 0
+        #
+        # A tolerance and not an equality, because the two attentions do not add
+        # their keys up in the same order. The unfused kernel gives a head to a
+        # block and walks the whole row, and the fused one cuts the row into as
+        # many slices as the grid has blocks to spare and folds the slices back
+        # together the way flash decoding does. Both are the same sum and
+        # neither is more right than the other, and a float32 sum is not
+        # associative, so the last bit of a long row is a coin toss between
+        # them. What the bound is worth is the same thing every other bound in
+        # this file is worth: a barrier in the wrong place reads a value from
+        # before a write rather than a value one bit off, and that is not a
+        # rounding difference, it is a different number.
+        var fused_trace_worst = Float32(0)
         if len(fscratch.trace) != len(dscratch.trace):
             raise Error("the two traces are not the same length")
         for i in range(len(fscratch.trace)):
-            if fscratch.trace[i] != dscratch.trace[i]:
-                fused_trace_diff += 1
+            var gap = fscratch.trace[i] - dscratch.trace[i]
+            if gap < 0:
+                gap = -gap
+            if gap > fused_trace_worst:
+                fused_trace_worst = gap
 
+        # The cache is the one part that is still exact, and it stays exact.
+        # Nothing that writes it reduces across a slice: a projection is a row
+        # of a matvec, a norm is one element, and a rotation is a pair. So the
+        # fused path and the unfused path run the same additions in the same
+        # order here and there is no rounding for them to disagree about.
         var fused_cache_diff = 0
         var fused_mine = Buffer(CONTEXT * KV_HEADS * HEAD_DIM)
         var fused_theirs = Buffer(CONTEXT * KV_HEADS * HEAD_DIM)
@@ -618,19 +649,19 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             "and a launch against one raises rather than running nothing",
         )
         suite.check(
-            fused_trace_diff == 0,
+            fused_trace_worst <= trace_peak * Float32(2e-4),
             (
-                "every residual stream it leaves behind a layer matches the"
-                " unfused one in every bit"
+                "every residual stream it leaves behind a layer agrees with the"
+                " unfused one"
             ),
         )
         suite.check(
-            fused_diff == 0,
+            fused_worst <= peak * Float32(2e-4),
             "and so do the logits",
         )
         suite.check(
             fused_cache_diff == 0,
-            "and so do the keys and values",
+            "and the keys and values agree in every bit",
         )
 
         suite.group("device prefill against device decode")
