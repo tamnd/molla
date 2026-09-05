@@ -46,6 +46,7 @@ from molla.nn.gpu import (
     ACT_SILU,
     ALANES,
     TILE,
+    DeviceHalf,
     DeviceVec,
     _scale,
     activate,
@@ -181,6 +182,47 @@ def rms_norm_kernel[
     while i < n:
         o_all[unsafe_offset=at + i] = (
             x_all[unsafe_offset=at + i] * scale * g[unsafe_offset=i]
+        )
+        i += tile
+
+
+def rms_norm_half_kernel[
+    tile: Int
+](
+    x_all: Pointer[Float16, MutAnyOrigin],
+    g: Pointer[Float32, MutAnyOrigin],
+    n_dev: Int32,
+    eps: Float32,
+):
+    """`rms_norm_kernel` in place on the key cache.
+
+    A separate kernel and not a flag, because what changes is the type of two
+    pointers and there is no way to say that with a parameter. The arithmetic is
+    the same and is done in float either way, so a model with a per head key
+    norm gets the same numbers here that the fused kernel's `OP_NORM` gives it.
+
+    In place, so there is one pointer where the other has two, which is also
+    what makes the store safe without the pairing the fused kernel needs: a
+    thread writes only the elements it read, and a launch boundary is what
+    publishes them.
+    """
+    var n = Int(n_dev)
+    var t = Int(thread_idx.x)
+    var at = Int(block_idx.x) * n
+
+    var acc = Float32(0)
+    var i = t
+    while i < n:
+        var v = Float32(x_all[unsafe_offset=at + i])
+        acc += v * v
+        i += tile
+    var total = _block_sum[tile](acc)
+
+    var scale = Float32(1.0) / sqrt(total / Float32(n) + eps)
+    i = t
+    while i < n:
+        x_all[unsafe_offset=at + i] = Float16(
+            Float32(x_all[unsafe_offset=at + i]) * scale * g[unsafe_offset=i]
         )
         i += tile
 
@@ -460,9 +502,9 @@ def argmax_kernel[
 
 
 def rope_kernel[
-    neox: Bool, with_factors: Bool
+    neox: Bool, with_factors: Bool, dt: DType
 ](
-    x: Pointer[Float32, MutAnyOrigin],
+    x: Pointer[Scalar[dt], MutAnyOrigin],
     steps: Pointer[Float32, MutAnyOrigin],
     factors: Pointer[Float32, MutAnyOrigin],
     at_dev: Int32,
@@ -541,10 +583,14 @@ def rope_kernel[
             lo = at + pair * 2
             hi = lo + 1
 
-        var a = x[unsafe_offset=lo]
-        var b = x[unsafe_offset=hi]
-        x[unsafe_offset=lo] = a * c - b * s
-        x[unsafe_offset=hi] = a * s + b * c
+        # Widened on the way in and narrowed on the way out when this is the
+        # key cache, and both are nothing when it is a query. A thread reads and
+        # writes the same two elements, so a half here needs none of the pairing
+        # the fused kernel needs: what publishes these is the end of the launch.
+        var a = Float32(x[unsafe_offset=lo])
+        var b = Float32(x[unsafe_offset=hi])
+        x[unsafe_offset=lo] = Scalar[dt](a * c - b * s)
+        x[unsafe_offset=hi] = Scalar[dt](a * s + b * c)
         pair += Int(block_dim.x)
 
 
@@ -635,8 +681,8 @@ def attend_kernel[
     tile: Int
 ](
     q: Pointer[Float32, MutAnyOrigin],
-    keys: Pointer[Float32, MutAnyOrigin],
-    values: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float16, MutAnyOrigin],
+    values: Pointer[Float16, MutAnyOrigin],
     scores: Pointer[Float32, MutAnyOrigin],
     o: Pointer[Float32, MutAnyOrigin],
     count_dev: Int32,
@@ -733,7 +779,9 @@ def attend_kernel[
         var acc = Float32(0)
         for j2 in range(count):
             var va = j2 * kv_width + kvh * head_dim
-            acc += scores[unsafe_offset=sa + j2] * values[unsafe_offset=va + d]
+            acc += scores[unsafe_offset=sa + j2] * Float32(
+                values[unsafe_offset=va + d]
+            )
         o[unsafe_offset=qa + d] = acc * inv
         d += tile
 
@@ -800,8 +848,8 @@ def attend_split_kernel[
     tile: Int
 ](
     q: Pointer[Float32, MutAnyOrigin],
-    keys: Pointer[Float32, MutAnyOrigin],
-    values: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float16, MutAnyOrigin],
+    values: Pointer[Float16, MutAnyOrigin],
     scores: Pointer[Float32, MutAnyOrigin],
     partials: Pointer[Float32, MutAnyOrigin],
     count_dev: Int32,
@@ -917,7 +965,9 @@ def attend_split_kernel[
         var acc = Float32(0)
         for j2 in range(lo, hi):
             var va = j2 * kv_width + kvh * head_dim
-            acc += scores[unsafe_offset=sa + j2] * values[unsafe_offset=va + d]
+            acc += scores[unsafe_offset=sa + j2] * Float32(
+                values[unsafe_offset=va + d]
+            )
         partials[unsafe_offset=pa + d] = acc
         d += tile
     if t == 0:
@@ -1140,6 +1190,47 @@ def device_rms_norm_run(
     comptime if has_accelerator():
         var p = x.ptr_at(at)
         _norm_launch(ctx, p, gain.ptr(), p, n, eps, runs)
+
+
+def device_rms_norm_half(
+    ctx: DeviceContext,
+    mut x: DeviceHalf,
+    at: Int,
+    n: Int,
+    gain: DeviceVec,
+    eps: Float32,
+    runs: Int = 1,
+) raises:
+    """`device_rms_norm_run` on the key cache, which is where a key already is.
+
+    The one caller is the per head key norm of a Qwen 3 shaped model, and the
+    reason it is here rather than a flag on the run form is that the cache is
+    float16 and everything else a norm touches is float32.
+    """
+    if runs < 1:
+        raise Error("a norm needs at least one run")
+    if at < 0 or n <= 0 or x.elements() < at + runs * n:
+        raise Error(
+            "a norm over "
+            + String(runs)
+            + " runs of "
+            + String(n)
+            + " from offset "
+            + String(at)
+            + " does not fit in a vector of "
+            + String(x.elements())
+        )
+    _check_norm(n, gain.elements(), n)
+    _need_device()
+    comptime if has_accelerator():
+        ctx.enqueue_function[rms_norm_half_kernel[TILE]](
+            x.ptr_at(at),
+            gain.ptr(),
+            Int32(n),
+            eps,
+            grid_dim=(runs, 1, 1),
+            block_dim=(TILE, 1, 1),
+        )
 
 
 def _check_norm(n: Int, gain: Int, written: Int) raises:
@@ -1535,16 +1626,79 @@ def device_rope(
 ) raises:
     """Rotate `heads` heads laid end to end at `at`, in place.
 
-    Which is both of the shapes a block needs. The query comes out of its
-    projection as a row of heads, and a key is rotated once where it lies in the
-    cache on the way in, at `slot * kv_heads * head_dim`, rather than every time
-    it is read.
+    Which is the shape a query comes out of its projection in. A key is the
+    other one and is `device_rope_half`, because a key is rotated once where it
+    lies in the cache rather than every time it is read, and the cache is
+    float16.
 
     `tables` has to have been built from this same spec. That is not checked
     beyond the width, because the two things that would catch it are storing a
     copy of the spec to compare against and trusting the caller, and a spec has
     no equality yet.
     """
+    _rope_into[DType.float32](
+        ctx,
+        spec,
+        x.ptr(),
+        x.elements(),
+        at,
+        heads,
+        head_dim,
+        pos,
+        tables,
+        tokens,
+        row,
+    )
+
+
+def device_rope_half(
+    ctx: DeviceContext,
+    spec: RopeSpec,
+    mut x: DeviceHalf,
+    at: Int,
+    heads: Int,
+    head_dim: Int,
+    pos: Int,
+    tables: RopeTables,
+    tokens: Int = 1,
+    row: Int = 0,
+) raises:
+    """`device_rope` on the key cache, which is where a key already lies.
+
+    The same kernel over float16, so the angles and the multiplies are the same
+    float arithmetic and only the two loads and the two stores differ.
+    """
+    _rope_into[DType.float16](
+        ctx,
+        spec,
+        x.ptr(),
+        x.elements(),
+        at,
+        heads,
+        head_dim,
+        pos,
+        tables,
+        tokens,
+        row,
+    )
+
+
+def _rope_into[
+    dt: DType
+](
+    ctx: DeviceContext,
+    spec: RopeSpec,
+    x: Pointer[Scalar[dt], MutAnyOrigin],
+    elements: Int,
+    at: Int,
+    heads: Int,
+    head_dim: Int,
+    pos: Int,
+    tables: RopeTables,
+    tokens: Int,
+    row: Int,
+) raises:
+    """The checks and the four way dispatch both rotations share."""
     if spec.dim % 2 != 0:
         raise Error("a rotary dimension has to be even")
     if head_dim < spec.dim:
@@ -1556,14 +1710,14 @@ def device_rope(
         )
     if tokens < 1:
         raise Error("rope needs at least one token")
-    if at < 0 or x.elements() < at + (tokens - 1) * row + heads * head_dim:
+    if at < 0 or elements < at + (tokens - 1) * row + heads * head_dim:
         raise Error(
             "rope wants "
             + String((tokens - 1) * row + heads * head_dim)
             + " values from offset "
             + String(at)
             + " but the vector ends at "
-            + String(x.elements())
+            + String(elements)
         )
     var pairs = spec.dim // 2
     if tables.steps.elements() < pairs:
@@ -1589,7 +1743,7 @@ def device_rope(
             low = ends[0]
             high = ends[1]
         if spec.neox and tables.use_factors:
-            _rope[True, True](
+            _rope[True, True, dt](
                 ctx,
                 spec,
                 x,
@@ -1604,7 +1758,7 @@ def device_rope(
                 row,
             )
         elif spec.neox:
-            _rope[True, False](
+            _rope[True, False, dt](
                 ctx,
                 spec,
                 x,
@@ -1619,7 +1773,7 @@ def device_rope(
                 row,
             )
         elif tables.use_factors:
-            _rope[False, True](
+            _rope[False, True, dt](
                 ctx,
                 spec,
                 x,
@@ -1634,7 +1788,7 @@ def device_rope(
                 row,
             )
         else:
-            _rope[False, False](
+            _rope[False, False, dt](
                 ctx,
                 spec,
                 x,
@@ -1651,11 +1805,11 @@ def device_rope(
 
 
 def _rope[
-    neox: Bool, with_factors: Bool
+    neox: Bool, with_factors: Bool, dt: DType
 ](
     ctx: DeviceContext,
     spec: RopeSpec,
-    mut x: DeviceVec,
+    x: Pointer[Scalar[dt], MutAnyOrigin],
     tables: RopeTables,
     at: Int,
     heads: Int,
@@ -1666,8 +1820,8 @@ def _rope[
     tokens: Int,
     row: Int,
 ) raises:
-    ctx.enqueue_function[rope_kernel[neox, with_factors]](
-        x.ptr(),
+    ctx.enqueue_function[rope_kernel[neox, with_factors, dt]](
+        x,
         tables.steps.ptr(),
         tables.factors.ptr(),
         Int32(at),
@@ -1689,8 +1843,8 @@ def device_attend(
     ctx: DeviceContext,
     spec: AttnSpec,
     q: DeviceVec,
-    keys: DeviceVec,
-    values: DeviceVec,
+    keys: DeviceHalf,
+    values: DeviceHalf,
     count: Int,
     pos: Int,
     mut out: DeviceVec,

@@ -311,6 +311,113 @@ struct DeviceVec(Movable):
         return got
 
 
+struct DeviceHalf(Movable):
+    """Float16 in device memory, owned, which is what a KV cache is made of.
+
+    A separate type from `DeviceVec` rather than a parameter on it, because
+    almost nothing in molla is float16 and the two are not interchangeable at a
+    kernel argument. What is float16 is the key and value cache, which is the
+    one buffer whose size grows with the conversation rather than with the model,
+    and which llama.cpp has held at half precision by default for long enough
+    that it is the strongest evidence available that it costs no accuracy. It is
+    half the bytes on the card and half the traffic through attention.
+
+    The kernels that read this take a `Pointer[Float16]` and say so. The kernels
+    that write it are the projections, whose output pointer is shared with every
+    other matvec in the model, so those take the address through
+    `as_matvec_out` and store through it with a `EPI_HALF` epilogue. The bitcast
+    is at the call, where it can be read, rather than inside a kernel where it
+    could not.
+    """
+
+    var buf: DeviceBuffer[DType.float16]
+    var n: Int
+
+    def __init__(out self, ctx: DeviceContext, n: Int) raises:
+        if n <= 0:
+            raise Error("a device vector needs a positive length")
+        self.buf = ctx.enqueue_create_buffer[DType.float16](n)
+        self.n = n
+
+    def elements(self) -> Int:
+        return self.n
+
+    def ptr(self) -> Pointer[Float16, MutAnyOrigin]:
+        """The device address, for a kernel argument."""
+        return Pointer[Float16, MutAnyOrigin](
+            unsafe_from_address=Int(self.buf.unsafe_ptr())
+        )
+
+    def ptr_at(self, at: Int) raises -> Pointer[Float16, MutAnyOrigin]:
+        """The device address of element `at`. Two bytes an element here."""
+        if at < 0 or at > self.n:
+            raise Error(
+                "offset "
+                + String(at)
+                + " is outside a device vector of "
+                + String(self.n)
+            )
+        return Pointer[Float16, MutAnyOrigin](
+            unsafe_from_address=Int(self.buf.unsafe_ptr()) + at * 2
+        )
+
+    def as_matvec_out(self, at: Int) raises -> Pointer[Float32, MutAnyOrigin]:
+        """The address of element `at`, spelled as a matvec would take it.
+
+        A projection writing into the cache is the same kernel as a projection
+        writing anywhere else, and its output argument is a float32 pointer
+        because every other output in the model is float32. Parametrizing that
+        kernel on the width of its store would double six instantiations to save
+        one predicted branch, so instead the epilogue is told to store a half
+        and the address arrives here already cast.
+
+        Nothing but a `EPI_HALF` epilogue may be handed this. A float32 store
+        through it writes two elements of the cache and reads as plausible
+        numbers rather than as an error, which is why this is a named call and
+        not a bitcast at the call site.
+        """
+        return Pointer[Float32, MutAnyOrigin](
+            unsafe_from_address=Int(self.ptr_at(at))
+        )
+
+    def download(self, mut out: Buffer) raises:
+        """Into a host buffer of floats, widened on the way.
+
+        For tests and traces, through a mapping, which is why nothing on the
+        path a token takes calls it. See `DeviceVec.download`.
+        """
+        if out.elements() != self.n:
+            raise Error(
+                "downloading a device vector of "
+                + String(self.n)
+                + " into "
+                + String(out.elements())
+                + " values"
+            )
+        with self.buf.map_to_host() as h:
+            for i in range(self.n):
+                out.data[i] = Float32(h[i])
+
+    def upload_run(mut self, x: List[Float32], at: Int, n: Int) raises:
+        """Part of a host list into the front of this vector, narrowed on the
+        way. The counterpart of `DeviceVec.upload_run` and for the same tests.
+        """
+        if at < 0 or n <= 0 or len(x) < at + n or n > self.n:
+            raise Error("a run to upload has to fit in both ends")
+        with self.buf.map_to_host() as h:
+            for i in range(n):
+                h[i] = Float16(x[at + i])
+
+    def at(self, index: Int) raises -> Float32:
+        """One value, widened, for a test that wants a scalar."""
+        if index < 0 or index >= self.n:
+            raise Error("index " + String(index) + " is outside this vector")
+        var got: Float16
+        with self.buf.map_to_host() as h:
+            got = h[index]
+        return Float32(got)
+
+
 comptime EPI_NONE = 0
 """The matvec writes its row and nothing else, which is what it always did."""
 comptime EPI_BIAS = 1
@@ -334,6 +441,22 @@ has already been written, which is the order `device_mlp` was already in.
 
 comptime ACT_BIT = 8
 """Set alongside `EPI_GLU` when the activation is gelu rather than silu."""
+
+comptime EPI_HALF = 16
+"""Store the row as a float16 rather than a float32.
+
+Only the key and value projections, whose output is the cache, and it is a bit
+on the epilogue rather than a parameter on the kernel because the kernel is
+already instantiated once per quant form and this would double that to save one
+branch that every thread of a launch takes the same way. It combines with
+`EPI_BIAS`, since a Qwen carries a bias on all three of q, k and v. It does not
+combine with `EPI_ADD` or `EPI_GLU` and nothing asks it to: a residual add and a
+gate are both further down a layer than the cache is.
+
+The pointer arrives from `DeviceHalf.as_matvec_out`, which is where the cast is
+written down. Reaching here with an ordinary float32 output would write two
+elements and be read as a plausible number.
+"""
 
 
 @always_inline
@@ -491,7 +614,12 @@ def write_epilogue(
             got = activate[ACT_GELU](got) * g
         else:
             got = activate[ACT_SILU](got) * g
-    if epi & EPI_ADD != 0:
+    if epi & EPI_HALF != 0:
+        # The cache, narrowed on the way in. Everything above this point is the
+        # same arithmetic in float that any other row gets, so the only
+        # difference a half cache makes to a projection is the last store.
+        o.unsafe_bitcast[Float16]()[unsafe_offset=out_at] = Float16(got)
+    elif epi & EPI_ADD != 0:
         o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + got
     else:
         o[unsafe_offset=out_at] = got
@@ -532,6 +660,36 @@ def coherent_load[
         return p[unsafe_offset=i]
 
 
+@always_inline
+def coherent_load_half[
+    coherent: Bool
+](p: Pointer[Float16, MutAnyOrigin], i: Int) -> Float32:
+    """The same read against the key and value cache, widened on the way out.
+
+    Everything `coherent_load` says applies, with one addition. The stale L1 line
+    it is working around is a line and not a word, so the atomic has to be over
+    the same bytes the ordinary read would touch, and the smallest device scope
+    atomic that is available on both backends is thirty two bits. So a coherent
+    half read loads the aligned pair this element sits in and takes its half.
+    Both halves of the pair are cache elements written by the same projection at
+    the same record, so there is never a partner in flight.
+
+    The pair is aligned because a cache row is `kv_width` elements and every
+    model molla accepts has an even one, and because the allocation begins far
+    past four byte alignment.
+    """
+    comptime if coherent and CompilationTarget.is_macos():
+        var q = p.unsafe_bitcast[Int32]()
+        var pair = bitcast[DType.float16, 2](
+            _dev32.load[ordering=Ordering.RELAXED](
+                Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset=i >> 1])
+            )
+        )
+        return Float32(pair[i & 1])
+    else:
+        return Float32(p[unsafe_offset=i])
+
+
 comptime ALANES = 32
 """Threads that share one key in an attention dot product.
 
@@ -552,7 +710,7 @@ def key_dot[
     coherent: Bool
 ](
     q: Pointer[Float32, MutAnyOrigin],
-    keys: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float16, MutAnyOrigin],
     qa: Int,
     ka: Int,
     head_dim: Int,
@@ -581,9 +739,9 @@ def key_dot[
     var part = Float32(0)
     var d = lane
     while d < head_dim:
-        part += coherent_load[coherent](q, qa + d) * coherent_load[coherent](
-            keys, ka + d
-        )
+        part += coherent_load[coherent](q, qa + d) * coherent_load_half[
+            coherent
+        ](keys, ka + d)
         d += ALANES
     return lane_group_sum[num_lanes=ALANES](part)
 
@@ -1430,6 +1588,51 @@ def device_matvec_into(
             + " and the output ends at "
             + String(out.elements())
         )
+    _matvec_dispatch(ctx, w, x, out.ptr_at(at), epi, aux)
+
+
+def device_matvec_into_half(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    mut out: DeviceHalf,
+    at: Int = 0,
+    epi: Int = EPI_NONE,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
+) raises:
+    """`device_matvec_into` with the key or value cache as its output.
+
+    The same kernel, the same dispatch and the same epilogue with `EPI_HALF`
+    added to it, which is the whole of the difference: a row is reduced in float
+    and narrowed by the store. The one thing a caller has to get right is that
+    the pointer comes from `DeviceHalf.as_matvec_out` and never from anywhere
+    else, and that is why this is a function rather than a flag on the other
+    one.
+    """
+    if at < 0:
+        raise Error("a matvec cannot write at a negative offset")
+    if out.elements() < at + w.rows:
+        raise Error(
+            "the device matvec writes "
+            + String(w.rows)
+            + " rows at offset "
+            + String(at)
+            + " and the output ends at "
+            + String(out.elements())
+        )
+    _matvec_dispatch(ctx, w, x, out.as_matvec_out(at), epi | EPI_HALF, aux)
+
+
+def _matvec_dispatch(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    o: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]],
+) raises:
+    """The kernel choice both matvec entry points share, once the output is an
+    address. Everything above this has checked its own bounds."""
     check_matvec_shapes(w, x.elements(), w.rows)
     comptime if not has_accelerator():
         raise Error(
@@ -1438,7 +1641,6 @@ def device_matvec_into(
             " not when it is run"
         )
     else:
-        var o = out.ptr_at(at)
         # No null to check for inside the kernel, so a caller that asked for
         # nothing gets the output pointer and a kernel that reads it is one that
         # was asked to.
@@ -1843,6 +2045,65 @@ def device_matmul_into(
             + " and the output ends at "
             + String(out.elements())
         )
+    _matmul_dispatch(ctx, w, x, out.ptr_at(at), tokens, epi, aux)
+
+
+def device_matmul_into_half(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    mut out: DeviceHalf,
+    tokens: Int,
+    at: Int = 0,
+    epi: Int = EPI_NONE,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
+) raises:
+    """`device_matmul_into` with the key or value cache as its output.
+
+    What `device_matvec_into_half` says, for a chunk rather than a token. A
+    prefill fills a run of cache slots from here and the run is contiguous, so
+    the narrowing is still nothing but the last store of a row.
+    """
+    if tokens <= 0:
+        raise Error("a batched matmul needs at least one token")
+    if at < 0:
+        raise Error("a matmul cannot write at a negative offset")
+    if x.elements() < tokens * w.cols:
+        raise Error(
+            "the device matmul wants "
+            + String(tokens)
+            + " rows of "
+            + String(w.cols)
+            + " and the input holds "
+            + String(x.elements())
+        )
+    if out.elements() < at + tokens * w.rows:
+        raise Error(
+            "the device matmul writes "
+            + String(tokens)
+            + " rows of "
+            + String(w.rows)
+            + " at offset "
+            + String(at)
+            + " and the output ends at "
+            + String(out.elements())
+        )
+    _matmul_dispatch(
+        ctx, w, x, out.as_matvec_out(at), tokens, epi | EPI_HALF, aux
+    )
+
+
+def _matmul_dispatch(
+    ctx: DeviceContext,
+    w: Tensor,
+    x: DeviceVec,
+    o: Pointer[Float32, MutAnyOrigin],
+    tokens: Int,
+    epi: Int,
+    aux: Optional[Pointer[Float32, MutAnyOrigin]],
+) raises:
+    """The kernel choice both matmul entry points share, once the output is an
+    address. Everything above this has checked its own bounds."""
     check_matvec_shapes(w, w.cols, w.rows)
     comptime if not has_accelerator():
         raise Error(
@@ -1851,7 +2112,6 @@ def device_matmul_into(
             " not when it is run"
         )
     else:
-        var o = out.ptr_at(at)
         var a = aux.value() if aux and epi != EPI_NONE else o
         var p = x.ptr()
         var g = group_size(w.kind)

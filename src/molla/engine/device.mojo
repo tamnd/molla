@@ -58,7 +58,13 @@ from molla.engine.sample import Sampler
 from molla.model.gguf import Gguf
 from molla.model.load import Weights, device_refusal, load, plan_load
 from molla.model.repack import RepackCache, model_key, open_cache
-from molla.nn.gpu import MM_GROUPS, PREFILL_CHUNK, SPAN, DeviceVec
+from molla.nn.gpu import (
+    MM_GROUPS,
+    PREFILL_CHUNK,
+    SPAN,
+    DeviceHalf,
+    DeviceVec,
+)
 from molla.nn.gpu_block import (
     DeviceModel,
     DeviceScratch,
@@ -119,10 +125,18 @@ struct DeviceKvCache(Movable):
     stops being a position both caches change together.
     """
 
-    var keys: List[DeviceVec]
-    """`layers` vectors of `context * kv_width` floats."""
+    var keys: List[DeviceHalf]
+    """`layers` vectors of `context * kv_width` halves.
 
-    var values: List[DeviceVec]
+    Half precision because llama.cpp has held its cache there by default for
+    long enough to be the strongest evidence available that it costs no
+    accuracy, and because this is the one buffer that grows with the
+    conversation rather than with the model. An 8B at a context of 2048 keeps
+    512 MiB of cache in float and 256 in half, and every key and value read in
+    attention is half the traffic it was.
+    """
+
+    var values: List[DeviceHalf]
     """The same, and the same length, always."""
 
     var layers: Int
@@ -152,16 +166,16 @@ struct DeviceKvCache(Movable):
         self.context = context
         self.kv_width = kv_width
         self.filled = 0
-        self.keys = List[DeviceVec]()
-        self.values = List[DeviceVec]()
+        self.keys = List[DeviceHalf]()
+        self.values = List[DeviceHalf]()
         var per = context * kv_width
         for _ in range(layers):
-            self.keys.append(DeviceVec(ctx, per))
-            self.values.append(DeviceVec(ctx, per))
+            self.keys.append(DeviceHalf(ctx, per))
+            self.values.append(DeviceHalf(ctx, per))
 
     def bytes(self) -> Int:
         """What this occupies on the card, which is worth reporting first."""
-        return 2 * self.layers * self.context * self.kv_width * 4
+        return 2 * self.layers * self.context * self.kv_width * 2
 
     def reset(mut self):
         """Forget the sequence without giving back the memory."""

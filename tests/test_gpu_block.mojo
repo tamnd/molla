@@ -447,10 +447,14 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         # together the way flash decoding does. Both are the same sum and
         # neither is more right than the other, and a float32 sum is not
         # associative, so the last bit of a long row is a coin toss between
-        # them. What the bound is worth is the same thing every other bound in
-        # this file is worth: a barrier in the wrong place reads a value from
-        # before a write rather than a value one bit off, and that is not a
-        # rounding difference, it is a different number.
+        # them. The bound is a hundred times tighter than the one the host
+        # comparison carries, because both sides of this one read the same half
+        # precision cache and the fold is the only thing left to disagree
+        # about. Measured worst is 1.7e-7 of the peak, so there is room. What
+        # the bound is worth is the same thing every other bound in this file is
+        # worth: a barrier in the wrong place reads a value from before a write
+        # rather than a value one bit off, and that is not a rounding
+        # difference, it is a different number.
         var fused_trace_worst = Float32(0)
         if len(fscratch.trace) != len(dscratch.trace):
             raise Error("the two traces are not the same length")
@@ -582,9 +586,17 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         keep(blob)
         keep(gains)
 
+        # Three digits and not four, because the host cache is float32 and the
+        # device cache is float16. Half carries eleven bits of mantissa, so a
+        # key goes in with up to 2.4e-4 of relative error on it before anything
+        # has read it, and what comes out the other side of an attention is a
+        # weighted sum of values that were rounded the same way. Measured worst
+        # here is 3.6e-4 of the peak logit, which is one rounding and not a
+        # drift, and the greedy pick below is unaffected.
+        var half_cache = Float32(2e-3)
         suite.check(peak > 0, "the host reference is not all zeros")
         suite.check(
-            worst <= peak * Float32(2e-4),
+            worst <= peak * half_cache,
             "and the device logits agree with it on every token",
         )
         suite.check(
@@ -621,7 +633,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             if gap > trace_worst:
                 trace_worst = gap
         suite.check(
-            trace_worst <= trace_peak * Float32(2e-4),
+            trace_worst <= trace_peak * half_cache,
             (
                 "and the residual stream agrees layer by layer, not only at"
                 " the end"
@@ -649,14 +661,14 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             "and a launch against one raises rather than running nothing",
         )
         suite.check(
-            fused_trace_worst <= trace_peak * Float32(2e-4),
+            fused_trace_worst <= trace_peak * Float32(1e-5),
             (
                 "every residual stream it leaves behind a layer agrees with the"
                 " unfused one"
             ),
         )
         suite.check(
-            fused_worst <= peak * Float32(2e-4),
+            fused_worst <= peak * Float32(1e-5),
             "and so do the logits",
         )
         suite.check(

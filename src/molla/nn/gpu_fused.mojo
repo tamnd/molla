@@ -88,12 +88,15 @@ from molla.nn.gpu import (
     EPI_ADD,
     EPI_BIAS,
     EPI_GLU,
+    EPI_HALF,
     EPI_NONE,
     TILE,
+    DeviceHalf,
     DeviceVec,
     activate,
     byte_float,
     coherent_load,
+    coherent_load_half,
     key_dot,
     nibble_float,
     planar_partial_dot,
@@ -262,6 +265,50 @@ def _get(p: Pointer[Float32, MutAnyOrigin], i: Int) -> Float32:
     return coherent_load[True](p, i)
 
 
+@always_inline
+def _put_pair(
+    p: Pointer[Float32, MutAnyOrigin], j: Int, a: Float32, b: Float32
+):
+    """Write two adjacent halves of the cache as one word.
+
+    `_put` needs a thirty two bit atomic to get a value off the core that wrote
+    it, and the cache is made of sixteen bit values, so the unit a writer owns
+    is the aligned pair and not the element. `j` is the index of that pair: the
+    elements it covers are `2 * j` and `2 * j + 1`, `a` goes in the low one and
+    `b` in the high one.
+
+    Every writer of the cache in this kernel therefore owns whole pairs. The
+    projections do it by taking rows two at a time and the rotations by owning a
+    pair of dimensions rather than a pair of angles, and both are free to do so
+    because a cache row is `kv_width` elements and every model molla accepts has
+    an even one. Two threads owning the two halves of a word would be a read
+    modify write on a value another core is holding, and there is no sixteen bit
+    atomic on either backend to make that safe.
+    """
+    var word = bitcast[DType.int32, 1](
+        SIMD[DType.float16, 2](Float16(a), Float16(b))
+    )
+    var q = p.unsafe_bitcast[Int32]()
+    comptime if CompilationTarget.is_macos():
+        dev32.store[ordering=Ordering.RELAXED](
+            Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset=j]), word
+        )
+    else:
+        q[unsafe_offset=j] = word
+
+
+@always_inline
+def _get_half(p: Pointer[Float32, MutAnyOrigin], i: Int) -> Float32:
+    """Read element `i` of the cache, widened.
+
+    A read has no pairing problem, so this is per element even though the write
+    beside it is per pair. `coherent_load_half` in `molla.nn.gpu` is the whole of
+    it and it loads the pair anyway, because the atomic it needs is thirty two
+    bits wide whichever half is wanted.
+    """
+    return coherent_load_half[True](p.unsafe_bitcast[Float16](), i)
+
+
 comptime SPACE_WORK = 0
 """The layer's intermediates: the norm, the query, the heads output, the
 projection scratch, the gate, the up and the attention scores."""
@@ -383,8 +430,8 @@ def _base(
     off: Int,
     work: Pointer[Float32, MutAnyOrigin],
     resid: Pointer[Float32, MutAnyOrigin],
-    keys: Pointer[Float32, MutAnyOrigin],
-    values: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float16, MutAnyOrigin],
+    values: Pointer[Float16, MutAnyOrigin],
     arena: Pointer[Float32, MutAnyOrigin],
 ) -> Pointer[Float32, MutAnyOrigin]:
     """One operand of a record, resolved to an address.
@@ -397,9 +444,19 @@ def _base(
     if space == SPACE_RESID:
         return Pointer[Float32, MutAnyOrigin](to=resid[unsafe_offset=off])
     if space == SPACE_KEYS:
-        return Pointer[Float32, MutAnyOrigin](to=keys[unsafe_offset=off])
+        # The cache is float16, so this is the address of element `off` of it
+        # and not of a float32 vector, and every record that names one of these
+        # two spaces knows that: a projection stores through an `EPI_HALF`
+        # epilogue and a rotation through `_get_half` and `_put_half`. See
+        # `DeviceHalf`.
+        #
+        # `unsafe_bitcast` and not a pointer rebuilt from an integer address,
+        # for the reason `_put` gives: the second form loses the address space
+        # and the first keeps it, and these two spaces are the ones an atomic
+        # store lands on.
+        return Pointer(to=keys[unsafe_offset=off]).unsafe_bitcast[Float32]()
     if space == SPACE_VALS:
-        return Pointer[Float32, MutAnyOrigin](to=values[unsafe_offset=off])
+        return Pointer(to=values[unsafe_offset=off]).unsafe_bitcast[Float32]()
     if space == SPACE_ARENA:
         return Pointer[Float32, MutAnyOrigin](to=arena[unsafe_offset=off])
     return Pointer[Float32, MutAnyOrigin](to=work[unsafe_offset=off])
@@ -460,6 +517,65 @@ def _tree_max(value: Float32) -> Float32:
 
 
 @always_inline
+def _rope_turn(
+    steps: Pointer[Float32, MutAnyOrigin],
+    factors: Pointer[Float32, MutAnyOrigin],
+    kind: Int,
+    pos: Int,
+    pair: Int,
+    scale: Float32,
+    ext: Float32,
+    attn: Float32,
+    low: Float32,
+    high: Float32,
+) -> SIMD[DType.float32, 2]:
+    """The cosine and the sine of one rotation, with the attention factor in.
+
+    The angle half of `device_rope`, lifted out of the record because the record
+    now has two loops that want it and the arithmetic has to be the same in both
+    to the digit. The returned pair is cosine first.
+    """
+    var freq = Float32(1.0)
+    if kind & FACTOR_BIT != 0:
+        freq = factors[unsafe_offset=pair]
+    var step = steps[unsafe_offset=pair]
+    var extrap = Float32(pos) * step / freq
+    var interp = scale * extrap
+    var theta = interp
+    if ext != 0:
+        var mix = _ramp(low, high, pair) * ext
+        theta = interp * (Float32(1.0) - mix) + extrap * mix
+    var turn = _reduce_angle(theta)
+    return SIMD[DType.float32, 2](cos(turn) * attn, sin(turn) * attn)
+
+
+@always_inline
+def _epi_value(
+    aux: Pointer[Float32, MutAnyOrigin],
+    r: Int,
+    epi: Int,
+    total: Float32,
+) -> Float32:
+    """What a row is worth once it is reduced, before it is stored.
+
+    The first two cases of the unfused matvec's epilogue in the same order: a
+    bias, or a gated activation against the up projection. `aux` is the output
+    pointer when nothing reads it, so there is no null to test for. Split from
+    the store because a row bound for the cache is stored two at a time and this
+    part of it is still one at a time.
+    """
+    var v = total
+    if epi & EPI_BIAS != 0:
+        v += aux[unsafe_offset=r]
+    elif epi & EPI_GLU != 0:
+        if epi & ACT_BIT != 0:
+            v = activate[ACT_GELU](v) * _get(aux, r)
+        else:
+            v = activate[ACT_SILU](v) * _get(aux, r)
+    return v
+
+
+@always_inline
 def _epilogue(
     o: Pointer[Float32, MutAnyOrigin],
     aux: Pointer[Float32, MutAnyOrigin],
@@ -471,17 +587,9 @@ def _epilogue(
 
     The same three cases in the same order as the unfused matvec: a bias, or a
     gated activation against the up projection, and then a residual add or a
-    plain store. `aux` is the output pointer when nothing reads it, so there is
-    no null to test for.
+    plain store.
     """
-    var v = total
-    if epi & EPI_BIAS != 0:
-        v += aux[unsafe_offset=r]
-    elif epi & EPI_GLU != 0:
-        if epi & ACT_BIT != 0:
-            v = activate[ACT_GELU](v) * _get(aux, r)
-        else:
-            v = activate[ACT_SILU](v) * _get(aux, r)
+    var v = _epi_value(aux, r, epi, total)
     if epi & EPI_ADD != 0:
         _put(o, r, _get(o, r) + v)
     else:
@@ -517,12 +625,41 @@ def _do_matvec[
     96 blocks is 43 rows a block. The stride is the whole grid so that the
     workers on adjacent rows at any moment are adjacent, which is what keeps the
     weight reads of one round of the loop in one region of the pool.
+
+    A projection whose output is the cache walks the same rows in the same
+    order and takes them two at a time, because a half is written as the aligned
+    pair it sits in and `_put_pair` says why. The reduction of a row is untouched
+    by that: which warp or which block adds a row up does not change the order
+    the columns come in, so the value is the same one the unfused matvec gets
+    and `tests/test_gpu_fused.mojo` still holds the two to every digit.
     """
     var t = Int(thread_idx.x)
+    var half = epi & EPI_HALF != 0
     if row_takes_a_warp(cols):
         var lane = t % ALANES
         var warps = FTILE // ALANES
-        var rw = b * warps + t // ALANES
+        var w = b * warps + t // ALANES
+        if half:
+            var pairs = rows // 2
+            var pi = w
+            while pi < pairs:
+                var lo = planar_row_sum[group, with_min, form, coherent=True](
+                    packed, x, w_at + (pi * 2) * stride, cols, lane
+                )
+                var hi = planar_row_sum[group, with_min, form, coherent=True](
+                    packed, x, w_at + (pi * 2 + 1) * stride, cols, lane
+                )
+                if lane == 0:
+                    _put_pair(
+                        o,
+                        pi,
+                        _epi_value(aux, pi * 2, epi, lo),
+                        _epi_value(aux, pi * 2 + 1, epi, hi),
+                    )
+                pi += blocks * warps
+            return
+
+        var rw = w
         while rw < rows:
             var total = planar_row_sum[group, with_min, form, coherent=True](
                 packed, x, w_at + rw * stride, cols, lane
@@ -530,6 +667,28 @@ def _do_matvec[
             if lane == 0:
                 _epilogue(o, aux, rw, epi, total)
             rw += blocks * warps
+        return
+
+    if half:
+        var pairs = rows // 2
+        var pi = b
+        while pi < pairs:
+            var alo = planar_partial_dot[
+                FTILE, group, with_min, form, coherent=True
+            ](packed, x, w_at + (pi * 2) * stride, cols, t)
+            var lo = _tree_sum(alo)
+            var ahi = planar_partial_dot[
+                FTILE, group, with_min, form, coherent=True
+            ](packed, x, w_at + (pi * 2 + 1) * stride, cols, t)
+            var hi = _tree_sum(ahi)
+            if t == 0:
+                _put_pair(
+                    o,
+                    pi,
+                    _epi_value(aux, pi * 2, epi, lo),
+                    _epi_value(aux, pi * 2 + 1, epi, hi),
+                )
+            pi += blocks
         return
 
     var r = b
@@ -550,8 +709,8 @@ def fused_kernel(
     arena: Pointer[Float32, MutAnyOrigin],
     work: Pointer[Float32, MutAnyOrigin],
     resid: Pointer[Float32, MutAnyOrigin],
-    keys: Pointer[Float32, MutAnyOrigin],
-    values: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float16, MutAnyOrigin],
+    values: Pointer[Float16, MutAnyOrigin],
     sync: Pointer[Int32, MutAnyOrigin],
     first_dev: Int32,
     last_dev: Int32,
@@ -622,17 +781,40 @@ def fused_kernel(
                 to=arena[unsafe_offset=_fi(plan_i, rec, R_G)]
             )
             var eps = _ff(plan_f, rec, R_EPS)
+
+            # A per head key norm runs in place on the cache, so this record has
+            # the same two widths the rotation below has, chosen the same way
+            # and uniformly across the grid. The sum is per element either way,
+            # since reading a half needs no ownership of anything.
+            var half = _fi(plan_i, rec, R_XS) == SPACE_KEYS
             var run = b
             while run < runs:
                 var at = run * n
                 var acc = Float32(0)
                 var i = t
                 while i < n:
-                    var v = _get(x, at + i)
+                    var v = _get_half(x, at + i) if half else _get(x, at + i)
                     acc += v * v
                     i += FTILE
                 var total = _tree_sum(acc)
                 var scale = Float32(1.0) / sqrt(total / Float32(n) + eps)
+                if half:
+                    var wj = t
+                    while wj * 2 + 1 < n:
+                        var e = at + wj * 2
+                        _put_pair(
+                            o,
+                            e >> 1,
+                            _get_half(x, e)
+                            * scale
+                            * gain[unsafe_offset=wj * 2],
+                            _get_half(x, e + 1)
+                            * scale
+                            * gain[unsafe_offset=wj * 2 + 1],
+                        )
+                        wj += FTILE
+                    run += blocks
+                    continue
                 i = t
                 while i < n:
                     _put(
@@ -697,24 +879,110 @@ def fused_kernel(
             var low = _ff(plan_f, rec, R_LOW)
             var high = _ff(plan_f, rec, R_HIGH)
             var pairs = dim // 2
+
+            # The key rotation runs on the cache and the query rotation on a
+            # work vector, so this one branch is the difference between halves
+            # and floats. It reads the same field for every block of the grid.
+            var half = _fi(plan_i, rec, R_XS) == SPACE_KEYS
             var head = b
             while head < heads:
                 var at = head * head_dim
+                if half:
+                    # Two rotations a thread rather than one, which makes the
+                    # four elements it reads exactly the two words it writes.
+                    # One rotation a thread would have it writing halves of two
+                    # words whose other halves belong to a thread it cannot see,
+                    # and `_put_pair` says why that is not allowed.
+                    # `_rope_record` is where the even count of rotations this
+                    # rests on is checked.
+                    var two = t
+                    while two * 2 + 1 < pairs:
+                        var p0 = two * 2
+                        var r0 = _rope_turn(
+                            steps,
+                            factors,
+                            kind,
+                            pos,
+                            p0,
+                            scale,
+                            ext,
+                            attn,
+                            low,
+                            high,
+                        )
+                        var r1 = _rope_turn(
+                            steps,
+                            factors,
+                            kind,
+                            pos,
+                            p0 + 1,
+                            scale,
+                            ext,
+                            attn,
+                            low,
+                            high,
+                        )
+                        if kind & NEOX_BIT == 0:
+                            # Adjacent pairs, so a word is one rotation whole
+                            # and a thread writes two of them.
+                            var e = at + p0 * 2
+                            var a0 = _get_half(x, e)
+                            var b0 = _get_half(x, e + 1)
+                            var a1 = _get_half(x, e + 2)
+                            var b1 = _get_half(x, e + 3)
+                            _put_pair(
+                                o,
+                                e >> 1,
+                                a0 * r0[0] - b0 * r0[1],
+                                a0 * r0[1] + b0 * r0[0],
+                            )
+                            _put_pair(
+                                o,
+                                (e >> 1) + 1,
+                                a1 * r1[0] - b1 * r1[1],
+                                a1 * r1[1] + b1 * r1[0],
+                            )
+                        else:
+                            # Split halves, so a word is one side of two
+                            # rotations and the two words are half a head apart.
+                            var lo = at + p0
+                            var hi = lo + pairs
+                            var a0 = _get_half(x, lo)
+                            var b0 = _get_half(x, hi)
+                            var a1 = _get_half(x, lo + 1)
+                            var b1 = _get_half(x, hi + 1)
+                            _put_pair(
+                                o,
+                                lo >> 1,
+                                a0 * r0[0] - b0 * r0[1],
+                                a1 * r1[0] - b1 * r1[1],
+                            )
+                            _put_pair(
+                                o,
+                                hi >> 1,
+                                a0 * r0[1] + b0 * r0[0],
+                                a1 * r1[1] + b1 * r1[0],
+                            )
+                        two += FTILE
+                    head += blocks
+                    continue
+
                 var pair = t
                 while pair < pairs:
-                    var freq = Float32(1.0)
-                    if kind & FACTOR_BIT != 0:
-                        freq = factors[unsafe_offset=pair]
-                    var step = steps[unsafe_offset=pair]
-                    var extrap = Float32(pos) * step / freq
-                    var interp = scale * extrap
-                    var theta = interp
-                    if ext != 0:
-                        var mix = _ramp(low, high, pair) * ext
-                        theta = interp * (Float32(1.0) - mix) + extrap * mix
-                    var turn = _reduce_angle(theta)
-                    var c = cos(turn) * attn
-                    var s = sin(turn) * attn
+                    var rot = _rope_turn(
+                        steps,
+                        factors,
+                        kind,
+                        pos,
+                        pair,
+                        scale,
+                        ext,
+                        attn,
+                        low,
+                        high,
+                    )
+                    var c = rot[0]
+                    var s = rot[1]
                     var lo = at + pair
                     var hi = at + pair + pairs
                     if kind & NEOX_BIT == 0:
@@ -826,9 +1094,9 @@ def fused_kernel(
                     if total > 0:
                         for j2 in range(lo, hi):
                             var va = j2 * kv_width + kvh * head_dim
-                            acc += scores[unsafe_offset=sa + j2] * _get(
-                                values, va + d
-                            )
+                            acc += scores[
+                                unsafe_offset=sa + j2
+                            ] * coherent_load_half[True](values, va + d)
                     _put(parts, pa + d, acc)
                     d += FTILE
                 if t == 0:
@@ -1415,8 +1683,8 @@ def launch_fused(
     p: FusedPlan,
     arena: DeviceVec,
     mut resid: DeviceVec,
-    mut keys: DeviceVec,
-    mut values: DeviceVec,
+    mut keys: DeviceHalf,
+    mut values: DeviceHalf,
     first: Int,
     last: Int,
     pos: Int,

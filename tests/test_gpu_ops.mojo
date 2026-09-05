@@ -39,7 +39,7 @@ from max.gpu.host import DeviceContext
 from harness import Suite
 
 from molla.nn.attention import AttnSpec, attend
-from molla.nn.gpu import DeviceVec
+from molla.nn.gpu import DeviceHalf, DeviceVec
 from molla.nn.gpu_ops import (
     attend_partials,
     device_add_into,
@@ -568,8 +568,8 @@ def test_attend(mut suite: Suite, ctx: DeviceContext) raises:
         var blind = AttnSpec(4, 2, 32)
         blind.window = 1
         var q = DeviceVec(ctx, 4 * 32)
-        var k = DeviceVec(ctx, 40 * 2 * 32)
-        var v = DeviceVec(ctx, 40 * 2 * 32)
+        var k = DeviceHalf(ctx, 40 * 2 * 32)
+        var v = DeviceHalf(ctx, 40 * 2 * 32)
         var o = DeviceVec(ctx, 4 * 32)
         var s = DeviceVec(ctx, 4 * 40)
         var part = DeviceVec(ctx, attend_partials(blind, 1, 40))
@@ -600,9 +600,21 @@ def _attend_case(
     var q = _wave(width, count)
     var keys = List[Float32]()
     var values = List[Float32]()
+    # Rounded to half on the way into the list rather than on the way into the
+    # cache, because the cache is float16 and the host reference has to be given
+    # the values the device will actually read. Rounding twice in two places is
+    # the same number here and reads as a comparison of like with like.
     for i in range(count * kv_width):
-        keys.append(Float32((i * 31 % 173)) / Float32(173) - Float32(0.5))
-        values.append(Float32((i * 17 % 149)) / Float32(149) - Float32(0.5))
+        keys.append(
+            Float32(
+                Float16(Float32((i * 31 % 173)) / Float32(173) - Float32(0.5))
+            )
+        )
+        values.append(
+            Float32(
+                Float16(Float32((i * 17 % 149)) / Float32(149) - Float32(0.5))
+            )
+        )
 
     var want = Buffer(width)
     var scratch = List[Float32]()
@@ -611,8 +623,8 @@ def _attend_case(
     attend(spec, q, keys, values, count, pos, want, scratch)
 
     var dq = DeviceVec(ctx, width)
-    var dk = DeviceVec(ctx, count * kv_width)
-    var dv = DeviceVec(ctx, count * kv_width)
+    var dk = DeviceHalf(ctx, count * kv_width)
+    var dv = DeviceHalf(ctx, count * kv_width)
     var dout = DeviceVec(ctx, width)
     var dscores = DeviceVec(ctx, spec.heads * count)
     # Whatever `attend_partials` asks for, which is what decides whether this
@@ -755,7 +767,7 @@ def test_refusals(mut suite: Suite, ctx: DeviceContext) raises:
     var attn = AttnSpec(2, 1, 32)
     var q = DeviceVec(ctx, 64)
     var o = DeviceVec(ctx, 64)
-    var kv = DeviceVec(ctx, 4 * 32)
+    var kv = DeviceHalf(ctx, 4 * 32)
     var scores = DeviceVec(ctx, 2 * 4)
     var part = DeviceVec(ctx, attend_partials(attn, 1, 4))
     raised = False
