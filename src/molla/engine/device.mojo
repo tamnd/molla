@@ -565,8 +565,21 @@ def load_on_device(
             raise Error(refusal)
         if not cache.usable:
             print(label + " writing a planar cache first, " + cache.reason)
+            # Transient, because the only thing this pass leaves behind is the
+            # cache file. Without it the pass ends with the whole model resident
+            # and the device load below faults its own copy in beside it, so a
+            # first run peaks at two copies of a model it only ever needs one
+            # of. Measured on SmolLM2 under `--device=metal` with a hardlinked
+            # copy so the page cache missed, that was 394 MiB against 217 on a
+            # second run, and the 11066 MiB figure quoted for the 8B for two
+            # milestones was the same thing at eight billion parameters.
             var warm = load(
-                g, plan_load(g, dev, 0, cache), 0, False, model_path
+                g,
+                plan_load(g, dev, 0, cache),
+                0,
+                False,
+                model_path,
+                transient=True,
             )
             # The report is the only thing that knows why a repack did not
             # happen. Raising with the reopened cache's reason instead describes
