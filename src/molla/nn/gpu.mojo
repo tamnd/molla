@@ -925,9 +925,11 @@ def planar_partial_dot[
         # See [docs/validation/layout.md](../../../docs/validation/layout.md).
         #
         # How many values a thread takes in one pass of the loop is
-        # `MATVEC_STEP` and it is not the same number on the two backends. See
-        # the comment on it for the measurement.
-        var i = t * MATVEC_STEP
+        # `matvec_step`, which is not the same number on the two backends and
+        # not the same number for every form. See the comment on it for the
+        # measurement.
+        comptime step = matvec_step[form]()
+        var i = t * step
         while i < cols:
             var gi = i >> shift
             var at = row + (i >> 1)
@@ -935,7 +937,7 @@ def planar_partial_dot[
             var m = Float32(0)
             comptime if with_min:
                 m = _group_scale[form](scales, packed, base[1], base[3], gi)
-            comptime for k in range(MATVEC_STEP // 2):
+            comptime for k in range(step // 2):
                 var b = UInt32(packed[unsafe_offset=at + k])
                 var lo = nibble_float[form](b & 0xF)
                 var hi = nibble_float[form](b >> 4)
@@ -946,7 +948,7 @@ def planar_partial_dot[
                 comptime if with_min:
                     acc += m * a0
                     acc += m * a1
-            i += tile * MATVEC_STEP
+            i += tile * step
     else:
         # Five and six bit types, whose low four bits are the plane above and
         # whose remaining one or two are in a second plane after it. One byte of
@@ -967,8 +969,9 @@ def planar_partial_dot[
         comptime hshift = high_shift[form]()
         comptime hper = 1 << hshift
         comptime hmask = UInt32((1 << hbits) - 1)
+        comptime step = matvec_step[form]()
         var high = row + (cols >> 1)
-        var i = t * MATVEC_STEP
+        var i = t * step
         while i < cols:
             var gi = i >> shift
             var at = row + (i >> 1)
@@ -976,7 +979,7 @@ def planar_partial_dot[
             var m = Float32(0)
             comptime if with_min:
                 m = _group_scale[form](scales, packed, base[1], base[3], gi)
-            comptime for k in range(MATVEC_STEP // 2):
+            comptime for k in range(step // 2):
                 var b = UInt32(packed[unsafe_offset=at + k])
                 # `i` is a multiple of the step, so when the step covers a whole
                 # high byte or more these two are constants after unrolling and
@@ -999,7 +1002,7 @@ def planar_partial_dot[
                 comptime if with_min:
                     acc += m * a0
                     acc += m * a1
-            i += tile * MATVEC_STEP
+            i += tile * step
     return acc
 
 
@@ -1182,7 +1185,37 @@ which `V_MASK16` in the probe implements, is in that same table. Against the
 loop at the same step width it is worth nothing on Metal and between nothing
 and a fifth on CUDA depending on the shape, so the shifts are not what this
 loop is paying for and the step width is.
+
+This is the number a plain form wants. A block scaled one wants twice it on
+CUDA, which is `matvec_step`.
 """
+
+
+@always_inline
+def matvec_step[form: Int]() -> Int:
+    """`MATVEC_STEP`, doubled on CUDA for a form that reads two scale planes.
+
+    What a thread does between two reads of the group scale is what the step
+    buys, so a form that pays twice as much for a group scale needs twice as
+    many values to pay it over. A block scaled form reads a byte and a block
+    factor where a plain form reads one float16, and on a 4090 at a step of two
+    that costs the 8B eighteen per cent of a decode: 1226 ms for 128 tokens
+    against 1042 for the layout this replaced. At four it is 1065, which is two
+    per cent, and at eight it is 1226 again, because the occupancy the step
+    costs has caught up with the reuse it buys.
+
+    It is not a free number to raise for everyone. Qwen 2.5 0.5B is 133 q5_0
+    tensors against 14 q4_K, so almost all of it is a plain form, and the same
+    build decodes 260 ms at two and 291 at four. So the step is asked per form
+    rather than per backend, and only the three k types get the wider one.
+
+    Metal is already at eight, which is four times the values a CUDA pass
+    carries, so the second scale read there is amortized before it is asked.
+    """
+    comptime if CompilationTarget.is_macos():
+        return MATVEC_STEP
+    return 2 * MATVEC_STEP if block_scaled(form) else MATVEC_STEP
+
 
 comptime SPAN = 16 if CompilationTarget.is_macos() else 8
 """How many tokens one group of threads in a matmul block carries at once.
