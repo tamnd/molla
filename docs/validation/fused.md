@@ -142,3 +142,42 @@ A fused SmolLM2 session on gpc was 1468 MiB resident against 279 MiB unfused, fo
 What was left in the plan build after that is `fused_selftest`, which allocates three integers and reads them back. Splitting it in half named the line: the probe kernel and its launch cost nothing, and the readback costs all of it. `enqueue_create_host_buffer` allocates pinned memory, and the first pinned allocation in a process costs 1.2 GiB of resident host memory whatever its size. An ordinary device to host copy into a plain list reads the same three words and costs nothing, and with that change a fused session is 279 MiB, which is the unfused figure to within a megabyte.
 
 The reason it is worth writing down rather than just fixing is that the fused path had been carrying a memory number nobody could explain, and the explanation everybody reached for was the plausible one. The measurement that settled it was the cheapest of the four and it was the last one taken.
+
+## Where a fused token actually goes
+
+Stage one shipped and the numbers above say it was worth it, and they do not say what is left. [budget.md](budget.md) answered that question for the 8B by differencing two context lengths and then timing the projection kernel on its own, and neither method reaches a model that decodes through this path. A fused token is one launch a layer with the steps inside it as records, so there is nothing to difference and no separate kernel to point a probe at.
+
+`scripts/fused_probe.mojo` gets at them without adding anything to the shipping path. `launch_fused` already takes a record range, so the probe launches a prefix of every layer, `starts[i]` through `starts[i] + k`, for every `k` from one to a whole layer, and differences the totals. Record `k` costs what prefix `k + 1` costs minus what prefix `k` costs. Every prefix pays the same one launch a layer and reads the same table, so both of those cancel and what is left is the record.
+
+Across all the layers rather than one layer repeated. A SmolLM2 layer is 3.8 MB and the card has 72 MB of L2, so timing one layer thirty times measures the cache. Thirty different layers once each measures the memory, which is what a token does.
+
+gpc, SmolLM2 135M Q8_0, thirty layers of twelve records, 384 blocks, position 513, best of twenty five passes.
+
+| record | op | shape | sync after | a layer | over the model | share |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | norm | 576 | yes | 6.3 us | 190 us | 10.5 per cent |
+| 1 | matvec q | 576 by 576 | no | 2.3 us | 68 us | 3.8 per cent |
+| 2 | matvec k | 576 by 192 | no | 1.1 us | 32 us | 1.8 per cent |
+| 3 | matvec v | 576 by 192 | yes | 2.2 us | 65 us | 3.6 per cent |
+| 4 | rope q | | no | 0.6 us | 19 us | 1.1 per cent |
+| 5 | rope k | | yes | 1.4 us | 43 us | 2.4 per cent |
+| 6 | attend | | yes | 18.9 us | 567 us | 31.4 per cent |
+| 7 | matvec o | 576 by 576 | yes | 4.1 us | 123 us | 6.8 per cent |
+| 8 | norm | 576 | yes | 2.5 us | 76 us | 4.2 per cent |
+| 9 | matvec gate | 576 by 1536 | no | 7.2 us | 217 us | 12.0 per cent |
+| 10 | matvec up | 576 by 1536 | yes | 8.4 us | 253 us | 14.0 per cent |
+| 11 | matvec down | 1536 by 576 | yes | 5.1 us | 153 us | 8.4 per cent |
+
+The layers come to 1.81 ms and a whole token is 2.37 ms, so the 0.56 ms between them is the embedding lookup, the final norm and the output head, none of which are in the plan.
+
+Qwen 2.5 0.5B q4_K_M, twenty four layers of the same twelve records, gives the same shape of answer on a different geometry. The first record is 11.2 microseconds against 3.2 for the same norm in the middle of the layer, the attention is 18.4 microseconds and 20.7 per cent, the gate and the up together are 35.4 and 39.8 per cent, and the down is 10.6 and 12.0.
+
+## What that says to do next
+
+The attention is a fifth to a third of a layer and it is reading the cache at 42 GB/s. One layer's keys and values at position 513 are 3 key heads of 64 floats each way over 513 positions, which is 787 KB, and the step costs 18.9 microseconds on a card that measures 1040 GB/s.
+
+The loop is the reason and not the amount. A block takes a slice of the keys and puts one thread on each key, so with 384 blocks over 9 heads a head gets 31 slices, a slice gets 17 of the 513 keys, and 111 of the block's 128 threads have nothing to do. The 17 that do have a key each walk that key's 64 dimensions serially, and the addresses the active threads touch at any one moment are `kv_width` apart, which is 768 bytes, so no two threads in a warp are in the same sector and every load fetches 32 bytes to use 4. An eighth of the block awake times an eighth of each sector used is most of the factor of 25, and the rest is the fold and the barrier in the middle of the step. That is #239.
+
+The first record of a layer is the second thing. It is the same norm on the same 576 floats as record 8 and costs two and a half times as much, because it is the record that carries the launch. The difference is 3.8 microseconds thirty times a token, which is six per cent, and it is exactly what stage two is for.
+
+The probe has a floor. It is the difference of two wall clock measurements, so a record costing under a microsecond moves by a few tenths between runs and one came out negative at five passes before the count was raised to twenty five. The four rows that matter, the attention and the three feed forward projections, repeat to within five per cent and the total repeats to within one. It also cannot say what a record costs alone, only what it adds to the prefix in front of it, so a record whose reads the card overlapped with the record before it is charged the part that did not overlap. That is the right number for a budget and the wrong one for comparing two kernels.
