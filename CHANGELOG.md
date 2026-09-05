@@ -4,6 +4,19 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.14] - 2026-09-05
+
+A SmolLM2 decode on a 4090 runs 1.20 times faster and Qwen2.5 0.5B 1.09 times, because the fold at the end of attention stopped running on five blocks out of three hundred and eighty four. SmolLM2 is 571.4 tokens a second against 476 and Qwen is 414.2 against 363, and both now decode faster than ollama. The output is byte identical.
+
+### Changed
+
+- The fold that joins attention's slices gives each answer a warp rather than a thread. It has only `heads * head_dim` answers in it, 576 on SmolLM2, so walking it a thread at a time left eighteen warps on five blocks running two serial passes over the slices while the other three hundred and seventy nine blocks waited at the barrier for them. The array being folded is about 74 KB and stays in L2, so this was latency and not traffic. Lanes stride the slices and `lane_group_max` and `lane_group_sum` finish the reduction, which takes the attention step from 17.15 microseconds a layer to 6.88 and a layer's total from 1761.5 to 1454.1. An 8B does not change, because its fold has 4096 answers and was already spread wide.
+- A query meets one key with a warp rather than a thread. Threads a whole key apart meant every load in flight pulled a 32 byte sector to use 4 bytes of it, and on a head count smaller than the tile most of the block sat idle. The lanes of a warp walk one key with a stride of 32 instead. All three attention kernels share one `key_dot`, because the fused layer and the unfused one are held to a bit for bit match and `lane_group_sum` reduces in a tree, so the order the products of a key are added in has to be one constant and one function for both. This is worth 7.5 per cent of the attention record and 1.4 per cent of an 8B token, and nothing on the small models, whose whole key cache is 23 MB against 72 MB of L2 and so was never losing anything to sectors.
+
+### Added
+
+- `scripts/fused_probe.mojo` prices one record of a fused layer. It launches the record range in prefixes and differences them, which works because every prefix pays the same launch a layer and reads the same table, so both cancel. It takes the prefix over every layer rather than repeating one, because a layer is 3.8 MB and the card has 72 MB of L2. This is what found the two changes above, and it corrected the reading they were first attempted under: attention's 42 GB/s was a latency figure and not a bandwidth one, and the coalescing fix that reading predicted was worth a twentieth of what the fold fix turned out to be.
+
 ## [0.4.13] - 2026-09-05
 
 An 8B decode on a 4090 runs 1.42 times faster because attention over the context stopped launching 32 blocks. The token is 9.16 ms against 13.03, which is 109.2 tokens a second against 86.0, and the output is byte identical.
