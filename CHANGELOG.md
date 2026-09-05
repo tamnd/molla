@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.17] - 2026-09-06
+
+The repack cache is 1.9 per cent larger than the model file where it was ten per cent, so an 8B holds 4781 MiB of weights against 5151 and a 4090 holds 5540 MiB of them at a context of 2048 against 5910. That is 1.066 times what llama.cpp holds on the card, and it costs 2.5 per cent of a decode. There is no longer a lossy step anywhere in the repack: all eight quantized types round trip bit for bit, and the logit corpus agrees with llama.cpp on all thirteen device cases on both backends with the greedy picks unchanged.
+
 ### Changed
 
 - The three k types keep a group scale in a byte rather than a float16. A planar group scale was a float16 because that is what q4_1 and q5_1 have, and a k type does not have that: its group scale is a small integer against one float16 for the whole 256 value block, six bits unsigned for q4_k and q5_k and a signed byte for q6_k, and every one of those fits a byte exactly. Storing it wide was the whole of the k type overhead and it is why those three were the only forms that were not size neutral against the file. They now hold the integer a byte a group and the float16 once a block, so a q4_k block is 148 bytes against 160, q5_k is 180 against 192, and q6_k is 210, which is what the file itself costs. The 8B repack cache is 4781 MiB against 5151.
