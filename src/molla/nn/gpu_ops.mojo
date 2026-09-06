@@ -640,33 +640,38 @@ def _ramp(low: Float32, high: Float32, pair: Int) -> Float32:
     return Float32(1.0) - at
 
 
-def _sees(
-    cells: Pointer[Int32, MutAnyOrigin],
-    j: Int,
-    pos: Int,
-    window: Int,
-    sinks: Int,
-    paged: Bool,
-) -> Bool:
+def _sees(j: Int, pos: Int, window: Int, sinks: Int) -> Bool:
     """Whether a query at `pos` may read entry `j` of the keys.
 
-    Both halves of `molla.nn.attention`, in the order that file has them. Unpaged
-    `j` is an offset into a run of keys that exist, so causality is the loop's
-    business and this is `AttnSpec.visible` term for term. Paged `j` is a cell,
-    the position it holds is a load, and this is `AttnSpec.sees`: a negative
-    position is a cell that is free or belongs to somebody else, a position past
-    the query's is another sequence's future, and the window and the sinks are
-    the same arithmetic on the position either way.
+    `molla.nn.attention.AttnSpec.visible` term for term, and paged or not it is
+    now that one expression, because `j` is a position either way: an offset
+    into a run of keys unpaged, and the subscript of the sequence's own index
+    paged. Causality is the loop's business in both, since a query at `pos`
+    reads entries zero through `pos` and stops.
+
+    That is what turning the index around bought. The pool indexed form had to
+    load the position a cell held and compare it, which is `AttnSpec.sees`, and
+    that comparison is now the loop bound. See
+    [docs/validation/batching.md](../../../docs/validation/batching.md).
+    """
+    return j < sinks or window <= 0 or j > pos - window
+
+
+@always_inline
+def _row_of(cells: Pointer[Int32, MutAnyOrigin], j: Int, paged: Bool) -> Int:
+    """Which row of the cache holds entry `j`, which is `j` itself unpaged.
+
+    Paged, `cells` is the sequence's index and `j` is one of its positions, so
+    the row is a load. A negative is a position the sequence does not hold,
+    which is what a cell trimmed out behind a window leaves, and the caller
+    treats it the way it treats a masked one.
 
     The branch is on a kernel argument, so every thread of every block takes the
     same side of it and it costs a predicted jump rather than a divergence.
     """
     if not paged:
-        return j < sinks or window <= 0 or j > pos - window
-    var held = Int(cells[unsafe_offset=j])
-    if held < 0 or held > pos:
-        return False
-    return held < sinks or window <= 0 or held > pos - window
+        return j
+    return Int(cells[unsafe_offset=j])
 
 
 def attend_kernel[
@@ -721,18 +726,18 @@ def attend_kernel[
     reads go through `cache_load`, so the only thing this kernel knows about the
     form is that a row is not the same length as a count of values.
 
-    When `paged` is set, `count` is a count of cells rather than of keys and it
-    is the same for every token of the chunk, `cells` holds the position each of
-    those cells holds for this sequence, and causality comes from that position
-    against the query's rather than from where the loop stops. See
-    [docs/validation/paging.md](../../../docs/validation/paging.md) for why the
-    mask is a position a cell and not a float a pair. Unpaged, `count` grows
-    with the token the way it always did and `cells` is not read at all, so the
-    caller is free to point it anywhere it likes.
+    When `paged` is set, `count` counts the sequence's positions rather than a
+    run of keys and `cells` is its index: entry `j` is the cell holding position
+    `j`, or a negative for a position it does not hold. So the loop is the same
+    loop over the same bound and the only difference is that the row a key sits
+    at is a load rather than the subscript. See
+    [docs/validation/batching.md](../../../docs/validation/batching.md) for why
+    the index is per sequence and not per pool. Unpaged, `cells` is not read at
+    all, so the caller is free to point it anywhere it likes.
     """
     var ty = Int(block_idx.y)
     var paged = Int(paged_dev) != 0
-    var count = Int(count_dev) if paged else Int(count_dev) + ty
+    var count = Int(count_dev) + ty
     var pos = Int(pos_dev) + ty
     var head_dim = Int(head_dim_dev)
     var kv_width = Int(kv_width_dev)
@@ -758,15 +763,15 @@ def attend_kernel[
     var mine = NEG_INF
     var j = team
     while j < count:
-        var visible = _sees(cells, j, pos, window, sinks, paged)
+        var seat = _row_of(cells, j, paged)
         var s = NEG_INF
-        if visible:
+        if seat >= 0 and _sees(j, pos, window, sinks):
             s = (
                 key_dot[False, form](
                     q,
                     keys,
                     qa,
-                    j * row,
+                    seat * row,
                     kvh * head_dim,
                     kv_width,
                     head_dim,
@@ -819,8 +824,11 @@ def attend_kernel[
             var w = scores[unsafe_offset=sa + j2]
             if w == 0:
                 continue
+            var seat2 = _row_of(cells, j2, paged)
+            if seat2 < 0:
+                continue
             acc += w * cache_load[form, False](
-                values, j2 * row, kv_width, kvh * head_dim + d
+                values, seat2 * row, kv_width, kvh * head_dim + d
             )
         o[unsafe_offset=qa + d] = acc * inv
         d += tile
@@ -836,6 +844,24 @@ microseconds, so the card was doing four times the work for the same time and a
 decode was using a quarter of it. 256 is where that stopped being true and the
 time began to rise, so it is the first grid width that is actually using the
 machine.
+"""
+
+comptime SCAN_PAD = 256
+"""How far a paged decode rounds its scan up, in positions.
+
+llama.cpp rounds the prefix it attends to a multiple of 256 and says in the
+source that it is there so the graph shape stops changing between batches. It is
+kept here because it measured: on the 4090 at a 512 token prompt, a decode that
+scans its own length runs at 260 tokens a second and one that rounds the length
+up to this runs at 275, which is where the contiguous path is. The positions
+between the sequence's end and the round number hold no cell, so they are the
+same skip a trimmed position is, and the work they add is at most 255 rows of a
+scan that is thousands.
+
+Decode only. A prefill chunk reads a triangle, token `i` of it reading `i` more
+positions than the first, and rounding the first token's count up squares that
+triangle off: the same knob measured 7900 prefill tokens a second against 9500.
+So a chunk of more than one token gets the count it asked for.
 """
 
 comptime ATTEND_MIN_CHUNK = 128
@@ -925,15 +951,16 @@ def attend_split_kernel[
     The scores go to the same scratch at the same offsets the single kernel
     writes, because the slices are disjoint and between them cover the row.
 
-    Paged, the slices are cut over cells rather than over keys, and the entirely
-    masked slice handled below stops being the rare case a window produces. It
-    becomes an ordinary one, because the cells a sequence owns are spread over
-    the pool rather than gathered at the front, so a slice that holds none of
-    them has to come out as nothing seen rather than as a division by zero.
+    Paged, the slices are cut over the sequence's positions rather than over a
+    run of keys, which is the same cut over the same count. The entirely masked
+    slice handled below stays the rare case a window produces, and gains one
+    more way to happen: a slice whose positions were all trimmed out from behind
+    a window holds no cells at all, and that has to come out as nothing seen
+    rather than as a division by zero.
     """
     var ty = Int(block_idx.y)
     var paged = Int(paged_dev) != 0
-    var count = Int(count_dev) if paged else Int(count_dev) + ty
+    var count = Int(count_dev) + ty
     var pos = Int(pos_dev) + ty
     var head_dim = Int(head_dim_dev)
     var kv_width = Int(kv_width_dev)
@@ -976,15 +1003,15 @@ def attend_split_kernel[
     var mine = NEG_INF
     var j = lo + team
     while j < hi:
-        var visible = _sees(cells, j, pos, window, sinks, paged)
+        var seat = _row_of(cells, j, paged)
         var s = NEG_INF
-        if visible:
+        if seat >= 0 and _sees(j, pos, window, sinks):
             s = (
                 key_dot[False, form](
                     q,
                     keys,
                     qa,
-                    j * row,
+                    seat * row,
                     kvh * head_dim,
                     kv_width,
                     head_dim,
@@ -1032,8 +1059,11 @@ def attend_split_kernel[
             var w = scores[unsafe_offset=sa + j2]
             if w == 0:
                 continue
+            var seat2 = _row_of(cells, j2, paged)
+            if seat2 < 0:
+                continue
             acc += w * cache_load[form, False](
-                values, j2 * row, kv_width, kvh * head_dim + d
+                values, seat2 * row, kv_width, kvh * head_dim + d
             )
         partials[unsafe_offset=pa + d] = acc
         d += tile
@@ -2209,6 +2239,7 @@ def device_attend(
         ),
         count,
         count + tokens - 1,
+        count + tokens - 1,
         pos,
         seen,
         False,
@@ -2226,8 +2257,8 @@ def device_attend_paged(
     q: DeviceVec,
     keys: DeviceHalf,
     values: DeviceHalf,
-    held: List[Int32],
-    cells: DeviceInts,
+    order: List[Int32],
+    index: DeviceInts,
     count: Int,
     pos: Int,
     mut out: DeviceVec,
@@ -2236,43 +2267,53 @@ def device_attend_paged(
     tokens: Int = 1,
     form: Int = CACHE_F16,
 ) raises:
-    """`device_attend` over a cell pool, masked by the position each cell holds.
+    """`device_attend` over a cell pool, gathered through one sequence's index.
 
-    The keys and values are the pool rather than one sequence's run, `cells` is
-    one entry a cell holding the position that cell holds for this sequence and
-    a negative for one it may not read, and `count` is how many of them a step
-    reads. That count is the same for every token of a chunk, which is the
-    difference from the unpaged call: there the count grows with the token
-    because causality is where the loop stops, and here it does not because
-    causality is a comparison of positions.
+    The keys and values are the pool rather than one sequence's run, `index` is
+    one entry a position of that sequence saying which cell holds it and a
+    negative for a position it does not hold, and `count` is how many positions
+    the first token of the chunk reads, which is `pos + 1`. Token `i` reads
+    `count + i`, exactly as it does unpaged, because a position is a position
+    whichever cell it went in.
 
-    `count` is the window rather than the buffer. Both vectors are allocated
-    once at the size of the pool and a step reads a prefix of them, because a
-    buffer sized to the window would be an allocation a token and a host list
-    sliced to the window would be a copy a token. Nothing here rounds it. The
-    caller does that, through `CellTable.window`, because it is the caller that
-    knows how much rounding keeps a launch shape still.
+    `count` is the sequence and not the pool. The buffer is allocated once at
+    the size of the pool because a buffer sized to a sequence would be an
+    allocation a token, and a step reads the prefix it has written, rounded up
+    to `SCAN_PAD` when the step is a decode. The rounding is why the caller has
+    to leave the entries above the sequence negative, and `DeviceKvCache.place`
+    is what keeps them that way.
 
-    `held` is the host copy of what `cells` holds and the caller owns both. It
+    `order` is the host copy of what `index` holds and the caller owns both. It
     is here for the refusal below, which is the same refusal `device_attend`
     makes and cannot be made against a device buffer without a read back on the
-    path a token takes. Both have to reach the window, because a caller that
-    uploads one vector and reasons about another produces fluent text about the
-    wrong context and nothing else goes wrong.
+    path a token takes. Both have to reach the end of the chunk, because a
+    caller that uploads one vector and reasons about another produces fluent
+    text about the wrong context and nothing else goes wrong.
     """
-    if count < 1 or len(held) < count or cells.elements() < count:
+    # The ask is checked before the pad, because the pad is clamped to the
+    # buffer and a check after it would find every ask fits by construction.
+    var ask = count + tokens - 1
+    if count < 1 or len(order) < ask or index.elements() < ask:
         raise Error(
             "paged attention over "
-            + String(count)
-            + " cells got "
-            + String(len(held))
+            + String(ask)
+            + " positions got "
+            + String(len(order))
             + " on the host and "
-            + String(cells.elements())
+            + String(index.elements())
             + " on the device"
         )
+    var wide = count
+    if tokens == 1:
+        wide = (count + SCAN_PAD - 1) // SCAN_PAD * SCAN_PAD
+        if wide > index.elements():
+            wide = index.elements()
+        if wide > len(order):
+            wide = len(order)
+    var last = wide + tokens - 1
     var seen = 0
-    for c in range(count):
-        if spec.sees(Int(held[c]), pos):
+    for p in range(count):
+        if Int(order[p]) >= 0 and spec.visible(p, pos):
             seen += 1
     _attend_go(
         ctx,
@@ -2280,9 +2321,10 @@ def device_attend_paged(
         q,
         keys,
         values,
-        cells.ptr(),
-        count,
-        count,
+        index.ptr(),
+        wide,
+        last,
+        index.elements(),
         pos,
         seen,
         True,
@@ -2303,6 +2345,7 @@ def _attend_go(
     cells: Pointer[Int32, MutAnyOrigin],
     count: Int,
     last: Int,
+    rows: Int,
     pos: Int,
     seen: Int,
     paged: Bool,
@@ -2314,10 +2357,13 @@ def _attend_go(
 ) raises:
     """The refusals and the split arithmetic, shared by both entry points.
 
-    `count` is keys unpaged and cells paged, `last` is the furthest entry any
-    token of the chunk reaches, and `seen` is how many of them the first token
-    can see. The two callers differ only in how they answer those three, which
-    is the whole of what paging changes above the kernel.
+    `count` is how many entries the first token of the chunk reads and `last` is
+    how many the furthest one reads, both in positions. `rows` is how many rows
+    of the cache the call can reach, which is `last` unpaged and the whole pool
+    paged, because a sequence's cells are anywhere in it. `seen` is how many
+    entries the first token can actually see once the window and the holes are
+    taken off. The two callers differ only in how they answer those, which is
+    the whole of what paging changes above the kernel.
     """
     if tokens < 1:
         raise Error("attention needs at least one query")
@@ -2340,10 +2386,10 @@ def _attend_go(
         raise Error("attention needs at least one key to look at")
     var kv_width = spec.kv_heads * spec.head_dim
     var row = cache_row(form, kv_width)
-    if keys.elements() < last * row or values.elements() < last * row:
+    if keys.elements() < rows * row or values.elements() < rows * row:
         raise Error(
             "attention wants "
-            + String(last * row)
+            + String(rows * row)
             + " halves of keys and values but got "
             + String(keys.elements())
             + " and "

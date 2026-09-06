@@ -29,14 +29,14 @@ a method, one level up: the day a slot stops being a position, one function
 changes and both caches follow, rather than one of them being updated and the
 other quietly staying correct for a while.
 
-`CellTable` below is the start of the day that paragraph is about. It is #31 and
+`CellTable` below is the day that paragraph is about. It is #31 and
 `docs/validation/paging.md` is the argument for its shape: the pool is addressed
 by cell rather than by position, a cell holds one token, and which cell a
 position went in is host side bookkeeping that no kernel walks. It holds the
-free list, the owner set, the window a step reads, the bounded ring a window
-model needs, and the eviction order. Nothing calls it yet, and that is the last
-thing #31 wants: a session still reserves its whole context and `slot_for` is
-still the identity, so the wiring is where #32 starts.
+free list, the owner set, the bounded ring a window model needs, and the
+eviction order. What reaches the card is `route`, one entry a position of one
+sequence saying which cell holds it, and `docs/validation/batching.md` is the
+argument for that being indexed by position rather than by cell.
 """
 
 comptime CELL_FREE = -1
@@ -45,18 +45,6 @@ comptime CELL_FREE = -1
 Negative rather than a separate flag vector, which is what llama.cpp does, for
 the same reason: the free question and the position question are then one load
 rather than two, and a position can never be negative anyway.
-"""
-
-comptime PAGE_PAD = 256
-"""How far a step's window rounds up, in cells.
-
-llama.cpp rounds the prefix it attends to a multiple of 256 and says in the
-source that it is there so the graph shape stops changing between batches. The
-same argument holds here for a coarser reason: a launch whose grid changes every
-token is a launch the driver cannot reuse anything about, and the cells between
-the frontier and the round number are masked off anyway because nothing owns
-them. What it costs is reading up to 255 cells that say nothing, which at a
-context of a few thousand is single digit per cent of the attention.
 """
 
 comptime MAX_SEQS = 64
@@ -187,13 +175,17 @@ struct CellTable(Movable):
     """
 
     var top: Int
-    """One past the highest live cell, which is how far attention has to read.
+    """One past the highest live cell, which is how far the pool is in use.
 
-    Kept rather than found, because it is asked once a step and finding it is a
-    scan back from the end of the pool. Allocation raises it and is the common
-    case. A release only lowers it when what it freed was at the top, and then
-    the scan back is over the cells that were just freed rather than over the
-    pool.
+    Kept rather than found, because finding it is a scan back from the end of
+    the pool. Allocation raises it and is the common case. A release only lowers
+    it when what it freed was at the top, and then the scan back is over the
+    cells that were just freed rather than over the pool.
+
+    Attention does not read this. It reads a sequence's own length, which is
+    what `route` is indexed by. The frontier is here for the reporting and for
+    the free list, both of which are questions about the pool rather than about
+    a sequence.
     """
 
     def __init__(out self, cells: Int) raises:
@@ -228,71 +220,65 @@ struct CellTable(Movable):
         self.head = 0
         self.top = 0
 
-    def window(self, pad: Int) raises -> Int:
-        """How many cells a step reads, `top` rounded up to `pad`.
-
-        The rounding is llama.cpp's and the reason it gives is the reason to
-        take it: a launch whose grid changes every token is a launch the driver
-        cannot reuse anything about, and the cells between `top` and the round
-        number are masked off by the window anyway because nothing owns them.
-        What it costs is reading up to `pad - 1` cells that say nothing, which
-        at a pad of 256 and a context of a few thousand is single digit per
-        cent of the attention and buys a constant shape.
-        """
-        if pad <= 0:
-            raise Error("a window has to round up to something positive")
-        var n = (self.top + pad - 1) // pad * pad
-        if n < pad:
-            n = pad
-        if n > self.size():
-            n = self.size()
-        return n
-
-    def held(
+    def route(
         self, seq: Int, upto: Int, mut out: List[Int32], at: Int = 0
     ) raises:
-        """The position each of the first `upto` cells holds for `seq`.
+        """Which cell holds each of `seq`'s first `upto` positions.
 
-        `CELL_FREE` for a cell `seq` does not own, whether that is because it is
-        free or because it belongs to somebody else, so one vector answers both
-        halves of the question attention asks. That is what makes this cheaper
-        than the mask llama.cpp builds: it is one entry a cell rather than one
-        entry a cell a token, so it does not grow with the batch, and the
-        causality that would be baked into a two dimensional mask is a compare
-        against the query's own position instead.
+        The other way round from a mask over the pool, and that is the whole
+        point of it. A mask says what each cell holds and leaves a query to look
+        at every cell to find its own, which costs the batch size once the pool
+        is shared. This says where each position is, so a query looks at its own
+        positions and nothing else, and causality stops being a comparison and
+        becomes where the loop ends, because the position is the subscript. See
+        [docs/validation/batching.md](../../../docs/validation/batching.md).
+
+        `CELL_FREE` for a position `seq` does not hold, which is one that was
+        trimmed out behind a window or one it never wrote. Attention skips those
+        the way it skips a masked cell.
 
         Written at `at` into a list the caller already sized, rather than
         appended to an empty one. What reads this is a device buffer that was
-        allocated once at the size of the pool and is filled again every step,
-        and a list that grew a step would be an allocation a step on the path a
-        token takes. The offset is what lets a batch of sequences write their
-        windows back to back into that one buffer.
+        allocated once and is filled again, and a list that grew a step would be
+        an allocation a step on the path a token takes. The offset is what lets
+        a batch of sequences lay their lists back to back in that one buffer.
+
+        A scan of the pool, which is what a rebuild costs. Nothing on the decode
+        path calls it, because a sequence's list is appended to as it allocates
+        and the entry it appends is the cell `alloc` just returned. This is for
+        the checks that compare two routes position by position, and for a
+        sequence that takes a prefix from somebody else and has to find out
+        where that prefix landed.
 
         Int32 because that is the width the buffer is. See `DeviceInts` for why
         it is not the host `Int`.
         """
         if upto < 0 or upto > self.size():
             raise Error(
-                "a window of "
+                "a run of "
                 + String(upto)
-                + " does not fit a pool of "
+                + " positions does not fit a pool of "
                 + String(self.size())
             )
         if at < 0 or at + upto > len(out):
             raise Error(
-                "a window of "
+                "a run of "
                 + String(upto)
                 + " at "
                 + String(at)
                 + " does not fit a list of "
                 + String(len(out))
             )
-        var bit = _bit_of(seq)
         for i in range(upto):
-            if (self.owners[i] & bit) != 0:
-                out[at + i] = Int32(self.pos[i])
-            else:
-                out[at + i] = Int32(CELL_FREE)
+            out[at + i] = Int32(CELL_FREE)
+        var bit = _bit_of(seq)
+        for i in range(self.size()):
+            var p = self.pos[i]
+            if p < 0 or p >= upto:
+                continue
+            if (self.owners[i] & bit) == 0:
+                continue
+            out[at + p] = Int32(i)
 
     def position(self, cell: Int) raises -> Int:
         """What position `cell` holds, or `CELL_FREE`."""

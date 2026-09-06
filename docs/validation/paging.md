@@ -118,6 +118,14 @@ So the check that survives the change is the one `molla.engine.cache` was writte
 
 The fuzz that is running is over pool layouts rather than over conversation trees, which is as far as the gate reaches while there is one sequence. Each trial takes a decoy of a random length, gives a random half of it back so the pool has holes rather than an offset, cuts the same prompt into chunks of a random length, and runs the chunks twice, once into the holed pool and once into an empty one. Nothing is contiguous about the first run and everything is about the second, and the logits have to agree. Eight trials from a fixed seed, so a failure is reachable again without capturing anything. The tree shaped version, where two sequences share a prefix and one of them diverges, needs a second sequence to exist, and that is #32.
 
+## What #32 changed underneath this
+
+The mask this page describes lasted until the second stage of #32, which turned the index around. The page is left as it was written because the measurements above were taken against the mask and are the reason the shape was chosen, but the names have moved and a reader following them into the source would not find them.
+
+Attention no longer takes a vector over cells holding positions. It takes a vector over one sequence's positions holding cells, so entry `i` is the cell holding position `i`. Causality goes back to being where the loop stops, which is what it was before paging existed, and the arithmetic in `AttnSpec.visible` is the same expression on both paths rather than two. What survives of the mask is one indirection, `_row_of`, which is the entry itself when nothing is paged.
+
+`CellTable.window` is gone and `CellTable.route` is what replaced it, filling a caller's list with a cell an entry for the first `upto` positions of one sequence. `PAGE_PAD` is gone and `SCAN_PAD` is what replaced it, rounding a decode's scan up to 256 and leaving a prefill chunk alone. `docs/validation/batching.md` has the measurement that made the pad decode only, and it contradicts what that spec predicted before it was run.
+
 ## Sizing
 
 The pool's size is what actually decides concurrency, so it is reported rather than inferred. Free device memory after the weights and the activation headroom, divided by `2 * layers * cache_row(form, kv_width) * 2` bytes a cell, is the token capacity, and that number belongs in `/molla/runners` beside the model.

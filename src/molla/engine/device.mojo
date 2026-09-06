@@ -53,7 +53,7 @@ from std.sys.info import CompilationTarget, has_accelerator
 from max.gpu.host import DeviceContext
 
 from molla.engine.bind import Bound
-from molla.engine.cache import PAGE_PAD, CellTable, check_room, slot_of
+from molla.engine.cache import CELL_FREE, CellTable, check_room, slot_of
 from molla.engine.sample import Sampler
 from molla.model.gguf import Gguf
 from molla.model.load import Weights, device_refusal, load, plan_load
@@ -260,12 +260,12 @@ struct DeviceKvCache(Movable):
         """What this occupies on the card, which is worth reporting first."""
         return self.pool.elements() * 2
 
-    def reset(mut self):
+    def reset(mut self) raises:
         """Forget the sequence without giving back the memory."""
         self.filled = 0
         self.table.reset()
         self.straight = True
-        self.paging.on = False
+        self.paging.forget()
 
     def slot_for(self, pos: Int) raises -> Int:
         return slot_of(pos, self.context)
@@ -292,9 +292,12 @@ struct DeviceKvCache(Movable):
         position, so this can turn paging on and says so through `paging.on`.
         It never turns it off.
 
-        Both vectors are queued here when the pass is paged, on the stream the
-        kernels are queued on and ahead of them, which is the one transfer
-        paging costs a step.
+        The index of cells by position is appended to here whether or not the
+        pass is paged, because the entry to append is the cell `alloc` just
+        handed back and finding it later would be a scan of the pool. What the
+        pass being paged decides is how much of it the card is sent: everything
+        the card has not seen, which after the first paged step is the tokens of
+        this one. See `DevicePaging.queue`.
         """
         if count < 1:
             raise Error("a step has to place at least one token")
@@ -306,6 +309,15 @@ struct DeviceKvCache(Movable):
                 + String(self.paging.chunk())
                 + " cells"
             )
+        if pos < 0 or pos + count > self.context:
+            raise Error(
+                "a step of "
+                + String(count)
+                + " tokens at "
+                + String(pos)
+                + " runs past a context of "
+                + String(self.context)
+            )
         check_room(count, self.table.free(), self.table.size())
         var first = -1
         for i in range(count):
@@ -315,11 +327,29 @@ struct DeviceKvCache(Movable):
             if i == 0:
                 first = cell
             self.paging.slots[i] = Int32(cell)
+            self.paging.order[pos + i] = Int32(cell)
+        # A step that goes back over ground the sequence has already covered
+        # leaves its old cells sitting above the new end, and a decode scan
+        # rounded up to `SCAN_PAD` would read them. So the tail is cleared, and
+        # the clearing goes to the card with the step rather than being left for
+        # whoever notices.
+        var end = pos + count
+        var upto = end
+        if self.paging.reach > end:
+            upto = self.paging.reach
+            for p in range(end, upto):
+                self.paging.order[p] = Int32(CELL_FREE)
+        self.paging.reach = end
         self.paging.on = paged or not self.straight
         if self.paging.on:
-            self.paging.window = self.table.window(PAGE_PAD)
-            self.table.held(self.seq, self.paging.window, self.paging.held)
-            self.paging.queue()
+            # From wherever the card has got to, which is this step's own tokens
+            # unless the passes before it were contiguous and left the card with
+            # nothing, and then it is the whole sequence, once.
+            var at = self.paging.sent
+            if at > pos:
+                at = pos
+            self.paging.queue(at, upto - at)
+            self.paging.sent = end
         return first
 
 
@@ -498,7 +528,7 @@ struct DeviceSession(Movable):
     def context(self) -> Int:
         return self.cache.context
 
-    def reset(mut self):
+    def reset(mut self) raises:
         """Start a new sequence in the same memory."""
         self.cache.reset()
         self.pos = 0
