@@ -133,6 +133,22 @@ def _time_paged(
     return best
 
 
+def _two(x: Float64) -> String:
+    """`x` to two decimals.
+
+    The tables above print one, which is enough for a speedup of five. This
+    column is a ratio near one and the second digit is the whole of what it
+    says, so a tenth would round the answer away.
+    """
+    var hundredths = Int(x * 100.0 + 0.5)
+    return (
+        String(hundredths // 100)
+        + "."
+        + String(hundredths % 100 // 10)
+        + String(hundredths % 10)
+    )
+
+
 def main() raises:
     comptime if not has_accelerator():
         print("attend_probe: no accelerator on this machine")
@@ -321,9 +337,7 @@ def main() raises:
                 + " us\t     "
                 + String(Int(pool / 1000.0))
                 + " us\t     "
-                + String(Int(pool / run))
-                + "."
-                + String(Int(pool * 100.0 / run) % 100)
+                + _two(pool / run)
                 + "x\t      "
                 + String(Int(token / 1000000.0))
                 + "."
