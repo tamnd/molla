@@ -4,6 +4,17 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.18] - 2026-09-06
+
+The KV cache is written once rather than three times, which is what a quantized cache needs and which on its own deletes a compile time parameter, a refusal and three separate answers to the same Metal constraint. The three largest kernels have half the instantiations they had, so the CUDA binary is 445 KiB smaller and the Metal one 483 KiB. Decode costs 2 per cent for the extra barrier and prefill is unchanged. The logit corpus agrees with llama.cpp on all thirteen device cases on both backends.
+
+### Changed
+
+- The key and the value are projected into a float32 workspace, normed and rotated there, and stored into the cache once. A q8_0 block is thirty two quants and one scale and the scale is a reduction over the whole block, so a writer owns a whole block or it owns nothing, and none of the three writers the cache had owned one: a projection gives an output row to a block, so thirty two consecutive elements of a cache row come from thirty two different blocks, and the rotation reads element `i` and element `i + dim / 2` and writes both, which at a head dimension of 128 is two blocks. That is why the second half of #204 is not a dtype change. The fused plan gained `OP_STORE` and the unfused path gained `device_store_kv`, so a layer's plan is fourteen records rather than twelve. See docs/validation/kvcache.md.
+- The projections no longer narrow their output, so the store width is not a kernel parameter any more. `EPI_HALF` is gone and with it the `half` parameter on the matvec, the matmul and the matrix core kernels, which halves their instantiations, and the float16 rope kernel, the float16 norm kernel and the two half projection entry points go with it because the one thing that wanted them was a cache written in place. #249 is now purely the occupancy question it always was underneath.
+- Metal's thirty two bit word ownership is asked of one writer rather than three. `PAIRED` is why the projections walked their rows two at a time, why the per head key norm owned a word and why the rotation owned two adjacent rotation pairs, and with the transforms in a float32 workspace none of those touches the cache at all. All three go back to one element a thread and the store is the only place the question is asked.
+- A rotation over a head whose `rope.dim` is not a multiple of four is a rotation rather than an error. The refusal existed because the rotation owned two rotations at once so that what it read was what it wrote. No model molla has met has such a head, and the day one does it now works.
+
 ## [0.4.17] - 2026-09-06
 
 The repack cache is 1.9 per cent larger than the model file where it was ten per cent, so an 8B holds 4781 MiB of weights against 5151 and a 4090 holds 5540 MiB of them at a context of 2048 against 5910. That is 1.066 times what llama.cpp holds on the card, and it costs 2.5 per cent of a decode. There is no longer a lossy step anywhere in the repack: all eight quantized types round trip bit for bit, and the logit corpus agrees with llama.cpp on all thirteen device cases on both backends with the greedy picks unchanged.
