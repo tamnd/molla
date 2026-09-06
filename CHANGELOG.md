@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.20] - 2026-09-06
+
+A q8_0 cache now costs 4 per cent of a decode where it cost 24, for the same bytes and the same answers, because a key read takes four adjacent elements a lane rather than one. And there is now a long soak that says the form is safe over thousands of positions, which is the thing #204 was really waiting on and which nothing in the suite could see.
+
 ### Changed
 
 - A q8_0 key read takes four adjacent elements a lane rather than one, which is most of what the form cost. Four adjacent elements are one aligned thirty two bit word of quants, and `coherent_load_i8` was already loading that word and throwing three of its bytes away because the smallest device scope atomic either backend has is thirty two bits. They are also inside one block, so they share a factor, and the factor now multiplies their partial sum once instead of multiplying each of them. On a 4090 with the 8B at Q4_K_M at a context of 4096, a q8_0 decode went from 23.7 per cent slower than float16 to 4.0, and prefill from 7.5 to 2.3. The cache bytes are unchanged because the store side did not change. The four per cent that is left is the value fold, which cannot take the same treatment without cutting the threads that run it by four, and #258 stays open for it. See docs/validation/kvcache.md.
