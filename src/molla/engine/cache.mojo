@@ -29,13 +29,14 @@ a method, one level up: the day a slot stops being a position, one function
 changes and both caches follow, rather than one of them being updated and the
 other quietly staying correct for a while.
 
-`CellTable` below is the start of the day that paragraph is about. It is stage
-two of #31 and `docs/validation/paging.md` is the argument for its shape: the
-pool is addressed by cell rather than by position, a cell holds one token, and
-which cell a position went in is host side bookkeeping that no kernel walks.
-Nothing calls it yet. It lands first on its own because a free list and an owner
-set are the part of paging that can be tested to exhaustion without a card, and
-because the stage after it wants to be a change to attention alone.
+`CellTable` below is the start of the day that paragraph is about. It is #31 and
+`docs/validation/paging.md` is the argument for its shape: the pool is addressed
+by cell rather than by position, a cell holds one token, and which cell a
+position went in is host side bookkeeping that no kernel walks. It holds the
+free list, the owner set, the window a step reads, the bounded ring a window
+model needs, and the eviction order. Nothing calls it yet, and that is the last
+thing #31 wants: a session still reserves its whole context and `slot_for` is
+still the identity, so the wiring is where #32 starts.
 """
 
 comptime CELL_FREE = -1
@@ -141,6 +142,38 @@ struct CellTable(Movable):
     every time turns a decode step into a scan of the pool.
     """
 
+    var running: UInt64
+    """A bit a sequence that still needs the cells it holds.
+
+    A sequence that has finished its turn is retired rather than released, so
+    its cells stay where they are and the next request that starts with the
+    same tokens can share them instead of computing them again. A cell no
+    running sequence owns is what #31 calls unreferenced, and it is what
+    `evict` is allowed to take.
+    """
+
+    var stamp: List[Int]
+    """When each sequence last touched the pool, on the `clock` below.
+
+    One entry a sequence rather than one a cell, which is the whole reason
+    eviction here is cheap. A retired sequence's cells were all written for the
+    same turn and are all worth the same to the request after it, so ordering
+    them individually would be an ordering over 147000 numbers to answer a
+    question that has 64 possible answers.
+
+    Zero means never touched, so a stamp of zero is skipped rather than sorted
+    first. `clock` is incremented before it is read, so a real stamp is never
+    zero.
+    """
+
+    var clock: Int
+    """Counts touches, so that `stamp` has an order.
+
+    Not a time. A wall clock would make eviction depend on how fast the machine
+    is, and the only question being asked is which of two sequences was used
+    more recently.
+    """
+
     var top: Int
     """One past the highest live cell, which is how far attention has to read.
 
@@ -157,6 +190,9 @@ struct CellTable(Movable):
             raise Error("a cell table needs at least one cell")
         self.pos = List[Int](length=cells, fill=CELL_FREE)
         self.owners = List[UInt64](length=cells, fill=0)
+        self.running = 0
+        self.stamp = List[Int](length=MAX_SEQS, fill=0)
+        self.clock = 0
         self.live = 0
         self.head = 0
         self.top = 0
@@ -172,6 +208,10 @@ struct CellTable(Movable):
         for i in range(self.size()):
             self.pos[i] = CELL_FREE
             self.owners[i] = 0
+        for s in range(MAX_SEQS):
+            self.stamp[s] = 0
+        self.running = 0
+        self.clock = 0
         self.live = 0
         self.head = 0
         self.top = 0
@@ -241,6 +281,9 @@ struct CellTable(Movable):
         the same position twice has a bug one level up, and a table that
         searched for a duplicate on every token would be paying for that bug
         once a token forever.
+
+        Allocating counts as running and as a touch, so a caller never has to
+        say that a sequence it is writing into is alive.
         """
         if at < 0:
             raise Error("a position cannot be negative")
@@ -257,6 +300,7 @@ struct CellTable(Movable):
                 if cell + 1 > self.top:
                     self.top = cell + 1
                 self.head = cell + 1 if cell + 1 < n else 0
+                self._touch(seq)
                 return cell
         raise Error("the cell pool is full at " + String(n) + " cells")
 
@@ -284,9 +328,16 @@ struct CellTable(Movable):
         No copy. That is the whole point of an owner set: two sequences sharing
         a prompt share its cells until one of them writes, and the write goes
         to a new cell because it is at a position neither holds yet.
+
+        Sharing counts as running and as a touch for `dst`, the same way
+        allocating does, and it does so whether or not any cell changed hands.
+        A caller that asks for a prefix is telling the table that `dst` is a
+        sequence it is about to use, and whether the prefix was there is the
+        answer rather than part of the question.
         """
         var add = _bit_of(dst)
         var keep = _bit_of(src)
+        self._touch(dst)
         var shared = 0
         for i in range(self.size()):
             if self.pos[i] == CELL_FREE:
@@ -319,18 +370,154 @@ struct CellTable(Movable):
                 continue
             if p1 >= 0 and self.pos[i] >= p1:
                 continue
-            self.owners[i] &= ~bit
-            if self.owners[i] == 0:
-                self.pos[i] = CELL_FREE
-                self.live -= 1
+            if self._drop(i, bit):
                 freed += 1
-        while self.top > 0 and self.pos[self.top - 1] == CELL_FREE:
-            self.top -= 1
+        self._settle()
         return freed
 
     def release_all(mut self, seq: Int) raises -> Int:
-        """Drop every claim `seq` has, which is what ending a session does."""
+        """Drop every claim `seq` has, and stop counting it as running.
+
+        What throwing a session away does, as opposed to `retire`, which is
+        what finishing a turn does. The difference is whether the cells are
+        kept for somebody else to find.
+
+        The stamp goes back to zero with the claims, because a sequence that
+        holds nothing is not a sequence eviction should ever look at again, and
+        zero is how `stamp` says never touched.
+        """
+        self.running &= ~_bit_of(seq)
+        self.stamp[seq] = 0
         return self.release(seq, 0, -1)
+
+    def trim(
+        mut self, seq: Int, pos: Int, window: Int, sinks: Int
+    ) raises -> Int:
+        """Free what a query at `pos` will never read again, and say how many.
+
+        The bounded ring. A window model's context stops growing here rather
+        than in the kernel: the cells that have fallen out behind the window
+        are dropped as the sequence walks past them, so a conversation of any
+        length holds `window + sinks` cells and a long chat costs constant KV.
+        The sinks are pinned by the same expression that makes attention read
+        them, which is that a position below `sinks` is visible forever.
+
+        The condition is `molla.nn.attention.AttnSpec.sees` negated term for
+        term, and it is written that way on purpose. Every cell this frees is a
+        cell attention would have masked, so trimming can change how much
+        memory a sequence holds and cannot change a logit. The two have to
+        agree, and the way to keep them agreeing is for one of them to be the
+        other one read backwards.
+
+        A model with no window trims nothing, because every position it has
+        ever held stays visible, and answering that here means a caller does
+        not have to ask whether its model has one.
+        """
+        if window <= 0:
+            return 0
+        if sinks < 0:
+            raise Error("a sink count cannot be negative")
+        var bit = _bit_of(seq)
+        var freed = 0
+        for i in range(self.size()):
+            var held = self.pos[i]
+            if held == CELL_FREE:
+                continue
+            if (self.owners[i] & bit) == 0:
+                continue
+            if held < sinks or held > pos - window:
+                continue
+            if self._drop(i, bit):
+                freed += 1
+        self._settle()
+        return freed
+
+    def retire(mut self, seq: Int) raises:
+        """Stop counting `seq` as running, without giving its cells back.
+
+        What a session does when a turn ends. The cells stay exactly as they
+        are, holding the positions they held, so the next request that begins
+        with the same tokens can take them with `share` rather than computing
+        them again. That is the whole reason this is not `release_all`, and it
+        is what #33's prefix cache is going to be built out of.
+
+        Until somebody shares them they are the eviction budget. A pool under
+        pressure takes them back in the order their sequences stopped being
+        used, which is why retiring is a touch: the stamp a retired sequence
+        carries is the moment it finished.
+        """
+        var bit = _bit_of(seq)
+        self._touch(seq)
+        self.running &= ~bit
+
+    def resume(mut self, seq: Int) raises:
+        """Count `seq` as running again, which a new turn on it does.
+
+        Whatever `evict` already took is gone, so a caller that resumes asks
+        the table what is left rather than assuming its cells survived.
+        `held_by` is that question and `cell_of` is the finer one.
+        """
+        self._touch(seq)
+
+    def unreferenced(self) -> Int:
+        """How many live cells no running sequence holds.
+
+        The eviction budget. Reported beside `free` rather than folded into it,
+        because the difference matters to a caller: a free cell costs nothing
+        and one of these costs a prefix that somebody may still come back for.
+        """
+        var n = 0
+        for i in range(self.size()):
+            if self.pos[i] == CELL_FREE:
+                continue
+            if (self.owners[i] & self.running) == 0:
+                n += 1
+        return n
+
+    def evict(mut self, need: Int) raises -> Int:
+        """Take back retired cells until `need` are free, and say how many.
+
+        Least recently used, over sequences rather than over cells. A retired
+        sequence's cells were all written for one turn and are worth the same
+        to the request after it, so the whole sequence goes at once and the
+        order is the order the sequences stopped. Picking cell by cell would be
+        an ordering over the pool to answer a question with 64 answers.
+
+        Nothing running is touched. Preempting a sequence that is mid stream is
+        a scheduler's decision and not a table's, and when the scheduler makes
+        it the way it says so is `release_all` and then recomputing, which is
+        what #31 means by preferring recompute over swapping to host memory.
+        There is no path here that moves a cell off the device.
+
+        Returns what it freed, which can be less than was asked for. A caller
+        that still does not fit gets its refusal from `check_room` or from
+        `alloc`, in the same words it would have got them before, rather than
+        from here.
+
+        The loop cannot spin. A victim is released whole, which zeroes its
+        stamp, and a zero stamp is not a candidate, so each turn of the loop
+        either frees cells or takes a sequence out of the running. A retired
+        sequence whose cells are all shared with one that is running frees
+        nothing and is exactly that second case.
+        """
+        if need < 0:
+            raise Error("cannot ask for a negative number of free cells")
+        var freed = 0
+        while self.free() < need:
+            var victim = -1
+            var oldest = 0
+            for s in range(MAX_SEQS):
+                if (self.running & (UInt64(1) << UInt64(s))) != 0:
+                    continue
+                if self.stamp[s] == 0:
+                    continue
+                if victim < 0 or self.stamp[s] < oldest:
+                    victim = s
+                    oldest = self.stamp[s]
+            if victim < 0:
+                return freed
+            freed += self.release_all(victim)
+        return freed
 
     def cell_of(self, seq: Int, at: Int) raises -> Int:
         """Which cell holds `at` for `seq`, or `CELL_FREE`.
@@ -355,6 +542,31 @@ struct CellTable(Movable):
             if (self.owners[i] & bit) != 0:
                 count += 1
         return count
+
+    def _touch(mut self, seq: Int) raises:
+        """Mark `seq` running and record that it used the pool just now."""
+        self.running |= _bit_of(seq)
+        self.clock += 1
+        self.stamp[seq] = self.clock
+
+    def _drop(mut self, cell: Int, bit: UInt64) -> Bool:
+        """Clear one owner of `cell`, saying whether that freed it.
+
+        The one place a cell goes back on the free list, so that `release` and
+        `trim` cannot disagree about what freeing means. They disagree about
+        which cells to free, which is the whole difference between them.
+        """
+        self.owners[cell] &= ~bit
+        if self.owners[cell] != 0:
+            return False
+        self.pos[cell] = CELL_FREE
+        self.live -= 1
+        return True
+
+    def _settle(mut self):
+        """Pull the frontier back over cells that were just freed."""
+        while self.top > 0 and self.pos[self.top - 1] == CELL_FREE:
+            self.top -= 1
 
     def _check_cell(self, cell: Int) raises:
         if cell < 0 or cell >= self.size():

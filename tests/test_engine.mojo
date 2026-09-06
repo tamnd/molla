@@ -147,6 +147,8 @@ def run(mut suite: Suite) raises:
     test_cells(suite)
     test_cells_sharing(suite)
     test_cells_window(suite)
+    test_cells_ring(suite)
+    test_cells_eviction(suite)
     test_cells_errors(suite)
     test_session_step(suite)
     test_prefill_matches_decode(suite)
@@ -424,6 +426,169 @@ def test_cells_window(mut suite: Suite) raises:
     except:
         failed = True
     suite.check(failed, "a window past the end of the pool is refused")
+
+
+def test_cells_ring(mut suite: Suite) raises:
+    """A window model gives back what it has walked past.
+
+    The property worth pinning is not that some number of cells was freed. It
+    is that trimming and masking agree, because a cell freed here that
+    attention would still have read is context lost in silence.
+    """
+    suite.group("cell ring")
+
+    var t = CellTable(16)
+    var a = List[Int]()
+    t.alloc_run(0, 0, 8, a)
+
+    suite.check(t.trim(0, 7, 0, 0) == 0, "a model with no window trims nothing")
+    suite.check(t.held_by(0) == 8, "and keeps everything it has")
+
+    suite.check(
+        t.trim(0, 7, 4, 0) == 4, "a window of four drops the other four"
+    )
+    suite.check(t.held_by(0) == 4, "leaving the window itself")
+    suite.check(
+        t.cell_of(0, 4) != CELL_FREE and t.cell_of(0, 3) == CELL_FREE,
+        "and the boundary is the position the window starts at",
+    )
+
+    # What the kernel would have read, asked of every cell that is left. The
+    # spec is the same one attention masks with, so this is the two sides of
+    # the same condition meeting.
+    var spec = AttnSpec(1, 1, 4)
+    spec.window = 4
+    var agreed = True
+    for p in range(8):
+        var kept = t.cell_of(0, p) != CELL_FREE
+        if kept != spec.sees(p, 7):
+            agreed = False
+    suite.check(agreed, "what is kept is exactly what a query at seven sees")
+
+    t.reset()
+    var b = List[Int]()
+    t.alloc_run(0, 0, 8, b)
+    suite.check(t.trim(0, 7, 4, 2) == 2, "sinks are pinned against the window")
+    suite.check(
+        t.cell_of(0, 0) != CELL_FREE and t.cell_of(0, 1) != CELL_FREE,
+        "so the first positions stay whatever the window says",
+    )
+    suite.check(
+        t.held_by(0) == 6, "and the sequence holds the window plus them"
+    )
+
+    # A sequence longer than the pool, one token at a time, which is the case
+    # the ring exists for. It has to run to the end without filling up.
+    t.reset()
+    var live_max = 0
+    for p in range(100):
+        _ = t.alloc(0, p)
+        _ = t.trim(0, p, 8, 2)
+        if t.live > live_max:
+            live_max = t.live
+    suite.check(
+        live_max <= 10, "a hundred tokens through a window of eight hold ten"
+    )
+    suite.check(
+        t.cell_of(0, 0) != CELL_FREE and t.cell_of(0, 99) != CELL_FREE,
+        "the sink and the newest token, at the two ends of the conversation",
+    )
+
+    # Another sequence's cells are not this one's to give back.
+    t.reset()
+    var c = List[Int]()
+    t.alloc_run(0, 0, 4, c)
+    var d = List[Int]()
+    t.alloc_run(1, 0, 4, d)
+    suite.check(t.trim(0, 3, 2, 0) == 2, "trimming one sequence frees its own")
+    suite.check(t.held_by(1) == 4, "and leaves the other one alone")
+
+
+def test_cells_eviction(mut suite: Suite) raises:
+    """A finished turn keeps its cells until somebody needs them.
+
+    Retiring rather than releasing is what makes a prefix worth looking for
+    later, and eviction is the price of that: the pool hands the oldest one
+    back when the next request does not fit.
+    """
+    suite.group("cell eviction")
+
+    var t = CellTable(8)
+    var a = List[Int]()
+    t.alloc_run(0, 0, 4, a)
+    suite.check(t.unreferenced() == 0, "a running sequence holds its own cells")
+
+    t.retire(0)
+    suite.check(
+        t.unreferenced() == 4, "and a retired one holds them for anybody"
+    )
+    suite.check(t.live == 4 and t.free() == 4, "without giving anything back")
+    suite.check(
+        t.cell_of(0, 2) == a[2], "the positions are still where they were"
+    )
+
+    var b = List[Int]()
+    t.alloc_run(1, 0, 4, b)
+    t.retire(1)
+    suite.check(t.free() == 0, "two retired turns can fill the pool")
+
+    suite.check(t.evict(3) == 4, "evicting takes back the whole oldest turn")
+    suite.check(
+        t.held_by(0) == 0 and t.held_by(1) == 4,
+        "the one that finished first, and only it",
+    )
+    suite.check(
+        t.evict(4) == 0, "and a second ask that fits already does nothing"
+    )
+
+    # Running sequences are not eviction's to take, whatever the pressure.
+    t.reset()
+    var c = List[Int]()
+    t.alloc_run(0, 0, 4, c)
+    var d = List[Int]()
+    t.alloc_run(1, 0, 4, d)
+    t.retire(1)
+    suite.check(t.evict(8) == 4, "eviction frees what it can")
+    suite.check(t.held_by(0) == 4, "and stops at the sequence still running")
+    suite.check(t.free() == 4, "which leaves the pool short of what was asked")
+
+    # A retired sequence sharing with a running one is not free to take either,
+    # and asking costs the ask rather than the cells.
+    t.reset()
+    var e = List[Int]()
+    t.alloc_run(0, 0, 4, e)
+    _ = t.share(0, 1, 0, -1)
+    t.retire(0)
+    suite.check(t.unreferenced() == 0, "a shared prefix is still referenced")
+    suite.check(t.evict(8) == 0, "so eviction has nothing to take")
+    suite.check(t.held_by(1) == 4, "and the sequence reading it keeps it")
+
+    # Least recently used, which is the order turns finished in rather than the
+    # order they started.
+    t.reset()
+    var f = List[Int]()
+    t.alloc_run(0, 0, 2, f)
+    var g = List[Int]()
+    t.alloc_run(1, 0, 2, g)
+    var h = List[Int]()
+    t.alloc_run(2, 0, 2, h)
+    t.retire(1)
+    t.retire(2)
+    t.retire(0)
+    suite.check(t.evict(3) == 2, "the first turn to finish goes first")
+    suite.check(t.held_by(1) == 0, "which is the one retired first")
+    suite.check(
+        t.held_by(2) == 2 and t.held_by(0) == 2, "and the rest are untouched"
+    )
+
+    # Coming back to a retired sequence puts it out of eviction's reach.
+    t.reset()
+    var i = List[Int]()
+    t.alloc_run(0, 0, 4, i)
+    t.retire(0)
+    t.resume(0)
+    suite.check(t.unreferenced() == 0, "resuming a turn references it again")
+    suite.check(t.evict(8) == 0, "and eviction leaves it alone")
 
 
 def test_cells_errors(mut suite: Suite) raises:

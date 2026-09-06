@@ -4,6 +4,11 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Added
+
+- A bounded ring for window and sink models. `CellTable.trim` frees the cells a query at the current position can no longer see, which is the condition attention masks with read backwards, so a cell it gives back is a cell that could not have changed a logit. A conversation of any length on a window model now holds the window plus the sinks rather than growing until it is refused, and a hundred tokens through a window of eight with two sinks holds ten.
+- Eviction over the cells no running sequence holds. A turn that ends is retired rather than released, so its cells stay where they are and the next request that starts with the same tokens can share them instead of computing them again, which is what the prefix cache in #33 will be built out of. When the pool runs short, `CellTable.evict` takes back the turns that finished longest ago, whole sequences at a time, and never touches one that is still running. Nothing moves to host memory: preempting a live stream is a scheduler's decision and the way it will say so is releasing and recomputing.
+
 ### Changed
 
 - Attention skips a masked key rather than multiplying the row it points at by zero. For a cell holding numbers the two are the same answer, and for a cell nothing has written they are not necessarily, because a fresh allocation comes back zeroed on Metal and full of whatever the driver had on the 4090, half of the wrong bits is an infinity, and zero times an infinity is a nan. Neither target produces that nan today, which was checked both ways on both machines: device code is compiled with the relaxed floating point that folds a multiply by zero to zero. So this is not a fix for a failure that was seen, it is declining to depend on a compiler flag for an invariant, and what it depends on instead is easier to state, which is that a row a query may not read is not read. The paged test now fills the free cells of its pool with an infinity, which passes either way and is the canary for the day a toolchain changes its floating point.
