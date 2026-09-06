@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Changed
+
+- Rope takes the position of each token out of a vector rather than adding the token's index to a base. A run of one sequence fills that vector with a base and its successors, so every angle is the angle it was and the logits are unchanged, and a batch that holds two sequences fills it with positions that no base describes. That is the first of the five stages in [docs/validation/batching.md](docs/validation/batching.md) and the reason it is first is that it is the smallest thing a mixed batch needs which nothing today provides.
+
 ## [0.5.3] - 2026-09-06
 
 The paged cache stops being a thing on the side and becomes the cache. A step takes cells from the table, the store scatters, and attention masks by the position each cell holds, so which row of the cache a token lands in is no longer decided by its position.

@@ -472,10 +472,10 @@ def rope_kernel[
     x: Pointer[Float32, MutAnyOrigin],
     steps: Pointer[Float32, MutAnyOrigin],
     factors: Pointer[Float32, MutAnyOrigin],
+    seats: Pointer[Int32, MutAnyOrigin],
     at_dev: Int32,
     head_dim_dev: Int32,
     dim_dev: Int32,
-    pos_dev: Int32,
     row_dev: Int32,
     scale: Float32,
     ext_factor: Float32,
@@ -513,14 +513,16 @@ def rope_kernel[
 
     The second grid dimension is the token, and it is the one place a batched
     kernel here needs a per token scalar rather than a base and a stride: the
-    row moves by `row` and the angle moves with it, because a token at
-    `pos + ty` rotates by `pos + ty`. A single token is one block deep with a
-    row stride of zero and the arithmetic below collapses to what it was.
+    row moves by `row` and the angle is read for that row out of `seats`. A run
+    of one sequence fills `seats` with a base and its successors and gets what a
+    base and a stride gave, and a batch that holds two sequences fills it with
+    positions that have no base to describe them. See
+    [docs/validation/batching.md](../../../docs/validation/batching.md).
     """
     var head_dim = Int(head_dim_dev)
     var dim = Int(dim_dev)
     var ty = Int(block_idx.y)
-    var pos = Int(pos_dev) + ty
+    var pos = Int(seats[unsafe_offset=ty])
     var pairs = dim // 2
     var head = Int(block_idx.x)
     var at = Int(at_dev) + ty * Int(row_dev) + head * head_dim
@@ -1951,7 +1953,7 @@ def device_rope(
     at: Int,
     heads: Int,
     head_dim: Int,
-    pos: Int,
+    seats: DeviceInts,
     tables: RopeTables,
     tokens: Int = 1,
     row: Int = 0,
@@ -1961,6 +1963,10 @@ def device_rope(
     Which is the shape a query comes out of its projection in, and a key too:
     both are rotated in a work vector now and the key is put away by
     `device_store_kv` afterwards.
+
+    `seats` holds the position of each token of the chunk and has to reach at
+    least `tokens` of them. A pass over one sequence fills it with a base and
+    its successors, which is what the argument used to be.
 
     `tables` has to have been built from this same spec. That is not checked
     beyond the width, because the two things that would catch it are storing a
@@ -1975,7 +1981,7 @@ def device_rope(
         at,
         heads,
         head_dim,
-        pos,
+        seats,
         tables,
         tokens,
         row,
@@ -1990,7 +1996,7 @@ def _rope_into(
     at: Int,
     heads: Int,
     head_dim: Int,
-    pos: Int,
+    seats: DeviceInts,
     tables: RopeTables,
     tokens: Int,
     row: Int,
@@ -2007,6 +2013,14 @@ def _rope_into(
         )
     if tokens < 1:
         raise Error("rope needs at least one token")
+    if seats.elements() < tokens:
+        raise Error(
+            "rope over "
+            + String(tokens)
+            + " tokens was given "
+            + String(seats.elements())
+            + " positions"
+        )
     if at < 0 or elements < at + (tokens - 1) * row + heads * head_dim:
         raise Error(
             "rope wants "
@@ -2048,7 +2062,7 @@ def _rope_into(
                 at,
                 heads,
                 head_dim,
-                pos,
+                seats,
                 low,
                 high,
                 tokens,
@@ -2063,7 +2077,7 @@ def _rope_into(
                 at,
                 heads,
                 head_dim,
-                pos,
+                seats,
                 low,
                 high,
                 tokens,
@@ -2078,7 +2092,7 @@ def _rope_into(
                 at,
                 heads,
                 head_dim,
-                pos,
+                seats,
                 low,
                 high,
                 tokens,
@@ -2093,7 +2107,7 @@ def _rope_into(
                 at,
                 heads,
                 head_dim,
-                pos,
+                seats,
                 low,
                 high,
                 tokens,
@@ -2111,7 +2125,7 @@ def _rope[
     at: Int,
     heads: Int,
     head_dim: Int,
-    pos: Int,
+    seats: DeviceInts,
     low: Float32,
     high: Float32,
     tokens: Int,
@@ -2121,10 +2135,10 @@ def _rope[
         x,
         tables.steps.ptr(),
         tables.factors.ptr(),
+        seats.ptr(),
         Int32(at),
         Int32(head_dim),
         Int32(spec.dim),
-        Int32(pos),
         Int32(row),
         spec.scale,
         spec.ext_factor,

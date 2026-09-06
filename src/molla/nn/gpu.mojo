@@ -545,6 +545,11 @@ struct DevicePaging(Movable):
     the one a fused decode takes and the one every test of the forward pass
     takes. A pass that is not paged carries one of these with `on` false and
     nothing reads the vectors.
+
+    The positions are the exception to all of that. They are read whether or not
+    the pass is paged, because rope needs a per token angle and a batch that
+    holds two sequences has no base to add a token index to. See
+    [docs/validation/batching.md](../../../docs/validation/batching.md).
     """
 
     var cells: DeviceInts
@@ -560,11 +565,26 @@ struct DevicePaging(Movable):
     var held: List[Int32]
     """The host side of `mask`."""
 
+    var seats: DeviceInts
+    """One entry a token of the chunk: the position that token sits at."""
+
+    var spots: List[Int32]
+    """The host side of `seats`."""
+
     var window: Int
     """How many cells of `mask` this step reads, which is a prefix of it."""
 
     var on: Bool
     """Whether this pass is paged at all."""
+
+    var ragged: Bool
+    """Whether the caller filled `spots` itself.
+
+    False for a run of one sequence, which is every pass today, and then
+    `steady` fills the positions from the base the pass was given. True is what
+    a mixed batch will set, because the tokens of one then belong to several
+    sequences and there is no base that describes them.
+    """
 
     def __init__(out self, ctx: DeviceContext, chunk: Int, pool: Int) raises:
         """Room for a chunk of tokens over a pool of cells, both fixed."""
@@ -572,10 +592,13 @@ struct DevicePaging(Movable):
             raise Error("paging needs a positive chunk and a positive pool")
         self.cells = DeviceInts(ctx, chunk)
         self.mask = DeviceInts(ctx, pool)
+        self.seats = DeviceInts(ctx, chunk)
         self.slots = List[Int32](length=chunk, fill=0)
         self.held = List[Int32](length=pool, fill=-1)
+        self.spots = List[Int32](length=chunk, fill=0)
         self.window = 0
         self.on = False
+        self.ragged = False
 
     def chunk(self) -> Int:
         return self.cells.elements()
@@ -593,6 +616,25 @@ struct DevicePaging(Movable):
         """
         self.cells.queue_in(self.slots)
         self.mask.queue_in(self.held)
+
+    def steady(mut self, base: Int, count: Int) raises:
+        """Fill the positions for a run of `count` tokens starting at `base`.
+
+        What every pass today wants, and it is here rather than at the call site
+        so that the one thing a ragged batch has to do differently is fill
+        `spots` and say `ragged`. A pass that does neither gets the positions it
+        has always had.
+        """
+        if count < 1 or count > self.chunk():
+            raise Error(
+                "a step of "
+                + String(count)
+                + " tokens does not fit a chunk of "
+                + String(self.chunk())
+            )
+        for i in range(count):
+            self.spots[i] = Int32(base + i)
+        self.seats.queue_in(self.spots)
 
 
 comptime EPI_NONE = 0
