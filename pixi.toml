@@ -86,3 +86,9 @@ conformance-template-full = { cmd = "mojo run -I src scripts/template_oracle.moj
 # of the flags the script documents. Not run by CI, because a shared runner
 # cannot produce a number worth writing down.
 bench = "python3 scripts/bench.py"
+# The q8_0 cache against the f16 one over a long teacher forced sequence, which
+# is the only thing here that can see a rounding that takes thousands of
+# positions to matter. Takes a model, a tokenizer and a text file after the task
+# name, plus the flags the script documents. Not run by CI, because it needs a
+# card and several minutes of it.
+soak-cache = "mojo run -I src scripts/cache_soak.mojo"

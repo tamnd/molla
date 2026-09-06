@@ -111,7 +111,47 @@ That is fixable and it is not fixed here. A lane owns one element of a block at 
 
 The logit corpus on both backends, which is the bar every layout change here has been held to, and it will not be enough on its own. A q8_0 cache rounds every key and value it stores, and a five token prompt reads back what it wrote five positions ago. What that cannot see is a rounding that accumulates over a long conversation, which is the failure mode this change actually has.
 
-So it needs a long generation soak: fill the context repeatedly, read back what was written thousands of positions earlier, and watch the output stay coherent and the perplexity stay flat. `httpsoak` is the soak molla has and it exercises the systems layer and touches no cache at all. It runs clean and it is not evidence about this.
+So it needs a long soak: fill the context, read back what was written thousands of positions earlier, and watch the answer stay where it was. `httpsoak` is the soak molla has and it exercises the systems layer and touches no cache at all. It runs clean and it is not evidence about this. `scripts/cache_soak.mojo` is the one that is, and the next section is what it saw.
+
+## The soak
+
+The comparison is teacher forced. The same fixed sequence goes through an f16 session and a q8_0 session, one token at a time, and every token is the one the text says rather than the one the model picked.
+
+Free running generation is the more natural soak and it is the wrong measurement. The two forms disagree about one token somewhere early, the texts diverge, and every difference after that is the divergence rather than the cache. Teacher forcing holds the prefix identical at every position, so the only thing left that differs between the two runs is what the cache did to the keys and the values on the way in.
+
+A token at a time and not in chunks, which costs two minutes a pass where a chunked prefill of the same tokens would cost fifteen seconds. A chunk reads the cache once for the whole chunk. Stepping means every position reads every position before it, which is the traffic the question is about.
+
+Three numbers come out, at sixteen checkpoints and over every position:
+
+| what | why it is there |
+| --- | --- |
+| Top one agreement, in eighths of the run | The answer to the actual question. A rounding that accumulates shows up as a later eighth agreeing less than an earlier one |
+| The divergence of the whole row, in nats | Agreement counts the winner and this counts everything |
+| The worst move in log probability in the head | A form that keeps the ranking and stretches the spacing moves this and moves neither of the others |
+
+And a control, which is the part worth insisting on. It runs f16 twice and compares those two, and the answer has to be exactly zero. A run whose control is not exact is measuring the machine.
+
+## What the soak saw
+
+A 4090, the 8B at Q4_K_M, 8192 positions of molla's own documentation, checkpoints every 512.
+
+The control is exact. Every one of the 8192 positions picked the same token both times and all sixteen checkpoints diverged by zero, so what follows is the cache and nothing else.
+
+| measurement | value |
+| --- | --- |
+| top one agreement, worst eighth | 0.9902 |
+| top one agreement, best eighth | 0.9971 |
+| divergence, worst checkpoint | 3.1e-4 nats |
+| divergence, mean over the first quarter | 1.30e-4 nats |
+| divergence, mean over the last quarter | 1.86e-4 nats |
+| worst move in log probability in the head | 0.093 |
+| rank of the f16 top token under q8_0 | 1, at every checkpoint |
+
+The eighths are 0.990, 0.997, 0.996, 0.990, 0.996, 0.990, 0.992, 0.993 in order, which is flat. The last quarter of the checkpoints diverges 1.44 times as much as the first quarter, and the checkpoints inside a quarter differ from each other by four orders of magnitude, so 1.44 is noise and not a trend. Two of the sixteen came in near 1e-8 because the text at that point was a word the model was already certain about, and one came in at 3.1e-4 for the opposite reason.
+
+That is the result the change needed. The error a q8_0 cache introduces is bounded rather than accumulating: a key rounded at position 40 is no worse when it is read at position 8000 than it was when it was read at position 41, which is what should happen, because the rounding happens once at the store and nothing reads it back and rounds it again.
+
+One in a hundred tokens differs. That is not nothing and it is the price on the label, and it is the same price llama.cpp's `--cache-type-k q8_0` charges for the same reason.
 
 ## What this does not answer
 

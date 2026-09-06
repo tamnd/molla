@@ -61,12 +61,18 @@ from molla.sys.mem import AllocCounter
 from molla.sys.mmap import Mapping
 from molla.tokenizer.tokenizer import Session, Tokenizer
 
-comptime KL_TOL = Float64(2e-3)
+comptime KL_TOL = Float64(4e-3)
 """How far the q8_0 distribution may sit from the f16 one at a checkpoint.
 
 Nats, and the whole vocabulary rather than the head. For scale, two rows that
 disagree about nothing but the fourth decimal of every log probability land near
-1e-6, and a row that has moved a token out of the top ten lands near 1e-2."""
+1e-6, and a row that has moved a token out of the top ten lands near 1e-2.
+
+Worst measured is 3.1e-4 on Llama 3.1 8B at Q4_K_M over 8192 positions and
+1.5e-3 on SmolLM2 135M over 512. The number is where it is because of the small
+model and not the large one, which is the same spread the logit corpus shows and
+is probably the same cause: a 135M has fewer heads to average an error over and
+a flatter distribution for it to move."""
 
 comptime GROWTH_TOL = Float64(4.0)
 """How much larger the divergence in the last quarter of the run may be than in
