@@ -77,6 +77,7 @@ from molla.nn.gpu_fused import (
     R_EPI,
     R_EPS,
     R_EXT,
+    R_FORM,
     R_G,
     R_GROUP,
     R_H,
@@ -128,7 +129,7 @@ from molla.nn.gpu_ops import (
     device_unpack_rows,
 )
 from molla.nn.model import ModelWeights
-from molla.nn.repack import LAYOUT_PLANAR, unpack_run
+from molla.nn.repack import CACHE_F16, LAYOUT_PLANAR, cache_row, unpack_run
 from molla.nn.rope import RopeSpec, corr_range, step_table
 from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
 
@@ -669,6 +670,7 @@ def device_attention(
     slot: Int,
     pos: Int,
     tokens: Int = 1,
+    form: Int = CACHE_F16,
 ) raises:
     """The attention sublayer, in place on the residual stream.
 
@@ -696,15 +698,18 @@ def device_attention(
         raise Error("a cache slot cannot be negative")
 
     var kv_width = spec.kv_width()
-    var at = slot * kv_width
-    var span = tokens * kv_width
-    if keys.elements() < at + span or values.elements() < at + span:
+    var row = cache_row(form, kv_width)
+    var at = slot * row
+    if (
+        keys.elements() < at + tokens * row
+        or values.elements() < at + tokens * row
+    ):
         raise Error(
             "the cache has no room for slot "
             + String(slot)
             + ", which needs "
-            + String(at + span)
-            + " values"
+            + String(at + tokens * row)
+            + " halves"
         )
 
     device_rms_norm(ctx, x, w.attn_norm, s.norm, spec.eps, tokens)
@@ -764,8 +769,8 @@ def device_attention(
         kv_width,
     )
 
-    device_store_kv(ctx, keys, at, s.k, span)
-    device_store_kv(ctx, values, at, s.v, span)
+    device_store_kv(ctx, keys, at, s.k, kv_width, tokens, form)
+    device_store_kv(ctx, values, at, s.v, kv_width, tokens, form)
 
     device_attend(
         ctx,
@@ -779,6 +784,7 @@ def device_attention(
         s.scores,
         s.partials,
         tokens,
+        form,
     )
     # The residual add rides the output projection's epilogue, so `s.projected`
     # is only used by the models that put a norm between the two. Those still
@@ -858,9 +864,10 @@ def device_layer(
     slot: Int,
     pos: Int,
     tokens: Int = 1,
+    form: Int = CACHE_F16,
 ) raises:
     """Both sublayers, which is one decoder layer."""
-    device_attention(ctx, spec, w, x, s, keys, values, slot, pos, tokens)
+    device_attention(ctx, spec, w, x, s, keys, values, slot, pos, tokens, form)
     device_mlp(ctx, spec, w, x, s, tokens)
 
 
@@ -1011,6 +1018,7 @@ def _layer_records(
     w: DeviceLayer,
     shape: WorkPlan,
     use_factors: Bool,
+    form: Int,
 ) raises:
     """One layer, as the records the fused kernel walks.
 
@@ -1024,6 +1032,7 @@ def _layer_records(
     """
     ref a = w.arena
     var kv_width = spec.kv_width()
+    var crow = cache_row(form, kv_width)
     var head_dim = spec.attn.head_dim
     var bias_epi = EPI_BIAS if w.has_bias else EPI_NONE
 
@@ -1157,12 +1166,14 @@ def _layer_records(
     # [docs/validation/kvcache.md](../../../docs/validation/kvcache.md).
     rec = plan.open(OP_STORE)
     plan.input(rec, SPACE_WORK, shape.k)
-    plan.output(rec, SPACE_KEYS, 0, kv_width)
+    plan.output(rec, SPACE_KEYS, 0, crow)
     plan.set(rec, R_N, kv_width)
+    plan.set(rec, R_FORM, form)
     rec = plan.open(OP_STORE)
     plan.input(rec, SPACE_WORK, shape.v)
-    plan.output(rec, SPACE_VALS, 0, kv_width)
+    plan.output(rec, SPACE_VALS, 0, crow)
     plan.set(rec, R_N, kv_width)
+    plan.set(rec, R_FORM, form)
     plan.sync(rec)
 
     rec = plan.open(OP_ATTEND)
@@ -1176,6 +1187,7 @@ def _layer_records(
     plan.set(rec, R_SINKS, spec.attn.sinks)
     plan.set(rec, R_ROW, shape.scores)
     plan.set(rec, R_SPLIT, shape.splits)
+    plan.set(rec, R_FORM, form)
     plan.setf(rec, R_SCALE, spec.attn.scale)
     plan.setf(rec, R_SOFTCAP, spec.attn.softcap)
     plan.sync(rec)
@@ -1339,6 +1351,7 @@ def build_fused_plan(
     context: Int,
     use_factors: Bool,
     wanted: Bool = True,
+    form: Int = CACHE_F16,
 ) raises -> FusedPlan:
     """The whole model's step table, built once when a session opens.
 
@@ -1361,7 +1374,9 @@ def build_fused_plan(
     var base = _pool_base(m)
     for i in range(m.block_count()):
         starts.append(plan.records)
-        _layer_records(plan, base, m.specs[i], m.layers[i], shape, use_factors)
+        _layer_records(
+            plan, base, m.specs[i], m.layers[i], shape, use_factors, form
+        )
     starts.append(plan.records)
     var built = FusedPlan(ctx, plan, starts, shape, base)
     fused_selftest(ctx, built.blocks)
@@ -1549,6 +1564,7 @@ def device_forward(
     slot: Int,
     mut keys: List[DeviceHalf],
     mut values: List[DeviceHalf],
+    form: Int = CACHE_F16,
 ) raises:
     """A run of tokens through the whole stack, logits left on the device.
 
@@ -1589,6 +1605,7 @@ def device_forward(
             slot,
             pos,
             run,
+            form,
         )
         s.record(ctx, x)
     _finish(ctx, m, s, x, run)

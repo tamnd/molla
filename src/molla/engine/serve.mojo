@@ -40,6 +40,7 @@ from molla.net.context import ServerContext
 from molla.net.listener import ListenAddress
 from molla.net.server import Server
 from molla.net.supervisor import SignalWatcher, serve_until_signal
+from molla.nn.repack import CACHE_F16, cache_type_name
 from molla.ops.config import LEVEL_INFO
 from molla.ops.log import LogPump, LogSink
 from molla.ops.metrics import Metrics
@@ -73,6 +74,7 @@ def run_serve(
     port: UInt16,
     context: Int,
     backend: Backend = Backend(),
+    form: Int = CACHE_F16,
 ) raises -> Int:
     """Load a model and answer OpenAI requests against it until a signal."""
     _ = ignore_sigpipe()
@@ -80,10 +82,12 @@ def run_serve(
     var started = monotonic_ms()
     print("loading", model_path)
     var runner = Runner(
-        model_path, tokenizer_path, model_path, context, backend
+        model_path, tokenizer_path, model_path, context, backend, form
     )
     print("  model         ", runner.describe())
     print("  backend       ", runner.running_on())
+    if backend.on_device:
+        print("  kv cache      ", cache_type_name(form))
     print("  tokenizer     ", tokenizer_path)
     print("  repack        ", runner.repack())
     print(

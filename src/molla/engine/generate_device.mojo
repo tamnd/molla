@@ -38,6 +38,7 @@ from molla.engine.generate import (
 from molla.engine.sample import Sampler, SamplerConfig
 from molla.model.gguf import Gguf
 from molla.model.repack import model_key, open_cache
+from molla.nn.repack import CACHE_F16, cache_type_name
 from molla.model.spec import read_geometry
 from molla.sys.clock import monotonic_ms
 from molla.sys.mem import AllocCounter
@@ -52,6 +53,7 @@ def run_generate_device(
     context: Int,
     sampling: SamplerConfig = SamplerConfig(),
     backend: Backend = Backend(),
+    form: Int = CACHE_F16,
 ) raises:
     """Load onto the device, prefill, decode, and print as it goes.
 
@@ -124,7 +126,7 @@ def run_generate_device(
         if take > want - len(ids):
             take = want - len(ids)
 
-        var decode = DeviceSession(ctx, host, b, want)
+        var decode = DeviceSession(ctx, host, b, want, form)
         var sampler = Sampler(sampling, b.vocab())
         for i in range(len(ids)):
             sampler.observe(ids[i])
@@ -138,6 +140,7 @@ def run_generate_device(
             loaded - started,
             cache,
             backend,
+            cache_type_name(form),
         )
 
         # The weights are on the card and the norms are in device vectors, so

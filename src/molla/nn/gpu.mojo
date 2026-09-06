@@ -63,6 +63,9 @@ from max.gpu.host import DeviceBuffer, DeviceContext
 
 from molla.nn.block import ACT_GELU, ACT_SILU
 from molla.nn.repack import (
+    CACHE_BLOCK,
+    CACHE_F16,
+    CACHE_Q8,
     LAYOUT_PLANAR,
     QUANT_I8,
     QUANT_K4,
@@ -382,6 +385,20 @@ struct DeviceHalf(Movable):
         with self.buf.map_to_host() as h:
             for i in range(self.n):
                 out.data[i] = Float32(h[i])
+
+    def download_bits(self, mut out: List[Int]) raises:
+        """The bit patterns rather than the values, for a row that is not floats.
+
+        A q8_0 cache row is a plane of quant bytes and then a plane of float16
+        factors, and reading the quant plane as float16 turns most byte patterns
+        into a nan, which does not compare equal to itself. So a test that has
+        to say two caches hold the same bytes has to ask for the bytes. Nothing
+        on the path a token takes calls this, the same as `download`.
+        """
+        out.clear()
+        with self.buf.map_to_host() as h:
+            for i in range(self.n):
+                out.append(Int(bitcast[DType.uint16, 1](h[i])))
 
     def upload_run(mut self, x: List[Float32], at: Int, n: Int) raises:
         """Part of a host list into the front of this vector, narrowed on the
@@ -737,6 +754,60 @@ def coherent_load_half[
         return Float32(p[unsafe_offset=i])
 
 
+@always_inline
+def coherent_load_i8[
+    coherent: Bool
+](p: Pointer[Int8, MutAnyOrigin], i: Int) -> Float32:
+    """A quant byte of a q8_0 cache row, read the way a half is read.
+
+    Everything `coherent_load_half` says, one step further down. The smallest
+    device scope atomic both backends have is thirty two bits and this byte is
+    one of four in it, so the aligned word is loaded and the byte is taken out of
+    it. All four belong to the same block of the same row and were written by the
+    same thread of `OP_STORE`, so there is never a partner in flight, and the word
+    is aligned because a cache row is rounded up to `CACHE_ALIGN`.
+    """
+    comptime if coherent and CompilationTarget.is_macos():
+        var q = p.unsafe_bitcast[Int32]()
+        var four = bitcast[DType.int8, 4](
+            _dev32.load[ordering=Ordering.RELAXED](
+                Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset=i >> 2])
+            )
+        )
+        return Float32(four[i & 3])
+    else:
+        return Float32(p[unsafe_offset=i])
+
+
+@always_inline
+def cache_load[
+    form: Int, coherent: Bool
+](
+    p: Pointer[Float16, MutAnyOrigin], row: Int, kv_width: Int, e: Int
+) -> Float32:
+    """Element `e` of the cache row that starts at half `row`.
+
+    The one place either form is read. A float16 row is the element itself, and a
+    q8_0 row is a signed byte out of the quant plane times the float16 scale of
+    the block it belongs to, which is `_group_scale`'s plain branch written for a
+    reader that owns one element rather than a tile of them.
+
+    The block index is `e / CACHE_BLOCK` over the whole row rather than over the
+    head, so a head whose width is not a multiple of the block still reads the
+    right scale. In `key_dot` the thirty two lanes of a warp are thirty two
+    consecutive elements, so they take the same scale and the load is a broadcast.
+    """
+    comptime if form == CACHE_F16:
+        return coherent_load_half[coherent](p, row + e)
+    else:
+        var q = p.unsafe_bitcast[Int8]()
+        var v = coherent_load_i8[coherent](q, row * 2 + e)
+        var s = coherent_load_half[coherent](
+            p, row + kv_width // 2 + e // CACHE_BLOCK
+        )
+        return v * s
+
+
 comptime ALANES = 32
 """Threads that share one key in an attention dot product.
 
@@ -754,12 +825,14 @@ in every bit rather than closely. See `key_dot`.
 
 @always_inline
 def key_dot[
-    coherent: Bool
+    coherent: Bool, form: Int = CACHE_F16
 ](
     q: Pointer[Float32, MutAnyOrigin],
     keys: Pointer[Float16, MutAnyOrigin],
     qa: Int,
+    row: Int,
     ka: Int,
+    kv_width: Int,
     head_dim: Int,
     lane: Int,
 ) -> Float32:
@@ -781,14 +854,16 @@ def key_dot[
     itself awake.
 
     `coherent` is `coherent_load`'s, false everywhere except inside the fused
-    kernel.
+    kernel. `row` is where this key's row starts and `ka` is where its head starts
+    inside the row, which are two arguments rather than one because at `CACHE_Q8`
+    the row is measured in halves and the offset inside it is measured in values.
     """
     var part = Float32(0)
     var d = lane
     while d < head_dim:
-        part += coherent_load[coherent](q, qa + d) * coherent_load_half[
-            coherent
-        ](keys, ka + d)
+        part += coherent_load[coherent](q, qa + d) * cache_load[form, coherent](
+            keys, row, kv_width, ka + d
+        )
         d += ALANES
     return lane_group_sum[num_lanes=ALANES](part)
 

@@ -45,7 +45,13 @@ from molla.nn.gpu_block import (
 )
 from molla.nn.model import ModelWeights, forward
 from molla.nn.quant import Q_F32, Q_Q8_0
-from molla.nn.repack import LAYOUT_PLANAR, SCALE_BYTES, planar_row_bytes
+from molla.nn.repack import (
+    CACHE_Q8,
+    LAYOUT_PLANAR,
+    SCALE_BYTES,
+    cache_row,
+    planar_row_bytes,
+)
 from molla.nn.rope import RopeSpec
 from molla.nn.tensor import WHERE_DEVICE, Buffer, Tensor
 from molla.sys.device import default_device
@@ -485,6 +491,108 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                     if fused_theirs.data[i] != fused_mine.data[i]:
                         fused_cache_diff += 1
 
+        # The same tokens again with the cache held at q8_0, unfused and fused
+        # into caches of their own. Two claims, and they are different claims.
+        # The two paths write the cache with different kernels, `_put_block` in
+        # the fused one and `store_kv_q8_kernel` in the other, and both round
+        # the same way over the same block, so the bytes have to match exactly.
+        # The logits only have to stay near the float16 run, because a q8 cache
+        # is a coarser cache and is expected to differ.
+        var qcache = DeviceKvCache(
+            ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM, CACHE_Q8
+        )
+        var qscratch = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB)
+        var qx = DeviceVec(ctx, WIDTH)
+        var qplan = build_fused_plan(ctx, model, CONTEXT, False, True, CACHE_Q8)
+        var qfcache = DeviceKvCache(
+            ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM, CACHE_Q8
+        )
+        var qfscratch = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB)
+        var qfx = DeviceVec(ctx, WIDTH)
+        var q8_out = Buffer(VOCAB)
+        var q8_worst = Float32(0)
+        var q8_fused_worst = Float32(0)
+        var q8_picks = 0
+        for step in range(len(tokens)):
+            var one: List[Int] = [tokens[step]]
+            device_forward(
+                ctx,
+                model,
+                qscratch,
+                qx,
+                one,
+                step,
+                step,
+                qcache.keys,
+                qcache.values,
+                CACHE_Q8,
+            )
+            ctx.synchronize()
+            qscratch.logits.download(q8_out)
+            var q8_top = 0
+            for i in range(VOCAB):
+                if q8_out.data[i] > q8_out.data[q8_top]:
+                    q8_top = i
+                var gap = q8_out.data[i] - decoded[step * VOCAB + i]
+                if gap < 0:
+                    gap = -gap
+                if gap > q8_worst:
+                    q8_worst = gap
+            var half_top = 0
+            for i in range(VOCAB):
+                if decoded[step * VOCAB + i] > decoded[step * VOCAB + half_top]:
+                    half_top = i
+            if q8_top == half_top:
+                q8_picks += 1
+
+            device_forward_fused(
+                ctx,
+                model,
+                qplan,
+                qfscratch,
+                qfx,
+                tokens[step],
+                step,
+                step,
+                qfcache.keys,
+                qfcache.values,
+            )
+            ctx.synchronize()
+            var q8_fused = Buffer(VOCAB)
+            qfscratch.logits.download(q8_fused)
+            for i in range(VOCAB):
+                var gap = q8_fused.data[i] - q8_out.data[i]
+                if gap < 0:
+                    gap = -gap
+                if gap > q8_fused_worst:
+                    q8_fused_worst = gap
+
+        var q8_row = cache_row(CACHE_Q8, KV_HEADS * HEAD_DIM)
+        var q8_diff = 0
+        var q8_mine = List[Int]()
+        var q8_theirs = List[Int]()
+        for l in range(LAYERS):
+            for half in range(2):
+                if half == 0:
+                    qcache.keys[l].download_bits(q8_mine)
+                    qfcache.keys[l].download_bits(q8_theirs)
+                else:
+                    qcache.values[l].download_bits(q8_mine)
+                    qfcache.values[l].download_bits(q8_theirs)
+                # The live halves of each row and not the padding. A row is
+                # rounded up so the next one starts where a thirty two bit
+                # store can own it, and nothing writes the halves that rounding
+                # adds, so they hold whatever the allocation came with and the
+                # two caches have no reason to agree about them. Bit patterns
+                # and not floats, because the quant plane read as float16 is
+                # mostly nans and a nan is not equal to itself.
+                var live = KV_HEADS * HEAD_DIM // 2 + KV_HEADS * HEAD_DIM // 32
+                for r in range(len(tokens)):
+                    for i in range(live):
+                        var at = r * q8_row + i
+                        if q8_theirs[at] != q8_mine[at]:
+                            q8_diff += 1
+
         # The prefill path, over the same tokens, into a cache of its own. This
         # is the claim #167 makes and it is not implied by anything above: the
         # decodes ran the matvec, the norms and the attention one token at
@@ -674,6 +782,54 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         suite.check(
             fused_cache_diff == 0,
             "and the keys and values agree in every bit",
+        )
+
+        suite.group("a q8 cache against a float16 one")
+        # Smaller, and no tighter a claim than that at this width. A kv row here
+        # is one q8 block, so the row is 17 halves rounded up to 24 and the
+        # padding is a third of what is left. At a real width the padding is
+        # nothing and the ratio is the 1.0625 bytes a value that
+        # `tests/test_repack.mojo` pins.
+        suite.check(
+            qcache.bytes() < cache.bytes(),
+            "a q8 cache is smaller than the float16 one it replaces",
+        )
+        # Two per cent, where the float16 cache is held to a fifth of that
+        # against the host. Measured worst here is 0.86 per cent of the peak
+        # logit, and it should be larger than the float16 number rather than
+        # equal to it: eight bits and a factor a block is a coarser cache than
+        # eleven bits an element, and the point of the flag is to trade that for
+        # the memory. What the bound is worth is the same thing every bound here
+        # is worth, which is that a scale plane read at the wrong offset is not
+        # a rounding difference.
+        var q8_gate = Float32(2e-2)
+        suite.check(
+            q8_worst <= peak * q8_gate,
+            "the logits off a q8 cache stay near the float16 ones",
+        )
+        if q8_worst > peak * q8_gate:
+            suite.fail("q8 logits", "worst " + String(q8_worst / peak))
+        # Not every step, and the difference is not a fault. This is a model of
+        # random weights with a vocabulary of 96, so the top two logits of a
+        # step are often a thousandth apart, and a coarser cache moves the pick
+        # at one step in twenty. What would say the path was broken is the pick
+        # moving at most of them.
+        suite.check(
+            q8_picks * 10 >= len(tokens) * 9,
+            "and greedy picks the same token at nearly every step",
+        )
+        if q8_picks * 10 < len(tokens) * 9:
+            suite.fail(
+                "q8 greedy",
+                String(q8_picks) + " of " + String(len(tokens)),
+            )
+        suite.check(
+            q8_fused_worst <= peak * Float32(1e-5),
+            "the fused path agrees with the unfused one at q8 too",
+        )
+        suite.check(
+            q8_diff == 0,
+            "and the two write the same bytes into the cache",
         )
 
         suite.group("device prefill against device decode")

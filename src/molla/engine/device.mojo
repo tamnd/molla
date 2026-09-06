@@ -74,6 +74,7 @@ from molla.nn.gpu_block import (
 )
 from molla.nn.gpu_fused import FusedPlan
 from molla.nn.model import frequency_factors
+from molla.nn.repack import CACHE_F16, cache_row, cache_type_name
 from molla.nn.tensor import Buffer
 from molla.sys.device import Device
 
@@ -126,7 +127,7 @@ struct DeviceKvCache(Movable):
     """
 
     var keys: List[DeviceHalf]
-    """`layers` vectors of `context * kv_width` halves.
+    """`layers` vectors of `context * cache_row(form, kv_width)` halves.
 
     Half precision because llama.cpp has held its cache there by default for
     long enough to be the strongest evidence available that it costs no
@@ -134,6 +135,11 @@ struct DeviceKvCache(Movable):
     conversation rather than with the model. An 8B at a context of 2048 keeps
     512 MiB of cache in float and 256 in half, and every key and value read in
     attention is half the traffic it was.
+
+    A q8_0 cache lives in the same buffer and is measured in the same halves.
+    What changes is how a row is read, not what holds it, so there is still one
+    allocation a layer and one pointer to hand a kernel. `cache_row` in
+    `molla.nn.repack` is the arithmetic.
     """
 
     var values: List[DeviceHalf]
@@ -142,10 +148,19 @@ struct DeviceKvCache(Movable):
     var layers: Int
     var context: Int
     var kv_width: Int
+    var form: Int
+    """`CACHE_F16` or `CACHE_Q8`, fixed when the session opens."""
+    var row: Int
+    """Halves one position of one layer occupies, which is what a slot scales."""
     var filled: Int
 
     def __init__(
-        out self, ctx: DeviceContext, layers: Int, context: Int, kv_width: Int
+        out self,
+        ctx: DeviceContext,
+        layers: Int,
+        context: Int,
+        kv_width: Int,
+        form: Int = CACHE_F16,
     ) raises:
         """Allocate the whole thing up front.
 
@@ -165,17 +180,19 @@ struct DeviceKvCache(Movable):
         self.layers = layers
         self.context = context
         self.kv_width = kv_width
+        self.form = form
+        self.row = cache_row(form, kv_width)
         self.filled = 0
         self.keys = List[DeviceHalf]()
         self.values = List[DeviceHalf]()
-        var per = context * kv_width
+        var per = context * self.row
         for _ in range(layers):
             self.keys.append(DeviceHalf(ctx, per))
             self.values.append(DeviceHalf(ctx, per))
 
     def bytes(self) -> Int:
         """What this occupies on the card, which is worth reporting first."""
-        return 2 * self.layers * self.context * self.kv_width * 2
+        return 2 * self.layers * self.context * self.row * 2
 
     def reset(mut self):
         """Forget the sequence without giving back the memory."""
@@ -290,7 +307,12 @@ struct DeviceSession(Movable):
     right shape and full of real numbers from an earlier token."""
 
     def __init__(
-        out self, ctx: DeviceContext, host: Bound, dev: Bound, context: Int
+        out self,
+        ctx: DeviceContext,
+        host: Bound,
+        dev: Bound,
+        context: Int,
+        form: Int = CACHE_F16,
     ) raises:
         """A model that is already loaded and bound twice, ready for a token.
 
@@ -322,7 +344,7 @@ struct DeviceSession(Movable):
             frequency_factors(host.model),
         )
         self.cache = DeviceKvCache(
-            ctx, dev.block_count(), context, dev.kv_width()
+            ctx, dev.block_count(), context, dev.kv_width(), form
         )
         self.scratch = DeviceScratch(ctx, dev.specs[0], context, dev.vocab())
         var chunk = PREFILL_CHUNK
@@ -352,6 +374,7 @@ struct DeviceSession(Movable):
             context,
             len(frequency_factors(host.model)) > 0,
             self.use_fused,
+            form,
         )
         self.pos = 0
         self.batched = False
@@ -401,6 +424,7 @@ struct DeviceSession(Movable):
                 slot,
                 self.cache.keys,
                 self.cache.values,
+                self.cache.form,
             )
         self.ctx.synchronize()
         self.batched = n > 1
@@ -518,7 +542,11 @@ def device_context(index: Int) raises -> DeviceContext:
 
 
 def open_session(
-    ctx: DeviceContext, host: Bound, dev: Bound, context: Int
+    ctx: DeviceContext,
+    host: Bound,
+    dev: Bound,
+    context: Int,
+    form: Int = CACHE_F16,
 ) raises -> Optional[DeviceSession]:
     """The session, behind the same guard for the same reason.
 
@@ -526,7 +554,7 @@ def open_session(
     both, and a `None` on the other side is what says which.
     """
     comptime if has_accelerator():
-        return DeviceSession(ctx, host, dev, context)
+        return DeviceSession(ctx, host, dev, context, form)
     raise Error(
         "this build has no device code in it, so there is no device session to"
         " run a sequence in"

@@ -76,6 +76,7 @@ def report_header(
     load_ms: Int,
     cache: RepackCache,
     backend: Backend,
+    cache_kind: String = String(""),
 ) raises:
     """What was loaded and how it was asked to run, before any text.
 
@@ -87,6 +88,10 @@ def report_header(
     The backend is on its own line and its reason is on the line under it when
     there is one, because `auto` staying on the host is the single most likely
     explanation for a run that is slower than somebody expected.
+
+    `cache_kind` is what the device cache holds and is empty for a host run,
+    which has no choice about it. It goes on the context line because that is
+    where the size it changes is already printed.
     """
     print(
         "model:    ",
@@ -99,13 +104,10 @@ def report_header(
     print("backend:  ", backend.describe())
     if backend.note.byte_length() > 0:
         print("          ", backend.note)
-    print(
-        "context:  ",
-        want,
-        "positions,",
-        cache_bytes // (1 << 20),
-        "MiB of cache",
-    )
+    var held = String("MiB of cache")
+    if cache_kind.byte_length() > 0:
+        held = String("MiB of ") + cache_kind + " cache"
+    print("context:  ", want, "positions,", cache_bytes // (1 << 20), held)
     print("prompt:   ", prompt_tokens, "tokens")
     print("sampling: ", describe(sampling))
     print("load:     ", load_ms, "ms")

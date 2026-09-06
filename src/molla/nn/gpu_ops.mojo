@@ -52,12 +52,16 @@ from molla.nn.gpu import (
     _scale_bases,
     activate,
     byte_float,
+    cache_load,
     high_shift,
     key_dot,
     nibble_float,
     wide_float,
 )
 from molla.nn.repack import (
+    CACHE_BLOCK,
+    CACHE_F16,
+    CACHE_Q8,
     LAYOUT_PLANAR,
     QUANT_I8,
     QUANT_K4,
@@ -67,6 +71,7 @@ from molla.nn.repack import (
     QUANT_S6,
     QUANT_U4,
     QUANT_U5,
+    cache_row,
     group_shift,
     group_size,
     has_min,
@@ -633,7 +638,7 @@ def _ramp(low: Float32, high: Float32, pair: Int) -> Float32:
 
 
 def attend_kernel[
-    tile: Int
+    tile: Int, form: Int
 ](
     q: Pointer[Float32, MutAnyOrigin],
     keys: Pointer[Float16, MutAnyOrigin],
@@ -644,6 +649,7 @@ def attend_kernel[
     pos_dev: Int32,
     head_dim_dev: Int32,
     kv_width_dev: Int32,
+    row_dev: Int32,
     group_dev: Int32,
     window_dev: Int32,
     sinks_dev: Int32,
@@ -675,12 +681,18 @@ def attend_kernel[
     the loop never visits. The window and the sinks are unchanged, since both
     were already expressed against `pos` and `pos` now moves with the token. A
     decode is one block deep with a query row stride of zero.
+
+    `form` is the cache's and `row` is how many halves one position of it takes,
+    which is `kv_width` at `CACHE_F16` and less than that at `CACHE_Q8`. Both
+    reads go through `cache_load`, so the only thing this kernel knows about the
+    form is that a row is not the same length as a count of values.
     """
     var ty = Int(block_idx.y)
     var count = Int(count_dev) + ty
     var pos = Int(pos_dev) + ty
     var head_dim = Int(head_dim_dev)
     var kv_width = Int(kv_width_dev)
+    var row = Int(row_dev)
     var group = Int(group_dev)
     var window = Int(window_dev)
     var sinks = Int(sinks_dev)
@@ -705,8 +717,19 @@ def attend_kernel[
         var visible = j < sinks or window <= 0 or j > pos - window
         var s = NEG_INF
         if visible:
-            var ka = j * kv_width + kvh * head_dim
-            s = key_dot[False](q, keys, qa, ka, head_dim, lane) * scale
+            s = (
+                key_dot[False, form](
+                    q,
+                    keys,
+                    qa,
+                    j * row,
+                    kvh * head_dim,
+                    kv_width,
+                    head_dim,
+                    lane,
+                )
+                * scale
+            )
             if softcap > 0:
                 s = softcap * _tanh(s / softcap)
         if lane == 0:
@@ -733,9 +756,8 @@ def attend_kernel[
     while d < head_dim:
         var acc = Float32(0)
         for j2 in range(count):
-            var va = j2 * kv_width + kvh * head_dim
-            acc += scores[unsafe_offset=sa + j2] * Float32(
-                values[unsafe_offset=va + d]
+            acc += scores[unsafe_offset=sa + j2] * cache_load[form, False](
+                values, j2 * row, kv_width, kvh * head_dim + d
             )
         o[unsafe_offset=qa + d] = acc * inv
         d += tile
@@ -800,7 +822,7 @@ def attend_partials(spec: AttnSpec, tokens: Int, context: Int) -> Int:
 
 
 def attend_split_kernel[
-    tile: Int
+    tile: Int, form: Int
 ](
     q: Pointer[Float32, MutAnyOrigin],
     keys: Pointer[Float16, MutAnyOrigin],
@@ -811,6 +833,7 @@ def attend_split_kernel[
     pos_dev: Int32,
     head_dim_dev: Int32,
     kv_width_dev: Int32,
+    row_dev: Int32,
     group_dev: Int32,
     window_dev: Int32,
     sinks_dev: Int32,
@@ -842,6 +865,7 @@ def attend_split_kernel[
     var pos = Int(pos_dev) + ty
     var head_dim = Int(head_dim_dev)
     var kv_width = Int(kv_width_dev)
+    var row = Int(row_dev)
     var group = Int(group_dev)
     var window = Int(window_dev)
     var sinks = Int(sinks_dev)
@@ -883,8 +907,19 @@ def attend_split_kernel[
         var visible = j < sinks or window <= 0 or j > pos - window
         var s = NEG_INF
         if visible:
-            var ka = j * kv_width + kvh * head_dim
-            s = key_dot[False](q, keys, qa, ka, head_dim, lane) * scale
+            s = (
+                key_dot[False, form](
+                    q,
+                    keys,
+                    qa,
+                    j * row,
+                    kvh * head_dim,
+                    kv_width,
+                    head_dim,
+                    lane,
+                )
+                * scale
+            )
             if softcap > 0:
                 s = softcap * _tanh(s / softcap)
         if lane == 0:
@@ -919,9 +954,8 @@ def attend_split_kernel[
     while d < head_dim:
         var acc = Float32(0)
         for j2 in range(lo, hi):
-            var va = j2 * kv_width + kvh * head_dim
-            acc += scores[unsafe_offset=sa + j2] * Float32(
-                values[unsafe_offset=va + d]
+            acc += scores[unsafe_offset=sa + j2] * cache_load[form, False](
+                values, j2 * row, kv_width, kvh * head_dim + d
             )
         partials[unsafe_offset=pa + d] = acc
         d += tile
@@ -1314,13 +1348,15 @@ def store_kv_kernel(
     src: Pointer[Float32, MutAnyOrigin],
     n_dev: Int32,
 ):
-    """Narrow a finished key or value row into the cache.
+    """Narrow finished key or value rows into the cache.
 
     One element a thread, which is the whole point of the pass. The three things
     that used to write the cache wrote it in place and none of them owned a
     contiguous run of it, so none of them could ever have quantized what it
-    wrote. This owns the run and it is the only writer, and today it narrows to
-    float16 and later it will encode a block.
+    wrote. This owns the run and it is the only writer.
+
+    A whole prefill chunk in one launch, and `n` is the chunk rather than a row,
+    because a float16 row is `kv_width` halves with nothing between two of them.
     """
     var n = Int(n_dev)
     var i = Int(block_idx.x * block_dim.x + thread_idx.x)
@@ -1330,35 +1366,131 @@ def store_kv_kernel(
         i += stride
 
 
+@always_inline
+def _q8(v: Float32) -> Int8:
+    """Round to nearest away from zero, clamped to the signed byte.
+
+    The clamp is insurance rather than arithmetic. The scaling puts every value
+    of the block inside `[-127, 127]` exactly, and float rounding at the ends of
+    that range is the only way out of it.
+    """
+    var r = v + Float32(0.5) if v >= 0 else v - Float32(0.5)
+    var i = Int(r)
+    if i > 127:
+        i = 127
+    if i < -127:
+        i = -127
+    return Int8(i)
+
+
+def store_kv_q8_kernel(
+    dst: Pointer[Float16, MutAnyOrigin],
+    src: Pointer[Float32, MutAnyOrigin],
+    n_dev: Int32,
+    row_dev: Int32,
+    rows_dev: Int32,
+):
+    """The same rows, encoded a q8_0 block a thread.
+
+    A block a thread and not an element a thread, because the scale is a
+    reduction over the whole block and a thread that owns less than a block
+    cannot compute it. That is the whole reason this pass exists and the reason
+    the transforms moved into a float32 workspace to feed it.
+
+    The block factor is `amax / 127` and the quants are round to nearest away
+    from zero, which is what the reference q8_0 encoder does. A block of zeros
+    gets a factor of zero and quants of zero, which reads back as zero.
+
+    A row of the source is `n` floats end to end and a row of the cache is
+    `row` halves with the pad `CACHE_ALIGN` leaves at the end of it, so the two
+    strides are different and the rows of a prefill chunk are walked rather than
+    treated as one long run.
+    """
+    var n = Int(n_dev)
+    var row = Int(row_dev)
+    var per = n // CACHE_BLOCK
+    var total = per * Int(rows_dev)
+    var q = dst.unsafe_bitcast[Int8]()
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    while i < total:
+        var r = i // per
+        var b = i - r * per
+        var src_at = r * n + b * CACHE_BLOCK
+        var amax = Float32(0)
+        for k in range(CACHE_BLOCK):
+            var v = src[unsafe_offset=src_at + k]
+            var a = v if v >= 0 else -v
+            if a > amax:
+                amax = a
+        var s = amax / Float32(127.0)
+        var inv = Float32(0) if amax == 0 else Float32(127.0) / amax
+        var dst_at = r * row * 2 + b * CACHE_BLOCK
+        for k in range(CACHE_BLOCK):
+            q[unsafe_offset=dst_at + k] = _q8(
+                src[unsafe_offset=src_at + k] * inv
+            )
+        dst[unsafe_offset=r * row + n // 2 + b] = s.cast[DType.float16]()
+        i += stride
+
+
 def device_store_kv(
-    ctx: DeviceContext, mut dst: DeviceHalf, at: Int, src: DeviceVec, n: Int
+    ctx: DeviceContext,
+    mut dst: DeviceHalf,
+    at: Int,
+    src: DeviceVec,
+    n: Int,
+    rows: Int = 1,
+    form: Int = CACHE_F16,
 ) raises:
-    """`dst[at + i] = src[i]` for `n` values, narrowing on the way."""
-    if at < 0 or n <= 0 or dst.elements() < at + n:
+    """`rows` finished rows of `n` values into the cache, starting at half `at`.
+
+    `at` and the stride between two rows are halves and `n` is a count of values,
+    and at `CACHE_Q8` those are different units: a row is `cache_row(form, n)`
+    halves long and holds `n` values.
+    """
+    var row = cache_row(form, n)
+    if at < 0 or n <= 0 or rows < 1 or dst.elements() < at + rows * row:
         raise Error(
             "storing "
+            + String(rows)
+            + " rows of "
             + String(n)
             + " values at offset "
             + String(at)
             + " does not fit in a cache of "
             + String(dst.elements())
         )
-    if src.elements() < n:
+    if src.elements() < rows * n:
         raise Error(
             "storing "
-            + String(n)
+            + String(rows * n)
             + " values out of a vector of "
             + String(src.elements())
         )
     _need_device()
     comptime if has_accelerator():
-        ctx.enqueue_function[store_kv_kernel](
-            dst.ptr_at(at),
-            src.ptr(),
-            Int32(n),
-            grid_dim=(_grid(n), 1, 1),
-            block_dim=(TILE, 1, 1),
-        )
+        if form == CACHE_Q8:
+            var blocks = rows * (n // CACHE_BLOCK)
+            ctx.enqueue_function[store_kv_q8_kernel](
+                dst.ptr_at(at),
+                src.ptr(),
+                Int32(n),
+                Int32(row),
+                Int32(rows),
+                grid_dim=(_grid(blocks), 1, 1),
+                block_dim=(TILE, 1, 1),
+            )
+        else:
+            # A float16 row is `n` halves with nothing between two of them, so
+            # the whole chunk is one contiguous run and the kernel never divides.
+            ctx.enqueue_function[store_kv_kernel](
+                dst.ptr_at(at),
+                src.ptr(),
+                Int32(rows * n),
+                grid_dim=(_grid(rows * n), 1, 1),
+                block_dim=(TILE, 1, 1),
+            )
 
 
 def device_softcap(
@@ -1786,6 +1918,7 @@ def device_attend(
     mut scores: DeviceVec,
     mut partials: DeviceVec,
     tokens: Int = 1,
+    form: Int = CACHE_F16,
 ) raises:
     """`tokens` queries against `count` keys and up, `heads * head_dim` out each.
 
@@ -1829,11 +1962,12 @@ def device_attend(
     if count <= 0:
         raise Error("attention needs at least one key to look at")
     var kv_width = spec.kv_heads * spec.head_dim
-    if keys.elements() < last * kv_width or values.elements() < last * kv_width:
+    var row = cache_row(form, kv_width)
+    if keys.elements() < last * row or values.elements() < last * row:
         raise Error(
             "attention wants "
-            + String(last * kv_width)
-            + " keys and values but got "
+            + String(last * row)
+            + " halves of keys and values but got "
             + String(keys.elements())
             + " and "
             + String(values.elements())
@@ -1867,9 +2001,74 @@ def device_attend(
     if chunks < 1:
         chunks = 1
     _need_device()
+    if form == CACHE_Q8:
+        _attend_launch[CACHE_Q8](
+            ctx,
+            spec,
+            q,
+            keys,
+            values,
+            count,
+            pos,
+            out,
+            scores,
+            partials,
+            tokens,
+            kv_width,
+            row,
+            width,
+            last,
+            chunks,
+        )
+    else:
+        _attend_launch[CACHE_F16](
+            ctx,
+            spec,
+            q,
+            keys,
+            values,
+            count,
+            pos,
+            out,
+            scores,
+            partials,
+            tokens,
+            kv_width,
+            row,
+            width,
+            last,
+            chunks,
+        )
+
+
+def _attend_launch[
+    form: Int
+](
+    ctx: DeviceContext,
+    spec: AttnSpec,
+    q: DeviceVec,
+    keys: DeviceHalf,
+    values: DeviceHalf,
+    count: Int,
+    pos: Int,
+    mut out: DeviceVec,
+    mut scores: DeviceVec,
+    mut partials: DeviceVec,
+    tokens: Int,
+    kv_width: Int,
+    row: Int,
+    width: Int,
+    last: Int,
+    chunks: Int,
+) raises:
+    """The launches, once the shape and the form are settled.
+
+    Split out so the form is a compile time parameter of the kernels and a
+    uniform branch of the caller, taken once a call rather than once a key.
+    """
     comptime if has_accelerator():
         if chunks == 1:
-            ctx.enqueue_function[attend_kernel[TILE]](
+            ctx.enqueue_function[attend_kernel[TILE, form]](
                 q.ptr(),
                 keys.ptr(),
                 values.ptr(),
@@ -1879,6 +2078,7 @@ def device_attend(
                 Int32(pos),
                 Int32(spec.head_dim),
                 Int32(kv_width),
+                Int32(row),
                 Int32(spec.group()),
                 Int32(spec.window),
                 Int32(spec.sinks),
@@ -1890,7 +2090,7 @@ def device_attend(
                 block_dim=(TILE, 1, 1),
             )
             return
-        ctx.enqueue_function[attend_split_kernel[TILE]](
+        ctx.enqueue_function[attend_split_kernel[TILE, form]](
             q.ptr(),
             keys.ptr(),
             values.ptr(),
@@ -1900,6 +2100,7 @@ def device_attend(
             Int32(pos),
             Int32(spec.head_dim),
             Int32(kv_width),
+            Int32(row),
             Int32(spec.group()),
             Int32(spec.window),
             Int32(spec.sinks),

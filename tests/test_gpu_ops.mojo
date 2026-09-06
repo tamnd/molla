@@ -45,6 +45,7 @@ from molla.nn.gpu_ops import (
     device_add_into,
     device_argmax,
     device_attend,
+    device_store_kv,
     device_gelu,
     device_geglu,
     device_rms_norm,
@@ -67,6 +68,7 @@ from molla.nn.kernel import (
     swiglu,
 )
 from molla.nn.quant import Q_F32
+from molla.nn.repack import CACHE_BLOCK, CACHE_Q8, cache_row
 from molla.nn.rope import RopeSpec, rotate_heads
 from molla.nn.tensor import Buffer, Tensor
 
@@ -94,6 +96,7 @@ def run_on_device(mut suite: Suite, ctx: DeviceContext) raises:
         test_argmax(suite, ctx)
         test_rope(suite, ctx)
         test_attend(suite, ctx)
+        test_attend_q8(suite, ctx)
         test_refusals(suite, ctx)
 
 
@@ -648,6 +651,120 @@ def _attend_case(
     suite.check(worst < gate, "device attention matches the host for " + name)
     if worst >= gate:
         suite.fail("device attention " + name, "worst " + String(worst))
+
+
+def _quantize_q8(values: List[Float32], mut out: List[Float32]):
+    """What a q8_0 cache row holds, computed on the host.
+
+    Written out rather than borrowed from the repack, because the repack
+    quantizes a weight matrix and this is the cache, and a reference that shares
+    its arithmetic with the thing it is checking is not one. Blocks of
+    `CACHE_BLOCK`, a factor of the largest magnitude over 127, rounded to nearest
+    away from zero, and the result is what the kernel is expected to read back.
+    """
+    var n = len(values)
+    for i in range(0, n, CACHE_BLOCK):
+        var amax = Float32(0)
+        for k in range(CACHE_BLOCK):
+            var a = values[i + k]
+            if a < 0:
+                a = -a
+            if a > amax:
+                amax = a
+        var inv = Float32(0) if amax == 0 else Float32(127.0) / amax
+        var s = Float32(Float16(amax / Float32(127.0)))
+        for k in range(CACHE_BLOCK):
+            var v = values[i + k] * inv
+            var r = v + Float32(0.5) if v >= 0 else v - Float32(0.5)
+            var q = Int(r)
+            if q > 127:
+                q = 127
+            if q < -127:
+                q = -127
+            out.append(Float32(q) * s)
+
+
+def test_attend_q8(mut suite: Suite, ctx: DeviceContext) raises:
+    """The q8_0 cache, stored by one kernel and read back by another.
+
+    The round trip is the test. A host quantizer says what the row is supposed
+    to hold, the store kernel writes it, attention reads it, and the answer has
+    to match the host attending to the values the host quantizer produced. That
+    catches the two mistakes this layout invites, which are a scale plane read
+    at the wrong offset and a block whose factor belongs to its neighbour, and
+    neither shows up as anything but slightly wrong numbers.
+    """
+    suite.group("device attention over a q8 cache")
+
+    var spec = AttnSpec(8, 2, 32)
+    var width = spec.heads * spec.head_dim
+    var kv_width = spec.kv_heads * spec.head_dim
+    var count = 40
+    var pos = count - 1
+
+    var q = _wave(width, 3)
+    var raw_k = List[Float32]()
+    var raw_v = List[Float32]()
+    for i in range(count * kv_width):
+        raw_k.append(Float32((i * 31 % 173)) / Float32(173) - Float32(0.5))
+        raw_v.append(Float32((i * 17 % 149)) / Float32(149) - Float32(0.5))
+    var keys = List[Float32]()
+    var values = List[Float32]()
+    _quantize_q8(raw_k, keys)
+    _quantize_q8(raw_v, values)
+
+    var want = Buffer(width)
+    var scratch = List[Float32]()
+    for _ in range(count):
+        scratch.append(0.0)
+    attend(spec, q, keys, values, count, pos, want, scratch)
+
+    var row = cache_row(CACHE_Q8, kv_width)
+    var dq = DeviceVec(ctx, width)
+    var src = DeviceVec(ctx, count * kv_width)
+    var dk = DeviceHalf(ctx, count * row)
+    var dv = DeviceHalf(ctx, count * row)
+    var dout = DeviceVec(ctx, width)
+    var dscores = DeviceVec(ctx, spec.heads * count)
+    var dpart = DeviceVec(ctx, attend_partials(spec, 1, count))
+    dq.upload(q)
+    src.copy_in(raw_k)
+    device_store_kv(ctx, dk, 0, src, kv_width, count, CACHE_Q8)
+    ctx.synchronize()
+    src.copy_in(raw_v)
+    device_store_kv(ctx, dv, 0, src, kv_width, count, CACHE_Q8)
+    device_attend(
+        ctx,
+        spec,
+        dq,
+        dk,
+        dv,
+        count,
+        pos,
+        dout,
+        dscores,
+        dpart,
+        1,
+        CACHE_Q8,
+    )
+    ctx.synchronize()
+    var got = Buffer(width)
+    dout.download(got)
+
+    var worst = _worst(got, want)
+    suite.check(worst < 2e-6, "a q8 cache reads back what the host quantized")
+    if worst >= 2e-6:
+        suite.fail("q8 attention", "worst " + String(worst))
+
+    # A width that is not a whole number of blocks has no q8 row, and the
+    # refusal is on the host where it can say so rather than in a kernel that
+    # would round the width down and drop the tail of every key.
+    var raised = False
+    try:
+        _ = cache_row(CACHE_Q8, 48)
+    except:
+        raised = True
+    suite.check(raised, "a width that is not whole blocks has no q8 row")
 
 
 def test_refusals(mut suite: Suite, ctx: DeviceContext) raises:
