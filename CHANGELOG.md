@@ -4,6 +4,12 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-06
+
+The last stage of the paged KV cache, which is the two policies over the cell table that 0.5.1 introduced. A window model now gives back what it has walked past, so a conversation of any length holds the window plus the sinks instead of being refused when it passes the context it reserved, and the pool has an order to take cells back in when the next request does not fit.
+
+Still nothing wired in. A session reserves its whole context and the slot a position goes in is still the position, so nothing about how molla runs has changed. What is left of #31 is the wiring, and that is where #32 starts.
+
 ### Added
 
 - A bounded ring for window and sink models. `CellTable.trim` frees the cells a query at the current position can no longer see, which is the condition attention masks with read backwards, so a cell it gives back is a cell that could not have changed a logit. A conversation of any length on a window model now holds the window plus the sinks rather than growing until it is refused, and a hundred tokens through a window of eight with two sinks holds ten.
