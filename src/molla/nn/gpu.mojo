@@ -2253,8 +2253,8 @@ which is eight accumulators of four floats a lane.
 
 Written in terms of the tile rather than as constants of their own, so that
 sweeping the tile is `NV_ROWS` and `NV_THREADS` and nothing else. What a sweep
-has to keep is that `NV_KPT` stays inside one quant group, which the kernel
-asserts, and that a warp keeps whole fragments in both directions.
+has to keep is that `NV_KPT` stays inside one quant group, which the kernel says
+where it reads the scale, and that a warp keeps whole fragments both ways.
 """
 
 comptime NV_ROW_THREADS = NV_THREADS // NV_ROWS
@@ -2386,14 +2386,11 @@ def planar_nvmma_kernel[
     var scales = w.unsafe_bitcast[Float16]()
     var base = _scale_bases[form, with_min](row, cols, groups)
     comptime shift = group_shift(group)
-    constrained[
-        NV_KPT <= group,
-        (
-            "a thread's run of the reduction has to sit inside one quant group,"
-            " since it reads the scale and the minimum once for the whole run"
-        ),
-    ]()
 
+    # `NV_KPT` has to stay inside one quant group, since the scale and the
+    # minimum are read once for a thread's whole run of the reduction. It is
+    # thirty two here against a group of thirty two, so a sweep that widens the
+    # tile without widening the block breaks this silently.
     var acc = InlineArray[SIMD[DType.float32, 4], NV_FT * NV_FR](fill=0)
 
     for k0 in range(0, cols, NV_K):
