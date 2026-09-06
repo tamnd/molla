@@ -638,6 +638,35 @@ def _ramp(low: Float32, high: Float32, pair: Int) -> Float32:
     return Float32(1.0) - at
 
 
+def _sees(
+    cells: Pointer[Int32, MutAnyOrigin],
+    j: Int,
+    pos: Int,
+    window: Int,
+    sinks: Int,
+    paged: Bool,
+) -> Bool:
+    """Whether a query at `pos` may read entry `j` of the keys.
+
+    Both halves of `molla.nn.attention`, in the order that file has them. Unpaged
+    `j` is an offset into a run of keys that exist, so causality is the loop's
+    business and this is `AttnSpec.visible` term for term. Paged `j` is a cell,
+    the position it holds is a load, and this is `AttnSpec.sees`: a negative
+    position is a cell that is free or belongs to somebody else, a position past
+    the query's is another sequence's future, and the window and the sinks are
+    the same arithmetic on the position either way.
+
+    The branch is on a kernel argument, so every thread of every block takes the
+    same side of it and it costs a predicted jump rather than a divergence.
+    """
+    if not paged:
+        return j < sinks or window <= 0 or j > pos - window
+    var held = Int(cells[unsafe_offset=j])
+    if held < 0 or held > pos:
+        return False
+    return held < sinks or window <= 0 or held > pos - window
+
+
 def attend_kernel[
     tile: Int, form: Int
 ](
@@ -646,6 +675,7 @@ def attend_kernel[
     values: Pointer[Float16, MutAnyOrigin],
     scores: Pointer[Float32, MutAnyOrigin],
     o: Pointer[Float32, MutAnyOrigin],
+    cells: Pointer[Int32, MutAnyOrigin],
     count_dev: Int32,
     pos_dev: Int32,
     head_dim_dev: Int32,
@@ -656,6 +686,7 @@ def attend_kernel[
     sinks_dev: Int32,
     q_row_dev: Int32,
     score_row_dev: Int32,
+    paged_dev: Int32,
     scale: Float32,
     softcap: Float32,
 ):
@@ -687,9 +718,19 @@ def attend_kernel[
     which is `kv_width` at `CACHE_F16` and less than that at `CACHE_Q8`. Both
     reads go through `cache_load`, so the only thing this kernel knows about the
     form is that a row is not the same length as a count of values.
+
+    When `paged` is set, `count` is a count of cells rather than of keys and it
+    is the same for every token of the chunk, `cells` holds the position each of
+    those cells holds for this sequence, and causality comes from that position
+    against the query's rather than from where the loop stops. See
+    [docs/validation/paging.md](../../../docs/validation/paging.md) for why the
+    mask is a position a cell and not a float a pair. Unpaged, `count` grows
+    with the token the way it always did and `cells` is not read at all, so the
+    caller is free to point it anywhere it likes.
     """
     var ty = Int(block_idx.y)
-    var count = Int(count_dev) + ty
+    var paged = Int(paged_dev) != 0
+    var count = Int(count_dev) if paged else Int(count_dev) + ty
     var pos = Int(pos_dev) + ty
     var head_dim = Int(head_dim_dev)
     var kv_width = Int(kv_width_dev)
@@ -715,7 +756,7 @@ def attend_kernel[
     var mine = NEG_INF
     var j = team
     while j < count:
-        var visible = j < sinks or window <= 0 or j > pos - window
+        var visible = _sees(cells, j, pos, window, sinks, paged)
         var s = NEG_INF
         if visible:
             s = (
@@ -830,6 +871,7 @@ def attend_split_kernel[
     values: Pointer[Float16, MutAnyOrigin],
     scores: Pointer[Float32, MutAnyOrigin],
     partials: Pointer[Float32, MutAnyOrigin],
+    cells: Pointer[Int32, MutAnyOrigin],
     count_dev: Int32,
     pos_dev: Int32,
     head_dim_dev: Int32,
@@ -841,6 +883,7 @@ def attend_split_kernel[
     q_row_dev: Int32,
     score_row_dev: Int32,
     chunks_dev: Int32,
+    paged_dev: Int32,
     scale: Float32,
     softcap: Float32,
 ):
@@ -860,9 +903,16 @@ def attend_split_kernel[
 
     The scores go to the same scratch at the same offsets the single kernel
     writes, because the slices are disjoint and between them cover the row.
+
+    Paged, the slices are cut over cells rather than over keys, and the entirely
+    masked slice handled below stops being the rare case a window produces. It
+    becomes an ordinary one, because the cells a sequence owns are spread over
+    the pool rather than gathered at the front, so a slice that holds none of
+    them has to come out as nothing seen rather than as a division by zero.
     """
     var ty = Int(block_idx.y)
-    var count = Int(count_dev) + ty
+    var paged = Int(paged_dev) != 0
+    var count = Int(count_dev) if paged else Int(count_dev) + ty
     var pos = Int(pos_dev) + ty
     var head_dim = Int(head_dim_dev)
     var kv_width = Int(kv_width_dev)
@@ -905,7 +955,7 @@ def attend_split_kernel[
     var mine = NEG_INF
     var j = lo + team
     while j < hi:
-        var visible = j < sinks or window <= 0 or j > pos - window
+        var visible = _sees(cells, j, pos, window, sinks, paged)
         var s = NEG_INF
         if visible:
             s = (
@@ -2095,11 +2145,139 @@ def device_attend(
     them mask everything is a configuration error rather than a numerical one,
     and it produces a division by a zero sum, which arrives as a buffer of nans
     several layers later.
+
+    `device_attend_paged` below is the same kernel over a pool of cells rather
+    than a run of keys, and it is a second entry point rather than an argument
+    here because the two answer the count and the causality differently and
+    everything after that is shared.
+    """
+    var seen = 0
+    for t in range(count):
+        if spec.visible(t, pos):
+            seen += 1
+    # `Pointer` is not nullable, so the unpaged call aims `cells` at the scores
+    # scratch rather than at nothing. The kernel is told it is not paged and
+    # never reads it, and an address that belongs to this call is a better thing
+    # to hand a kernel than one that belongs to nobody.
+    _attend_go(
+        ctx,
+        spec,
+        q,
+        keys,
+        values,
+        Pointer[Int32, MutAnyOrigin](
+            unsafe_from_address=Int(scores.buf.unsafe_ptr())
+        ),
+        count,
+        count + tokens - 1,
+        pos,
+        seen,
+        False,
+        out,
+        scores,
+        partials,
+        tokens,
+        form,
+    )
+
+
+def device_attend_paged(
+    ctx: DeviceContext,
+    spec: AttnSpec,
+    q: DeviceVec,
+    keys: DeviceHalf,
+    values: DeviceHalf,
+    held: List[Int32],
+    cells: DeviceInts,
+    pos: Int,
+    mut out: DeviceVec,
+    mut scores: DeviceVec,
+    mut partials: DeviceVec,
+    tokens: Int = 1,
+    form: Int = CACHE_F16,
+) raises:
+    """`device_attend` over a cell pool, masked by the position each cell holds.
+
+    The keys and values are the pool rather than one sequence's run, `cells` is
+    one entry a cell holding the position that cell holds for this sequence and
+    a negative for one it may not read, and the number of cells scanned is
+    `cells.elements()`. That is the same for every token of a chunk, which is
+    the difference from the unpaged call: there the count grows with the token
+    because causality is where the loop stops, and here it does not because
+    causality is a comparison of positions.
+
+    `held` is the host copy of what `cells` holds and the caller owns both. It
+    is here for the refusal below, which is the same refusal `device_attend`
+    makes and cannot be made against a device buffer without a read back on the
+    path a token takes. The two are checked to be the same length, because a
+    caller that uploads one vector and reasons about another produces fluent
+    text about the wrong context and nothing else goes wrong.
+
+    Nothing here rounds the cell count. The caller does that, through
+    `CellTable.window`, because it is the caller that knows how much rounding
+    keeps a launch shape still.
+    """
+    if len(held) != cells.elements():
+        raise Error(
+            "paged attention got "
+            + String(len(held))
+            + " host cells against "
+            + String(cells.elements())
+            + " on the device"
+        )
+    var count = cells.elements()
+    var seen = 0
+    for c in range(count):
+        if spec.sees(Int(held[c]), pos):
+            seen += 1
+    _attend_go(
+        ctx,
+        spec,
+        q,
+        keys,
+        values,
+        cells.ptr(),
+        count,
+        count,
+        pos,
+        seen,
+        True,
+        out,
+        scores,
+        partials,
+        tokens,
+        form,
+    )
+
+
+def _attend_go(
+    ctx: DeviceContext,
+    spec: AttnSpec,
+    q: DeviceVec,
+    keys: DeviceHalf,
+    values: DeviceHalf,
+    cells: Pointer[Int32, MutAnyOrigin],
+    count: Int,
+    last: Int,
+    pos: Int,
+    seen: Int,
+    paged: Bool,
+    mut out: DeviceVec,
+    mut scores: DeviceVec,
+    mut partials: DeviceVec,
+    tokens: Int,
+    form: Int,
+) raises:
+    """The refusals and the split arithmetic, shared by both entry points.
+
+    `count` is keys unpaged and cells paged, `last` is the furthest entry any
+    token of the chunk reaches, and `seen` is how many of them the first token
+    can see. The two callers differ only in how they answer those three, which
+    is the whole of what paging changes above the kernel.
     """
     if tokens < 1:
         raise Error("attention needs at least one query")
     var width = spec.heads * spec.head_dim
-    var last = count + tokens - 1
     if q.elements() < tokens * width:
         raise Error(
             "attention wants a query of "
@@ -2134,10 +2312,6 @@ def device_attend(
             + " scores but got "
             + String(scores.elements())
         )
-    var seen = 0
-    for t in range(count):
-        if spec.visible(t, pos):
-            seen += 1
     if seen == 0:
         raise Error(
             "position "
@@ -2163,6 +2337,7 @@ def device_attend(
             q,
             keys,
             values,
+            cells,
             count,
             pos,
             out,
@@ -2174,6 +2349,7 @@ def device_attend(
             width,
             last,
             chunks,
+            paged,
         )
     else:
         _attend_launch[CACHE_F16](
@@ -2182,6 +2358,7 @@ def device_attend(
             q,
             keys,
             values,
+            cells,
             count,
             pos,
             out,
@@ -2193,6 +2370,7 @@ def device_attend(
             width,
             last,
             chunks,
+            paged,
         )
 
 
@@ -2204,6 +2382,7 @@ def _attend_launch[
     q: DeviceVec,
     keys: DeviceHalf,
     values: DeviceHalf,
+    cells: Pointer[Int32, MutAnyOrigin],
     count: Int,
     pos: Int,
     mut out: DeviceVec,
@@ -2215,6 +2394,7 @@ def _attend_launch[
     width: Int,
     last: Int,
     chunks: Int,
+    paged: Bool,
 ) raises:
     """The launches, once the shape and the form are settled.
 
@@ -2229,6 +2409,7 @@ def _attend_launch[
                 values.ptr(),
                 scores.ptr(),
                 out.ptr(),
+                cells,
                 Int32(count),
                 Int32(pos),
                 Int32(spec.head_dim),
@@ -2239,6 +2420,7 @@ def _attend_launch[
                 Int32(spec.sinks),
                 Int32(width),
                 Int32(last),
+                Int32(1) if paged else Int32(0),
                 spec.scale,
                 spec.softcap,
                 grid_dim=(spec.heads, tokens, 1),
@@ -2251,6 +2433,7 @@ def _attend_launch[
             values.ptr(),
             scores.ptr(),
             partials.ptr(),
+            cells,
             Int32(count),
             Int32(pos),
             Int32(spec.head_dim),
@@ -2262,6 +2445,7 @@ def _attend_launch[
             Int32(width),
             Int32(last),
             Int32(chunks),
+            Int32(1) if paged else Int32(0),
             spec.scale,
             spec.softcap,
             grid_dim=(spec.heads, tokens, chunks),
