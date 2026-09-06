@@ -2214,6 +2214,7 @@ def device_attend_paged(
     values: DeviceHalf,
     held: List[Int32],
     cells: DeviceInts,
+    count: Int,
     pos: Int,
     mut out: DeviceVec,
     mut scores: DeviceVec,
@@ -2225,32 +2226,36 @@ def device_attend_paged(
 
     The keys and values are the pool rather than one sequence's run, `cells` is
     one entry a cell holding the position that cell holds for this sequence and
-    a negative for one it may not read, and the number of cells scanned is
-    `cells.elements()`. That is the same for every token of a chunk, which is
-    the difference from the unpaged call: there the count grows with the token
+    a negative for one it may not read, and `count` is how many of them a step
+    reads. That count is the same for every token of a chunk, which is the
+    difference from the unpaged call: there the count grows with the token
     because causality is where the loop stops, and here it does not because
     causality is a comparison of positions.
+
+    `count` is the window rather than the buffer. Both vectors are allocated
+    once at the size of the pool and a step reads a prefix of them, because a
+    buffer sized to the window would be an allocation a token and a host list
+    sliced to the window would be a copy a token. Nothing here rounds it. The
+    caller does that, through `CellTable.window`, because it is the caller that
+    knows how much rounding keeps a launch shape still.
 
     `held` is the host copy of what `cells` holds and the caller owns both. It
     is here for the refusal below, which is the same refusal `device_attend`
     makes and cannot be made against a device buffer without a read back on the
-    path a token takes. The two are checked to be the same length, because a
-    caller that uploads one vector and reasons about another produces fluent
-    text about the wrong context and nothing else goes wrong.
-
-    Nothing here rounds the cell count. The caller does that, through
-    `CellTable.window`, because it is the caller that knows how much rounding
-    keeps a launch shape still.
+    path a token takes. Both have to reach the window, because a caller that
+    uploads one vector and reasons about another produces fluent text about the
+    wrong context and nothing else goes wrong.
     """
-    if len(held) != cells.elements():
+    if count < 1 or len(held) < count or cells.elements() < count:
         raise Error(
-            "paged attention got "
+            "paged attention over "
+            + String(count)
+            + " cells got "
             + String(len(held))
-            + " host cells against "
+            + " on the host and "
             + String(cells.elements())
             + " on the device"
         )
-    var count = cells.elements()
     var seen = 0
     for c in range(count):
         if spec.sees(Int(held[c]), pos):

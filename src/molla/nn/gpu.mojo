@@ -526,6 +526,75 @@ struct DeviceInts(Movable):
         return Int(got)
 
 
+struct DevicePaging(Movable):
+    """What a paged pass hands the kernels, filled once and read by every layer.
+
+    Two index vectors and the host lists behind them. Where the tokens of this
+    step go, which the scattered store reads, and what this sequence may read of
+    the pool, which attention masks by. Both are allocated when the session
+    opens and both are filled once a pass, so paging costs two transfers of a
+    few kilobytes a step rather than two a layer.
+
+    The host lists are kept rather than built a step for the reason
+    `DeviceInts.queue_in` gives: the copy is queued and not waited for, so the
+    bytes it reads have to outlive the call. They are also read again after the
+    copy, because `device_attend_paged` counts what a query can see on the host
+    rather than reading a device buffer back.
+
+    `on` is here rather than at the call sites because the unpaged path is still
+    the one a fused decode takes and the one every test of the forward pass
+    takes. A pass that is not paged carries one of these with `on` false and
+    nothing reads the vectors.
+    """
+
+    var cells: DeviceInts
+    """One entry a token of the chunk: which cell its key and value go in."""
+
+    var mask: DeviceInts
+    """One entry a cell of the pool: the position that cell holds for this
+    sequence, or a negative for one the sequence may not read."""
+
+    var slots: List[Int32]
+    """The host side of `cells`."""
+
+    var held: List[Int32]
+    """The host side of `mask`."""
+
+    var window: Int
+    """How many cells of `mask` this step reads, which is a prefix of it."""
+
+    var on: Bool
+    """Whether this pass is paged at all."""
+
+    def __init__(out self, ctx: DeviceContext, chunk: Int, pool: Int) raises:
+        """Room for a chunk of tokens over a pool of cells, both fixed."""
+        if chunk <= 0 or pool <= 0:
+            raise Error("paging needs a positive chunk and a positive pool")
+        self.cells = DeviceInts(ctx, chunk)
+        self.mask = DeviceInts(ctx, pool)
+        self.slots = List[Int32](length=chunk, fill=0)
+        self.held = List[Int32](length=pool, fill=-1)
+        self.window = 0
+        self.on = False
+
+    def chunk(self) -> Int:
+        return self.cells.elements()
+
+    def pool(self) -> Int:
+        return self.mask.elements()
+
+    def queue(mut self) raises:
+        """Send both vectors, whole, on the stream the kernels are queued on.
+
+        Whole rather than as far as the step reaches, because a partial copy of
+        a device buffer is a second offset to get wrong and the whole of this is
+        a few kilobytes. What bounds the step is `window` and the row count the
+        store is given, neither of which is in the buffer.
+        """
+        self.cells.queue_in(self.slots)
+        self.mask.queue_in(self.held)
+
+
 comptime EPI_NONE = 0
 """The matvec writes its row and nothing else, which is what it always did."""
 comptime EPI_BIAS = 1

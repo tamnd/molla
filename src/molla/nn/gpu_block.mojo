@@ -58,6 +58,7 @@ from molla.nn.gpu import (
     PREFILL_CHUNK,
     SPAN,
     DeviceHalf,
+    DevicePaging,
     DeviceVec,
     device_matmul_into,
     device_matvec_into,
@@ -117,6 +118,7 @@ from molla.nn.gpu_ops import (
     device_add_run,
     attend_partials,
     device_attend,
+    device_attend_paged,
     device_gelu,
     device_rms_norm,
     device_rms_norm_inplace,
@@ -126,6 +128,7 @@ from molla.nn.gpu_ops import (
     device_silu,
     device_softcap,
     device_store_kv,
+    device_store_kv_at,
     device_unpack_rows,
 )
 from molla.nn.model import ModelWeights
@@ -667,6 +670,7 @@ def device_attention(
     mut s: DeviceScratch,
     mut keys: DeviceHalf,
     mut values: DeviceHalf,
+    paging: DevicePaging,
     slot: Int,
     pos: Int,
     tokens: Int = 1,
@@ -674,10 +678,16 @@ def device_attention(
 ) raises:
     """The attention sublayer, in place on the residual stream.
 
-    `tokens` of them at once, occupying cache slots `slot` through
-    `slot + tokens - 1` at positions `pos` through `pos + tokens - 1`. Every
-    kernel below takes the count and none of them branch on it, because a chunk
-    of one is the geometry a decode already had.
+    `tokens` of them at once, at positions `pos` through `pos + tokens - 1`.
+    Every kernel below takes the count and none of them branch on it, because a
+    chunk of one is the geometry a decode already had.
+
+    Where those tokens go and what they may read is either `slot`, which is a
+    run of cache rows starting there, or `paging`, which is a cell a token and a
+    window over the pool. The two are the same computation and differ in how a
+    row is addressed and where causality comes from: a run gets it from where
+    the loop stops and a pool gets it from the position each cell holds. See
+    [docs/validation/paging.md](../../../docs/validation/paging.md).
 
     The same eleven steps in the same order as `molla.nn.block.attention_layer`,
     and the order is the part that matters rather than the kernels: the bias
@@ -694,13 +704,13 @@ def device_attention(
             + " wide where the layer wants "
             + String(tokens * spec.width)
         )
-    if slot < 0:
+    if not paging.on and slot < 0:
         raise Error("a cache slot cannot be negative")
 
     var kv_width = spec.kv_width()
     var row = cache_row(form, kv_width)
     var at = slot * row
-    if (
+    if not paging.on and (
         keys.elements() < at + tokens * row
         or values.elements() < at + tokens * row
     ):
@@ -769,23 +779,44 @@ def device_attention(
         kv_width,
     )
 
-    device_store_kv(ctx, keys, at, s.k, kv_width, tokens, form)
-    device_store_kv(ctx, values, at, s.v, kv_width, tokens, form)
-
-    device_attend(
-        ctx,
-        spec.attn,
-        s.q,
-        keys,
-        values,
-        slot + 1,
-        pos,
-        s.heads_out,
-        s.scores,
-        s.partials,
-        tokens,
-        form,
-    )
+    if paging.on:
+        device_store_kv_at(ctx, keys, paging.cells, s.k, kv_width, tokens, form)
+        device_store_kv_at(
+            ctx, values, paging.cells, s.v, kv_width, tokens, form
+        )
+        device_attend_paged(
+            ctx,
+            spec.attn,
+            s.q,
+            keys,
+            values,
+            paging.held,
+            paging.mask,
+            paging.window,
+            pos,
+            s.heads_out,
+            s.scores,
+            s.partials,
+            tokens,
+            form,
+        )
+    else:
+        device_store_kv(ctx, keys, at, s.k, kv_width, tokens, form)
+        device_store_kv(ctx, values, at, s.v, kv_width, tokens, form)
+        device_attend(
+            ctx,
+            spec.attn,
+            s.q,
+            keys,
+            values,
+            slot + 1,
+            pos,
+            s.heads_out,
+            s.scores,
+            s.partials,
+            tokens,
+            form,
+        )
     # The residual add rides the output projection's epilogue, so `s.projected`
     # is only used by the models that put a norm between the two. Those still
     # pay for the scratch vector and the two launches, because a norm over the
@@ -861,13 +892,16 @@ def device_layer(
     mut s: DeviceScratch,
     mut keys: DeviceHalf,
     mut values: DeviceHalf,
+    paging: DevicePaging,
     slot: Int,
     pos: Int,
     tokens: Int = 1,
     form: Int = CACHE_F16,
 ) raises:
     """Both sublayers, which is one decoder layer."""
-    device_attention(ctx, spec, w, x, s, keys, values, slot, pos, tokens, form)
+    device_attention(
+        ctx, spec, w, x, s, keys, values, paging, slot, pos, tokens, form
+    )
     device_mlp(ctx, spec, w, x, s, tokens)
 
 
@@ -1564,6 +1598,7 @@ def device_forward(
     slot: Int,
     mut keys: List[DeviceHalf],
     mut values: List[DeviceHalf],
+    paging: DevicePaging,
     form: Int = CACHE_F16,
 ) raises:
     """A run of tokens through the whole stack, logits left on the device.
@@ -1576,7 +1611,8 @@ def device_forward(
     `pos` and `slot` are two arguments for the reason the host version gives:
     they are the same number until something evicts, and the day they stop being
     the same is the day a single argument becomes a bug in two places. A run
-    occupies `len(tokens)` of each, starting at these.
+    occupies `len(tokens)` of each, starting at these. When `paging` is on the
+    slot is not used at all, because a cell a token has replaced a run.
 
     Only the last token of the run gets logits, because it is the only one a
     caller can do anything with and the output head is the largest single
@@ -1592,6 +1628,15 @@ def device_forward(
             + String(count)
         )
 
+    if paging.on and paging.chunk() < len(tokens):
+        raise Error(
+            "a paged pass of "
+            + String(len(tokens))
+            + " tokens has room for "
+            + String(paging.chunk())
+            + " cells"
+        )
+
     var run = _embed(ctx, m, s, x, tokens, pos)
     for i in range(count):
         device_layer(
@@ -1602,6 +1647,7 @@ def device_forward(
             s,
             keys[i],
             values[i],
+            paging,
             slot,
             pos,
             run,

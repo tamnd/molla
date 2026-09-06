@@ -44,6 +44,8 @@ Four, in this order, because each one is testable on its own and the first is wo
 
 **Sharing and eviction.** Sharing as a bit set on a range and releasing as a bit cleared with the cell freed when the set empties, both of which came with the table itself because an owner set is what they are. What this stage adds on top is the two policies: a bounded ring for window and sink models, and an eviction order over the cells no running sequence holds. Both are below.
 
+Then the wiring, which is not a fifth stage so much as the point of the first four: a forward pass takes its cells from the table and reads them through the mask. It is below.
+
 Continuous batching, #32, sits on top of stage two and does not need stage four. Chunked prefill is not separate work: it is what a cap on the batch does to a long prompt.
 
 ## The mask is a position a cell, not a float a pair
@@ -91,6 +93,22 @@ A turn that ends does not give its cells back. It stops being running, which lea
 The cost of keeping them is that the pool fills with turns nobody came back for, so `evict` takes them back when the next request does not fit. Least recently used, over sequences rather than over cells. A turn's cells were all written at once and are all worth the same to the request after it, so the whole sequence goes and the order is the order the turns finished in. That is 64 stamps to order rather than one number a cell, and one scan of the pool a victim rather than one a cell.
 
 Nothing running is evicted. Preempting a stream that is mid flight is a scheduler's decision and it belongs with #34, and when the scheduler makes it the way it says so is `release_all` and then recomputing. There is no path here that moves a cell to host memory, which is the preference #31 asks for. Swapping a 4096 cell sequence of an 8B out and back is 512 MiB in each direction, about 20 ms a direction over PCIe 4, and it holds the bus while it happens. Recomputing costs a prefill the engine already has a path for. Which is cheaper is worth measuring once there is a scheduler to measure it with, and until then the one that does not need a host buffer, a transfer queue and a policy for what to do when the swap itself does not fit is the one to have.
+
+## The wiring
+
+The four stages built the parts. The wiring is what makes a forward pass use them, and it is one function: `DeviceKvCache.place` takes a cell for each token of a step, writes the cell indices into the vector the store scatters through, writes the window into the vector attention masks with, and queues both on the stream the kernels are queued on and ahead of them. That is the one transfer paging costs a step, and it is two index vectors rather than the megabyte of floats a matrix mask would be.
+
+Whether a step is paged is reported by `place` rather than decided by the caller. A pass over cells that are not the positions they hold has to be paged whatever anybody wanted, because the contiguous path addresses the cache by position, so `place` can turn paging on and never turns it off. While one sequence has the pool to itself the free list hands out cells in order, every cell is its own position, and the answer is no, which is what keeps this change bit identical on the path a token takes today. The fused decode asks the same question for the same reason: it reads a run and has no mask, so it runs when `place` says the cells allow it and falls back to the unfused path when they do not.
+
+`MOLLA_PAGED=1` sends every step down the paged path anyway. Nothing in production sets it. It exists so the cost of the indirection can be measured now, on the same models and the same cards as everything else in `docs/validation/bench.md`, rather than discovered when #32 makes paging the only way. The cost has two parts. One is the scatter, which turns a contiguous store of a row into a store through an index and reads one more integer a token a layer. The other is `PAGE_PAD`, which rounds the window a step reads up to 256 cells so the launch shape stops changing every token, and which means a short context scans cells it did not have to. At a context under the pad the paged path does the pad's worth of work where the contiguous path did the context's worth, and above it the rounding is at most 255 cells of a window that is thousands.
+
+Measured on the 4090, Qwen 2.5 0.5B at Q4_K_M, a 512 token prompt and 128 decoded, the unfused path on both sides so that the only difference is the paging. Three pairs, run alternately. Decode is 237.0, 266.7 and 271.8 tokens a second contiguous against 247.6, 275.9 and 280.7 paged, so the paged path is three to four per cent faster, consistently, in all three pairs. Time to first token is 51 to 53 ms contiguous against a steady 54 ms paged, so the scatter costs a millisecond or two on a 512 token prefill.
+
+Faster is not what the pad predicted, and the reason it wins anyway is the thing the pad was for. At 640 positions the paged step scans 768 cells, which is twenty per cent more work than the contiguous step's 640 keys, and it still comes out ahead because its launch is the same shape every token. The contiguous path grows its grid by one key a step and pays for the change; the paged one changes shape once every 256 tokens. So the pad is not only what keeps the launch shape from churning, it is what pays for the mask.
+
+The load on that machine was sixteen of thirty two cores during the runs, so the magnitudes are worth less than the direction, and the direction is the same in every pair. The 8B has not been taken yet because the machine did not have the memory free to map it.
+
+The end to end check is a prompt run twice into two caches, once contiguously and once through a pool a decoy sequence has already taken the front of, so that every token lands in a cell its position never would have. The cache rows have to match byte for byte at the offset, because the store writes the same bytes and only the index changed, and the logits have to match to a tolerance a hundred times tighter than the host comparison carries, because the only thing left to disagree about is the order a sum is folded in.
 
 ## What done means
 

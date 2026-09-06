@@ -53,7 +53,7 @@ from std.sys.info import CompilationTarget, has_accelerator
 from max.gpu.host import DeviceContext
 
 from molla.engine.bind import Bound
-from molla.engine.cache import check_room, slot_of
+from molla.engine.cache import PAGE_PAD, CellTable, check_room, slot_of
 from molla.engine.sample import Sampler
 from molla.model.gguf import Gguf
 from molla.model.load import Weights, device_refusal, load, plan_load
@@ -63,6 +63,7 @@ from molla.nn.gpu import (
     PREFILL_CHUNK,
     SPAN,
     DeviceHalf,
+    DevicePaging,
     DeviceVec,
 )
 from molla.nn.gpu_block import (
@@ -86,6 +87,19 @@ Unset picks by the model, which is `fused_by_default`. The knob stays because
 the line that function draws is drawn from three models on one card, and the
 first machine that disagrees with it should be able to say so without a
 rebuild. See [docs/validation/fused.md](../../../docs/validation/fused.md).
+"""
+
+comptime PAGED_ENV = "MOLLA_PAGED"
+"""Set to `1` to send every step through the paged kernels whether or not the
+cells make it necessary.
+
+Off, because one sequence has the whole pool to itself and the cells it is
+handed are the positions it asked for, so paging it would be the same
+arithmetic reached through an index vector and a mask. A step takes the paged
+path the moment a cell stops being its own position, which is what #32 will do
+to it, and this is how the cost of that indirection gets measured before it is
+the only way. It also puts a decode on the unfused path, since the fused
+kernel addresses the cache by position and cannot page.
 """
 
 comptime FUSED_MAX_BYTES = 1024 * 1024 * 1024
@@ -117,13 +131,21 @@ got longer, and the fused path spreads the same step over more of the grid.
 
 
 struct DeviceKvCache(Movable):
-    """One sequence's keys and values, in device memory, a window per layer.
+    """A pool of cells, in device memory, a window per layer.
 
     The same shape as `molla.engine.cache.KvCache` and the same policy, which is
     not a coincidence and not a copy: the two questions that are policy rather
     than storage, which slot a position goes in and what happens when the context
-    fills, are free functions over there and this calls them. The day a slot
-    stops being a position both caches change together.
+    fills, are free functions over there and this calls them.
+
+    This is where the day that paragraph was written for arrived. A position no
+    longer picks its own row. `CellTable` hands out a cell, the store scatters
+    through a vector of cell indices, and attention masks by the position each
+    cell holds. One sequence still has the whole pool to itself, so the cells it
+    gets back are the positions it asked for and every byte lands where it
+    landed before, which is what makes this a change with a bit identical gate
+    rather than a new answer. What it buys is that the second sequence is now a
+    scheduler away rather than a rewrite away.
 
     One allocation, not two a layer. The keys of every layer and then the values
     of every layer live in `pool`, and `keys` and `values` are windows on it at a
@@ -166,6 +188,29 @@ struct DeviceKvCache(Movable):
     """Halves one position of one layer occupies, which is what a slot scales."""
     var filled: Int
 
+    var table: CellTable
+    """Which cell holds which position, and for whom. Host side, never
+    uploaded."""
+
+    var paging: DevicePaging
+    """The two index vectors a step hands the kernels, refilled once a pass."""
+
+    var seq: Int
+    """Which sequence this cache is writing for. Zero, until there is a
+    scheduler to hand out another one."""
+
+    var straight: Bool
+    """Whether every cell this sequence holds is the position it holds.
+
+    True from an empty pool for one sequence, because the free list hands cells
+    out in order, and it is what lets the fused decode keep addressing the cache
+    by position. That kernel reads a run and has no mask, so the day this goes
+    false is the day a decode has to come back to the unfused path until #170
+    stage two teaches the fused one to page. Nothing sets it false yet, and the
+    check is here rather than an assumption because the failure it would prevent
+    is fluent text about the wrong context.
+    """
+
     def __init__(
         out self,
         ctx: DeviceContext,
@@ -195,6 +240,13 @@ struct DeviceKvCache(Movable):
         self.form = form
         self.row = cache_row(form, kv_width)
         self.filled = 0
+        self.table = CellTable(context)
+        var chunk = PREFILL_CHUNK
+        if chunk > context:
+            chunk = context
+        self.paging = DevicePaging(ctx, chunk, context)
+        self.seq = 0
+        self.straight = True
         var per = context * self.row
         self.pool = DeviceHalf(ctx, 2 * layers * per)
         self.keys = List[DeviceHalf]()
@@ -211,6 +263,9 @@ struct DeviceKvCache(Movable):
     def reset(mut self):
         """Forget the sequence without giving back the memory."""
         self.filled = 0
+        self.table.reset()
+        self.straight = True
+        self.paging.on = False
 
     def slot_for(self, pos: Int) raises -> Int:
         return slot_of(pos, self.context)
@@ -224,6 +279,48 @@ struct DeviceKvCache(Movable):
     def advance(mut self, count: Int = 1) raises:
         self.reserve(count)
         self.filled += count
+
+    def place(mut self, pos: Int, count: Int, paged: Bool) raises -> Int:
+        """Take a cell for each of `count` tokens at `pos`, and say where.
+
+        Returns the first cell, which is the slot the contiguous path writes at
+        and is the position itself while `straight` holds.
+
+        `paged` is what the caller wants rather than what it gets. A pass over
+        cells that are not the positions they hold has to be paged whatever the
+        caller asked for, because the contiguous path addresses the cache by
+        position, so this can turn paging on and says so through `paging.on`.
+        It never turns it off.
+
+        Both vectors are queued here when the pass is paged, on the stream the
+        kernels are queued on and ahead of them, which is the one transfer
+        paging costs a step.
+        """
+        if count < 1:
+            raise Error("a step has to place at least one token")
+        if count > self.paging.chunk():
+            raise Error(
+                "a step of "
+                + String(count)
+                + " tokens has room for "
+                + String(self.paging.chunk())
+                + " cells"
+            )
+        check_room(count, self.table.free(), self.table.size())
+        var first = -1
+        for i in range(count):
+            var cell = self.table.alloc(self.seq, pos + i)
+            if cell != pos + i:
+                self.straight = False
+            if i == 0:
+                first = cell
+            self.paging.slots[i] = Int32(cell)
+        self.paging.on = paged or not self.straight
+        if self.paging.on:
+            self.paging.window = self.table.window(PAGE_PAD)
+            self.table.held(self.seq, self.paging.window, self.paging.held)
+            self.paging.queue()
+        return first
 
 
 def fused_by_default(m: DeviceModel) raises -> Bool:
@@ -306,6 +403,10 @@ struct DeviceSession(Movable):
     """Whether a decode goes through the fused kernel. Off unless `MOLLA_FUSED`
     says otherwise, until the measurements in #170 say which is faster on which
     device."""
+
+    var use_paged: Bool
+    """Whether a step is paged even when its cells are its positions. Off unless
+    `MOLLA_PAGED` says otherwise. See `PAGED_ENV`."""
 
     var pos: Int
     """How many positions this sequence has consumed. The next token is at
@@ -390,6 +491,7 @@ struct DeviceSession(Movable):
             self.use_fused,
             form,
         )
+        self.use_paged = getenv(PAGED_ENV) == "1"
         self.pos = 0
         self.batched = False
 
@@ -413,8 +515,13 @@ struct DeviceSession(Movable):
         if n == 0:
             raise Error("a forward pass needs at least one token")
         self.cache.reserve(n)
-        var slot = self.cache.slot_for(self.pos)
-        if n == 1 and self.use_fused:
+        # The fused decode addresses the cache by position and has no mask, so
+        # it is asked for rather than chosen: `place` says whether the cells it
+        # handed out let that path be right, and while one sequence has the pool
+        # to itself the answer is always yes.
+        var want_fused = n == 1 and self.use_fused
+        var slot = self.cache.place(self.pos, n, self.use_paged)
+        if want_fused and not self.cache.paging.on:
             device_forward_fused(
                 self.ctx,
                 self.model,
@@ -438,6 +545,7 @@ struct DeviceSession(Movable):
                 slot,
                 self.cache.keys,
                 self.cache.values,
+                self.cache.paging,
                 self.cache.form,
             )
         self.ctx.synchronize()

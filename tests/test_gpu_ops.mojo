@@ -695,6 +695,17 @@ def test_attend_paged(mut suite: Suite, ctx: DeviceContext) raises:
         suite, ctx, split_win, 512, 600, 511, "slices a window empties", 3e-6
     )
 
+    # A window that is a prefix of the vectors it was uploaded in, which is what
+    # every step does: the buffers are the pool and the window is how much of it
+    # the pool is using. The cells past the window here would all be visible if
+    # they were read.
+    _attend_paged_case(
+        suite, ctx, spec, 40, 64, 39, "a window inside its buffer", 2e-6, 96
+    )
+    _attend_paged_case(
+        suite, ctx, split, 512, 600, 511, "and one cut into slices", 3e-6, 424
+    )
+
     var raised = False
     try:
         var short = AttnSpec(4, 2, 32)
@@ -708,13 +719,34 @@ def test_attend_paged(mut suite: Suite, ctx: DeviceContext) raises:
         var host = List[Int32]()
         for i in range(20):
             host.append(Int32(i))
-        device_attend_paged(ctx, short, q, k, v, host, cellv, 39, o, s, part)
+        device_attend_paged(
+            ctx, short, q, k, v, host, cellv, 40, 39, o, s, part
+        )
     except:
         raised = True
     suite.check(
-        raised,
-        "a host window that is not the length of the device one is refused",
+        raised, "a host window shorter than the one asked for is refused"
     )
+
+    raised = False
+    try:
+        var short = AttnSpec(4, 2, 32)
+        var q = DeviceVec(ctx, 4 * 32)
+        var k = DeviceHalf(ctx, 40 * 2 * 32)
+        var v = DeviceHalf(ctx, 40 * 2 * 32)
+        var o = DeviceVec(ctx, 4 * 32)
+        var s = DeviceVec(ctx, 4 * 40)
+        var part = DeviceVec(ctx, attend_partials(short, 1, 40))
+        var cellv = DeviceInts(ctx, 20)
+        var host = List[Int32]()
+        for i in range(40):
+            host.append(Int32(i))
+        device_attend_paged(
+            ctx, short, q, k, v, host, cellv, 40, 39, o, s, part
+        )
+    except:
+        raised = True
+    suite.check(raised, "and so is a device window that does not reach it")
 
 
 def _attend_paged_case(
@@ -726,8 +758,15 @@ def _attend_paged_case(
     pos: Int,
     name: String,
     gate: Float32,
+    slack: Int = 0,
 ) raises:
     """`count` positions scattered over a pool of `cells`, against the host.
+
+    `slack` cells past the window, on both sides, holding a position the query
+    can see and numbers it must not read. A step reads a prefix of vectors that
+    are allocated once at the size of the pool, so the entries past the window
+    are always there and a kernel that took the buffer's length for the window
+    would produce a number that is wrong by however much they weigh.
 
     The scatter is a stride of seven, which is coprime with every pool size
     here, so a position lands nowhere near the order it was written in and the
@@ -746,6 +785,7 @@ def _attend_paged_case(
     """
     var width = spec.heads * spec.head_dim
     var kv_width = spec.kv_heads * spec.head_dim
+    var pool = cells + slack
 
     var q = _wave(width, count)
 
@@ -754,7 +794,7 @@ def _attend_paged_case(
     # right cell holds.
     var keys = List[Float32]()
     var values = List[Float32]()
-    for i in range(cells * kv_width):
+    for i in range(pool * kv_width):
         keys.append(
             Float32(
                 Float16(Float32((i * 53 % 101)) / Float32(101) - Float32(0.5))
@@ -772,6 +812,10 @@ def _attend_paged_case(
     var held = List[Int]()
     for c in range(cells):
         held.append(-1 if c % 2 == 0 else pos + 1 + c % 5)
+    # Past the window, a position the query can see, so that reading one of
+    # these changes the answer rather than being masked off anyway.
+    for _ in range(slack):
+        held.append(0)
     for i in range(count):
         var cell = i * 7 % cells
         held[cell] = i
@@ -809,22 +853,22 @@ def _attend_paged_case(
     attend(spec, q, keys, values, cells, pos, want, scratch, held)
 
     var host = List[Int32]()
-    for c in range(cells):
+    for c in range(pool):
         host.append(Int32(held[c]))
 
     var dq = DeviceVec(ctx, width)
-    var dk = DeviceHalf(ctx, cells * kv_width)
-    var dv = DeviceHalf(ctx, cells * kv_width)
+    var dk = DeviceHalf(ctx, pool * kv_width)
+    var dv = DeviceHalf(ctx, pool * kv_width)
     var dout = DeviceVec(ctx, width)
     var dscores = DeviceVec(ctx, spec.heads * cells)
     var dpart = DeviceVec(ctx, attend_partials(spec, 1, cells))
-    var cellv = DeviceInts(ctx, cells)
+    var cellv = DeviceInts(ctx, pool)
     cellv.queue_in(host)
     dq.upload(q)
-    dk.upload_run(keys, 0, cells * kv_width)
-    dv.upload_run(values, 0, cells * kv_width)
+    dk.upload_run(keys, 0, pool * kv_width)
+    dv.upload_run(values, 0, pool * kv_width)
     device_attend_paged(
-        ctx, spec, dq, dk, dv, host, cellv, pos, dout, dscores, dpart
+        ctx, spec, dq, dk, dv, host, cellv, cells, pos, dout, dscores, dpart
     )
     ctx.synchronize()
     var got = Buffer(width)

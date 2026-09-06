@@ -390,42 +390,67 @@ def test_cells_window(mut suite: Suite) raises:
     var c = List[Int]()
     t.alloc_run(1, 0, 2, c)
 
-    var win = List[Int]()
+    # The list is the whole pool and a step fills the prefix it is going to
+    # read, so the tail has to come back untouched. That is what lets one
+    # buffer be allocated at startup and written again every step.
+    var win = List[Int32](length=t.size(), fill=Int32(99))
     t.held(0, t.top, win)
-    suite.check(len(win) == 5, "a window is one entry a cell")
     suite.check(
-        win[0] == 0 and win[1] == 1 and win[2] == 2,
+        Int(win[0]) == 0 and Int(win[1]) == 1 and Int(win[2]) == 2,
         "each of a sequence's cells says which position it holds",
     )
     suite.check(
-        win[3] == CELL_FREE and win[4] == CELL_FREE,
+        Int(win[3]) == CELL_FREE and Int(win[4]) == CELL_FREE,
         "and another sequence's cells say nothing at all",
     )
+    suite.check(Int(win[5]) == 99, "and nothing past the window is written")
 
-    var other = List[Int]()
+    var other = List[Int32](length=t.size(), fill=Int32(0))
     t.held(1, t.top, other)
     suite.check(
-        other[3] == 0 and other[4] == 1 and other[0] == CELL_FREE,
+        Int(other[3]) == 0
+        and Int(other[4]) == 1
+        and Int(other[0]) == CELL_FREE,
         "the same cells read the other way round for the other sequence",
+    )
+
+    # Two windows back to back in one list, which is how a batch of sequences
+    # gets to share the buffer.
+    var both = List[Int32](length=2 * t.top, fill=Int32(0))
+    t.held(0, t.top, both)
+    t.held(1, t.top, both, t.top)
+    suite.check(
+        Int(both[0]) == 0 and Int(both[t.top + 3]) == 0,
+        "an offset puts the second window after the first",
     )
 
     # A shared prefix is in both windows at once, which is the property the
     # whole thing exists for and the one a copy would have hidden.
     _ = t.share(0, 2, 0, 2)
-    var shared = List[Int]()
+    var shared = List[Int32](length=t.size(), fill=Int32(0))
     t.held(2, t.top, shared)
     suite.check(
-        shared[0] == 0 and shared[1] == 1 and shared[2] == CELL_FREE,
+        Int(shared[0]) == 0
+        and Int(shared[1]) == 1
+        and Int(shared[2]) == CELL_FREE,
         "a shared prefix is in the sharer's window and the rest is not",
     )
 
     var failed = False
     try:
-        var over = List[Int]()
+        var over = List[Int32](length=17, fill=Int32(0))
         t.held(0, 17, over)
     except:
         failed = True
     suite.check(failed, "a window past the end of the pool is refused")
+
+    var cramped = False
+    try:
+        var small = List[Int32](length=4, fill=Int32(0))
+        t.held(0, 5, small)
+    except:
+        cramped = True
+    suite.check(cramped, "and a window that does not fit the list it is given")
 
 
 def test_cells_ring(mut suite: Suite) raises:
