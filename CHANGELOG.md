@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-06
+
+M2d closes. molla now does what the reference engines do on prefill, and the gap that grew with the model size no longer grows the same way.
+
+The milestone was opened on one observation from [docs/validation/engines.md](docs/validation/engines.md): the prefill gap to llama.cpp was 3.1 times on SmolLM2 135M, 8.6 on Qwen 2.5 0.5B and 27.9 on Llama 3.1 8B, while the decode gap was a constant factor on all three. A gap that grows with the model is a missing algorithm rather than a slow kernel, and the missing algorithm was a matrix core GEMM. Both backends have one now, Metal in #201 and CUDA in #212, and on gpc those three prefill ratios read 1.85, 3.11 and 9.82. Decode reads 1.41, 1.66 and 1.47 times llama.cpp against the 1.5 times gate at M7, so two of the three models are inside the gate and Qwen is the one outside it. Card memory is 610, 926 and 5542 MiB against llama.cpp's 694, 1122 and 5198.
+
+Eleven items landed across 0.4.8 through 0.4.21. The decode attention path stopped leaving three quarters of the card idle, a fold that ran on five blocks of three hundred and eighty four was rewritten, a narrow matvec row stopped being reduced through eight barriers, and a prefill thread stopped issuing one activation load for every multiply. The KV cache can be held at float16 or q8_0. The first run no longer loads the model twice. Two items were answered rather than implemented, because the measurement said the change they proposed was not where the time was, and two more stay open on purpose: #212 for software pipelining the CUDA tile, and #258 for the q8 cache value fold. The measurements are in [docs/validation/prefill.md](docs/validation/prefill.md), [docs/validation/kvcache.md](docs/validation/kvcache.md) and [docs/validation/bench.md](docs/validation/bench.md).
+
 ## [0.4.21] - 2026-09-06
 
 CUDA prefill on Llama 3.1 8B is 1.81 times what it was and time to first token is 474 ms where it was 860, because the tensor core tile #212 recorded as a failed experiment has been rebuilt around what the numbers there said was missing. It is used only where the matmul is large enough to fill the card, which is what turns it from a regression on the two small models into parity on one and 1.24 times on the other.
