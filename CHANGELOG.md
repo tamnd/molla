@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-09-07
+
+The first two of the five stages continuous batching needs, both of them changes a single sequence cannot tell apart. Rope reads a position for each token out of a vector rather than adding the token's index to a base, and the paged index turns around from a vector over the cell pool to a vector over one sequence's own positions.
+
+Neither changes a logit and that is the point of doing them first. What they change is what the next stage is allowed to assume: a token can say where it is, and a sequence can find its own cells without reading anybody else's. The batch is a scheduler away rather than a rewrite away.
+
+One thing came out against the spec. Removing the overscan the paged cache pays was supposed to be what the turnaround bought, and measuring it says the overscan is what makes a paged decode fast. So the rounding stays for a decode, where it is now three per cent ahead of the contiguous path, and goes for a prefill chunk, where it cost fifteen per cent. docs/validation/batching.md carries the table and names the prediction it corrects.
+
 ### Changed
 
 - Rope takes the position of each token out of a vector rather than adding the token's index to a base. A run of one sequence fills that vector with a base and its successors, so every angle is the angle it was and the logits are unchanged, and a batch that holds two sequences fills it with positions that no base describes. That is the first of the five stages in [docs/validation/batching.md](docs/validation/batching.md) and the reason it is first is that it is the smallest thing a mixed batch needs which nothing today provides.
