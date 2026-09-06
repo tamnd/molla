@@ -24,19 +24,17 @@ Ollama is asked through `/api/generate` with `stream` off and `raw` on, which re
 
 ## gpc, the RTX 4090
 
-An RTX 4090 with 24564 MiB, reached through WSL2 on a Windows machine, which is why the harness reports Linux x86_64 with 32 logical cores. It is a WSL2 CUDA result and not a Linux CUDA result, for the reason in [toolchain.md](toolchain.md): the only NVIDIA card in the fleet is in a Windows box. This is the quietest machine in the set and the one where a number is a measurement.
+An RTX 4090 with 24564 MiB, reached through WSL2 on a Windows machine, which is why the harness reports Linux x86_64 with 32 logical cores. It is a WSL2 CUDA result and not a Linux CUDA result, for the reason in [toolchain.md](toolchain.md): the only NVIDIA card in the fleet is in a Windows box.
 
-molla 0.4.13, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-05. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, five runs, median, and the load average was between 0.6 and 0.7 before each run. These are the lengths M7 takes its gate at.
+molla 0.4.21, llama.cpp b1 de8656b, Ollama 0.32.9, on 2026-09-06. All three on `--device=cuda`, 512 prompt tokens asked for, 128 generated, five runs, median. These are the lengths M7 takes its gate at.
 
-All three rows of each table were taken in one sitting on this build. The last row of each is molla 0.4.11, measured the same way the day before, and that is the row the molla row should be read against.
+All four rows of each table were taken in one sitting. The last row of each is molla 0.4.20 from the same clone twenty minutes later, and that is the row the molla row should be read against.
 
-What separates the two molla rows is #235, the decode attention split. It only reaches the 8B, because the two small models decode through the fused path and the fused kernel has cut a head's keys across blocks since 0.4.10. So the first two tables are the control and the third is the change, which is the reverse of the arrangement this page carried for #200.
+What separates the two molla rows is #212, the CUDA tensor core prefill tile, and it is a prefill change only. It reaches the 8B on every matrix, Qwen on its two wide feed forward matrices and SmolLM2 on none, which is why SmolLM2 prefill is identical to the digit in both rows: it is the same kernel measured twice. The decode column should be read as unchanged everywhere. It moves by up to 4 per cent between the two rows on the two small models and that is under the spread this harness shows between reruns of the same build.
 
-Run to run spread on this harness is larger than the two small rows moved. Three molla only reruns of SmolLM2 in the same sitting read 467.2, 474.1 and 458.8 decode, a spread of 3.3 per cent, so the 472.3 in the table against 490.4 the day before is not a measurement of anything. The 8B row is 17 per cent and is far outside it.
+The load average was between 8 and 13 during this sitting and 3 by the end of it, where the sitting this page carried before was taken at 0.7. The rival columns are what say whether that matters, since neither rival changed between the two: llama.cpp reads 32721, 36296 and 9874 here against 37677, 37256 and 10475 there, so 13 per cent, 3 per cent and 6 per cent low. Read the ratios rather than the absolute numbers, and do not compare a cell here with a cell from an earlier version of this page.
 
-That 17 per cent is smaller than the 30 per cent #235 measured at a 1121 token prompt, and the difference is the prompt. This page is 512 tokens, the term the split addresses grows with the context, and the ratio therefore grows with it too. Neither number contradicts the other and the longer one is in [budget.md](budget.md).
-
-Ollama's prefill column in this sitting reads 124154 and 112472 tokens a second on the two small models, and those are not measurements. The Ollama server caches the last prompt, the harness takes the first run only for that reason, and on a warm server even the first run can hit the cache. The day before, the same two cells read 16138.7 and 6655.0. Treat the Ollama prefill cells as an upper bound with no lower bound under them, which is what the footnote the harness prints has always said and what these two numbers make impossible to ignore. The Ollama decode column does not have the problem, because 128 generated tokens are generated either way.
+Ollama's prefill column reads sanely in this sitting, at 9092, 4231 and 2990. The version of this page before it carried 124154 and 112472 on the two small models, which were the server's prompt cache and not measurements. The harness takes Ollama's first run only for exactly that reason, and on a warm server even the first run can hit it, so these cells are an upper bound with no lower bound under them whatever they read. The Ollama decode column does not have the problem, because 128 generated tokens are generated either way.
 
 llama.cpp reports itself as build 1 on this machine because it was built there from a clone with no tags, and the build number comes from `git describe`. The commit is the identity that matters and it is in the line above.
 
@@ -46,28 +44,36 @@ SmolLM2 135M Instruct Q8_0, digest 5a1395716f79, 514 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB | card MiB |
 | --- | --- | --- | --- | --- | --- |
-| molla | 10280.0 | 472.3 | 50 | 279 | 648 |
-| llama.cpp | 37676.6 | 857.8 | 14 | 443 | 642 |
-| ollama | 124154.6 | 703.9 | 4 | - | - |
-| molla 0.4.11 | 10708.3 | 490.4 | 48 | 279 | 648 |
+| molla | 17724.1 | 559.0 | 29 | 277 | 610 |
+| llama.cpp | 32721.4 | 788.1 | 16 | 443 | 694 |
+| ollama | 9091.7 | 660.3 | 57 | - | - |
+| molla 0.4.20 | 17724.1 | 584.5 | 29 | 277 | 610 |
 
 Qwen 2.5 0.5B Instruct q4_K_M, digest 74a4da8c9fdb, 514 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB | card MiB |
 | --- | --- | --- | --- | --- | --- |
-| molla | 4990.3 | 371.0 | 103 | 549 | 918 |
-| llama.cpp | 37256.0 | 749.6 | 14 | 807 | 1122 |
-| ollama | 112472.6 | 517.0 | 5 | - | - |
-| molla 0.4.11 | 5039.2 | 383.2 | 102 | 550 | 930 |
+| molla | 11681.8 | 416.9 | 44 | 552 | 926 |
+| llama.cpp | 36295.7 | 691.6 | 14 | 805 | 1122 |
+| ollama | 4230.7 | 457.6 | 121 | - | - |
+| molla 0.4.20 | 9178.6 | 435.4 | 56 | 550 | 926 |
 
 Llama 3.1 8B Instruct q4_K_M, digest 7b064f5842bf, 515 prompt tokens, 5 runs.
 
 | engine | prefill tok/s | decode tok/s | ttft ms | host MiB | card MiB |
 | --- | --- | --- | --- | --- | --- |
-| molla | 378.7 | 111.9 | 1360 | 976 | 6084 |
-| llama.cpp | 10475.2 | 161.1 | 49 | 5047 | 5198 |
-| ollama | 6105.9 | 147.9 | 84 | - | - |
-| molla 0.4.11 | 372.9 | 95.5 | 1381 | 1044 | 6084 |
+| molla | 1005.9 | 106.9 | 512 | 946 | 5542 |
+| llama.cpp | 9874.3 | 156.8 | 52 | 4895 | 5198 |
+| ollama | 2989.6 | 145.0 | 172 | - | - |
+| molla 0.4.20 | 596.1 | 110.7 | 864 | 837 | 5542 |
+
+## Where that puts the two gates
+
+The gate at M7 is decode within 1.5 times of llama.cpp on the same model, the same quantization and the same device. On this sitting molla is 1.41 times off on SmolLM2, 1.66 on Qwen and 1.47 on the 8B, so two of the three are inside it and the third is not. The version of this page before it read 1.82, 2.02 and 1.44 on the same three, so the 8B has been inside for a version and SmolLM2 has just come inside. It is a decode gate and this sitting's change is a prefill one, so what moved those two is the decode work through the rest of M2c and M2d rather than anything in the tables above.
+
+Prefill is the other half and it is not a gate. molla is 1.85 times behind llama.cpp on SmolLM2, 3.11 on Qwen and 9.82 on the 8B, where the sitting that opened M2d read 3.1, 8.6 and 27.9. The ratio still grows with model size and it grows much less steeply, which is what #212 was for and what is left of it.
+
+Memory is the standing goal's other half and molla holds it on this card: 610 MiB against 694 on SmolLM2, 926 against 1122 on Qwen, and 5542 against 5198 on the 8B, which is under the rival on two of the three and 1.07 times over on the third where it used to be 1.42.
 
 ## macbook, the M4
 
