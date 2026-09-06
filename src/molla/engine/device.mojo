@@ -117,14 +117,26 @@ got longer, and the fused path spreads the same step over more of the grid.
 
 
 struct DeviceKvCache(Movable):
-    """One sequence's keys and values, in device memory, one vector per layer.
+    """One sequence's keys and values, in device memory, a window per layer.
 
     The same shape as `molla.engine.cache.KvCache` and the same policy, which is
     not a coincidence and not a copy: the two questions that are policy rather
     than storage, which slot a position goes in and what happens when the context
     fills, are free functions over there and this calls them. The day a slot
     stops being a position both caches change together.
+
+    One allocation, not two a layer. The keys of every layer and then the values
+    of every layer live in `pool`, and `keys` and `values` are windows on it at a
+    layer's offset. Nothing above this can tell, since a window is an ordinary
+    `DeviceHalf`, and two things below it can. A driver that is handed one
+    allocation instead of sixty four has one thing to place, and a kernel that
+    covers a whole token in one launch can be handed one pointer and a stride
+    where it would otherwise need the list, which is what #170 stage two asks
+    for. See [docs/validation/paging.md](../../../docs/validation/paging.md).
     """
+
+    var pool: DeviceHalf
+    """Keys for every layer, then values for every layer, in one allocation."""
 
     var keys: List[DeviceHalf]
     """`layers` vectors of `context * cache_row(form, kv_width)` halves.
@@ -136,10 +148,10 @@ struct DeviceKvCache(Movable):
     512 MiB of cache in float and 256 in half, and every key and value read in
     attention is half the traffic it was.
 
-    A q8_0 cache lives in the same buffer and is measured in the same halves.
+    A q8_0 cache lives in the same window and is measured in the same halves.
     What changes is how a row is read, not what holds it, so there is still one
-    allocation a layer and one pointer to hand a kernel. `cache_row` in
-    `molla.nn.repack` is the arithmetic.
+    pointer to hand a kernel. `cache_row` in `molla.nn.repack` is the
+    arithmetic.
     """
 
     var values: List[DeviceHalf]
@@ -183,16 +195,18 @@ struct DeviceKvCache(Movable):
         self.form = form
         self.row = cache_row(form, kv_width)
         self.filled = 0
+        var per = context * self.row
+        self.pool = DeviceHalf(ctx, 2 * layers * per)
         self.keys = List[DeviceHalf]()
         self.values = List[DeviceHalf]()
-        var per = context * self.row
-        for _ in range(layers):
-            self.keys.append(DeviceHalf(ctx, per))
-            self.values.append(DeviceHalf(ctx, per))
+        for i in range(layers):
+            self.keys.append(DeviceHalf(self.pool, i * per, per))
+        for i in range(layers):
+            self.values.append(DeviceHalf(self.pool, (layers + i) * per, per))
 
     def bytes(self) -> Int:
         """What this occupies on the card, which is worth reporting first."""
-        return 2 * self.layers * self.context * self.row * 2
+        return self.pool.elements() * 2
 
     def reset(mut self):
         """Forget the sequence without giving back the memory."""

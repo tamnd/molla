@@ -351,6 +351,33 @@ struct DeviceHalf(Movable):
         self.buf = ctx.enqueue_create_buffer[DType.float16](n)
         self.n = n
 
+    def __init__(out self, pool: Self, at: Int, n: Int) raises:
+        """A window on somebody else's allocation, owning none of it.
+
+        The offset and the length are in elements and not in bytes, which is
+        what `create_sub_buffer` takes. Everything above this sees an ordinary
+        `DeviceHalf`, which is the point: a caller that wants a layer's keys
+        asks for them the same way whether they are their own allocation or a
+        slice of a pool.
+
+        The caller has to keep the pool alive for as long as the window. Every
+        window here is a field of the same struct that holds the pool, so that
+        holds by construction rather than by care.
+        """
+        if n <= 0:
+            raise Error("a device window needs a positive length")
+        if at < 0 or at + n > pool.n:
+            raise Error(
+                "a window of "
+                + String(n)
+                + " at "
+                + String(at)
+                + " does not fit a pool of "
+                + String(pool.n)
+            )
+        self.buf = pool.buf.create_sub_buffer[DType.float16](at, n)
+        self.n = n
+
     def elements(self) -> Int:
         return self.n
 
