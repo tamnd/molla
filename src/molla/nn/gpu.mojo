@@ -452,6 +452,80 @@ struct DeviceHalf(Movable):
         return Float32(got)
 
 
+struct DeviceInts(Movable):
+    """Int32 indices in device memory, owned.
+
+    One thing is made of these and it is the only paging structure that reaches
+    the card: the vector of cell indices for a step, one entry a token, saying
+    which cell of the pool that token's key and value go in. Everything else
+    about paging is host side bookkeeping in `molla.engine.cache`, which is the
+    whole point of a cell being one token wide. See
+    [docs/validation/paging.md](../../../docs/validation/paging.md).
+
+    Int32 and not Int, because it is a kernel argument and the two targets do
+    not agree on how wide a host `Int` is. A pool large enough to need more than
+    two billion cells would be sixteen petabytes of an 8B's keys and values.
+
+    `queue_in` is how a step fills it, and it is the one transfer on the path a
+    token takes. A prefill chunk is 256 entries, so 1 KiB, ordered on the same
+    stream as the kernel that reads it.
+    """
+
+    var buf: DeviceBuffer[DType.int32]
+    var n: Int
+
+    def __init__(out self, ctx: DeviceContext, n: Int) raises:
+        if n <= 0:
+            raise Error("a device index vector needs a positive length")
+        self.buf = ctx.enqueue_create_buffer[DType.int32](n)
+        self.n = n
+
+    def elements(self) -> Int:
+        return self.n
+
+    def ptr(self) -> Pointer[Int32, MutAnyOrigin]:
+        return Pointer[Int32, MutAnyOrigin](
+            unsafe_from_address=Int(self.buf.unsafe_ptr())
+        )
+
+    def queue_in(mut self, x: List[Int32]) raises:
+        """Fill this from a host list, queued rather than waited for.
+
+        Unlike `DeviceVec.copy_in` this does not synchronize, because it is on
+        the path a token takes and a wait here would cost more than the store
+        it feeds. The price is that `x` has to outlive the copy, so the caller
+        keeps it: the session owns one staging list for the life of the session
+        rather than building one a step.
+
+        The whole buffer is copied whatever the step holds. A chunk that is
+        shorter than the buffer leaves stale entries past its end, which is
+        harmless because the kernel is told how many rows it is writing and
+        never reaches them.
+        """
+        if len(x) != self.n:
+            raise Error(
+                "filling a device index vector of "
+                + String(self.n)
+                + " from a list of "
+                + String(len(x))
+            )
+        self.buf.context().enqueue_copy(
+            self.buf,
+            Pointer[Int32, MutAnyOrigin](
+                unsafe_from_address=Int(x.unsafe_ptr())
+            ),
+        )
+
+    def at(self, index: Int) raises -> Int:
+        """One index, for a test. Through a mapping, like every other `at`."""
+        if index < 0 or index >= self.n:
+            raise Error("index " + String(index) + " is outside this vector")
+        var got: Int32
+        with self.buf.map_to_host() as h:
+            got = h[index]
+        return Int(got)
+
+
 comptime EPI_NONE = 0
 """The matvec writes its row and nothing else, which is what it always did."""
 comptime EPI_BIAS = 1

@@ -39,13 +39,14 @@ from max.gpu.host import DeviceContext
 from harness import Suite
 
 from molla.nn.attention import AttnSpec, attend
-from molla.nn.gpu import DeviceHalf, DeviceVec
+from molla.nn.gpu import DeviceHalf, DeviceInts, DeviceVec
 from molla.nn.gpu_ops import (
     attend_partials,
     device_add_into,
     device_argmax,
     device_attend,
     device_store_kv,
+    device_store_kv_at,
     device_gelu,
     device_geglu,
     device_rms_norm,
@@ -68,7 +69,7 @@ from molla.nn.kernel import (
     swiglu,
 )
 from molla.nn.quant import Q_F32
-from molla.nn.repack import CACHE_BLOCK, CACHE_Q8, cache_row
+from molla.nn.repack import CACHE_BLOCK, CACHE_F16, CACHE_Q8, cache_row
 from molla.nn.rope import RopeSpec, rotate_heads
 from molla.nn.tensor import Buffer, Tensor
 
@@ -97,6 +98,7 @@ def run_on_device(mut suite: Suite, ctx: DeviceContext) raises:
         test_rope(suite, ctx)
         test_attend(suite, ctx)
         test_attend_q8(suite, ctx)
+        test_store_scatter(suite, ctx)
         test_refusals(suite, ctx)
 
 
@@ -765,6 +767,116 @@ def test_attend_q8(mut suite: Suite, ctx: DeviceContext) raises:
     except:
         raised = True
     suite.check(raised, "a width that is not whole blocks has no q8 row")
+
+
+def test_store_scatter(mut suite: Suite, ctx: DeviceContext) raises:
+    """A row lands in the cell it was handed and nowhere else.
+
+    Both halves of that matter and the second one is the one worth building a
+    test around. A scatter that writes the right rows and also writes a row it
+    was not asked for corrupts another sequence's cache, which reads as fluent
+    text about somebody else's conversation and is not traceable to anything.
+    So the pool is filled with a pattern first, and every cell the index vector
+    does not name has to still hold it afterwards.
+
+    What a placed row is compared against is the same rows written by the
+    contiguous store, bit for bit, rather than a reimplementation of the
+    quantizer. The two stores have to agree exactly or a cache written on one
+    path and read on the other is a different cache.
+    """
+    suite.group("device scattered cache store")
+
+    var kv_width = 64
+    var rows = 4
+    var cells = 8
+
+    # Out of order, not contiguous, and not starting at zero, which is what a
+    # pool with other sequences in it hands back.
+    var order = List[Int32]()
+    order.append(5)
+    order.append(1)
+    order.append(6)
+    order.append(0)
+
+    var idx = DeviceInts(ctx, rows)
+    idx.queue_in(order)
+    ctx.synchronize()
+    suite.check(idx.at(2) == 6, "the index vector arrives on the card")
+
+    var raw = List[Float32]()
+    for i in range(rows * kv_width):
+        raw.append(Float32((i * 29 % 211)) / Float32(211) - Float32(0.5))
+    var pattern = List[Float32]()
+    for i in range(cells * kv_width):
+        pattern.append(Float32(1) + Float32(i % 5))
+
+    var forms = List[Int]()
+    forms.append(CACHE_F16)
+    forms.append(CACHE_Q8)
+    for fi in range(len(forms)):
+        var form = forms[fi]
+        var row = cache_row(form, kv_width)
+        var name = " at f16" if form == CACHE_F16 else " at q8"
+
+        var src = DeviceVec(ctx, rows * kv_width)
+        var wide = DeviceVec(ctx, cells * kv_width)
+        var flat = DeviceHalf(ctx, rows * row)
+        var pool = DeviceHalf(ctx, cells * row)
+        src.copy_in(raw)
+        wide.copy_in(pattern)
+        device_store_kv(ctx, flat, 0, src, kv_width, rows, form)
+        device_store_kv(ctx, pool, 0, wide, kv_width, cells, form)
+        ctx.synchronize()
+
+        var want = List[Int]()
+        flat.download_bits(want)
+        var before = List[Int]()
+        pool.download_bits(before)
+
+        device_store_kv_at(ctx, pool, idx, src, kv_width, rows, form)
+        ctx.synchronize()
+        var after = List[Int]()
+        pool.download_bits(after)
+
+        var placed = 0
+        var kept = 0
+        for c in range(cells):
+            var from_row = -1
+            for t in range(rows):
+                if Int(order[t]) == c:
+                    from_row = t
+            var same = True
+            for k in range(row):
+                var expect = before[c * row + k]
+                if from_row >= 0:
+                    expect = want[from_row * row + k]
+                if after[c * row + k] != expect:
+                    same = False
+            if from_row >= 0:
+                placed += 1 if same else 0
+            else:
+                kept += 1 if same else 0
+        suite.check(
+            placed == rows, "every row lands in the cell it was given" + name
+        )
+        suite.check(kept == cells - rows, "and no other cell is written" + name)
+
+    var pool = DeviceHalf(ctx, cells * kv_width)
+    var src = DeviceVec(ctx, rows * kv_width)
+    var raised = False
+    try:
+        device_store_kv_at(ctx, pool, idx, src, kv_width, rows + 1)
+    except:
+        raised = True
+    suite.check(raised, "more rows than the index vector holds is refused")
+
+    raised = False
+    try:
+        var narrow = DeviceHalf(ctx, kv_width - 1)
+        device_store_kv_at(ctx, narrow, idx, src, kv_width, rows)
+    except:
+        raised = True
+    suite.check(raised, "and so is a pool with no room for one row")
 
 
 def test_refusals(mut suite: Suite, ctx: DeviceContext) raises:
