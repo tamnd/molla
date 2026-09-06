@@ -11,11 +11,15 @@ what a token pays. The bytes column is the keys and the values one layer holds
 at that context, which is what the kernel has to read, and the rate is that over
 the time.
 
-Three tables. The first is the single kernel over the whole context, which is
+Four tables. The first is the single kernel over the whole context, which is
 what this measured before the split landed and is kept so the two can be
 compared. The second is the grid depth sweep that said the grid was the problem.
 The third is the split against the single kernel at the same contexts, which is
-the answer to issue #234.
+the answer to issue #234. The fourth is the same context read as a cell pool
+masked by the position each cell holds against the same context read as a run,
+which is what the third stage of #31 costs and is the measurement
+[docs/validation/paging.md](../docs/validation/paging.md) says has to exist
+before the stage after it is worth starting.
 
 The keys and values are left as allocated. What is in them does not change what
 the kernel reads, and a buffer of zeros scores zero, exponentiates to one and
@@ -31,8 +35,12 @@ from std.time import monotonic
 from max.gpu.host import DeviceContext
 
 from molla.nn.attention import AttnSpec
-from molla.nn.gpu import DeviceVec
-from molla.nn.gpu_ops import attend_partials, device_attend
+from molla.nn.gpu import DeviceHalf, DeviceInts, DeviceVec
+from molla.nn.gpu_ops import (
+    attend_partials,
+    device_attend,
+    device_attend_paged,
+)
 
 comptime REPS = 20
 """Launches in one timed run, averaged. More than the projection probe uses,
@@ -49,8 +57,8 @@ def _time(
     ctx: DeviceContext,
     spec: AttnSpec,
     q: DeviceVec,
-    keys: DeviceVec,
-    values: DeviceVec,
+    keys: DeviceHalf,
+    values: DeviceHalf,
     mut out: DeviceVec,
     mut scores: DeviceVec,
     mut partials: DeviceVec,
@@ -87,6 +95,60 @@ def _time(
     return best
 
 
+def _time_paged(
+    ctx: DeviceContext,
+    spec: AttnSpec,
+    q: DeviceVec,
+    keys: DeviceHalf,
+    values: DeviceHalf,
+    held: List[Int32],
+    cells: DeviceInts,
+    mut out: DeviceVec,
+    mut scores: DeviceVec,
+    mut partials: DeviceVec,
+    pos: Int,
+) raises -> Float64:
+    """`_time` for the paged call, which takes a window instead of a count."""
+    var best = Float64(0)
+    for rep in range(5):
+        var began = monotonic()
+        for _ in range(REPS):
+            device_attend_paged(
+                ctx,
+                spec,
+                q,
+                keys,
+                values,
+                held,
+                cells,
+                pos,
+                out,
+                scores,
+                partials,
+            )
+        ctx.synchronize()
+        var took = Float64(monotonic() - began) / Float64(REPS)
+        if rep == 0 or took < best:
+            best = took
+    return best
+
+
+def _two(x: Float64) -> String:
+    """`x` to two decimals.
+
+    The tables above print one, which is enough for a speedup of five. This
+    column is a ratio near one and the second digit is the whole of what it
+    says, so a tenth would round the answer away.
+    """
+    var hundredths = Int(x * 100.0 + 0.5)
+    return (
+        String(hundredths // 100)
+        + "."
+        + String(hundredths % 100 // 10)
+        + String(hundredths % 10)
+    )
+
+
 def main() raises:
     comptime if not has_accelerator():
         print("attend_probe: no accelerator on this machine")
@@ -111,8 +173,8 @@ def main() raises:
         var most = contexts[len(contexts) - 1]
         var q = DeviceVec(ctx, width)
         var out = DeviceVec(ctx, width)
-        var keys = DeviceVec(ctx, most * kv_width)
-        var values = DeviceVec(ctx, most * kv_width)
+        var keys = DeviceHalf(ctx, most * kv_width)
+        var values = DeviceHalf(ctx, most * kv_width)
         var scores = DeviceVec(ctx, spec.heads * most)
         # One float, which is less room than one slice needs, so `device_attend`
         # cuts the keys into one piece and launches the single kernel. This is
@@ -129,10 +191,10 @@ def main() raises:
             var ns = _time(
                 ctx, spec, q, keys, values, out, scores, unsplit, count
             )
-            # Keys and values, float32, over the whole context. What one query
+            # Keys and values, float16, over the whole context. What one query
             # head re-reads because four of them share a key head is not in
             # this, because it is not what leaves the memory.
-            var kv = Float64(2 * count * kv_width * 4)
+            var kv = Float64(2 * count * kv_width * 2)
             var token = ns * Float64(LAYERS)
             print(
                 String(count)
@@ -227,6 +289,55 @@ def main() raises:
                 + String(Int(before / after))
                 + "."
                 + String(Int(before * 10.0 / after) % 10)
+                + "x\t      "
+                + String(Int(token / 1000000.0))
+                + "."
+                + String(Int(token / 10000.0) % 100)
+                + " ms"
+            )
+
+        # The same keys again, read as a pool. Every cell holds a position this
+        # sequence owns, so the pool is the same size as the context and the
+        # kernel reads exactly the bytes the run above reads. What is left in
+        # the difference is the mask itself: one int32 a cell loaded, and a
+        # comparison of two positions where the run got its causality from
+        # where the loop stopped.
+        print("")
+        print("and what the mask costs, the same keys read as a cell pool")
+        print("context   a run       a pool     ratio      32 layers")
+        for i in range(len(contexts)):
+            var pool_len = contexts[i]
+            var window = List[Int32]()
+            for c in range(pool_len):
+                window.append(Int32(c))
+            var cellv = DeviceInts(ctx, pool_len)
+            cellv.queue_in(window)
+            ctx.synchronize()
+            var run = _time(
+                ctx, spec, q, keys, values, out, scores, split, pool_len
+            )
+            var pool = _time_paged(
+                ctx,
+                spec,
+                q,
+                keys,
+                values,
+                window,
+                cellv,
+                out,
+                scores,
+                split,
+                pool_len - 1,
+            )
+            var token = pool * Float64(LAYERS)
+            print(
+                String(pool_len)
+                + "\t  "
+                + String(Int(run / 1000.0))
+                + " us\t     "
+                + String(Int(pool / 1000.0))
+                + " us\t     "
+                + _two(pool / run)
                 + "x\t      "
                 + String(Int(token / 1000000.0))
                 + "."

@@ -45,6 +45,7 @@ from molla.nn.gpu_ops import (
     device_add_into,
     device_argmax,
     device_attend,
+    device_attend_paged,
     device_store_kv,
     device_store_kv_at,
     device_gelu,
@@ -98,6 +99,7 @@ def run_on_device(mut suite: Suite, ctx: DeviceContext) raises:
         test_rope(suite, ctx)
         test_attend(suite, ctx)
         test_attend_q8(suite, ctx)
+        test_attend_paged(suite, ctx)
         test_store_scatter(suite, ctx)
         test_refusals(suite, ctx)
 
@@ -653,6 +655,167 @@ def _attend_case(
     suite.check(worst < gate, "device attention matches the host for " + name)
     if worst >= gate:
         suite.fail("device attention " + name, "worst " + String(worst))
+
+
+def test_attend_paged(mut suite: Suite, ctx: DeviceContext) raises:
+    suite.group("device attention over a cell pool")
+
+    # The same grouped query shape the contiguous test starts with, forty
+    # positions living in a pool of sixty four cells.
+    var spec = AttnSpec(8, 2, 32)
+    _attend_paged_case(suite, ctx, spec, 40, 64, 39, "grouped query", 2e-6)
+
+    # One position in a pool that is nearly all somebody else's, which is what
+    # the first token of a new sequence meets on a busy card.
+    _attend_paged_case(suite, ctx, spec, 1, 48, 0, "a single cell", 2e-6)
+
+    # A sliding window over cells that are not in order, which is where a
+    # window counted in cells rather than in positions gives the wrong answer.
+    var windowed = AttnSpec(4, 2, 32)
+    windowed.window = 8
+    _attend_paged_case(suite, ctx, windowed, 40, 64, 39, "a window", 2e-6)
+
+    var sinks = AttnSpec(4, 2, 32)
+    sinks.window = 8
+    sinks.sinks = 3
+    _attend_paged_case(suite, ctx, sinks, 40, 64, 39, "sinks scattered", 2e-6)
+
+    # Long enough to be cut into slices. Every slice holds a mix of this
+    # sequence's cells and cells it may not read, which the contiguous split
+    # never sees, and a slice that happens to hold none of them has to come
+    # back as nothing seen rather than as a division by zero.
+    var split = AttnSpec(4, 2, 32)
+    _attend_paged_case(
+        suite, ctx, split, 512, 600, 511, "a pool in slices", 3e-6
+    )
+
+    var split_win = AttnSpec(4, 2, 32)
+    split_win.window = 40
+    _attend_paged_case(
+        suite, ctx, split_win, 512, 600, 511, "slices a window empties", 3e-6
+    )
+
+    var raised = False
+    try:
+        var short = AttnSpec(4, 2, 32)
+        var q = DeviceVec(ctx, 4 * 32)
+        var k = DeviceHalf(ctx, 40 * 2 * 32)
+        var v = DeviceHalf(ctx, 40 * 2 * 32)
+        var o = DeviceVec(ctx, 4 * 32)
+        var s = DeviceVec(ctx, 4 * 40)
+        var part = DeviceVec(ctx, attend_partials(short, 1, 40))
+        var cellv = DeviceInts(ctx, 40)
+        var host = List[Int32]()
+        for i in range(20):
+            host.append(Int32(i))
+        device_attend_paged(ctx, short, q, k, v, host, cellv, 39, o, s, part)
+    except:
+        raised = True
+    suite.check(
+        raised,
+        "a host window that is not the length of the device one is refused",
+    )
+
+
+def _attend_paged_case(
+    mut suite: Suite,
+    ctx: DeviceContext,
+    spec: AttnSpec,
+    count: Int,
+    cells: Int,
+    pos: Int,
+    name: String,
+    gate: Float32,
+) raises:
+    """`count` positions scattered over a pool of `cells`, against the host.
+
+    The scatter is a stride of seven, which is coprime with every pool size
+    here, so a position lands nowhere near the order it was written in and the
+    cells between the positions hold junk that no query may read. Half of those
+    are free and the other half hold a position past the query's, which are the
+    two reasons a cell can be invisible and are the two the kernel has to get
+    right. A kernel that ignored the mask and walked the pool as a run would
+    still produce a number, and it would not be this one.
+
+    The reference is the host attention given the same window, which is the
+    same comparison `_attend_case` makes one level down: the host paged path is
+    checked against the host contiguous one in `tests/test_attention.mojo`, so
+    what is being checked here is the kernel rather than the idea.
+    """
+    var width = spec.heads * spec.head_dim
+    var kv_width = spec.kv_heads * spec.head_dim
+
+    var q = _wave(width, count)
+
+    # Junk over the whole pool first, from a different generator than the keys,
+    # so a row read out of the wrong cell cannot happen to hold the numbers the
+    # right cell holds.
+    var keys = List[Float32]()
+    var values = List[Float32]()
+    for i in range(cells * kv_width):
+        keys.append(
+            Float32(
+                Float16(Float32((i * 53 % 101)) / Float32(101) - Float32(0.5))
+            )
+        )
+        values.append(
+            Float32(
+                Float16(Float32((i * 41 % 97)) / Float32(97) - Float32(0.5))
+            )
+        )
+
+    # Minus one rather than `CELL_FREE`, because the kernel is told a position
+    # is negative and nothing more, and a test that imported the engine's name
+    # for it would be checking that two constants agree instead.
+    var held = List[Int]()
+    for c in range(cells):
+        held.append(-1 if c % 2 == 0 else pos + 1 + c % 5)
+    for i in range(count):
+        var cell = i * 7 % cells
+        held[cell] = i
+        for d in range(kv_width):
+            var at = i * kv_width + d
+            keys[cell * kv_width + d] = Float32(
+                Float16(Float32((at * 31 % 173)) / Float32(173) - Float32(0.5))
+            )
+            values[cell * kv_width + d] = Float32(
+                Float16(Float32((at * 17 % 149)) / Float32(149) - Float32(0.5))
+            )
+
+    var want = Buffer(width)
+    var scratch = List[Float32]()
+    for _ in range(cells):
+        scratch.append(0.0)
+    attend(spec, q, keys, values, cells, pos, want, scratch, held)
+
+    var host = List[Int32]()
+    for c in range(cells):
+        host.append(Int32(held[c]))
+
+    var dq = DeviceVec(ctx, width)
+    var dk = DeviceHalf(ctx, cells * kv_width)
+    var dv = DeviceHalf(ctx, cells * kv_width)
+    var dout = DeviceVec(ctx, width)
+    var dscores = DeviceVec(ctx, spec.heads * cells)
+    var dpart = DeviceVec(ctx, attend_partials(spec, 1, cells))
+    var cellv = DeviceInts(ctx, cells)
+    cellv.queue_in(host)
+    dq.upload(q)
+    dk.upload_run(keys, 0, cells * kv_width)
+    dv.upload_run(values, 0, cells * kv_width)
+    device_attend_paged(
+        ctx, spec, dq, dk, dv, host, cellv, pos, dout, dscores, dpart
+    )
+    ctx.synchronize()
+    var got = Buffer(width)
+    dout.download(got)
+
+    var worst = _worst(got, want)
+    suite.check(
+        worst < gate, "paged device attention matches the host for " + name
+    )
+    if worst >= gate:
+        suite.fail("paged device attention " + name, "worst " + String(worst))
 
 
 def _quantize_q8(values: List[Float32], mut out: List[Float32]):
