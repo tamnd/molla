@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.21] - 2026-09-06
+
+CUDA prefill on Llama 3.1 8B is 1.81 times what it was and time to first token is 474 ms where it was 860, because the tensor core tile #212 recorded as a failed experiment has been rebuilt around what the numbers there said was missing. It is used only where the matmul is large enough to fill the card, which is what turns it from a regression on the two small models into parity on one and 1.24 times on the other.
+
 ### Changed
 
 - The CUDA prefill matmul runs on tensor cores where the matmul is large enough to fill the card, which is 1.81 times the prefill on Llama 3.1 8B at Q4_K_M and 1.24 on Qwen 2.5 0.5B. This is the kernel #212 recorded as a failed experiment, rebuilt around the three things the numbers there said were missing. The fragments come from `ld_matrix`, one instruction a warp, where the first version issued twelve four byte loads for every multiply. The staged tiles are swizzled so those loads take no bank conflicts, which is what makes the staged depth 64 rather than 32, since a 128 byte row is one full pass over the shared memory banks. And the tile is 128 output rows by 64 tokens rather than 64 by 32, which is a quarter of the weight traffic. It reaches about 17 TFLOP/s where the first version reached 8.2. Decode is untouched. See docs/validation/prefill.md.
