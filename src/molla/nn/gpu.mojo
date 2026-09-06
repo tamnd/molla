@@ -2251,6 +2251,28 @@ comptime NV_XV = (NV_TOKENS * NV_K) // 8
 """How the staging is split: threads to a row, values to a thread, and the
 eight value chunk both tiles are addressed in."""
 
+comptime NV_MIN_BLOCKS = 128
+comptime NV_MIN_WORK = NV_MIN_BLOCKS * NV_ROWS * NV_TOKENS
+"""How much output a matmul has to have before the tile is worth using.
+
+One block an SM on a 4090, and a block covers `NV_ROWS * NV_TOKENS` of the
+output, so a matmul smaller than this leaves whole SMs with nothing to run. The
+ordinary kernel covers four rows and sixty four tokens a block, which is sixteen
+times as many blocks for the same output, and below the line that is worth more
+than the instruction is.
+
+Measured on gpc, prefill tokens a second, molla against itself: Llama 3.1 8B at
+Q4_K_M goes 597 to 866 with the tile, Qwen 2.5 0.5B goes 9345 to 8862 and
+SmolLM2 135M goes 18357 to 9885. The 8B is above the line on every matrix it
+has, the 135M is below it on every one, and the 0.5B is above it on the three
+feed forward matrices and below it on the four attention ones.
+
+One block an SM and not two, because the ordinary kernel is the thing being
+beaten and it is only ahead where the tile leaves cores idle. It is a property
+of the card rather than of the model, and it is the one number here that would
+want re measuring on a card with a different core count.
+"""
+
 
 @always_inline
 def nv_at(row: Int, k: Int) -> Int:
@@ -2638,8 +2660,10 @@ def _matmul_forms(
     #
     # A group of sixteen stages two groups to a step and is left on the
     # ordinary form until there is a model that wants it.
-    comptime if not CompilationTarget.is_macos() and has_nvidia_gpu_accelerator():
-        if g == 32:
+    comptime if (
+        not CompilationTarget.is_macos()
+    ) and has_nvidia_gpu_accelerator():
+        if g == 32 and tokens * w.rows >= NV_MIN_WORK:
             if form == QUANT_U4 and carries_min:
                 _launch_nvmma[32, True, QUANT_U4](ctx, w, p, o, a, epi, tokens)
                 return
