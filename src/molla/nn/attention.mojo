@@ -119,6 +119,27 @@ struct AttnSpec(Copyable, ImplicitlyCopyable, Movable):
             return True
         return at > pos - self.window
 
+    def sees(self, held: Int, pos: Int) -> Bool:
+        """Whether a query at `pos` can see a cell holding position `held`.
+
+        The same question `visible` answers, asked of a cell rather than of an
+        offset into a run, and it is the form that survives paging. A cell this
+        sequence may not read carries a negative position, which is what
+        `molla.engine.cache` writes for one that is free or owned by somebody
+        else, and a cell holding a position the query has not reached is part
+        of another sequence's future. Both are invisible.
+
+        So causality does live here, unlike in `visible`, and that is the
+        difference rather than an inconsistency. When the keys are a run, a
+        caller that passes the keys that exist has already said which ones are
+        causal by how many it passed. When the keys are a window on a pool, the
+        window holds cells the query cannot see and the only thing that says so
+        is the position each cell holds.
+        """
+        if held < 0 or held > pos:
+            return False
+        return self.visible(held, pos)
+
 
 def attend(
     spec: AttnSpec,
@@ -129,6 +150,7 @@ def attend(
     pos: Int,
     mut out: Buffer,
     mut scores: List[Float32],
+    held: List[Int] = List[Int](),
 ) raises:
     """One query against `count` keys, writing `heads * head_dim` values.
 
@@ -137,6 +159,14 @@ def attend(
     thousand element allocation per call is a thousand element allocation per
     call. It is left holding the last head's probabilities on the way out, which
     is useful when something looks wrong and is not part of the contract.
+
+    `held` is the window: the position each of the `count` rows holds for this
+    sequence, or a negative for a row it may not read. Empty means the rows are
+    a run of positions starting at zero, which is what a cache holding one
+    sequence contiguously hands over and is what every caller passed before
+    there were cells. The two are the same computation with a different way of
+    saying which row is which position, so there is one loop rather than a
+    paged path and an unpaged one.
     """
     var width = spec.heads * spec.head_dim
     if q.elements() < width:
@@ -172,6 +202,14 @@ def attend(
             + " scores but got "
             + String(len(scores))
         )
+    var paged = len(held) > 0
+    if paged and len(held) < count:
+        raise Error(
+            "attention wants a window of "
+            + String(count)
+            + " but got "
+            + String(len(held))
+        )
 
     for h in range(spec.heads):
         var kvh = spec.kv_head_of(h)
@@ -179,7 +217,7 @@ def attend(
         var seen = 0
 
         for t in range(count):
-            if not spec.visible(t, pos):
+            if not spec.sees(held[t] if paged else t, pos):
                 continue
             var ka = t * kv_width + kvh * spec.head_dim
             var s = Float32(0)
@@ -213,7 +251,7 @@ def attend(
             out.data[qa + d] = 0.0
         var slot = 0
         for t in range(count):
-            if not spec.visible(t, pos):
+            if not spec.sees(held[t] if paged else t, pos):
                 continue
             var p = scores[slot]
             slot += 1
