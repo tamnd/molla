@@ -187,47 +187,6 @@ def rms_norm_kernel[
         i += tile
 
 
-def rms_norm_half_kernel[
-    tile: Int
-](
-    x_all: Pointer[Float16, MutAnyOrigin],
-    g: Pointer[Float32, MutAnyOrigin],
-    n_dev: Int32,
-    eps: Float32,
-):
-    """`rms_norm_kernel` in place on the key cache.
-
-    A separate kernel and not a flag, because what changes is the type of two
-    pointers and there is no way to say that with a parameter. The arithmetic is
-    the same and is done in float either way, so a model with a per head key
-    norm gets the same numbers here that the fused kernel's `OP_NORM` gives it.
-
-    In place, so there is one pointer where the other has two, which is also
-    what makes the store safe without the pairing the fused kernel needs: a
-    thread writes only the elements it read, and a launch boundary is what
-    publishes them.
-    """
-    var n = Int(n_dev)
-    var t = Int(thread_idx.x)
-    var at = Int(block_idx.x) * n
-
-    var acc = Float32(0)
-    var i = t
-    while i < n:
-        var v = Float32(x_all[unsafe_offset=at + i])
-        acc += v * v
-        i += tile
-    var total = _block_sum[tile](acc)
-
-    var scale = Float32(1.0) / sqrt(total / Float32(n) + eps)
-    i = t
-    while i < n:
-        x_all[unsafe_offset=at + i] = Float16(
-            Float32(x_all[unsafe_offset=at + i]) * scale * g[unsafe_offset=i]
-        )
-        i += tile
-
-
 def softmax_kernel[tile: Int](x: Pointer[Float32, MutAnyOrigin], n_dev: Int32):
     """In place over a run, with the maximum subtracted first.
 
@@ -502,9 +461,9 @@ def argmax_kernel[
 
 
 def rope_kernel[
-    neox: Bool, with_factors: Bool, dt: DType
+    neox: Bool, with_factors: Bool
 ](
-    x: Pointer[Scalar[dt], MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
     steps: Pointer[Float32, MutAnyOrigin],
     factors: Pointer[Float32, MutAnyOrigin],
     at_dev: Int32,
@@ -583,14 +542,10 @@ def rope_kernel[
             lo = at + pair * 2
             hi = lo + 1
 
-        # Widened on the way in and narrowed on the way out when this is the
-        # key cache, and both are nothing when it is a query. A thread reads and
-        # writes the same two elements, so a half here needs none of the pairing
-        # the fused kernel needs: what publishes these is the end of the launch.
-        var a = Float32(x[unsafe_offset=lo])
-        var b = Float32(x[unsafe_offset=hi])
-        x[unsafe_offset=lo] = Scalar[dt](a * c - b * s)
-        x[unsafe_offset=hi] = Scalar[dt](a * s + b * c)
+        var a = x[unsafe_offset=lo]
+        var b = x[unsafe_offset=hi]
+        x[unsafe_offset=lo] = a * c - b * s
+        x[unsafe_offset=hi] = a * s + b * c
         pair += Int(block_dim.x)
 
 
@@ -1192,47 +1147,6 @@ def device_rms_norm_run(
         _norm_launch(ctx, p, gain.ptr(), p, n, eps, runs)
 
 
-def device_rms_norm_half(
-    ctx: DeviceContext,
-    mut x: DeviceHalf,
-    at: Int,
-    n: Int,
-    gain: DeviceVec,
-    eps: Float32,
-    runs: Int = 1,
-) raises:
-    """`device_rms_norm_run` on the key cache, which is where a key already is.
-
-    The one caller is the per head key norm of a Qwen 3 shaped model, and the
-    reason it is here rather than a flag on the run form is that the cache is
-    float16 and everything else a norm touches is float32.
-    """
-    if runs < 1:
-        raise Error("a norm needs at least one run")
-    if at < 0 or n <= 0 or x.elements() < at + runs * n:
-        raise Error(
-            "a norm over "
-            + String(runs)
-            + " runs of "
-            + String(n)
-            + " from offset "
-            + String(at)
-            + " does not fit in a vector of "
-            + String(x.elements())
-        )
-    _check_norm(n, gain.elements(), n)
-    _need_device()
-    comptime if has_accelerator():
-        ctx.enqueue_function[rms_norm_half_kernel[TILE]](
-            x.ptr_at(at),
-            gain.ptr(),
-            Int32(n),
-            eps,
-            grid_dim=(runs, 1, 1),
-            block_dim=(TILE, 1, 1),
-        )
-
-
 def _check_norm(n: Int, gain: Int, written: Int) raises:
     if gain != n:
         raise Error(
@@ -1389,6 +1303,58 @@ def device_add_run(
         ctx.enqueue_function[add_run_kernel](
             acc.ptr_at(at),
             x.ptr(),
+            Int32(n),
+            grid_dim=(_grid(n), 1, 1),
+            block_dim=(TILE, 1, 1),
+        )
+
+
+def store_kv_kernel(
+    dst: Pointer[Float16, MutAnyOrigin],
+    src: Pointer[Float32, MutAnyOrigin],
+    n_dev: Int32,
+):
+    """Narrow a finished key or value row into the cache.
+
+    One element a thread, which is the whole point of the pass. The three things
+    that used to write the cache wrote it in place and none of them owned a
+    contiguous run of it, so none of them could ever have quantized what it
+    wrote. This owns the run and it is the only writer, and today it narrows to
+    float16 and later it will encode a block.
+    """
+    var n = Int(n_dev)
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    while i < n:
+        dst[unsafe_offset=i] = src[unsafe_offset=i].cast[DType.float16]()
+        i += stride
+
+
+def device_store_kv(
+    ctx: DeviceContext, mut dst: DeviceHalf, at: Int, src: DeviceVec, n: Int
+) raises:
+    """`dst[at + i] = src[i]` for `n` values, narrowing on the way."""
+    if at < 0 or n <= 0 or dst.elements() < at + n:
+        raise Error(
+            "storing "
+            + String(n)
+            + " values at offset "
+            + String(at)
+            + " does not fit in a cache of "
+            + String(dst.elements())
+        )
+    if src.elements() < n:
+        raise Error(
+            "storing "
+            + String(n)
+            + " values out of a vector of "
+            + String(src.elements())
+        )
+    _need_device()
+    comptime if has_accelerator():
+        ctx.enqueue_function[store_kv_kernel](
+            dst.ptr_at(at),
+            src.ptr(),
             Int32(n),
             grid_dim=(_grid(n), 1, 1),
             block_dim=(TILE, 1, 1),
@@ -1630,17 +1596,16 @@ def device_rope(
 ) raises:
     """Rotate `heads` heads laid end to end at `at`, in place.
 
-    Which is the shape a query comes out of its projection in. A key is the
-    other one and is `device_rope_half`, because a key is rotated once where it
-    lies in the cache rather than every time it is read, and the cache is
-    float16.
+    Which is the shape a query comes out of its projection in, and a key too:
+    both are rotated in a work vector now and the key is put away by
+    `device_store_kv` afterwards.
 
     `tables` has to have been built from this same spec. That is not checked
     beyond the width, because the two things that would catch it are storing a
     copy of the spec to compare against and trusting the caller, and a spec has
     no equality yet.
     """
-    _rope_into[DType.float32](
+    _rope_into(
         ctx,
         spec,
         x.ptr(),
@@ -1655,44 +1620,10 @@ def device_rope(
     )
 
 
-def device_rope_half(
+def _rope_into(
     ctx: DeviceContext,
     spec: RopeSpec,
-    mut x: DeviceHalf,
-    at: Int,
-    heads: Int,
-    head_dim: Int,
-    pos: Int,
-    tables: RopeTables,
-    tokens: Int = 1,
-    row: Int = 0,
-) raises:
-    """`device_rope` on the key cache, which is where a key already lies.
-
-    The same kernel over float16, so the angles and the multiplies are the same
-    float arithmetic and only the two loads and the two stores differ.
-    """
-    _rope_into[DType.float16](
-        ctx,
-        spec,
-        x.ptr(),
-        x.elements(),
-        at,
-        heads,
-        head_dim,
-        pos,
-        tables,
-        tokens,
-        row,
-    )
-
-
-def _rope_into[
-    dt: DType
-](
-    ctx: DeviceContext,
-    spec: RopeSpec,
-    x: Pointer[Scalar[dt], MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
     elements: Int,
     at: Int,
     heads: Int,
@@ -1747,7 +1678,7 @@ def _rope_into[
             low = ends[0]
             high = ends[1]
         if spec.neox and tables.use_factors:
-            _rope[True, True, dt](
+            _rope[True, True](
                 ctx,
                 spec,
                 x,
@@ -1762,7 +1693,7 @@ def _rope_into[
                 row,
             )
         elif spec.neox:
-            _rope[True, False, dt](
+            _rope[True, False](
                 ctx,
                 spec,
                 x,
@@ -1777,7 +1708,7 @@ def _rope_into[
                 row,
             )
         elif tables.use_factors:
-            _rope[False, True, dt](
+            _rope[False, True](
                 ctx,
                 spec,
                 x,
@@ -1792,7 +1723,7 @@ def _rope_into[
                 row,
             )
         else:
-            _rope[False, False, dt](
+            _rope[False, False](
                 ctx,
                 spec,
                 x,
@@ -1809,11 +1740,11 @@ def _rope_into[
 
 
 def _rope[
-    neox: Bool, with_factors: Bool, dt: DType
+    neox: Bool, with_factors: Bool
 ](
     ctx: DeviceContext,
     spec: RopeSpec,
-    x: Pointer[Scalar[dt], MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
     tables: RopeTables,
     at: Int,
     heads: Int,
@@ -1824,7 +1755,7 @@ def _rope[
     tokens: Int,
     row: Int,
 ) raises:
-    ctx.enqueue_function[rope_kernel[neox, with_factors, dt]](
+    ctx.enqueue_function[rope_kernel[neox, with_factors]](
         x,
         tables.steps.ptr(),
         tables.factors.ptr(),

@@ -53,7 +53,6 @@ from molla.nn.gpu import (
     EPI_ADD,
     EPI_BIAS,
     EPI_GLU,
-    EPI_HALF,
     EPI_NONE,
     MM_GROUPS,
     PREFILL_CHUNK,
@@ -61,9 +60,7 @@ from molla.nn.gpu import (
     DeviceHalf,
     DeviceVec,
     device_matmul_into,
-    device_matmul_into_half,
     device_matvec_into,
-    device_matvec_into_half,
 )
 from molla.nn.gpu_fused import (
     PAIRED,
@@ -73,6 +70,7 @@ from molla.nn.gpu_fused import (
     OP_MATVEC,
     OP_NORM,
     OP_ROPE,
+    OP_STORE,
     R_ATTN,
     R_COLS,
     R_DIM,
@@ -120,14 +118,13 @@ from molla.nn.gpu_ops import (
     device_attend,
     device_gelu,
     device_rms_norm,
-    device_rms_norm_half,
     device_rms_norm_inplace,
     device_rms_norm_run,
     device_rope,
-    device_rope_half,
     device_scale_into,
     device_silu,
     device_softcap,
+    device_store_kv,
     device_unpack_rows,
 )
 from molla.nn.model import ModelWeights
@@ -502,6 +499,28 @@ struct DeviceScratch(Movable):
 
     var norm: DeviceVec
     var q: DeviceVec
+
+    var k: DeviceVec
+    """The key row, before it is stored.
+
+    A key is projected, normalised per head on the models that do that, and
+    rotated, and all three used to happen in place on the cache. They happen
+    here now and the cache is written once at the end of them, because a
+    quantized cache cannot be written in place: a q8_0 block's scale is a
+    reduction over the whole block, so a writer owns a block or it owns
+    nothing, and none of those three owns one. See
+    [docs/validation/kvcache.md](../../../docs/validation/kvcache.md).
+    """
+
+    var v: DeviceVec
+    """The value row, before it is stored.
+
+    Nothing happens to a value between the projection and the store, and it
+    goes through here anyway, because the projection does not own a block
+    either. A projection gives an output row to a block or a warp, so thirty
+    two consecutive elements of a cache row come from thirty two of them.
+    """
+
     var heads_out: DeviceVec
     var projected: DeviceVec
     var gate: DeviceVec
@@ -569,6 +588,8 @@ struct DeviceScratch(Movable):
             wide = (chunk + block - 1) // block * block
         self.norm = DeviceVec(ctx, wide * spec.width)
         self.q = DeviceVec(ctx, wide * spec.q_width())
+        self.k = DeviceVec(ctx, wide * spec.kv_width())
+        self.v = DeviceVec(ctx, wide * spec.kv_width())
         self.heads_out = DeviceVec(ctx, wide * spec.q_width())
         self.projected = DeviceVec(ctx, wide * spec.width)
         self.gate = DeviceVec(ctx, wide * spec.hidden)
@@ -637,28 +658,6 @@ def _project(
         device_matmul_into(ctx, w, x, out, tokens, at, epi, aux)
 
 
-def _project_half(
-    ctx: DeviceContext,
-    w: Tensor,
-    x: DeviceVec,
-    mut out: DeviceHalf,
-    tokens: Int,
-    at: Int = 0,
-    epi: Int = EPI_NONE,
-    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
-) raises:
-    """`_project` with the key or value cache as its output.
-
-    The same two kernels and the same dividing line between them. What the cache
-    changes is the last store of a row and nothing above it, so the two
-    projections that write one come through here and the other five do not.
-    """
-    if tokens == 1:
-        device_matvec_into_half(ctx, w, x, out, at, epi, aux)
-    else:
-        device_matmul_into_half(ctx, w, x, out, tokens, at, epi, aux)
-
-
 def device_attention(
     ctx: DeviceContext,
     spec: BlockSpec,
@@ -715,15 +714,13 @@ def device_attention(
     # just reduced, which is the same addition to the same number, and the three
     # launches and their three round trips through device memory are gone.
     #
-    # Straight into the cache rather than into scratch and then a copy, which is
-    # what the offset on the matvec is for. The cache is where they are needed
-    # and this is the only place they are written.
+    # Into scratch rather than straight into the cache, and the cache is written
+    # once at the end of the transforms instead of three times through them. See
+    # [docs/validation/kvcache.md](../../../docs/validation/kvcache.md).
     var bias_epi = EPI_BIAS if w.has_bias else EPI_NONE
     _project(ctx, w.wq, s.norm, s.q, tokens, 0, bias_epi, w.q_bias.ptr())
-    _project_half(ctx, w.wk, s.norm, keys, tokens, at, bias_epi, w.k_bias.ptr())
-    _project_half(
-        ctx, w.wv, s.norm, values, tokens, at, bias_epi, w.v_bias.ptr()
-    )
+    _project(ctx, w.wk, s.norm, s.k, tokens, 0, bias_epi, w.k_bias.ptr())
+    _project(ctx, w.wv, s.norm, s.v, tokens, 0, bias_epi, w.v_bias.ptr())
 
     # Every head of every token in the chunk is one launch, because the heads of
     # a token lie end to end and so do the tokens.
@@ -732,10 +729,10 @@ def device_attention(
         device_rms_norm_run(
             ctx, s.q, 0, head_dim, w.q_norm, spec.eps, tokens * spec.attn.heads
         )
-        device_rms_norm_half(
+        device_rms_norm_run(
             ctx,
-            keys,
-            at,
+            s.k,
+            0,
             head_dim,
             w.k_norm,
             spec.eps,
@@ -754,11 +751,11 @@ def device_attention(
         tokens,
         spec.q_width(),
     )
-    device_rope_half(
+    device_rope(
         ctx,
         spec.rope,
-        keys,
-        at,
+        s.k,
+        0,
         spec.attn.kv_heads,
         spec.attn.head_dim,
         pos,
@@ -766,6 +763,9 @@ def device_attention(
         tokens,
         kv_width,
     )
+
+    device_store_kv(ctx, keys, at, s.k, span)
+    device_store_kv(ctx, values, at, s.v, span)
 
     device_attend(
         ctx,
@@ -979,22 +979,14 @@ def _rope_record(
     off: Int,
     slot_mul: Int,
 ) raises -> Int:
-    """One rotation in place, as a record.
+    """One rotation in place on the work vector, as a record.
 
-    A rotation on the cache is the one that runs on halves, and where the fused
-    kernel has to write whole words it gives a thread two rotations so that what
-    it reads is what it writes. That needs an even number of rotations in a
-    head, which every model molla has met has, and this is where the day one
-    does not turns into a message rather than into two threads writing over each
-    other. It is asked only where the pairing is, which is `PAIRED`.
+    Both rotations run on floats now. The key rotation used to run in place on
+    the cache and had to give a thread two rotations so that the four halves it
+    read were the two words it wrote, which needed an even number of rotations
+    in a head and refused a model that did not have one. Nothing here owns a
+    word any more, so a head of any width rotates.
     """
-    if PAIRED and space == SPACE_KEYS and rope.dim % 4 != 0:
-        raise Error(
-            "a rotation over "
-            + String(rope.dim)
-            + " dimensions of a head does not divide into pairs of rotations,"
-            " and the key cache is written a pair at a time"
-        )
     var rec = plan.open(OP_ROPE)
     plan.input(rec, space, off, slot_mul)
     plan.output(rec, space, off, slot_mul)
@@ -1050,10 +1042,11 @@ def _layer_records(
     )
     plan.sync(rec)
 
-    # Straight into the cache rather than into scratch and then a copy, which is
-    # what the slot multiplier on the operand is for. The slot is the one thing
-    # here that changes between tokens, so it is a kernel argument and the
-    # record carries what to multiply it by.
+    # Into the work vector rather than straight into the cache. The store
+    # records below are the cache's only writer, which is what the slot
+    # multiplier on their output is for: the slot is the one thing here that
+    # changes between tokens, so it is a kernel argument and the record carries
+    # what to multiply it by.
     rec = _matvec_record(
         plan,
         base,
@@ -1073,10 +1066,10 @@ def _layer_records(
         w.wk,
         SPACE_WORK,
         shape.norm,
-        SPACE_KEYS,
+        SPACE_WORK,
+        shape.k,
         0,
-        kv_width,
-        bias_epi | EPI_HALF,
+        bias_epi,
     )
     if w.has_bias:
         plan.helper(rec, SPACE_ARENA, a.k_bias)
@@ -1086,10 +1079,10 @@ def _layer_records(
         w.wv,
         SPACE_WORK,
         shape.norm,
-        SPACE_VALS,
+        SPACE_WORK,
+        shape.v,
         0,
-        kv_width,
-        bias_epi | EPI_HALF,
+        bias_epi,
     )
     if w.has_bias:
         plan.helper(rec, SPACE_ARENA, a.v_bias)
@@ -1115,12 +1108,12 @@ def _layer_records(
             spec.eps,
             head_dim,
             spec.attn.kv_heads,
-            SPACE_KEYS,
+            SPACE_WORK,
+            shape.k,
             0,
-            kv_width,
-            SPACE_KEYS,
+            SPACE_WORK,
+            shape.k,
             0,
-            kv_width,
         )
         plan.sync(rec)
 
@@ -1153,10 +1146,23 @@ def _layer_records(
         high,
         spec.attn.kv_heads,
         head_dim,
-        SPACE_KEYS,
+        SPACE_WORK,
+        shape.k,
         0,
-        kv_width,
     )
+    plan.sync(rec)
+
+    # The one writer of the cache, and the reason everything above it moved into
+    # the work vector. See
+    # [docs/validation/kvcache.md](../../../docs/validation/kvcache.md).
+    rec = plan.open(OP_STORE)
+    plan.input(rec, SPACE_WORK, shape.k)
+    plan.output(rec, SPACE_KEYS, 0, kv_width)
+    plan.set(rec, R_N, kv_width)
+    rec = plan.open(OP_STORE)
+    plan.input(rec, SPACE_WORK, shape.v)
+    plan.output(rec, SPACE_VALS, 0, kv_width)
+    plan.set(rec, R_N, kv_width)
     plan.sync(rec)
 
     rec = plan.open(OP_ATTEND)

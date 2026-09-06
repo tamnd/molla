@@ -642,10 +642,10 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
 
         suite.group("fused layer against unfused")
         suite.check(
-            plan.records == LAYERS * 12 + 4,
+            plan.records == LAYERS * 14 + 4,
             (
-                "a plan holds twelve records a layer, and two more for each of"
-                " the two post norms the first layer has"
+                "a plan holds fourteen records a layer, and two more for each"
+                " of the two post norms the first layer has"
             ),
         )
         suite.check(

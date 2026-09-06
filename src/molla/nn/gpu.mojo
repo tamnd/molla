@@ -327,12 +327,11 @@ struct DeviceHalf(Movable):
     that it is the strongest evidence available that it costs no accuracy. It is
     half the bytes on the card and half the traffic through attention.
 
-    The kernels that read this take a `Pointer[Float16]` and say so. The kernels
-    that write it are the projections, whose output pointer is shared with every
-    other matvec in the model, so those take the address through
-    `as_matvec_out` and store through it with a `EPI_HALF` epilogue. The bitcast
-    is at the call, where it can be read, rather than inside a kernel where it
-    could not.
+    The kernels that read this take a `Pointer[Float16]` and say so, and the one
+    that writes it takes the same. Nothing else writes it: a key is projected,
+    normalised and rotated in float32 and stored here once, which is what a
+    quantized cache will need and what an in place cache could never have given
+    it. See [docs/validation/kvcache.md](../../../docs/validation/kvcache.md).
     """
 
     var buf: DeviceBuffer[DType.float16]
@@ -364,25 +363,6 @@ struct DeviceHalf(Movable):
             )
         return Pointer[Float16, MutAnyOrigin](
             unsafe_from_address=Int(self.buf.unsafe_ptr()) + at * 2
-        )
-
-    def as_matvec_out(self, at: Int) raises -> Pointer[Float32, MutAnyOrigin]:
-        """The address of element `at`, spelled as a matvec would take it.
-
-        A projection writing into the cache is the same kernel as a projection
-        writing anywhere else, and its output argument is a float32 pointer
-        because every other output in the model is float32. Parametrizing that
-        kernel on the width of its store would double six instantiations to save
-        one predicted branch, so instead the epilogue is told to store a half
-        and the address arrives here already cast.
-
-        Nothing but a `EPI_HALF` epilogue may be handed this. A float32 store
-        through it writes two elements of the cache and reads as plausible
-        numbers rather than as an error, which is why this is a named call and
-        not a bitcast at the call site.
-        """
-        return Pointer[Float32, MutAnyOrigin](
-            unsafe_from_address=Int(self.ptr_at(at))
         )
 
     def download(self, mut out: Buffer) raises:
@@ -446,22 +426,6 @@ has already been written, which is the order `device_mlp` was already in.
 
 comptime ACT_BIT = 8
 """Set alongside `EPI_GLU` when the activation is gelu rather than silu."""
-
-comptime EPI_HALF = 16
-"""Store the row as a float16 rather than a float32.
-
-Only the key and value projections, whose output is the cache, and it is a bit
-on the epilogue rather than a parameter on the kernel because the kernel is
-already instantiated once per quant form and this would double that to save one
-branch that every thread of a launch takes the same way. It combines with
-`EPI_BIAS`, since a Qwen carries a bias on all three of q, k and v. It does not
-combine with `EPI_ADD` or `EPI_GLU` and nothing asks it to: a residual add and a
-gate are both further down a layer than the cache is.
-
-The pointer arrives from `DeviceHalf.as_matvec_out`, which is where the cast is
-written down. Reaching here with an ordinary float32 output would write two
-elements and be read as a plausible number.
-"""
 
 
 @always_inline
@@ -663,9 +627,7 @@ def planar_quant_stride[form: Int](cols: Int) -> Int:
 
 
 @always_inline
-def write_epilogue[
-    half: Bool
-](
+def write_epilogue(
     o: Pointer[Float32, MutAnyOrigin],
     aux: Pointer[Float32, MutAnyOrigin],
     epi: Int,
@@ -685,13 +647,15 @@ def write_epilogue[
     is the index into `aux` and for a gate is not, because a gate is a whole
     other output tensor of the same shape.
 
-    `half` is a parameter and not a bit of `epi` for a reason worth writing down.
-    It began as a bit, and the projections of an 8B went from 6.6 ms a token to
-    7.1 in `scripts/proj_probe.mojo`, which never asks for a half at all: the
-    feed forward projections lost twelve to twenty percent each because the
-    kernel they share now had a store the compiler could not see through. A
-    parameter puts the two stores in two kernels and gives the float one its
-    code back. The dispatch reads the bit once on the host and picks.
+    There is one store here and it is a float. There used to be two, because the
+    key and value projections wrote the cache and had to narrow, and the width
+    was a parameter on the kernel rather than a bit of `epi` because as a bit it
+    cost the feed forward projections of an 8B twelve to twenty percent each in
+    `scripts/proj_probe.mojo`: a store the compiler could not see through slows
+    down every projection that shares the kernel, including the ones that never
+    ask for a half. Both problems went away with the cache's writer, which is
+    `OP_STORE` and its unfused twin `device_store_kv`. Every kernel that shares
+    this is instantiated once now rather than twice.
     """
     var got = v
     if epi & EPI_BIAS != 0:
@@ -702,16 +666,10 @@ def write_epilogue[
             got = activate[ACT_GELU](got) * g
         else:
             got = activate[ACT_SILU](got) * g
-    comptime if half:
-        # The cache, narrowed on the way in. Everything above this point is the
-        # same arithmetic in float that any other row gets, so the only
-        # difference a half cache makes to a projection is the last store.
-        o.unsafe_bitcast[Float16]()[unsafe_offset=out_at] = Float16(got)
+    if epi & EPI_ADD != 0:
+        o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + got
     else:
-        if epi & EPI_ADD != 0:
-            o[unsafe_offset=out_at] = o[unsafe_offset=out_at] + got
-        else:
-            o[unsafe_offset=out_at] = got
+        o[unsafe_offset=out_at] = got
 
 
 comptime _dev32 = Atomic[DType.int32, scope="device"]
@@ -1073,7 +1031,7 @@ def planar_row_sum[
 
 
 def planar_matvec_kernel[
-    tile: Int, group: Int, with_min: Bool, form: Int, half: Bool
+    tile: Int, group: Int, with_min: Bool, form: Int
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
@@ -1120,7 +1078,7 @@ def planar_matvec_kernel[
                 w, x, rw * stride, cols, lane
             )
             if lane == 0:
-                write_epilogue[half](o, aux, Int(epi_dev), rw, rw, total)
+                write_epilogue(o, aux, Int(epi_dev), rw, rw, total)
         return
 
     var r = Int(block_idx.x)
@@ -1149,7 +1107,7 @@ def planar_matvec_kernel[
         # One token, so the index into the output and the row are the same
         # number, which is why a gate reads `aux[r]` here and `aux[out_at]`
         # there and both are the same read.
-        write_epilogue[half](o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
+        write_epilogue(o, aux, Int(epi_dev), r, r, part[unsafe_offset=0])
 
 
 comptime MATVEC_BYTES = 8 if CompilationTarget.is_macos() else 1
@@ -1349,7 +1307,7 @@ there and this kernel is the six bit fallback.
 
 
 def planar_matmul_kernel[
-    tile: Int, group: Int, with_min: Bool, form: Int, half: Bool
+    tile: Int, group: Int, with_min: Bool, form: Int
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
@@ -1583,9 +1541,7 @@ def planar_matmul_kernel[
         # tail block is dropped here, which is the only place it has to be.
         var r = r0 + rr
         if t < live and r < rows:
-            write_epilogue[half](
-                o, aux, Int(epi_dev), (base + t) * rows + r, r, got
-            )
+            write_epilogue(o, aux, Int(epi_dev), (base + t) * rows + r, r, got)
 
 
 def device_ready() -> Bool:
@@ -1656,7 +1612,7 @@ def check_matvec_shapes(w: Tensor, in_elements: Int, out_elements: Int) raises:
 
 
 def _launch[
-    tile: Int, group: Int, with_min: Bool, form: Int, half: Bool
+    tile: Int, group: Int, with_min: Bool, form: Int
 ](
     ctx: DeviceContext,
     w: Tensor,
@@ -1666,9 +1622,7 @@ def _launch[
     epi: Int,
 ) raises:
     """One instantiation, launched. No transfer either side of it."""
-    ctx.enqueue_function[
-        planar_matvec_kernel[tile, group, with_min, form, half]
-    ](
+    ctx.enqueue_function[planar_matvec_kernel[tile, group, with_min, form]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x.ptr(),
         o,
@@ -1739,38 +1693,6 @@ def device_matvec_into(
     _matvec_dispatch(ctx, w, x, out.ptr_at(at), epi, aux)
 
 
-def device_matvec_into_half(
-    ctx: DeviceContext,
-    w: Tensor,
-    x: DeviceVec,
-    mut out: DeviceHalf,
-    at: Int = 0,
-    epi: Int = EPI_NONE,
-    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
-) raises:
-    """`device_matvec_into` with the key or value cache as its output.
-
-    The same kernel, the same dispatch and the same epilogue with `EPI_HALF`
-    added to it, which is the whole of the difference: a row is reduced in float
-    and narrowed by the store. The one thing a caller has to get right is that
-    the pointer comes from `DeviceHalf.as_matvec_out` and never from anywhere
-    else, and that is why this is a function rather than a flag on the other
-    one.
-    """
-    if at < 0:
-        raise Error("a matvec cannot write at a negative offset")
-    if out.elements() < at + w.rows:
-        raise Error(
-            "the device matvec writes "
-            + String(w.rows)
-            + " rows at offset "
-            + String(at)
-            + " and the output ends at "
-            + String(out.elements())
-        )
-    _matvec_dispatch(ctx, w, x, out.as_matvec_out(at), epi | EPI_HALF, aux)
-
-
 def _matvec_dispatch(
     ctx: DeviceContext,
     w: Tensor,
@@ -1793,15 +1715,10 @@ def _matvec_dispatch(
         # nothing gets the output pointer and a kernel that reads it is one that
         # was asked to.
         var a = aux.value() if aux and epi & (EPI_BIAS | EPI_GLU) != 0 else o
-        if epi & EPI_HALF != 0:
-            _matvec_forms[True](ctx, w, x, o, a, epi)
-        else:
-            _matvec_forms[False](ctx, w, x, o, a, epi)
+        _matvec_forms(ctx, w, x, o, a, epi)
 
 
-def _matvec_forms[
-    half: Bool
-](
+def _matvec_forms(
     ctx: DeviceContext,
     w: Tensor,
     x: DeviceVec,
@@ -1809,26 +1726,26 @@ def _matvec_forms[
     a: Pointer[Float32, MutAnyOrigin],
     epi: Int,
 ) raises:
-    """The eight quant forms, at one of the two widths the output can be."""
+    """The eight quant forms."""
     var g = group_size(w.kind)
     var carries_min = has_min(w.kind)
     var form = quant_form(w.kind)
     if form == QUANT_U4 and g == 32 and carries_min:
-        _launch[MATVEC_TILE, 32, True, QUANT_U4, half](ctx, w, x, o, a, epi)
+        _launch[MATVEC_TILE, 32, True, QUANT_U4](ctx, w, x, o, a, epi)
     elif form == QUANT_S4 and g == 32 and not carries_min:
-        _launch[MATVEC_TILE, 32, False, QUANT_S4, half](ctx, w, x, o, a, epi)
+        _launch[MATVEC_TILE, 32, False, QUANT_S4](ctx, w, x, o, a, epi)
     elif form == QUANT_U5 and g == 32 and carries_min:
-        _launch[MATVEC_TILE, 32, True, QUANT_U5, half](ctx, w, x, o, a, epi)
+        _launch[MATVEC_TILE, 32, True, QUANT_U5](ctx, w, x, o, a, epi)
     elif form == QUANT_S5 and g == 32 and not carries_min:
-        _launch[MATVEC_TILE, 32, False, QUANT_S5, half](ctx, w, x, o, a, epi)
+        _launch[MATVEC_TILE, 32, False, QUANT_S5](ctx, w, x, o, a, epi)
     elif form == QUANT_S6 and g == 16 and not carries_min:
-        _launch[MATVEC_TILE, 16, False, QUANT_S6, half](ctx, w, x, o, a, epi)
+        _launch[MATVEC_TILE, 16, False, QUANT_S6](ctx, w, x, o, a, epi)
     elif form == QUANT_K4 and g == 32 and carries_min:
-        _launch[MATVEC_TILE, 32, True, QUANT_K4, half](ctx, w, x, o, a, epi)
+        _launch[MATVEC_TILE, 32, True, QUANT_K4](ctx, w, x, o, a, epi)
     elif form == QUANT_K5 and g == 32 and carries_min:
-        _launch[MATVEC_TILE, 32, True, QUANT_K5, half](ctx, w, x, o, a, epi)
+        _launch[MATVEC_TILE, 32, True, QUANT_K5](ctx, w, x, o, a, epi)
     elif form == QUANT_I8 and g == 32 and not carries_min:
-        _launch[MATVEC_TILE, 32, False, QUANT_I8, half](ctx, w, x, o, a, epi)
+        _launch[MATVEC_TILE, 32, False, QUANT_I8](ctx, w, x, o, a, epi)
     else:
         raise Error(
             "no device matvec is compiled for quant form "
@@ -1904,7 +1821,7 @@ what decides how many blocks a core can hold at once.
 
 
 def planar_mma_kernel[
-    group: Int, with_min: Bool, form: Int, half: Bool
+    group: Int, with_min: Bool, form: Int
 ](
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
@@ -2099,7 +2016,7 @@ def planar_mma_kernel[
         var r = idx % MMA_ROWS
         if t0 + t >= tokens or r0 + r >= rows:
             continue
-        write_epilogue[half](
+        write_epilogue(
             o,
             aux,
             epi,
@@ -2110,7 +2027,7 @@ def planar_mma_kernel[
 
 
 def _launch_mma[
-    group: Int, with_min: Bool, form: Int, half: Bool
+    group: Int, with_min: Bool, form: Int
 ](
     ctx: DeviceContext,
     w: Tensor,
@@ -2121,7 +2038,7 @@ def _launch_mma[
     tokens: Int,
 ) raises:
     """One instantiation of the matrix core form, launched."""
-    ctx.enqueue_function[planar_mma_kernel[group, with_min, form, half]](
+    ctx.enqueue_function[planar_mma_kernel[group, with_min, form]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x,
         o,
@@ -2141,7 +2058,7 @@ def _launch_mma[
 
 
 def _launch_mm[
-    tile: Int, group: Int, with_min: Bool, form: Int, half: Bool
+    tile: Int, group: Int, with_min: Bool, form: Int
 ](
     ctx: DeviceContext,
     w: Tensor,
@@ -2152,9 +2069,7 @@ def _launch_mm[
     tokens: Int,
 ) raises:
     """One instantiation of the batched form, launched."""
-    ctx.enqueue_function[
-        planar_matmul_kernel[tile, group, with_min, form, half]
-    ](
+    ctx.enqueue_function[planar_matmul_kernel[tile, group, with_min, form]](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
         x,
         o,
@@ -2220,51 +2135,6 @@ def device_matmul_into(
     _matmul_dispatch(ctx, w, x, out.ptr_at(at), tokens, epi, aux)
 
 
-def device_matmul_into_half(
-    ctx: DeviceContext,
-    w: Tensor,
-    x: DeviceVec,
-    mut out: DeviceHalf,
-    tokens: Int,
-    at: Int = 0,
-    epi: Int = EPI_NONE,
-    aux: Optional[Pointer[Float32, MutAnyOrigin]] = None,
-) raises:
-    """`device_matmul_into` with the key or value cache as its output.
-
-    What `device_matvec_into_half` says, for a chunk rather than a token. A
-    prefill fills a run of cache slots from here and the run is contiguous, so
-    the narrowing is still nothing but the last store of a row.
-    """
-    if tokens <= 0:
-        raise Error("a batched matmul needs at least one token")
-    if at < 0:
-        raise Error("a matmul cannot write at a negative offset")
-    if x.elements() < tokens * w.cols:
-        raise Error(
-            "the device matmul wants "
-            + String(tokens)
-            + " rows of "
-            + String(w.cols)
-            + " and the input holds "
-            + String(x.elements())
-        )
-    if out.elements() < at + tokens * w.rows:
-        raise Error(
-            "the device matmul writes "
-            + String(tokens)
-            + " rows of "
-            + String(w.rows)
-            + " at offset "
-            + String(at)
-            + " and the output ends at "
-            + String(out.elements())
-        )
-    _matmul_dispatch(
-        ctx, w, x, out.as_matvec_out(at), tokens, epi | EPI_HALF, aux
-    )
-
-
 def _matmul_dispatch(
     ctx: DeviceContext,
     w: Tensor,
@@ -2285,15 +2155,10 @@ def _matmul_dispatch(
         )
     else:
         var a = aux.value() if aux and epi & (EPI_BIAS | EPI_GLU) != 0 else o
-        if epi & EPI_HALF != 0:
-            _matmul_forms[True](ctx, w, x.ptr(), o, a, epi, tokens)
-        else:
-            _matmul_forms[False](ctx, w, x.ptr(), o, a, epi, tokens)
+        _matmul_forms(ctx, w, x.ptr(), o, a, epi, tokens)
 
 
-def _matmul_forms[
-    half: Bool
-](
+def _matmul_forms(
     ctx: DeviceContext,
     w: Tensor,
     p: Pointer[Float32, MutAnyOrigin],
@@ -2302,11 +2167,7 @@ def _matmul_forms[
     epi: Int,
     tokens: Int,
 ) raises:
-    """The six quant forms, at one of the two widths the output can be.
-
-    Split from the dispatch above it for the reason `write_epilogue` gives:
-    a store the compiler can see through is worth two kernels.
-    """
+    """The six quant forms."""
     var g = group_size(w.kind)
     var carries_min = has_min(w.kind)
     var form = quant_form(w.kind)
@@ -2321,72 +2182,42 @@ def _matmul_forms[
     comptime if CompilationTarget.is_macos():
         if g == 32:
             if form == QUANT_U4 and carries_min:
-                _launch_mma[32, True, QUANT_U4, half](
-                    ctx, w, p, o, a, epi, tokens
-                )
+                _launch_mma[32, True, QUANT_U4](ctx, w, p, o, a, epi, tokens)
                 return
             if form == QUANT_S4 and not carries_min:
-                _launch_mma[32, False, QUANT_S4, half](
-                    ctx, w, p, o, a, epi, tokens
-                )
+                _launch_mma[32, False, QUANT_S4](ctx, w, p, o, a, epi, tokens)
                 return
             if form == QUANT_U5 and carries_min:
-                _launch_mma[32, True, QUANT_U5, half](
-                    ctx, w, p, o, a, epi, tokens
-                )
+                _launch_mma[32, True, QUANT_U5](ctx, w, p, o, a, epi, tokens)
                 return
             if form == QUANT_S5 and not carries_min:
-                _launch_mma[32, False, QUANT_S5, half](
-                    ctx, w, p, o, a, epi, tokens
-                )
+                _launch_mma[32, False, QUANT_S5](ctx, w, p, o, a, epi, tokens)
                 return
             if form == QUANT_K4 and carries_min:
-                _launch_mma[32, True, QUANT_K4, half](
-                    ctx, w, p, o, a, epi, tokens
-                )
+                _launch_mma[32, True, QUANT_K4](ctx, w, p, o, a, epi, tokens)
                 return
             if form == QUANT_K5 and carries_min:
-                _launch_mma[32, True, QUANT_K5, half](
-                    ctx, w, p, o, a, epi, tokens
-                )
+                _launch_mma[32, True, QUANT_K5](ctx, w, p, o, a, epi, tokens)
                 return
             if form == QUANT_I8 and not carries_min:
-                _launch_mma[32, False, QUANT_I8, half](
-                    ctx, w, p, o, a, epi, tokens
-                )
+                _launch_mma[32, False, QUANT_I8](ctx, w, p, o, a, epi, tokens)
                 return
     if form == QUANT_U4 and g == 32 and carries_min:
-        _launch_mm[MM_TILE, 32, True, QUANT_U4, half](
-            ctx, w, p, o, a, epi, tokens
-        )
+        _launch_mm[MM_TILE, 32, True, QUANT_U4](ctx, w, p, o, a, epi, tokens)
     elif form == QUANT_S4 and g == 32 and not carries_min:
-        _launch_mm[MM_TILE, 32, False, QUANT_S4, half](
-            ctx, w, p, o, a, epi, tokens
-        )
+        _launch_mm[MM_TILE, 32, False, QUANT_S4](ctx, w, p, o, a, epi, tokens)
     elif form == QUANT_U5 and g == 32 and carries_min:
-        _launch_mm[MM_TILE, 32, True, QUANT_U5, half](
-            ctx, w, p, o, a, epi, tokens
-        )
+        _launch_mm[MM_TILE, 32, True, QUANT_U5](ctx, w, p, o, a, epi, tokens)
     elif form == QUANT_S5 and g == 32 and not carries_min:
-        _launch_mm[MM_TILE, 32, False, QUANT_S5, half](
-            ctx, w, p, o, a, epi, tokens
-        )
+        _launch_mm[MM_TILE, 32, False, QUANT_S5](ctx, w, p, o, a, epi, tokens)
     elif form == QUANT_S6 and g == 16 and not carries_min:
-        _launch_mm[MM_TILE, 16, False, QUANT_S6, half](
-            ctx, w, p, o, a, epi, tokens
-        )
+        _launch_mm[MM_TILE, 16, False, QUANT_S6](ctx, w, p, o, a, epi, tokens)
     elif form == QUANT_K4 and g == 32 and carries_min:
-        _launch_mm[MM_TILE, 32, True, QUANT_K4, half](
-            ctx, w, p, o, a, epi, tokens
-        )
+        _launch_mm[MM_TILE, 32, True, QUANT_K4](ctx, w, p, o, a, epi, tokens)
     elif form == QUANT_K5 and g == 32 and carries_min:
-        _launch_mm[MM_TILE, 32, True, QUANT_K5, half](
-            ctx, w, p, o, a, epi, tokens
-        )
+        _launch_mm[MM_TILE, 32, True, QUANT_K5](ctx, w, p, o, a, epi, tokens)
     elif form == QUANT_I8 and g == 32 and not carries_min:
-        _launch_mm[MM_TILE, 32, False, QUANT_I8, half](
-            ctx, w, p, o, a, epi, tokens
-        )
+        _launch_mm[MM_TILE, 32, False, QUANT_I8](ctx, w, p, o, a, epi, tokens)
     else:
         raise Error(
             "no device matmul is compiled for quant form "
