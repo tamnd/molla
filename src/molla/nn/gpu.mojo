@@ -799,11 +799,11 @@ def coherent_load_i8x4[
     comptime if coherent and CompilationTarget.is_macos():
         return bitcast[DType.int8, 4](
             _dev32.load[ordering=Ordering.RELAXED](
-                Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset = i >> 2])
+                Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset=i >> 2])
             )
         )
     else:
-        return bitcast[DType.int8, 4](q[unsafe_offset = i >> 2])
+        return bitcast[DType.int8, 4](q[unsafe_offset=i >> 2])
 
 
 @always_inline

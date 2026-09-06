@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Changed
+
+- A q8_0 key read takes four adjacent elements a lane rather than one, which is most of what the form cost. Four adjacent elements are one aligned thirty two bit word of quants, and `coherent_load_i8` was already loading that word and throwing three of its bytes away because the smallest device scope atomic either backend has is thirty two bits. They are also inside one block, so they share a factor, and the factor now multiplies their partial sum once instead of multiplying each of them. On a 4090 with the 8B at Q4_K_M at a context of 4096, a q8_0 decode went from 23.7 per cent slower than float16 to 4.0, and prefill from 7.5 to 2.3. The cache bytes are unchanged because the store side did not change. The four per cent that is left is the value fold, which cannot take the same treatment without cutting the threads that run it by four, and #258 stays open for it. See docs/validation/kvcache.md.
+
 ### Added
 
 - `pixi run soak-cache`, which runs one long teacher forced sequence through an f16 session and a q8_0 session and compares them at every position. This is the thing that can see a rounding that only matters after thousands of positions, which the suite and the logit corpus cannot: both of them read a cache a few positions after they wrote it. On a 4090 with the 8B at Q4_K_M over 8192 positions the two forms pick the same token 99.0 to 99.7 per cent of the time in every eighth of the run, the divergence of the whole distribution stays near 1.5e-4 nats and does not grow with the position, and the f16 top token is still the q8_0 top token at every checkpoint. The control, which runs f16 twice, is exact. See docs/validation/kvcache.md.
