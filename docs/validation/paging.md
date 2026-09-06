@@ -116,6 +116,8 @@ Issue #31 says a fuzz test over random conversation trees shows cached and uncac
 
 So the check that survives the change is the one `molla.engine.cache` was written around: prefilling n tokens and then decoding has to leave the cache holding what feeding those n tokens one at a time leaves it holding. With cells that is no longer a byte comparison of two buffers, because the two routes may place the same positions in different cells. It becomes a comparison of what each position holds, read through the index, which is the same statement one level up.
 
+The fuzz that is running is over pool layouts rather than over conversation trees, which is as far as the gate reaches while there is one sequence. Each trial takes a decoy of a random length, gives a random half of it back so the pool has holes rather than an offset, cuts the same prompt into chunks of a random length, and runs the chunks twice, once into the holed pool and once into an empty one. Nothing is contiguous about the first run and everything is about the second, and the logits have to agree. Eight trials from a fixed seed, so a failure is reachable again without capturing anything. The tree shaped version, where two sequences share a prefix and one of them diverges, needs a second sequence to exist, and that is #32.
+
 ## Sizing
 
 The pool's size is what actually decides concurrency, so it is reported rather than inferred. Free device memory after the weights and the activation headroom, divided by `2 * layers * cache_row(form, kv_width) * 2` bytes a cell, is the token capacity, and that number belongs in `/molla/runners` beside the model.
