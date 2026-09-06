@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Added
+
+- `pixi run soak-cache`, which runs one long teacher forced sequence through an f16 session and a q8_0 session and compares them at every position. This is the thing that can see a rounding that only matters after thousands of positions, which the suite and the logit corpus cannot: both of them read a cache a few positions after they wrote it. On a 4090 with the 8B at Q4_K_M over 8192 positions the two forms pick the same token 99.0 to 99.7 per cent of the time in every eighth of the run, the divergence of the whole distribution stays near 1.5e-4 nats and does not grow with the position, and the f16 top token is still the q8_0 top token at every checkpoint. The control, which runs f16 twice, is exact. See docs/validation/kvcache.md.
+
 ## [0.4.19] - 2026-09-06
 
 The KV cache can be held at q8_0 behind `--cache-type`, which is 53 per cent of the memory a float16 cache takes and costs 24 per cent of a decode at a long context. Off by default. The logit corpus agrees with llama.cpp on all thirteen device cases on both backends, and the 8B answers a prompt with byte identical text at both forms.
