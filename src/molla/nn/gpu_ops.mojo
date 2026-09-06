@@ -47,6 +47,7 @@ from molla.nn.gpu import (
     ALANES,
     TILE,
     DeviceHalf,
+    DeviceInts,
     DeviceVec,
     _group_scale,
     _scale_bases,
@@ -1488,6 +1489,160 @@ def device_store_kv(
                 dst.ptr_at(at),
                 src.ptr(),
                 Int32(rows * n),
+                grid_dim=(_grid(rows * n), 1, 1),
+                block_dim=(TILE, 1, 1),
+            )
+
+
+def store_kv_at_kernel(
+    dst: Pointer[Float16, MutAnyOrigin],
+    src: Pointer[Float32, MutAnyOrigin],
+    cells: Pointer[Int32, MutAnyOrigin],
+    n_dev: Int32,
+    row_dev: Int32,
+    rows_dev: Int32,
+):
+    """The same narrowing, with each row going to the cell it was handed.
+
+    A separate kernel from `store_kv_kernel` rather than a flag on it. The
+    contiguous form is the one every decode takes today and it is a load, a
+    convert and a store with no arithmetic at all, since a float16 row is
+    `kv_width` halves with nothing between two of them and a whole chunk is one
+    run. This one divides to find its row and loads an index before it can
+    store, and paying that on the path that does not need it to save twenty
+    lines would be the wrong trade in the wrong place.
+    """
+    var n = Int(n_dev)
+    var row = Int(row_dev)
+    var total = n * Int(rows_dev)
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    while i < total:
+        var r = i // n
+        var c = i - r * n
+        var cell = Int(cells[unsafe_offset=r])
+        dst[unsafe_offset=cell * row + c] = src[unsafe_offset=i].cast[
+            DType.float16
+        ]()
+        i += stride
+
+
+def store_kv_q8_at_kernel(
+    dst: Pointer[Float16, MutAnyOrigin],
+    src: Pointer[Float32, MutAnyOrigin],
+    cells: Pointer[Int32, MutAnyOrigin],
+    n_dev: Int32,
+    row_dev: Int32,
+    rows_dev: Int32,
+):
+    """`store_kv_q8_kernel` with the destination row read out of `cells`.
+
+    A block a thread for the reason that kernel gives, and the only difference
+    is where a row lands. The block a thread owns is still one block of one
+    row, so a row going somewhere else changes an offset and nothing about the
+    reduction.
+    """
+    var n = Int(n_dev)
+    var row = Int(row_dev)
+    var per = n // CACHE_BLOCK
+    var total = per * Int(rows_dev)
+    var q = dst.unsafe_bitcast[Int8]()
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    var stride = Int(grid_dim.x * block_dim.x)
+    while i < total:
+        var r = i // per
+        var b = i - r * per
+        var cell = Int(cells[unsafe_offset=r])
+        var src_at = r * n + b * CACHE_BLOCK
+        var amax = Float32(0)
+        for k in range(CACHE_BLOCK):
+            var v = src[unsafe_offset=src_at + k]
+            var a = v if v >= 0 else -v
+            if a > amax:
+                amax = a
+        var s = amax / Float32(127.0)
+        var inv = Float32(0) if amax == 0 else Float32(127.0) / amax
+        var dst_at = cell * row * 2 + b * CACHE_BLOCK
+        for k in range(CACHE_BLOCK):
+            q[unsafe_offset=dst_at + k] = _q8(
+                src[unsafe_offset=src_at + k] * inv
+            )
+        dst[unsafe_offset=cell * row + n // 2 + b] = s.cast[DType.float16]()
+        i += stride
+
+
+def device_store_kv_at(
+    ctx: DeviceContext,
+    mut dst: DeviceHalf,
+    cells: DeviceInts,
+    src: DeviceVec,
+    n: Int,
+    rows: Int,
+    form: Int = CACHE_F16,
+) raises:
+    """`rows` finished rows of `n` values, each into the cell `cells` names.
+
+    The scattered form of `device_store_kv` and the only place paging reaches a
+    kernel. Row `t` of the source lands at cell `cells[t]` of the pool, so a
+    sequence whose cells are not contiguous writes in one launch rather than in
+    one launch a token, and a sequence whose cells happen to be contiguous
+    writes exactly what the contiguous store would have written.
+
+    The indices are not checked here. They cannot be: they are on the card, and
+    reading them back to look at them would cost a synchronize on the path a
+    token takes and would still be checking a copy. What checks them is the
+    allocator that produced them, which is the only thing that ever writes a
+    cell index and which has never handed out a cell it does not own. The bound
+    that is checkable from the host is the one that is checked, which is that
+    the pool is at least as long as it claims and the source holds the rows it
+    says it does.
+    """
+    var row = cache_row(form, n)
+    if n <= 0 or rows < 1 or cells.elements() < rows:
+        raise Error(
+            "storing "
+            + String(rows)
+            + " rows of "
+            + String(n)
+            + " values through an index vector of "
+            + String(cells.elements())
+        )
+    if dst.elements() < row:
+        raise Error(
+            "a cache of "
+            + String(dst.elements())
+            + " halves has no room for a row of "
+            + String(row)
+        )
+    if src.elements() < rows * n:
+        raise Error(
+            "storing "
+            + String(rows * n)
+            + " values out of a vector of "
+            + String(src.elements())
+        )
+    _need_device()
+    comptime if has_accelerator():
+        if form == CACHE_Q8:
+            var blocks = rows * (n // CACHE_BLOCK)
+            ctx.enqueue_function[store_kv_q8_at_kernel](
+                dst.ptr(),
+                src.ptr(),
+                cells.ptr(),
+                Int32(n),
+                Int32(row),
+                Int32(rows),
+                grid_dim=(_grid(blocks), 1, 1),
+                block_dim=(TILE, 1, 1),
+            )
+        else:
+            ctx.enqueue_function[store_kv_at_kernel](
+                dst.ptr(),
+                src.ptr(),
+                cells.ptr(),
+                Int32(n),
+                Int32(row),
+                Int32(rows),
                 grid_dim=(_grid(rows * n), 1, 1),
                 block_dim=(TILE, 1, 1),
             )
