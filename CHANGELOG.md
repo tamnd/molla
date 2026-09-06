@@ -7,6 +7,12 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 ### Changed
 
 - Rope takes the position of each token out of a vector rather than adding the token's index to a base. A run of one sequence fills that vector with a base and its successors, so every angle is the angle it was and the logits are unchanged, and a batch that holds two sequences fills it with positions that no base describes. That is the first of the five stages in [docs/validation/batching.md](docs/validation/batching.md) and the reason it is first is that it is the smallest thing a mixed batch needs which nothing today provides.
+- The paged index turns around. Attention used to take a vector over the cell pool holding the position each cell held, which is right for one sequence because one sequence's cells are the pool's cells, and wrong for a batch because every sequence would then have to scan the whole pool. It now takes a vector over one sequence's own positions holding the cell each is in. Causality goes back to being where the loop stops, the scan is a sequence's own length rather than the pool's frontier, and a decode appends one entry instead of rewriting a window. The two paths converge as a result: the count arithmetic and the window and sink arithmetic are now the same expression whether a step is paged or not, and the only difference left is one indirection to find the row. That is the second of the five stages, and the logits are unchanged on both the contiguous path and the paged one.
+- A decode rounds its scan up to 256 positions, which is what `PAGE_PAD` used to do for every step. The batching spec predicted the turnaround would let the rounding go, and measuring it says otherwise: on the 4090 a paged decode that scans its own length runs about five per cent slower than the contiguous path, and rounding the scan up gives that back and about three per cent more, because a grid that grows by one key a step pays for the shape change. Rounding a prefill chunk up costs fifteen per cent of prefill for nothing, since the chunk already launches over its own triangle. So the rounding applies when a step carries one token and not otherwise, which is the decode and prefill line without having to ask the caller which it is doing.
+
+### Removed
+
+- `CellTable.window` and `PAGE_PAD`, both replaced by the turned around index. `CellTable.route` fills a caller's list with the cell holding each of a sequence's first n positions, and `SCAN_PAD` is the decode only rounding.
 
 ## [0.5.3] - 2026-09-06
 

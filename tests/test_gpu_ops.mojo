@@ -698,12 +698,12 @@ def test_attend_paged(mut suite: Suite, ctx: DeviceContext) raises:
         suite, ctx, split_win, 512, 600, 511, "slices a window empties", 3e-6
     )
 
-    # A window that is a prefix of the vectors it was uploaded in, which is what
-    # every step does: the buffers are the pool and the window is how much of it
-    # the pool is using. The cells past the window here would all be visible if
-    # they were read.
+    # A sequence that is a prefix of the vectors it was uploaded in, which is
+    # what every step is: the buffers are the pool and the sequence is however
+    # much of it that sequence has written. The rows the index points at past
+    # its length would all change the answer if they were read.
     _attend_paged_case(
-        suite, ctx, spec, 40, 64, 39, "a window inside its buffer", 2e-6, 96
+        suite, ctx, spec, 40, 64, 39, "a run inside its buffer", 2e-6, 96
     )
     _attend_paged_case(
         suite, ctx, split, 512, 600, 511, "and one cut into slices", 3e-6, 424
@@ -718,18 +718,16 @@ def test_attend_paged(mut suite: Suite, ctx: DeviceContext) raises:
         var o = DeviceVec(ctx, 4 * 32)
         var s = DeviceVec(ctx, 4 * 40)
         var part = DeviceVec(ctx, attend_partials(short, 1, 40))
-        var cellv = DeviceInts(ctx, 40)
+        var indexv = DeviceInts(ctx, 40)
         var host = List[Int32]()
         for i in range(20):
             host.append(Int32(i))
         device_attend_paged(
-            ctx, short, q, k, v, host, cellv, 40, 39, o, s, part
+            ctx, short, q, k, v, host, indexv, 40, 39, o, s, part
         )
     except:
         raised = True
-    suite.check(
-        raised, "a host window shorter than the one asked for is refused"
-    )
+    suite.check(raised, "a host run shorter than the one asked for is refused")
 
     raised = False
     try:
@@ -740,16 +738,16 @@ def test_attend_paged(mut suite: Suite, ctx: DeviceContext) raises:
         var o = DeviceVec(ctx, 4 * 32)
         var s = DeviceVec(ctx, 4 * 40)
         var part = DeviceVec(ctx, attend_partials(short, 1, 40))
-        var cellv = DeviceInts(ctx, 20)
+        var indexv = DeviceInts(ctx, 20)
         var host = List[Int32]()
         for i in range(40):
             host.append(Int32(i))
         device_attend_paged(
-            ctx, short, q, k, v, host, cellv, 40, 39, o, s, part
+            ctx, short, q, k, v, host, indexv, 40, 39, o, s, part
         )
     except:
         raised = True
-    suite.check(raised, "and so is a device window that does not reach it")
+    suite.check(raised, "and so is a device run that does not reach it")
 
 
 def _attend_paged_case(
@@ -765,11 +763,17 @@ def _attend_paged_case(
 ) raises:
     """`count` positions scattered over a pool of `cells`, against the host.
 
-    `slack` cells past the window, on both sides, holding a position the query
-    can see and numbers it must not read. A step reads a prefix of vectors that
-    are allocated once at the size of the pool, so the entries past the window
-    are always there and a kernel that took the buffer's length for the window
-    would produce a number that is wrong by however much they weigh.
+    `slack` cells past the sequence, holding numbers it must not read. A step
+    reads a prefix of vectors that are allocated once at the size of the pool,
+    and a decode rounds that prefix up to `SCAN_PAD`, so the entries past the
+    sequence are both there and read. What makes them harmless is that they are
+    negative, and this is what checks that they are treated as such.
+
+    The host reference is given the other index. It gets one entry a cell saying
+    which position that cell holds and the device gets one entry a position
+    saying which cell it is in, both built from the same scatter, so what this
+    checks is the turnaround itself rather than one form against a copy of
+    itself.
 
     The scatter is a stride of seven, which is coprime with every pool size
     here, so a position lands nowhere near the order it was written in and the
@@ -855,23 +859,29 @@ def _attend_paged_case(
         scratch.append(0.0)
     attend(spec, q, keys, values, cells, pos, want, scratch, held)
 
-    var host = List[Int32]()
-    for c in range(pool):
-        host.append(Int32(held[c]))
+    # The index the device gets, which is the scatter read the other way round.
+    # Past the sequence every entry is negative, which is what a decode rounding
+    # its scan up to `SCAN_PAD` reads and has to skip. There is no row to skip
+    # to, so a kernel that took a negative for a cell would be reading at a
+    # negative offset rather than coming back with a number that is merely
+    # wrong.
+    var order = List[Int32](length=pool, fill=Int32(-1))
+    for i in range(count):
+        order[i] = Int32(i * 7 % cells)
 
     var dq = DeviceVec(ctx, width)
     var dk = DeviceHalf(ctx, pool * kv_width)
     var dv = DeviceHalf(ctx, pool * kv_width)
     var dout = DeviceVec(ctx, width)
-    var dscores = DeviceVec(ctx, spec.heads * cells)
-    var dpart = DeviceVec(ctx, attend_partials(spec, 1, cells))
-    var cellv = DeviceInts(ctx, pool)
-    cellv.queue_in(host)
+    var dscores = DeviceVec(ctx, spec.heads * pool)
+    var dpart = DeviceVec(ctx, attend_partials(spec, 1, pool))
+    var indexv = DeviceInts(ctx, pool)
+    indexv.queue_in(order)
     dq.upload(q)
     dk.upload_run(keys, 0, pool * kv_width)
     dv.upload_run(values, 0, pool * kv_width)
     device_attend_paged(
-        ctx, spec, dq, dk, dv, host, cellv, cells, pos, dout, dscores, dpart
+        ctx, spec, dq, dk, dv, order, indexv, count, pos, dout, dscores, dpart
     )
     ctx.synchronize()
     var got = Buffer(width)

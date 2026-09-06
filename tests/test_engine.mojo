@@ -146,7 +146,7 @@ def run(mut suite: Suite) raises:
     test_cache_errors(suite)
     test_cells(suite)
     test_cells_sharing(suite)
-    test_cells_window(suite)
+    test_cells_route(suite)
     test_cells_ring(suite)
     test_cells_eviction(suite)
     test_cells_errors(suite)
@@ -355,28 +355,25 @@ def test_cells_sharing(mut suite: Suite) raises:
     suite.check(t.cell_of(1, 0) == two, "and each finds its own")
 
 
-def test_cells_window(mut suite: Suite) raises:
-    """How far attention reads, and what it finds when it gets there.
+def test_cells_route(mut suite: Suite) raises:
+    """Where a sequence's positions went, which is what attention gathers by.
 
-    The window is the one number a step has to get right for the mask to be
-    cheap. Too short and a sequence loses the tail of its own context silently,
-    too long and every token pays for cells that hold nothing.
+    The property worth pinning is that the answer is about one sequence and not
+    about the pool. Two sequences in the same cells have to come back as two
+    runs starting at zero, because the subscript a kernel walks is the position
+    and not the cell.
     """
-    suite.group("cell window")
+    suite.group("cell route")
 
     var t = CellTable(16)
-    suite.check(t.top == 0, "an empty pool has nothing to read")
-    suite.check(t.window(4) == 4, "and a window still rounds up to the pad")
+    suite.check(t.top == 0, "an empty pool has nothing in it")
 
     var a = List[Int]()
     t.alloc_run(0, 0, 5, a)
     suite.check(t.top == 5, "the frontier follows the highest cell taken")
-    suite.check(t.window(4) == 8, "and the window rounds it up")
-    suite.check(t.window(1) == 5, "a pad of one is the frontier itself")
-    suite.check(t.window(32) == 16, "and a pad past the pool is the pool")
 
     # A release at the top pulls the frontier back with it, which is what keeps
-    # a finished conversation from being read forever by the ones after it.
+    # a finished conversation from holding the pool open behind it.
     suite.check(t.release(0, 3, -1) == 2, "releasing the tail frees two")
     suite.check(t.top == 3, "and the frontier comes back")
     suite.check(t.release(0, 0, 1) == 1, "releasing the front frees one")
@@ -393,64 +390,67 @@ def test_cells_window(mut suite: Suite) raises:
     # The list is the whole pool and a step fills the prefix it is going to
     # read, so the tail has to come back untouched. That is what lets one
     # buffer be allocated at startup and written again every step.
-    var win = List[Int32](length=t.size(), fill=Int32(99))
-    t.held(0, t.top, win)
+    var run = List[Int32](length=t.size(), fill=Int32(99))
+    t.route(0, 3, run)
     suite.check(
-        Int(win[0]) == 0 and Int(win[1]) == 1 and Int(win[2]) == 2,
-        "each of a sequence's cells says which position it holds",
+        Int(run[0]) == 0 and Int(run[1]) == 1 and Int(run[2]) == 2,
+        "each of a sequence's positions says which cell it is in",
     )
-    suite.check(
-        Int(win[3]) == CELL_FREE and Int(win[4]) == CELL_FREE,
-        "and another sequence's cells say nothing at all",
-    )
-    suite.check(Int(win[5]) == 99, "and nothing past the window is written")
+    suite.check(Int(run[3]) == 99, "and nothing past its length is written")
 
     var other = List[Int32](length=t.size(), fill=Int32(0))
-    t.held(1, t.top, other)
+    t.route(1, 2, other)
     suite.check(
-        Int(other[3]) == 0
-        and Int(other[4]) == 1
-        and Int(other[0]) == CELL_FREE,
-        "the same cells read the other way round for the other sequence",
+        Int(other[0]) == 3 and Int(other[1]) == 4,
+        "the other sequence starts at zero in cells of its own",
     )
 
-    # Two windows back to back in one list, which is how a batch of sequences
-    # gets to share the buffer.
-    var both = List[Int32](length=2 * t.top, fill=Int32(0))
-    t.held(0, t.top, both)
-    t.held(1, t.top, both, t.top)
+    # A position nobody wrote, which is what a cell trimmed out behind a window
+    # leaves and what attention has to skip rather than read.
+    var holed = List[Int32](length=t.size(), fill=Int32(0))
+    t.route(0, 5, holed)
     suite.check(
-        Int(both[0]) == 0 and Int(both[t.top + 3]) == 0,
-        "an offset puts the second window after the first",
+        Int(holed[3]) == CELL_FREE and Int(holed[4]) == CELL_FREE,
+        "a position the sequence does not hold comes back free",
     )
 
-    # A shared prefix is in both windows at once, which is the property the
-    # whole thing exists for and the one a copy would have hidden.
+    # Two runs back to back in one list, which is how a batch of sequences gets
+    # to share the buffer.
+    var both = List[Int32](length=8, fill=Int32(0))
+    t.route(0, 3, both)
+    t.route(1, 2, both, 3)
+    suite.check(
+        Int(both[0]) == 0 and Int(both[3]) == 3,
+        "an offset puts the second run after the first",
+    )
+
+    # A shared prefix is in both runs at once, at the same positions and in the
+    # same cells, which is the property the owner set exists for.
     _ = t.share(0, 2, 0, 2)
     var shared = List[Int32](length=t.size(), fill=Int32(0))
-    t.held(2, t.top, shared)
+    t.route(2, 3, shared)
     suite.check(
         Int(shared[0]) == 0
         and Int(shared[1]) == 1
         and Int(shared[2]) == CELL_FREE,
-        "a shared prefix is in the sharer's window and the rest is not",
+        "a shared prefix is in the sharer's run and the rest is not",
     )
 
     var failed = False
     try:
         var over = List[Int32](length=17, fill=Int32(0))
-        t.held(0, 17, over)
+        t.route(0, 17, over)
     except:
         failed = True
-    suite.check(failed, "a window past the end of the pool is refused")
+    suite.check(failed, "a run longer than the pool is refused")
 
     var cramped = False
     try:
         var small = List[Int32](length=4, fill=Int32(0))
-        t.held(0, 5, small)
+        t.route(0, 5, small)
     except:
         cramped = True
-    suite.check(cramped, "and a window that does not fit the list it is given")
+    suite.check(cramped, "and a run that does not fit the list it is given")
 
 
 def test_cells_ring(mut suite: Suite) raises:

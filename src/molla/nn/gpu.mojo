@@ -516,6 +516,48 @@ struct DeviceInts(Movable):
             ),
         )
 
+    def queue_span(mut self, x: List[Int32], at: Int, count: Int) raises:
+        """Fill `count` entries from `at`, queued the way `queue_in` is.
+
+        What a vector that only grows at the end wants. A sequence's index of
+        cells is as long as its context and gains one entry a decode, so sending
+        the whole of it to move four bytes is the transfer this exists to avoid.
+        A prefill sends its chunk and every decode after it sends one entry.
+
+        The same rule about `x` outliving the copy holds, for the same reason,
+        and the caller keeps it for the same reason.
+        """
+        if at < 0 or count < 0 or at + count > self.n:
+            raise Error(
+                "a span of "
+                + String(count)
+                + " at "
+                + String(at)
+                + " does not fit a device index vector of "
+                + String(self.n)
+            )
+        if at + count > len(x):
+            raise Error(
+                "a span of "
+                + String(count)
+                + " at "
+                + String(at)
+                + " does not fit a list of "
+                + String(len(x))
+            )
+        if count == 0:
+            return
+        var part = self.buf.create_sub_buffer[DType.int32](at, count)
+        # Four bytes an entry, spelled out because `x.unsafe_ptr()` hands back a
+        # `Pointer` rather than an `UnsafePointer` and there is no arithmetic on
+        # one of those.
+        part.context().enqueue_copy(
+            part,
+            Pointer[Int32, MutAnyOrigin](
+                unsafe_from_address=Int(x.unsafe_ptr()) + at * 4
+            ),
+        )
+
     def at(self, index: Int) raises -> Int:
         """One index, for a test. Through a mapping, like every other `at`."""
         if index < 0 or index >= self.n:
@@ -530,10 +572,11 @@ struct DevicePaging(Movable):
     """What a paged pass hands the kernels, filled once and read by every layer.
 
     Two index vectors and the host lists behind them. Where the tokens of this
-    step go, which the scattered store reads, and what this sequence may read of
-    the pool, which attention masks by. Both are allocated when the session
-    opens and both are filled once a pass, so paging costs two transfers of a
-    few kilobytes a step rather than two a layer.
+    step go, which the scattered store reads, and which cell holds each position
+    of this sequence, which attention gathers through. Both are allocated when
+    the session opens and both are filled once a pass, so paging costs two
+    transfers a step rather than two a layer, and the second of them is the
+    entries the step appended rather than the whole vector.
 
     The host lists are kept rather than built a step for the reason
     `DeviceInts.queue_in` gives: the copy is queued and not waited for, so the
@@ -555,15 +598,15 @@ struct DevicePaging(Movable):
     var cells: DeviceInts
     """One entry a token of the chunk: which cell its key and value go in."""
 
-    var mask: DeviceInts
-    """One entry a cell of the pool: the position that cell holds for this
-    sequence, or a negative for one the sequence may not read."""
+    var index: DeviceInts
+    """One entry a position of this sequence: which cell holds it, or a negative
+    for a position the sequence does not hold."""
 
     var slots: List[Int32]
     """The host side of `cells`."""
 
-    var held: List[Int32]
-    """The host side of `mask`."""
+    var order: List[Int32]
+    """The host side of `index`."""
 
     var seats: DeviceInts
     """One entry a token of the chunk: the position that token sits at."""
@@ -571,8 +614,14 @@ struct DevicePaging(Movable):
     var spots: List[Int32]
     """The host side of `seats`."""
 
-    var window: Int
-    """How many cells of `mask` this step reads, which is a prefix of it."""
+    var reach: Int
+    """How many entries of `order` the host has written, which is the sequence's
+    length. Everything above it is negative, which is what lets a decode round
+    its scan up to `SCAN_PAD` without reading a cell that is not its own."""
+
+    var sent: Int
+    """How many entries of `index` the card has, which is `reach` once a paged
+    step has run and less than it while the passes are still contiguous."""
 
     var on: Bool
     """Whether this pass is paged at all."""
@@ -591,31 +640,57 @@ struct DevicePaging(Movable):
         if chunk <= 0 or pool <= 0:
             raise Error("paging needs a positive chunk and a positive pool")
         self.cells = DeviceInts(ctx, chunk)
-        self.mask = DeviceInts(ctx, pool)
+        self.index = DeviceInts(ctx, pool)
         self.seats = DeviceInts(ctx, chunk)
         self.slots = List[Int32](length=chunk, fill=0)
-        self.held = List[Int32](length=pool, fill=-1)
+        self.order = List[Int32](length=pool, fill=-1)
         self.spots = List[Int32](length=chunk, fill=0)
-        self.window = 0
+        self.reach = 0
+        self.sent = 0
         self.on = False
         self.ragged = False
+        # The card gets the negatives once, here, because from now on it only
+        # gets the spans a step wrote and a buffer that starts as whatever the
+        # driver left is a query reading a cell nobody gave it. A decode scans
+        # past the end of its sequence on purpose, so the entries out there have
+        # to mean something from the first step rather than from the first one
+        # that reaches them.
+        self.index.queue_in(self.order)
 
     def chunk(self) -> Int:
         return self.cells.elements()
 
     def pool(self) -> Int:
-        return self.mask.elements()
+        return self.index.elements()
 
-    def queue(mut self) raises:
-        """Send both vectors, whole, on the stream the kernels are queued on.
+    def forget(mut self) raises:
+        """Drop the index, which is what resetting the cache does.
 
-        Whole rather than as far as the step reaches, because a partial copy of
-        a device buffer is a second offset to get wrong and the whole of this is
-        a few kilobytes. What bounds the step is `window` and the row count the
-        store is given, neither of which is in the buffer.
+        Written out rather than left stale, because the entries past the end of
+        a sequence are what a later one will read once it is longer, and a stale
+        cell there is a query reading somebody else's key rather than skipping a
+        position nobody holds.
+        """
+        for i in range(len(self.order)):
+            self.order[i] = Int32(-1)
+        self.index.queue_in(self.order)
+        self.reach = 0
+        self.sent = 0
+        self.on = False
+
+    def queue(mut self, at: Int, count: Int) raises:
+        """Send the step's cells whole and the index entries it just wrote.
+
+        The cell vector is one entry a token of a chunk, so a kilobyte, and it
+        goes whole because a partial copy of it would save nothing. The index is
+        as long as the pool and only ever grows at the end, so what a step has
+        to send is the run it appended: a chunk at prefill and one entry at each
+        decode after it. See `DeviceInts.queue_span`.
+
+        On the stream the kernels are queued on and ahead of them.
         """
         self.cells.queue_in(self.slots)
-        self.mask.queue_in(self.held)
+        self.index.queue_span(self.order, at, count)
 
     def steady(mut self, base: Int, count: Int) raises:
         """Fill the positions for a run of `count` tokens starting at `base`.
