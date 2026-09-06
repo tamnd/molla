@@ -48,6 +48,7 @@ from molla.nn.gpu import (
     TILE,
     DeviceHalf,
     DeviceInts,
+    DevicePaging,
     DeviceVec,
     _group_scale,
     _scale_bases,
@@ -683,6 +684,8 @@ def attend_kernel[
     scores: Pointer[Float32, MutAnyOrigin],
     o: Pointer[Float32, MutAnyOrigin],
     cells: Pointer[Int32, MutAnyOrigin],
+    seats: Pointer[Int32, MutAnyOrigin],
+    bases: Pointer[Int32, MutAnyOrigin],
     count_dev: Int32,
     pos_dev: Int32,
     head_dim_dev: Int32,
@@ -694,6 +697,7 @@ def attend_kernel[
     q_row_dev: Int32,
     score_row_dev: Int32,
     paged_dev: Int32,
+    ragged_dev: Int32,
     scale: Float32,
     softcap: Float32,
 ):
@@ -734,11 +738,23 @@ def attend_kernel[
     [docs/validation/batching.md](../../../docs/validation/batching.md) for why
     the index is per sequence and not per pool. Unpaged, `cells` is not read at
     all, so the caller is free to point it anywhere it likes.
+
+    When `ragged` is set the tokens of the chunk belong to more than one
+    sequence, so there is no base for them to run from. Token `ty` takes its
+    position out of `seats` and the start of its sequence's list out of `bases`,
+    and the number of positions it reads is its own position plus one, which is
+    what the count was already. Ragged is always paged, because two sequences
+    cannot both be the leading run of one cache.
     """
     var ty = Int(block_idx.y)
     var paged = Int(paged_dev) != 0
     var count = Int(count_dev) + ty
     var pos = Int(pos_dev) + ty
+    var base = 0
+    if Int(ragged_dev) != 0:
+        pos = Int(seats[unsafe_offset=ty])
+        count = pos + 1
+        base = Int(bases[unsafe_offset=ty])
     var head_dim = Int(head_dim_dev)
     var kv_width = Int(kv_width_dev)
     var row = Int(row_dev)
@@ -763,7 +779,7 @@ def attend_kernel[
     var mine = NEG_INF
     var j = team
     while j < count:
-        var seat = _row_of(cells, j, paged)
+        var seat = _row_of(cells, base + j, paged)
         var s = NEG_INF
         if seat >= 0 and _sees(j, pos, window, sinks):
             s = (
@@ -824,7 +840,7 @@ def attend_kernel[
             var w = scores[unsafe_offset=sa + j2]
             if w == 0:
                 continue
-            var seat2 = _row_of(cells, j2, paged)
+            var seat2 = _row_of(cells, base + j2, paged)
             if seat2 < 0:
                 continue
             acc += w * cache_load[form, False](
@@ -919,6 +935,8 @@ def attend_split_kernel[
     scores: Pointer[Float32, MutAnyOrigin],
     partials: Pointer[Float32, MutAnyOrigin],
     cells: Pointer[Int32, MutAnyOrigin],
+    seats: Pointer[Int32, MutAnyOrigin],
+    bases: Pointer[Int32, MutAnyOrigin],
     count_dev: Int32,
     pos_dev: Int32,
     head_dim_dev: Int32,
@@ -931,6 +949,7 @@ def attend_split_kernel[
     score_row_dev: Int32,
     chunks_dev: Int32,
     paged_dev: Int32,
+    ragged_dev: Int32,
     scale: Float32,
     softcap: Float32,
 ):
@@ -957,11 +976,21 @@ def attend_split_kernel[
     more way to happen: a slice whose positions were all trimmed out from behind
     a window holds no cells at all, and that has to come out as nothing seen
     rather than as a division by zero.
+
+    Ragged, the count a slice is cut out of is the token's own rather than the
+    chunk's, so two tokens of a batch cut their keys at different places and a
+    short one leaves most of its slices empty. That is the same empty slice the
+    paragraph above is about and it takes the same exit. See `attend_kernel`.
     """
     var ty = Int(block_idx.y)
     var paged = Int(paged_dev) != 0
     var count = Int(count_dev) + ty
     var pos = Int(pos_dev) + ty
+    var base = 0
+    if Int(ragged_dev) != 0:
+        pos = Int(seats[unsafe_offset=ty])
+        count = pos + 1
+        base = Int(bases[unsafe_offset=ty])
     var head_dim = Int(head_dim_dev)
     var kv_width = Int(kv_width_dev)
     var row = Int(row_dev)
@@ -1003,7 +1032,7 @@ def attend_split_kernel[
     var mine = NEG_INF
     var j = lo + team
     while j < hi:
-        var seat = _row_of(cells, j, paged)
+        var seat = _row_of(cells, base + j, paged)
         var s = NEG_INF
         if seat >= 0 and _sees(j, pos, window, sinks):
             s = (
@@ -1059,7 +1088,7 @@ def attend_split_kernel[
             var w = scores[unsafe_offset=sa + j2]
             if w == 0:
                 continue
-            var seat2 = _row_of(cells, j2, paged)
+            var seat2 = _row_of(cells, base + j2, paged)
             if seat2 < 0:
                 continue
             acc += w * cache_load[form, False](
@@ -1158,6 +1187,7 @@ def device_rms_norm(
     eps: Float32,
     runs: Int = 1,
     x_at: Int = 0,
+    whole: Bool = True,
 ) raises:
     """`out = x * rsqrt(mean(x*x) + eps) * gain`, `runs` rows of it.
 
@@ -1166,6 +1196,13 @@ def device_rms_norm(
     output head wants: a chunk of a hundred tokens has one token's logits worth
     reading and normalising the other ninety nine would be the largest matmul
     in the pass done for nothing.
+
+    `whole` is how a caller says it means to norm part of a longer vector when
+    the part it wants happens to start at the front. One row at an offset is
+    already a shape the caller has described, but the first row's offset is
+    zero, which is also what a caller that described nothing passes. A batch
+    answering the sequence that came first in the chunk is exactly that case,
+    so it says so rather than being told its residual stream is too wide.
 
     The gain arrives as a device vector and not as a `Tensor`, because a norm
     weight is a few thousand f32 values that are read every token of every
@@ -1180,7 +1217,7 @@ def device_rms_norm(
     # a run count or an offset is given the caller has said what the shape is,
     # and the input is allowed to be longer, because a prefill chunk holds room
     # for the largest chunk and a short one does not fill it.
-    if runs == 1 and x_at == 0:
+    if whole and runs == 1 and x_at == 0:
         _check_norm(x.elements(), n, out.elements())
     if x_at < 0 or x.elements() < x_at + runs * n:
         raise Error(
@@ -2224,24 +2261,30 @@ def device_attend(
     for t in range(count):
         if spec.visible(t, pos):
             seen += 1
-    # `Pointer` is not nullable, so the unpaged call aims `cells` at the scores
-    # scratch rather than at nothing. The kernel is told it is not paged and
-    # never reads it, and an address that belongs to this call is a better thing
-    # to hand a kernel than one that belongs to nobody.
+    # `Pointer` is not nullable, so the unpaged call aims the three index vectors
+    # at the scores scratch rather than at nothing. The kernel is told it is
+    # neither paged nor ragged and never reads them, and an address that belongs
+    # to this call is a better thing to hand a kernel than one that belongs to
+    # nobody.
+    var spare = Pointer[Int32, MutAnyOrigin](
+        unsafe_from_address=Int(scores.buf.unsafe_ptr())
+    )
     _attend_go(
         ctx,
         spec,
         q,
         keys,
         values,
-        Pointer[Int32, MutAnyOrigin](
-            unsafe_from_address=Int(scores.buf.unsafe_ptr())
-        ),
+        spare,
+        spare,
+        spare,
+        count,
         count,
         count + tokens - 1,
         count + tokens - 1,
         pos,
         seen,
+        False,
         False,
         out,
         scores,
@@ -2257,8 +2300,7 @@ def device_attend_paged(
     q: DeviceVec,
     keys: DeviceHalf,
     values: DeviceHalf,
-    order: List[Int32],
-    index: DeviceInts,
+    paging: DevicePaging,
     count: Int,
     pos: Int,
     mut out: DeviceVec,
@@ -2267,14 +2309,14 @@ def device_attend_paged(
     tokens: Int = 1,
     form: Int = CACHE_F16,
 ) raises:
-    """`device_attend` over a cell pool, gathered through one sequence's index.
+    """`device_attend` over a cell pool, gathered through a sequence's index.
 
-    The keys and values are the pool rather than one sequence's run, `index` is
-    one entry a position of that sequence saying which cell holds it and a
-    negative for a position it does not hold, and `count` is how many positions
-    the first token of the chunk reads, which is `pos + 1`. Token `i` reads
-    `count + i`, exactly as it does unpaged, because a position is a position
-    whichever cell it went in.
+    The keys and values are the pool rather than one sequence's run, and
+    `paging.index` is one entry a position saying which cell holds it and a
+    negative for a position the sequence does not hold. `count` is how many
+    positions the first token of the chunk reads, which is `pos + 1`. Token `i`
+    reads `count + i`, exactly as it does unpaged, because a position is a
+    position whichever cell it went in.
 
     `count` is the sequence and not the pool. The buffer is allocated once at
     the size of the pool because a buffer sized to a sequence would be an
@@ -2283,51 +2325,103 @@ def device_attend_paged(
     to leave the entries above the sequence negative, and `DeviceKvCache.place`
     is what keeps them that way.
 
-    `order` is the host copy of what `index` holds and the caller owns both. It
-    is here for the refusal below, which is the same refusal `device_attend`
-    makes and cannot be made against a device buffer without a read back on the
-    path a token takes. Both have to reach the end of the chunk, because a
-    caller that uploads one vector and reasons about another produces fluent
-    text about the wrong context and nothing else goes wrong.
+    `paging.order` is the host copy of what `paging.index` holds. It is here for
+    the refusal below, which is the same refusal `device_attend` makes and cannot
+    be made against a device buffer without a read back on the path a token
+    takes. Both have to reach the end of the chunk, because a caller that
+    uploads one vector and reasons about another produces fluent text about the
+    wrong context and nothing else goes wrong.
+
+    When `paging.ragged` is set the tokens belong to more than one sequence, so
+    `count` and `pos` stop describing the chunk and describe the deepest token in
+    it. Every token then takes its own position out of `paging.spots` and its own
+    list out of `paging.firsts`, and `count` is here to size the scratch and the
+    grid for the token that needs the most of both. Nothing is rounded up in that
+    case, because a batch that holds a prefill chunk has a shape of its own
+    already and the rounding is what a lone decode wants.
     """
+    var ask = count + tokens - 1
+    var deep = pos
+    if paging.ragged:
+        if len(paging.spots) < tokens or len(paging.firsts) < tokens:
+            raise Error(
+                "a ragged step of "
+                + String(tokens)
+                + " tokens got "
+                + String(len(paging.spots))
+                + " positions and "
+                + String(len(paging.firsts))
+                + " list starts"
+            )
+        ask = 0
+        for i in range(tokens):
+            var reach = Int(paging.firsts[i]) + Int(paging.spots[i]) + 1
+            if reach > ask:
+                ask = reach
+                deep = Int(paging.spots[i])
     # The ask is checked before the pad, because the pad is clamped to the
     # buffer and a check after it would find every ask fits by construction.
-    var ask = count + tokens - 1
-    if count < 1 or len(order) < ask or index.elements() < ask:
+    if count < 1 or len(paging.order) < ask or paging.index.elements() < ask:
         raise Error(
             "paged attention over "
             + String(ask)
             + " positions got "
-            + String(len(order))
+            + String(len(paging.order))
             + " on the host and "
-            + String(index.elements())
+            + String(paging.index.elements())
             + " on the device"
         )
     var wide = count
-    if tokens == 1:
+    if tokens == 1 and not paging.ragged:
         wide = (count + SCAN_PAD - 1) // SCAN_PAD * SCAN_PAD
-        if wide > index.elements():
-            wide = index.elements()
-        if wide > len(order):
-            wide = len(order)
+        if wide > paging.index.elements():
+            wide = paging.index.elements()
+        if wide > len(paging.order):
+            wide = len(paging.order)
+    var reads = wide
     var last = wide + tokens - 1
+    if paging.ragged:
+        reads = count
+        last = count
+
+    # What the deepest token can see, which is the one refusal a kernel cannot
+    # make for itself. Ragged, every token is asked rather than the first,
+    # because a batch is as wrong as its worst sequence and a window that masks
+    # one of them masks it whatever the others manage.
     var seen = 0
-    for p in range(count):
-        if Int(order[p]) >= 0 and spec.visible(p, pos):
-            seen += 1
+    if paging.ragged:
+        seen = -1
+        for i in range(tokens):
+            var at = Int(paging.firsts[i])
+            var p = Int(paging.spots[i])
+            var mine = 0
+            for j in range(p + 1):
+                if Int(paging.order[at + j]) >= 0 and spec.visible(j, p):
+                    mine += 1
+            if seen < 0 or mine < seen:
+                seen = mine
+                deep = p
+    else:
+        for p in range(count):
+            if Int(paging.order[p]) >= 0 and spec.visible(p, pos):
+                seen += 1
     _attend_go(
         ctx,
         spec,
         q,
         keys,
         values,
-        index.ptr(),
+        paging.index.ptr(),
+        paging.seats.ptr(),
+        paging.bases.ptr(),
+        reads,
         wide,
         last,
-        index.elements(),
-        pos,
+        paging.index.elements(),
+        deep,
         seen,
         True,
+        paging.ragged,
         out,
         scores,
         partials,
@@ -2343,12 +2437,16 @@ def _attend_go(
     keys: DeviceHalf,
     values: DeviceHalf,
     cells: Pointer[Int32, MutAnyOrigin],
+    seats: Pointer[Int32, MutAnyOrigin],
+    bases: Pointer[Int32, MutAnyOrigin],
     count: Int,
+    wide: Int,
     last: Int,
     rows: Int,
     pos: Int,
     seen: Int,
     paged: Bool,
+    ragged: Bool,
     mut out: DeviceVec,
     mut scores: DeviceVec,
     mut partials: DeviceVec,
@@ -2364,6 +2462,12 @@ def _attend_go(
     entries the first token can actually see once the window and the holes are
     taken off. The two callers differ only in how they answer those, which is
     the whole of what paging changes above the kernel.
+
+    `wide` is what the split arithmetic cuts, and it is `count` rounded up when
+    the caller wants the grid to stop changing shape every token. It is separate
+    from `count` because how many slices to launch and how many positions to
+    read are two questions, and rounding the first is free where rounding the
+    second is work. See `SCAN_PAD`.
     """
     if tokens < 1:
         raise Error("attention needs at least one query")
@@ -2413,7 +2517,7 @@ def _attend_go(
             + " sinks should never produce"
         )
     var slot = spec.head_dim + 2
-    var chunks = _attend_chunks(spec.heads, tokens, count)
+    var chunks = _attend_chunks(spec.heads, tokens, wide)
     var room = partials.elements() // (tokens * spec.heads * slot)
     if chunks > room:
         chunks = room
@@ -2428,6 +2532,8 @@ def _attend_go(
             keys,
             values,
             cells,
+            seats,
+            bases,
             count,
             pos,
             out,
@@ -2440,6 +2546,7 @@ def _attend_go(
             last,
             chunks,
             paged,
+            ragged,
         )
     else:
         _attend_launch[CACHE_F16](
@@ -2449,6 +2556,8 @@ def _attend_go(
             keys,
             values,
             cells,
+            seats,
+            bases,
             count,
             pos,
             out,
@@ -2461,6 +2570,7 @@ def _attend_go(
             last,
             chunks,
             paged,
+            ragged,
         )
 
 
@@ -2473,6 +2583,8 @@ def _attend_launch[
     keys: DeviceHalf,
     values: DeviceHalf,
     cells: Pointer[Int32, MutAnyOrigin],
+    seats: Pointer[Int32, MutAnyOrigin],
+    bases: Pointer[Int32, MutAnyOrigin],
     count: Int,
     pos: Int,
     mut out: DeviceVec,
@@ -2485,6 +2597,7 @@ def _attend_launch[
     last: Int,
     chunks: Int,
     paged: Bool,
+    ragged: Bool,
 ) raises:
     """The launches, once the shape and the form are settled.
 
@@ -2500,6 +2613,8 @@ def _attend_launch[
                 scores.ptr(),
                 out.ptr(),
                 cells,
+                seats,
+                bases,
                 Int32(count),
                 Int32(pos),
                 Int32(spec.head_dim),
@@ -2511,6 +2626,7 @@ def _attend_launch[
                 Int32(width),
                 Int32(last),
                 Int32(1) if paged else Int32(0),
+                Int32(1) if ragged else Int32(0),
                 spec.scale,
                 spec.softcap,
                 grid_dim=(spec.heads, tokens, 1),
@@ -2524,6 +2640,8 @@ def _attend_launch[
             scores.ptr(),
             partials.ptr(),
             cells,
+            seats,
+            bases,
             Int32(count),
             Int32(pos),
             Int32(spec.head_dim),
@@ -2536,6 +2654,7 @@ def _attend_launch[
             Int32(last),
             Int32(chunks),
             Int32(1) if paged else Int32(0),
+            Int32(1) if ragged else Int32(0),
             spec.scale,
             spec.softcap,
             grid_dim=(spec.heads, tokens, chunks),

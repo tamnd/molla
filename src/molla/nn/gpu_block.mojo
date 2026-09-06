@@ -549,6 +549,10 @@ struct DeviceScratch(Movable):
     var chunk: Int
     """How many tokens this scratch is sized for. One, for a decode."""
 
+    var seqs: Int
+    """How many rows of logits this has room for, which is how many sequences a
+    pass using it may answer."""
+
     var tracing: Bool
     """Whether `device_forward` records the residual stream as it goes. Off.
 
@@ -567,6 +571,7 @@ struct DeviceScratch(Movable):
         context: Int,
         vocab: Int,
         chunk: Int = 1,
+        seqs: Int = 1,
     ) raises:
         """Sized for `chunk` tokens at once, which is one unless this is prefill.
 
@@ -574,6 +579,11 @@ struct DeviceScratch(Movable):
         scale with the chunk and the context together, which is what decides
         how large a chunk is worth having. See
         [docs/validation/prefill.md](../../../docs/validation/prefill.md).
+
+        The logits scale with `seqs` instead, because a chunk of a hundred
+        tokens has one token worth reading and a batch of four sequences has
+        four however many tokens they brought between them. One unless a
+        scheduler is putting more than one sequence in a pass.
         """
         if context <= 0:
             raise Error("a layer needs room for at least one position")
@@ -581,6 +591,8 @@ struct DeviceScratch(Movable):
             raise Error("a model needs a vocabulary to write logits into")
         if chunk <= 0:
             raise Error("a pass has to carry at least one token")
+        if seqs <= 0:
+            raise Error("a pass has to answer at least one sequence")
         # Everything a matmul reads is rounded up to a whole block of tokens,
         # because the dead lanes of a short chunk read past its last token
         # rather than clamping onto it. See `planar_matmul_kernel`. At the
@@ -602,9 +614,10 @@ struct DeviceScratch(Movable):
         self.partials = DeviceVec(
             ctx, attend_partials(spec.attn, chunk, context)
         )
-        self.logits = DeviceVec(ctx, vocab)
+        self.logits = DeviceVec(ctx, seqs * vocab)
         self.ids = DeviceVec(ctx, chunk)
         self.chunk = chunk
+        self.seqs = seqs
         self.tracing = False
         self.trace = List[Float32]()
 
@@ -790,8 +803,7 @@ def device_attention(
             s.q,
             keys,
             values,
-            paging.order,
-            paging.index,
+            paging,
             pos + 1,
             pos,
             s.heads_out,
@@ -1504,18 +1516,59 @@ def _finish(
     run: Int,
 ) raises:
     """The final norm, the output head and the cap, for whichever path ran."""
-    device_rms_norm(
-        ctx,
-        x,
-        m.output_norm,
-        s.norm,
-        m.specs[0].eps,
-        1,
-        (run - 1) * m.width(),
-    )
-    device_matvec_into(ctx, m.head, s.norm, s.logits)
+    var rows = List[Int](length=1, fill=run - 1)
+    _finish_rows(ctx, m, s, x, rows)
+
+
+def _finish_rows(
+    ctx: DeviceContext,
+    m: DeviceModel,
+    mut s: DeviceScratch,
+    mut x: DeviceVec,
+    rows: List[Int],
+) raises:
+    """The same, for one row of the residual stream per sequence answered.
+
+    A pass of one sequence answers its last token and that is one row. A batch
+    answers the last token each of its sequences brought, which is a row each
+    and not the last row of the chunk, since the sequence that finished the
+    chunk is only the one that happened to be packed last.
+
+    One norm and one matvec a row rather than a batched pair of them, because
+    the rows are few and far apart. A chunk of five hundred tokens has one row
+    worth reading and a batch of sixteen sequences has sixteen, so the launch
+    count is the sequence count and the work is the same work either way. What
+    would not be the same is normalising the rows in between.
+    """
+    if len(rows) < 1:
+        raise Error("a pass has to answer at least one sequence")
+    if len(rows) > s.seqs:
+        raise Error(
+            "a pass answering "
+            + String(len(rows))
+            + " sequences has room for "
+            + String(s.seqs)
+        )
+    for k in range(len(rows)):
+        if rows[k] < 0:
+            raise Error(
+                "sequence " + String(k) + " answers from row " + String(rows[k])
+            )
+        device_rms_norm(
+            ctx,
+            x,
+            m.output_norm,
+            s.norm,
+            m.specs[0].eps,
+            1,
+            rows[k] * m.width(),
+            False,
+        )
+        device_matvec_into(ctx, m.head, s.norm, s.logits, k * m.vocab())
     if m.arch.final_softcap > 0:
-        device_softcap(ctx, s.logits, m.arch.final_softcap, m.vocab())
+        device_softcap(
+            ctx, s.logits, m.arch.final_softcap, len(rows) * m.vocab()
+        )
     if s.tracing:
         # One more after the final norm, so the output head sits between the
         # last snapshot and the logits with nothing else in it. Brought back
@@ -1600,6 +1653,7 @@ def device_forward(
     mut values: List[DeviceHalf],
     mut paging: DevicePaging,
     form: Int = CACHE_F16,
+    rows: List[Int] = List[Int](),
 ) raises:
     """A run of tokens through the whole stack, logits left on the device.
 
@@ -1618,6 +1672,18 @@ def device_forward(
     caller can do anything with and the output head is the largest single
     projection in the pass. See
     [docs/validation/prefill.md](../../../docs/validation/prefill.md).
+
+    `rows` is what a batch says instead. Each entry is a token of the chunk whose
+    logits somebody wants, which is the last token each sequence in the batch
+    brought, and the logits come back in that order at a vocabulary apiece. An
+    empty list is the run's last token, which is what a single sequence wants and
+    what every caller wanted before there was a batch.
+
+    A batch sets `paging.ragged` before it gets here, by calling `mixed` with a
+    position and a list start for each of its tokens, and then `pos` is the
+    deepest position in the batch rather than the chunk's base. Everything below
+    reads the descriptor rather than the base, so what `pos` is left doing is
+    sizing the scratch for the token that needs the most of it.
     """
     var count = m.block_count()
     if len(keys) != count or len(values) != count:
@@ -1657,4 +1723,17 @@ def device_forward(
             form,
         )
         s.record(ctx, x)
-    _finish(ctx, m, s, x, run)
+    if len(rows) == 0:
+        _finish(ctx, m, s, x, run)
+        return
+    for k in range(len(rows)):
+        if rows[k] >= run:
+            raise Error(
+                "sequence "
+                + String(k)
+                + " answers from token "
+                + String(rows[k])
+                + " of a run of "
+                + String(run)
+            )
+    _finish_rows(ctx, m, s, x, rows)
