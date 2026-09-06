@@ -728,36 +728,34 @@ def test_attend_paged(mut suite: Suite, ctx: DeviceContext) raises:
     # of these is a token reading somebody else's key or reading off the end of
     # the buffer, and a kernel is a bad place to find that out.
     var wide = DevicePaging(ctx, 4, 20)
-    var spots = List[Int32](length=4, fill=0)
-    var firsts = List[Int32](length=4, fill=0)
     var too_many = False
     try:
-        wide.mixed(spots, firsts, 5)
+        wide.mixed(5)
     except:
         too_many = True
     suite.check(too_many, "a batch wider than the chunk is refused")
 
     var backwards = False
-    spots[1] = Int32(-1)
+    wide.spots[1] = Int32(-1)
     try:
-        wide.mixed(spots, firsts, 2)
+        wide.mixed(2)
     except:
         backwards = True
     suite.check(backwards, "and a token at a negative position")
-    spots[1] = Int32(0)
+    wide.spots[1] = Int32(0)
 
     var overrun = False
-    spots[1] = Int32(7)
-    firsts[1] = Int32(16)
+    wide.spots[1] = Int32(7)
+    wide.firsts[1] = Int32(16)
     try:
-        wide.mixed(spots, firsts, 2)
+        wide.mixed(2)
     except:
         overrun = True
     suite.check(overrun, "and a list that runs off the end of the index")
 
-    spots[1] = Int32(3)
-    firsts[1] = Int32(10)
-    wide.mixed(spots, firsts, 2)
+    wide.spots[1] = Int32(3)
+    wide.firsts[1] = Int32(10)
+    wide.mixed(2)
     suite.check(
         wide.ragged and Int(wide.firsts[1]) == 10,
         "a batch that fits is taken and says the pass is ragged",

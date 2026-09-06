@@ -76,7 +76,7 @@ Five, and the first two are single sequence changes with a bit identical gate, w
 
 **A batch of sequences.** The per token descriptor arrives, `device_forward` stops taking one `pos` and one window, and two sequences share a pass. The check is that a batch of two run together gives each of them what it gets run alone.
 
-**The loop.** Slots, admission, and one batch a step built from everything that has work. Chunked prefill falls out. The check is sixteen streams on the 4090.
+**The loop.** Slots, admission, and one batch a step built from everything that has work. Chunked prefill falls out. The check is sixteen streams on the 4090. Split in two, because admission is a thing the pass below can be tested against and the loop is a thing the runner above has to drive.
 
 **Fairness.** FIFO by default and a round robin by session, so one long generation cannot hold a shared server. The check is that a long stream and a short one interleave.
 
@@ -113,7 +113,21 @@ Logits are a row a sequence. `device_forward` takes a list of token indices whos
 
 The final norm needed one word of help. It reads one row out of the residual stream, and its check for a caller that wired the wrong gain in keys off the row being the whole vector, which the first row of a wide stream also looks like. So the caller says which it means. That is the whole of the change outside the descriptor.
 
-What is not here is the scheduler. `DeviceKvCache.place` still allocates for one sequence and writes its list at the front of the index, because handing out regions of the index and cells to more than one sequence is stage four's job and there is no admission to do it under yet. The gate lays out two regions by hand and drives `CellTable` directly, which is the honest way to test a pass that nothing above it can yet build.
+What is not here is the loop. A pass can carry a batch and nothing above it builds one, so the step that decides which sequences go into a batch is still ahead.
+
+## What admission came out as
+
+Stage four's first half, the part that hands out the index.
+
+A lease is the reservation and it is a region of the index, not a count of cells. That is the one thing here worth stating plainly, because it makes two problems into one. A sequence admitted for `n` positions gets `n` index entries, and it can hold at most `n` cells because a cell it holds is a position it wrote and every position it writes has an entry. So admitting the region is admitting the cells, and there is nothing to keep in step. The index stays one buffer the size of the pool rather than a buffer per sequence, which is what the section above says it costs to hold on the card.
+
+Regions are handed out first fit and coalesced when they come back. First fit over best fit because there are a few dozen regions at most, both policies fragment, and the one that is easier to reason about is the one whose failures can be described. Coalescing on release is what makes a pool that has been fully drained one region again whatever order the sequences left in, and that is checked rather than assumed.
+
+A fresh cache gives its whole index to sequence zero. So a session that has never heard of admission gets the cache it always had, one region at the front as long as the context, and a scheduler's first move is to evict that and admit its own. The single sequence path did not change and does not know any of this happened.
+
+`place_for` is `place` with two more arguments and it is where the descriptor gets filled. It takes the sequence, and it takes where that sequence's tokens sit in the step's chunk. Everything a token says about itself is written at that subscript by the call that allocated its cell, because that call is the one thing that knows both the token's position and where its region starts. Committing the descriptor is separate and happens once a step. So a batch of sixteen is sixteen `place_for` calls and one `mixed`, and nothing walks the batch a second time to work out what the first walk already knew.
+
+What is still ahead is the step loop itself: which sequences go into a batch, how a prompt too long for the cap is cut, and what happens when a sequence finishes mid batch.
 
 ## What done means
 

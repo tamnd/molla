@@ -625,15 +625,6 @@ struct DevicePaging(Movable):
     var firsts: List[Int32]
     """The host side of `bases`."""
 
-    var reach: Int
-    """How many entries of `order` the host has written, which is the sequence's
-    length. Everything above it is negative, which is what lets a decode round
-    its scan up to `SCAN_PAD` without reading a cell that is not its own."""
-
-    var sent: Int
-    """How many entries of `index` the card has, which is `reach` once a paged
-    step has run and less than it while the passes are still contiguous."""
-
     var on: Bool
     """Whether this pass is paged at all."""
 
@@ -658,8 +649,6 @@ struct DevicePaging(Movable):
         self.order = List[Int32](length=pool, fill=-1)
         self.spots = List[Int32](length=chunk, fill=0)
         self.firsts = List[Int32](length=chunk, fill=0)
-        self.reach = 0
-        self.sent = 0
         self.on = False
         self.ragged = False
         # Every token's list starts at the front until a batch says otherwise,
@@ -691,22 +680,29 @@ struct DevicePaging(Movable):
         for i in range(len(self.order)):
             self.order[i] = Int32(-1)
         self.index.queue_in(self.order)
-        self.reach = 0
-        self.sent = 0
         self.on = False
 
-    def queue(mut self, at: Int, count: Int) raises:
-        """Send the step's cells whole and the index entries it just wrote.
+    def queue_cells(mut self) raises:
+        """Send the cell a token writes through, for the whole chunk.
 
-        The cell vector is one entry a token of a chunk, so a kilobyte, and it
-        goes whole because a partial copy of it would save nothing. The index is
-        as long as the pool and only ever grows at the end, so what a step has
-        to send is the run it appended: a chunk at prefill and one entry at each
-        decode after it. See `DeviceInts.queue_span`.
+        One entry a token of a chunk, so a kilobyte, and it goes whole because a
+        partial copy of it would save nothing. A step sends this once however
+        many sequences it carries, since the cells of all of them sit in the one
+        vector at the subscripts their tokens occupy.
 
         On the stream the kernels are queued on and ahead of them.
         """
         self.cells.queue_in(self.slots)
+
+    def queue_index(mut self, at: Int, count: Int) raises:
+        """Send `count` entries of the index from `at`, and nothing else.
+
+        The index is as long as the pool and a sequence only ever appends to its
+        own region of it, so what a step has to send for a sequence is the run
+        it appended: its region at prefill and one entry at each decode after
+        it. A step carrying sixteen sequences sends sixteen of these, because
+        the regions are not next to each other. See `DeviceInts.queue_span`.
+        """
         self.index.queue_span(self.order, at, count)
 
     def steady(mut self, base: Int, count: Int) raises:
@@ -731,10 +727,8 @@ struct DevicePaging(Movable):
         self.seats.queue_in(self.spots)
         self.bases.queue_in(self.firsts)
 
-    def mixed(
-        mut self, spots: List[Int32], firsts: List[Int32], count: Int
-    ) raises:
-        """Fill the positions and the list starts for a batch of sequences.
+    def mixed(mut self, count: Int) raises:
+        """Check the positions and list starts already here, and send them.
 
         What `steady` does when the tokens of a step belong to one sequence and
         the positions run. Here they do not: token `i` sits at `spots[i]` for
@@ -742,6 +736,12 @@ struct DevicePaging(Movable):
         at `firsts[i]`. Two tokens of the same sequence carry the same start, and
         that repetition is what makes this one integer a token rather than a
         second structure saying which sequence a token belongs to.
+
+        The two lists are read rather than passed, because what fills them is a
+        cell allocation, which knows a token's position and its sequence's region
+        at the moment it hands the cell out. A batch calls that once a sequence
+        and this once, which is the difference between filling a descriptor and
+        committing it.
 
         A ragged pass is a paged pass. Two sequences cannot both be the cache's
         leading run, so the moment a step carries tokens of more than one there
@@ -755,19 +755,9 @@ struct DevicePaging(Movable):
                 + " tokens does not fit a chunk of "
                 + String(self.chunk())
             )
-        if len(spots) < count or len(firsts) < count:
-            raise Error(
-                "a step of "
-                + String(count)
-                + " tokens got "
-                + String(len(spots))
-                + " positions and "
-                + String(len(firsts))
-                + " list starts"
-            )
         for i in range(count):
-            var p = Int(spots[i])
-            var f = Int(firsts[i])
+            var p = Int(self.spots[i])
+            var f = Int(self.firsts[i])
             if p < 0:
                 raise Error(
                     "token " + String(i) + " sits at position " + String(p)
@@ -783,8 +773,6 @@ struct DevicePaging(Movable):
                     + ", which runs past a pool of "
                     + String(self.pool())
                 )
-            self.spots[i] = spots[i]
-            self.firsts[i] = firsts[i]
         self.ragged = True
         self.seats.queue_in(self.spots)
         self.bases.queue_in(self.firsts)

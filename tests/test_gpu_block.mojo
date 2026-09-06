@@ -957,31 +957,24 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                         cache_worst = gap
 
         # Two sequences in one pass, which is the gate #32 stage three is for.
-        # One pool holds both of them. Sequence zero's list of cells sits at the
-        # front of the index and sequence one's at the halfway mark, and a token
-        # says which list is its own by carrying the offset that list starts at.
-        # That offset is the whole descriptor, because the number of entries a
-        # token reads is its own position plus one and it already carries its
-        # position.
-        #
-        # Nothing here goes through `DeviceKvCache.place`, and that is on
-        # purpose. `place` writes one sequence's list at the front of the index
-        # and hands out the cells for one sequence, which is right for the
-        # session that owns the cache and is exactly what the scheduler in stage
-        # four replaces. What is under test here is the pass, so the cells and
-        # the two regions are laid out by hand and `CellTable.route` fills each
-        # region the way it was written to.
+        # One pool holds both of them. Each takes a region of the index through
+        # `admit`, and a token says which list is its own by carrying the offset
+        # its region starts at. That offset is the whole descriptor, because the
+        # number of entries a token reads is its own position plus one and it
+        # already carries its position.
         var mid = CONTEXT // 2
         var duo = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, 4, 2)
         var duox = DeviceVec(ctx, (4 + SPAN * MM_GROUPS) * WIDTH)
         var solo = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, 4)
         var solox = DeviceVec(ctx, (4 + SPAN * MM_GROUPS) * WIDTH)
         var shared = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+        # A fresh cache gives its whole index to the sequence a session owns, so
+        # the first thing anything scheduling several of them does is take that
+        # back and hand out regions of its own. Two here, half the context each.
+        shared.evict(0)
         var starts = List[Int]()
-        starts.append(0)
-        starts.append(mid)
-        var spots = List[Int32](length=4, fill=0)
-        var firsts = List[Int32](length=4, fill=0)
+        for _ in range(2):
+            starts.append(shared.leases[shared.admit(mid)].base)
         var alone = Buffer(2 * VOCAB)
         var together = Buffer(2 * VOCAB)
         var one_out = Buffer(VOCAB)
@@ -1031,22 +1024,14 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             for i in range(VOCAB):
                 alone.data[q * VOCAB + i] = one_out.data[i]
 
-            # And the same prompt into the shared pool, in its own region. The
-            # index goes up whole rather than a span at a time because the two
-            # regions are not next to each other, and a scheduler that appends a
-            # token to each of sixteen sequences has sixteen spans to send. That
-            # is stage four's problem and it does not change what the kernels
-            # read.
-            for i in range(n):
-                var cell = shared.table.alloc(q, i)
-                shared.paging.slots[i] = Int32(cell)
-                spots[i] = Int32(i)
-                firsts[i] = Int32(starts[q])
-            shared.table.route(q, n, shared.paging.order, starts[q])
-            shared.paging.on = True
-            shared.paging.cells.queue_in(shared.paging.slots)
-            shared.paging.index.queue_in(shared.paging.order)
-            shared.paging.mixed(spots, firsts, n)
+            # And the same prompt into the shared pool, in its own region. One
+            # call takes the cells and fills the descriptor for this sequence's
+            # share of the step, because whatever hands a cell out is the thing
+            # that knows both the token's position and where its region starts.
+            # Committing the descriptor is separate and happens once a step, so
+            # a batch of sixteen is sixteen of these and still one `mixed`.
+            _ = shared.place_for(q, 0, n, True)
+            shared.paging.mixed(n)
             if shared.paging.ragged:
                 pair_prefill += 1
             device_forward(
@@ -1063,21 +1048,17 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             )
 
         # One step carrying a decode of each. The positions are four and three,
-        # the list starts are zero and the halfway mark, and `pos` is the deeper
-        # of the two positions because all it does now is size the scratch for
-        # the token that needs the most of it.
+        # the list starts are the two regions, and `pos` is the deeper of the
+        # two positions because all it does now is size the scratch for the
+        # token that needs the most of it. `at` is where a sequence's token sits
+        # in the step, which is what makes the step one batch rather than two
+        # passes that happen to share a pool.
         var both = List[Int]()
         for q in range(2):
             var n = 4 - q
-            var cell = shared.table.alloc(q, n)
-            shared.paging.slots[q] = Int32(cell)
-            shared.paging.order[starts[q] + n] = Int32(cell)
-            spots[q] = Int32(n)
-            firsts[q] = Int32(starts[q])
+            _ = shared.place_for(q, n, 1, True, q)
             both.append(tokens[q * 8 + n])
-        shared.paging.cells.queue_in(shared.paging.slots)
-        shared.paging.index.queue_in(shared.paging.order)
-        shared.paging.mixed(spots, firsts, 2)
+        shared.paging.mixed(2)
         var want_rows = List[Int]()
         want_rows.append(0)
         want_rows.append(1)
@@ -1150,6 +1131,24 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             )
         except:
             pair_over = True
+
+        # Admission on its own, now that the pool it is handing out has been
+        # used. Nothing is left to give while both regions are held, and once
+        # they are given back the two halves have to be one region again rather
+        # than two holes side by side.
+        var admit_over = False
+        try:
+            _ = shared.admit(CONTEXT)
+        except:
+            admit_over = True
+        shared.evict(0)
+        shared.evict(1)
+        var gave_back = shared.admitted() == 0 and shared.spare() == CONTEXT
+        var rejoined = True
+        try:
+            _ = shared.admit(CONTEXT)
+        except:
+            rejoined = False
 
         keep(pool)
         keep(blob)
@@ -1369,4 +1368,16 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         suite.check(
             pair_over,
             "a batch wanting more answers than the scratch holds is refused",
+        )
+        suite.check(
+            starts[0] != starts[1],
+            "two admitted sequences read two regions of one index",
+        )
+        suite.check(
+            admit_over,
+            "and a sequence wanting more than is left is refused",
+        )
+        suite.check(gave_back, "and evicting both hands the whole index back")
+        suite.check(
+            rejoined, "and the halves that come back are one region again"
         )

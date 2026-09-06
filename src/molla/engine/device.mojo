@@ -53,7 +53,13 @@ from std.sys.info import CompilationTarget, has_accelerator
 from max.gpu.host import DeviceContext
 
 from molla.engine.bind import Bound
-from molla.engine.cache import CELL_FREE, CellTable, check_room, slot_of
+from molla.engine.cache import (
+    CELL_FREE,
+    MAX_SEQS,
+    CellTable,
+    check_room,
+    slot_of,
+)
 from molla.engine.sample import Sampler
 from molla.model.gguf import Gguf
 from molla.model.load import Weights, device_refusal, load, plan_load
@@ -130,6 +136,61 @@ got longer, and the fused path spreads the same step over more of the grid.
 """
 
 
+struct Lease(Copyable, Movable):
+    """One admitted sequence's claim on the pool, and where its list lives.
+
+    A sequence is admitted for a number of positions, and what it gets for them
+    is a region of the index that many entries long. The cells themselves are
+    not reserved, because `CellTable` hands those out one at a time and a region
+    of the index is the reservation: a sequence with room for four thousand
+    entries can hold four thousand cells and no more, so admitting one is
+    admitting the other. That is why the index is the size of the pool and not
+    the size of the pool times the sequence count. See
+    [docs/validation/batching.md](../../../docs/validation/batching.md).
+
+    Everything here is a fact about one sequence. `reach` and `sent` lived on
+    `DevicePaging` while there was one sequence to have them and moved here when
+    there were several, which is the same move the index itself made a stage
+    earlier.
+    """
+
+    var base: Int
+    """Where this sequence's list of cells starts in `DevicePaging.order`."""
+
+    var room: Int
+    """Entries admission reserved, which is the positions it may hold."""
+
+    var end: Int
+    """Positions written so far.
+
+    Everything from here to `room` is negative in the index, which is what lets
+    a decode round its scan up to `SCAN_PAD` without reading a cell that is not
+    its own."""
+
+    var sent: Int
+    """How many of those entries the card has, which is `end` once a paged step
+    has run and less than it while the passes are still contiguous."""
+
+    var live: Bool
+    """Whether the sequence is still admitted."""
+
+    var straight: Bool
+    """Whether every cell it holds is the position it holds.
+
+    True from an empty pool for the first sequence admitted, because the free
+    list hands cells out in order. False for the second, whose first cell is
+    wherever the first one got to, and that is the day the fused decode stops
+    being available to it."""
+
+    def __init__(out self, base: Int, room: Int, live: Bool = True):
+        self.base = base
+        self.room = room
+        self.end = 0
+        self.sent = 0
+        self.live = live
+        self.straight = True
+
+
 struct DeviceKvCache(Movable):
     """A pool of cells, in device memory, a window per layer.
 
@@ -196,19 +257,36 @@ struct DeviceKvCache(Movable):
     """The two index vectors a step hands the kernels, refilled once a pass."""
 
     var seq: Int
-    """Which sequence this cache is writing for. Zero, until there is a
-    scheduler to hand out another one."""
+    """Which sequence a caller that names none is writing for.
+
+    Zero, and admitted for the whole pool when the cache is made, so a session
+    that knows nothing about admission gets what it always got. A scheduler
+    admits the others."""
+
+    var leases: List[Lease]
+    """One entry per sequence id `CellTable` knows, admitted or not."""
+
+    var free_at: List[Int]
+    var free_len: List[Int]
+    """Regions of the index nobody holds, ascending and never adjacent.
+
+    Two lists rather than a list of pairs, because a struct with two integers in
+    it is a struct to declare and to move for the sake of a few dozen entries.
+    Adjacency is what `evict` coalesces, and it matters: a server that admits and
+    releases all day would otherwise saw the index into pieces none of which
+    fits the next request, while the total free stayed large enough.
+    """
 
     var straight: Bool
-    """Whether every cell this sequence holds is the position it holds.
+    """Whether every cell the default sequence holds is the position it holds.
 
     True from an empty pool for one sequence, because the free list hands cells
     out in order, and it is what lets the fused decode keep addressing the cache
     by position. That kernel reads a run and has no mask, so the day this goes
     false is the day a decode has to come back to the unfused path until #170
-    stage two teaches the fused one to page. Nothing sets it false yet, and the
-    check is here rather than an assumption because the failure it would prevent
-    is fluent text about the wrong context.
+    stage two teaches the fused one to page. Admitting a second sequence sets it
+    false and it does not come back until the cache is reset, because the cells
+    that sequence took are interleaved with the first one's for good.
     """
 
     def __init__(
@@ -247,6 +325,16 @@ struct DeviceKvCache(Movable):
         self.paging = DevicePaging(ctx, chunk, context)
         self.seq = 0
         self.straight = True
+        self.leases = List[Lease]()
+        for _ in range(MAX_SEQS):
+            self.leases.append(Lease(0, 0, False))
+        # The default sequence takes the whole index and there is nothing free,
+        # so a session that never heard of admission gets the cache it always
+        # got: one region at the front, as long as the context. A scheduler
+        # calls `release_all` on it and admits its own.
+        self.leases[0] = Lease(0, context)
+        self.free_at = List[Int]()
+        self.free_len = List[Int]()
         var per = context * self.row
         self.pool = DeviceHalf(ctx, 2 * layers * per)
         self.keys = List[DeviceHalf]()
@@ -261,11 +349,150 @@ struct DeviceKvCache(Movable):
         return self.pool.elements() * 2
 
     def reset(mut self) raises:
-        """Forget the sequence without giving back the memory."""
+        """Forget every sequence without giving back the memory."""
         self.filled = 0
         self.table.reset()
         self.straight = True
         self.paging.forget()
+        for i in range(len(self.leases)):
+            self.leases[i] = Lease(0, 0, False)
+        self.leases[0] = Lease(0, self.context)
+        self.free_at.clear()
+        self.free_len.clear()
+
+    def admitted(self) -> Int:
+        """How many sequences hold a region right now."""
+        var n = 0
+        for i in range(len(self.leases)):
+            if self.leases[i].live:
+                n += 1
+        return n
+
+    def spare(self) -> Int:
+        """Positions the index has left over, across every free region.
+
+        Not what the next request can have, which is the largest free region and
+        not the total. `admit` reports both when it refuses, because a caller
+        that sees a large total and a refusal deserves to be told which of the
+        two numbers stopped it.
+        """
+        var n = 0
+        for i in range(len(self.free_len)):
+            n += self.free_len[i]
+        return n
+
+    def admit(mut self, room: Int) raises -> Int:
+        """Take a region of the index `room` positions long, and say for whom.
+
+        This is #32's admission rule and the whole of it: a request is admitted
+        when its worst case fits and refused when it does not. Over admitting
+        and then preempting is worse than waiting, because a preempted sequence
+        recomputes its prefill and the work it already did is gone.
+
+        First fit over the free regions rather than best fit. The regions are a
+        few dozen at most and both policies fragment, so the one that is easier
+        to reason about wins. Adjacent free regions are coalesced by `evict`, so
+        a pool that has been fully released is one region again whatever order
+        the sequences left in.
+
+        The sequence id is the caller's handle and it is what `CellTable` knows
+        the sequence by, so a cell's owner and a lease's subscript are the same
+        number.
+        """
+        if room < 1:
+            raise Error("a sequence has to be admitted for a position")
+        var pick = -1
+        var most = 0
+        for i in range(len(self.free_len)):
+            if self.free_len[i] > most:
+                most = self.free_len[i]
+            if pick < 0 and self.free_len[i] >= room:
+                pick = i
+        if pick < 0:
+            raise Error(
+                "a sequence wanting "
+                + String(room)
+                + " positions does not fit, the largest region left is "
+                + String(most)
+                + " and the total free is "
+                + String(self.spare())
+            )
+        var seq = -1
+        for i in range(len(self.leases)):
+            if not self.leases[i].live:
+                seq = i
+                break
+        if seq < 0:
+            raise Error(
+                "every one of the "
+                + String(len(self.leases))
+                + " sequence slots is taken"
+            )
+        var base = self.free_at[pick]
+        self.free_at[pick] += room
+        self.free_len[pick] -= room
+        if self.free_len[pick] == 0:
+            _ = self.free_at.pop(pick)
+            _ = self.free_len.pop(pick)
+        self.leases[seq] = Lease(base, room)
+        # Whatever the last tenant of this region left has to go, because a
+        # decode scans past the end of its own list and would read it. The card
+        # gets the clearing now rather than with the first step, since a step
+        # only sends what it wrote.
+        for p in range(base, base + room):
+            self.paging.order[p] = Int32(CELL_FREE)
+        self.paging.queue_index(base, room)
+        if self.admitted() > 1:
+            self.straight = False
+        return seq
+
+    def evict(mut self, seq: Int) raises:
+        """Give back a sequence's cells and its region of the index.
+
+        The cells go through `release_all`, which is the same call a session
+        makes when it is done, and the region goes back into the free list next
+        to whatever it is adjacent to. Nothing is written into the index here,
+        because `admit` clears a region when it hands it out and clearing it
+        twice is a copy nobody reads.
+        """
+        self._check_seq(seq)
+        if not self.leases[seq].live:
+            raise Error(
+                "sequence " + String(seq) + " is not admitted to this pool"
+            )
+        _ = self.table.release_all(seq)
+        var base = self.leases[seq].base
+        var room = self.leases[seq].room
+        self.leases[seq] = Lease(0, 0, False)
+        var at = len(self.free_at)
+        for i in range(len(self.free_at)):
+            if self.free_at[i] > base:
+                at = i
+                break
+        self.free_at.insert(at, base)
+        self.free_len.insert(at, room)
+        # Coalesce with the region after and then the one before, in that order,
+        # so a release between two free regions leaves one and not three.
+        if at + 1 < len(self.free_at):
+            if self.free_at[at] + self.free_len[at] == self.free_at[at + 1]:
+                self.free_len[at] += self.free_len[at + 1]
+                _ = self.free_at.pop(at + 1)
+                _ = self.free_len.pop(at + 1)
+        if at > 0:
+            if self.free_at[at - 1] + self.free_len[at - 1] == self.free_at[at]:
+                self.free_len[at - 1] += self.free_len[at]
+                _ = self.free_at.pop(at)
+                _ = self.free_len.pop(at)
+
+    def _check_seq(self, seq: Int) raises:
+        if seq < 0 or seq >= len(self.leases):
+            raise Error(
+                "sequence "
+                + String(seq)
+                + " is not one of the "
+                + String(len(self.leases))
+                + " this pool has room for"
+            )
 
     def slot_for(self, pos: Int) raises -> Int:
         return slot_of(pos, self.context)
@@ -283,8 +510,27 @@ struct DeviceKvCache(Movable):
     def place(mut self, pos: Int, count: Int, paged: Bool) raises -> Int:
         """Take a cell for each of `count` tokens at `pos`, and say where.
 
+        The default sequence's version of `place_for`, which is what a session
+        that holds the whole pool calls and is every caller outside a scheduler.
+        """
+        return self.place_for(self.seq, pos, count, paged)
+
+    def place_for(
+        mut self, seq: Int, pos: Int, count: Int, paged: Bool, at: Int = 0
+    ) raises -> Int:
+        """Take a cell for each of `count` tokens of `seq` at `pos`.
+
         Returns the first cell, which is the slot the contiguous path writes at
         and is the position itself while `straight` holds.
+
+        `at` is where this sequence's tokens sit in the step's chunk, which is
+        zero for a pass carrying one sequence and is however many tokens the
+        sequences before it contributed otherwise. Everything a token of the
+        batch says about itself gets written at that subscript: the cell it
+        stores through, the position it sits at, and the offset its list starts
+        at. So a batch is a `place_for` a sequence and then one `paging.mixed`,
+        and the descriptor is filled by whatever knew the answer rather than
+        rebuilt afterwards by something that has to work it out again.
 
         `paged` is what the caller wants rather than what it gets. A pass over
         cells that are not the positions they hold has to be paged whatever the
@@ -297,37 +543,52 @@ struct DeviceKvCache(Movable):
         handed back and finding it later would be a scan of the pool. What the
         pass being paged decides is how much of it the card is sent: everything
         the card has not seen, which after the first paged step is the tokens of
-        this one. See `DevicePaging.queue`.
+        this one. See `DevicePaging.queue_index`.
         """
+        self._check_seq(seq)
+        if not self.leases[seq].live:
+            raise Error(
+                "sequence " + String(seq) + " is not admitted to this pool"
+            )
         if count < 1:
             raise Error("a step has to place at least one token")
-        if count > self.paging.chunk():
+        if at < 0 or at + count > self.paging.chunk():
             raise Error(
                 "a step of "
                 + String(count)
-                + " tokens has room for "
+                + " tokens at "
+                + String(at)
+                + " has room for "
                 + String(self.paging.chunk())
                 + " cells"
             )
-        if pos < 0 or pos + count > self.context:
+        if pos < 0 or pos + count > self.leases[seq].room:
             raise Error(
                 "a step of "
                 + String(count)
                 + " tokens at "
                 + String(pos)
-                + " runs past a context of "
-                + String(self.context)
+                + " runs past the "
+                + String(self.leases[seq].room)
+                + " positions sequence "
+                + String(seq)
+                + " was admitted for"
             )
         check_room(count, self.table.free(), self.table.size())
+        var base = self.leases[seq].base
         var first = -1
         for i in range(count):
-            var cell = self.table.alloc(self.seq, pos + i)
+            var cell = self.table.alloc(seq, pos + i)
             if cell != pos + i:
-                self.straight = False
+                self.leases[seq].straight = False
+                if seq == self.seq:
+                    self.straight = False
             if i == 0:
                 first = cell
-            self.paging.slots[i] = Int32(cell)
-            self.paging.order[pos + i] = Int32(cell)
+            self.paging.slots[at + i] = Int32(cell)
+            self.paging.spots[at + i] = Int32(pos + i)
+            self.paging.firsts[at + i] = Int32(base)
+            self.paging.order[base + pos + i] = Int32(cell)
         # A step that goes back over ground the sequence has already covered
         # leaves its old cells sitting above the new end, and a decode scan
         # rounded up to `SCAN_PAD` would read them. So the tail is cleared, and
@@ -335,21 +596,22 @@ struct DeviceKvCache(Movable):
         # whoever notices.
         var end = pos + count
         var upto = end
-        if self.paging.reach > end:
-            upto = self.paging.reach
+        if self.leases[seq].end > end:
+            upto = self.leases[seq].end
             for p in range(end, upto):
-                self.paging.order[p] = Int32(CELL_FREE)
-        self.paging.reach = end
+                self.paging.order[base + p] = Int32(CELL_FREE)
+        self.leases[seq].end = end
         self.paging.on = paged or not self.straight
         if self.paging.on:
             # From wherever the card has got to, which is this step's own tokens
             # unless the passes before it were contiguous and left the card with
             # nothing, and then it is the whole sequence, once.
-            var at = self.paging.sent
-            if at > pos:
-                at = pos
-            self.paging.queue(at, upto - at)
-            self.paging.sent = end
+            var since = self.leases[seq].sent
+            if since > pos:
+                since = pos
+            self.paging.queue_cells()
+            self.paging.queue_index(base + since, upto - since)
+            self.leases[seq].sent = end
         return first
 
 
