@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Changed
+
+- The device KV cache is one allocation rather than two a layer. A thirty two layer model asked the driver for sixty four buffers and now asks for one, and a layer's keys and values are windows on it at a layer's offset. Nothing above the cache can tell, because a window is an ordinary `DeviceHalf`, and it is the same mechanism the weights have used since they were loaded into one pool with a sub buffer a tensor. This is the first of the four stages in [docs/validation/paging.md](docs/validation/paging.md) and it changes no arithmetic, so the logit corpus is unchanged. What it buys is the shape the one kernel a token work needs, which is one pointer and a stride rather than a list of sixty four.
+
+### Added
+
+- [docs/validation/paging.md](docs/validation/paging.md), which is the plan for the paged KV cache of M3 and the reason it is not the design the issue was written against. llama.cpp holds its cache as a flat pool of cells, one cell to one token position, with the owner set as a bitset in host memory and the only device side indirection a vector of cell indices computed once per micro batch. That is paging at a block size of one, and at a block size of one there is no internal fragmentation, no partial block to copy on divergence, and no block table for a kernel to walk. molla takes that shape rather than the block table one, and takes the radix tree that llama.cpp does not have, since a per slot prefix compare shares a chat turn and does not share a system prompt between two unrelated requests.
+
 ## [0.5.0] - 2026-09-06
 
 M2d closes. molla now does what the reference engines do on prefill, and the gap that grew with the model size no longer grows the same way.

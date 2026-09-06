@@ -35,7 +35,7 @@ from molla.model.spec import architecture_id
 from molla.nn.arch import arch_of
 from molla.nn.attention import AttnSpec
 from molla.nn.block import BlockSpec, LayerWeights, Scratch
-from molla.nn.gpu import MM_GROUPS, SPAN, DeviceVec
+from molla.nn.gpu import MM_GROUPS, SPAN, DeviceHalf, DeviceVec
 from molla.nn.gpu_block import (
     DeviceModel,
     DeviceScratch,
@@ -85,7 +85,66 @@ def run(mut suite: Suite) raises:
 
 
 def run_on_device(mut suite: Suite, ctx: DeviceContext) raises:
+    test_pool(suite, ctx)
     test_forward(suite, ctx)
+
+
+def test_pool(mut suite: Suite, ctx: DeviceContext) raises:
+    """The cache is one allocation and a layer's window is where it says.
+
+    Worth its own check rather than leaning on the forward pass, because the
+    forward pass would pass with every window at offset zero as long as it was
+    the only sequence in flight: it writes a layer and reads the same layer, and
+    two layers landing on top of each other shows up as wrong attention several
+    layers later, or not at all on a one layer model. This asks the question
+    directly, which is whether a write through layer `i`'s window lands at
+    layer `i`'s offset in the pool and nowhere else.
+    """
+    suite.group("device cache pool")
+
+    comptime if not has_accelerator():
+        suite.check(True, "skipped, this build has no device code in it")
+        return
+    else:
+        var cache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+        var per = CONTEXT * cache.row
+        suite.check(
+            cache.pool.elements() == 2 * LAYERS * per,
+            "the pool holds every layer's keys and then every layer's values",
+        )
+        suite.check(
+            cache.bytes() == cache.pool.elements() * 2,
+            "and the size it reports is the pool's, at two bytes a half",
+        )
+        suite.check(
+            len(cache.keys) == LAYERS and len(cache.values) == LAYERS,
+            "and there is a window a layer on each side",
+        )
+
+        # A different value at the front of every window, written through the
+        # window and read back through the pool.
+        var one = List[Float32]()
+        one.append(0.0)
+        for i in range(LAYERS):
+            one[0] = Float32(i + 1)
+            cache.keys[i].upload_run(one, 0, 1)
+            one[0] = Float32(-(i + 1))
+            cache.values[i].upload_run(one, 0, 1)
+
+        var placed = True
+        for i in range(LAYERS):
+            if cache.pool.at(i * per) != Float32(i + 1):
+                placed = False
+            if cache.pool.at((LAYERS + i) * per) != Float32(-(i + 1)):
+                placed = False
+        suite.check(placed, "and a write through a window lands at its offset")
+
+        var refused = False
+        try:
+            _ = DeviceHalf(cache.pool, 2 * LAYERS * per, 1)
+        except:
+            refused = True
+        suite.check(refused, "and a window past the end of the pool is refused")
 
 
 def _shapes(mut cols: List[Int], mut rows: List[Int]):
