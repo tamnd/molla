@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-06
+
+Three of the four stages of the paged KV cache, which is #31 and the first item of M3. None of it is wired in yet, so nothing about how molla runs today has changed, and that is deliberate: each stage is testable on its own and the wiring is where #32 starts.
+
+The design is not the one the issue was written against, and [docs/validation/paging.md](docs/validation/paging.md) says why at length. llama.cpp holds its cache as a flat pool of cells, one cell to one token position, with the owner set as a bitset in host memory and the only device side indirection a vector of cell indices computed once per micro batch. That is paging at a block size of one, and at a block size of one there is no internal fragmentation, no partial block to copy when two sequences diverge, and no block table for a kernel to walk. molla takes that shape rather than the block table one.
+
+What landed is one allocation for the whole device cache, a cell table on the host, a scattered store, and a mask that is a position a cell rather than the float a pair llama.cpp uploads. The mask costs eight per cent of decode attention on the 4090 and does not grow with context, which is measured rather than asserted.
+
 ### Changed
 
 - The device KV cache is one allocation rather than two a layer. A thirty two layer model asked the driver for sixty four buffers and now asks for one, and a layer's keys and values are windows on it at a layer's offset. Nothing above the cache can tell, because a window is an ordinary `DeviceHalf`, and it is the same mechanism the weights have used since they were loaded into one pool with a sub buffer a tensor. This is the first of the four stages in [docs/validation/paging.md](docs/validation/paging.md) and it changes no arithmetic, so the logit corpus is unchanged. What it buys is the shape the one kernel a token work needs, which is one pointer and a stride rather than a list of sixty four.
