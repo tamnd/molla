@@ -2233,8 +2233,10 @@ scale and the minimum are read once for its run.
 """
 
 comptime NV_THREADS = 128
-comptime NV_WARP_ROWS = NV_ROWS // 2
-comptime NV_WARP_TOKENS = NV_TOKENS // 2
+comptime NV_WARPS = NV_THREADS // WARP_SIZE
+comptime NV_WARP_COLS = 2
+comptime NV_WARP_ROWS = NV_ROWS // (NV_WARPS // NV_WARP_COLS)
+comptime NV_WARP_TOKENS = NV_TOKENS // NV_WARP_COLS
 comptime NV_FR = NV_WARP_ROWS // 8
 comptime NV_FT = NV_WARP_TOKENS // 16
 """Four warps, two by two, each covering thirty two rows and thirty two tokens.
@@ -2242,6 +2244,10 @@ comptime NV_FT = NV_WARP_TOKENS // 16
 The instruction is sixteen by eight by sixteen with the tokens on the sixteen
 side, so a warp's tokens are `NV_FT` fragments and its rows are `NV_FR` of them,
 which is eight accumulators of four floats a lane.
+
+Written in terms of the tile rather than as constants of their own, so that
+sweeping the tile is `NV_ROWS` and `NV_THREADS` and nothing else. A hundred and
+twenty eight rows over eight warps was swept and is in `NV_MIN_BLOCKS`.
 """
 
 comptime NV_ROW_THREADS = NV_THREADS // NV_ROWS
@@ -2356,8 +2362,9 @@ def planar_nvmma_kernel[
     var tid = Int(thread_idx.x)
     var warp = tid // WARP_SIZE
     var lane = tid % WARP_SIZE
-    var wt0 = (warp // 2) * NV_WARP_TOKENS
-    var wr0 = (warp % 2) * NV_WARP_ROWS
+    comptime warp_rows = NV_WARPS // NV_WARP_COLS
+    var wt0 = (warp // warp_rows) * NV_WARP_TOKENS
+    var wr0 = (warp % warp_rows) * NV_WARP_ROWS
 
     var t0 = Int(block_idx.x) * NV_TOKENS
     var r0 = Int(block_idx.y) * NV_ROWS
