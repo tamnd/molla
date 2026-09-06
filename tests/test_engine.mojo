@@ -14,7 +14,7 @@ tolerance would pass it.
 from harness import Suite
 
 from molla.engine.bind import Bound
-from molla.engine.cache import KvCache
+from molla.engine.cache import CELL_FREE, MAX_SEQS, CellTable, KvCache
 from molla.engine.sample import Sampler, SamplerConfig
 from molla.engine.session import Session
 from molla.model.spec import ARCH_LLAMA, Geometry
@@ -144,6 +144,9 @@ def run(mut suite: Suite) raises:
     test_cache_shape(suite)
     test_cache_room(suite)
     test_cache_errors(suite)
+    test_cells(suite)
+    test_cells_sharing(suite)
+    test_cells_errors(suite)
     test_session_step(suite)
     test_prefill_matches_decode(suite)
     test_generate(suite)
@@ -225,6 +228,179 @@ def test_cache_errors(mut suite: Suite) raises:
     except:
         failed = True
     suite.check(failed, "and neither does one past the end")
+
+
+def test_cells(mut suite: Suite) raises:
+    """A cell holds a position for a sequence, and gives it back.
+
+    The pool here is four cells so that it can be filled, which is the case
+    worth having: a table that never runs out never exercises the wrap in the
+    search or the reuse of a cell somebody let go of.
+    """
+    suite.group("cell table")
+
+    var t = CellTable(4)
+    suite.check(
+        t.size() == 4 and t.free() == 4 and t.live == 0,
+        "a new pool is all free",
+    )
+
+    var a = List[Int]()
+    t.alloc_run(0, 0, 4, a)
+    suite.check(len(a) == 4, "a run of four hands back four cells")
+    suite.check(t.live == 4 and t.free() == 0, "and fills the pool")
+    suite.check(t.position(a[2]) == 2, "a cell knows the position it holds")
+    suite.check(t.owns(a[2], 0), "and the sequence that put it there")
+    suite.check(not t.owns(a[2], 1), "and nobody else")
+    suite.check(t.cell_of(0, 3) == a[3], "a position finds its cell")
+    suite.check(t.held_by(0) == 4, "and the sequence holds all four")
+
+    var full = False
+    try:
+        _ = t.alloc(0, 4)
+    except:
+        full = True
+    suite.check(full, "a full pool refuses the next token")
+
+    suite.check(t.release(0, 0, 2) == 2, "releasing two positions frees two")
+    suite.check(t.live == 2 and t.free() == 2, "and the pool says so")
+    suite.check(
+        t.position(a[0]) == CELL_FREE and t.position(a[1]) == CELL_FREE,
+        "a freed cell holds nothing",
+    )
+    suite.check(
+        t.cell_of(0, 0) == CELL_FREE, "and the position it held is gone"
+    )
+    suite.check(t.held_by(0) == 2, "while the rest of the sequence stays")
+
+    # The search starts where the last one stopped, which after filling the
+    # pool is back at cell zero, so this is the wrap and the reuse at once.
+    var again = t.alloc(0, 4)
+    suite.check(again == a[0], "the next token takes a cell that was let go")
+    suite.check(t.position(again) == 4, "at the position it was asked for")
+
+    var refused = False
+    try:
+        var b = List[Int]()
+        t.alloc_run(1, 0, 2, b)
+    except:
+        refused = True
+    suite.check(refused, "a run that does not fit is refused whole")
+    suite.check(
+        t.free() == 1 and t.held_by(1) == 0,
+        "and leaves nothing of itself behind",
+    )
+
+    t.reset()
+    suite.check(
+        t.free() == 4 and t.held_by(0) == 0, "reset gives every cell back"
+    )
+
+
+def test_cells_sharing(mut suite: Suite) raises:
+    """Two sequences on one set of cells, and neither of them copying.
+
+    This is the property the whole cell form is for. A prefix that two requests
+    share is one set of cells with two bits set, and the first request to leave
+    frees only the part the other one never claimed.
+    """
+    suite.group("cell sharing")
+
+    var t = CellTable(8)
+    var a = List[Int]()
+    t.alloc_run(0, 0, 4, a)
+
+    suite.check(t.share(0, 1, 0, -1) == 4, "sharing a whole sequence is four")
+    suite.check(t.live == 4, "and costs no cells")
+    suite.check(t.held_by(1) == 4, "the second sequence holds the same four")
+    suite.check(t.cell_of(1, 2) == a[2], "and reads them at the same position")
+
+    suite.check(t.release(0, 0, -1) == 0, "the first one leaving frees nothing")
+    suite.check(
+        t.held_by(0) == 0 and t.held_by(1) == 4,
+        "but it does stop holding them",
+    )
+    suite.check(t.release_all(1) == 4, "the last one out frees all four")
+    suite.check(t.live == 0, "and the pool is empty")
+
+    # A prefix hit shares part of a sequence rather than all of it, so the
+    # range has to be honoured on both ends.
+    t.reset()
+    var c = List[Int]()
+    t.alloc_run(0, 0, 4, c)
+    suite.check(t.share(0, 2, 0, 2) == 2, "sharing a prefix takes the prefix")
+    suite.check(t.held_by(2) == 2, "and only the prefix")
+    suite.check(
+        t.cell_of(2, 2) == CELL_FREE, "the part past it belongs to nobody else"
+    )
+    suite.check(
+        t.release(0, 0, -1) == 2,
+        "so the owner leaving frees what was not shared",
+    )
+    suite.check(t.held_by(2) == 2, "and leaves the shared prefix alone")
+
+    # Two sequences can hold the same position in different cells, which is
+    # what makes a position a sequence's and not the pool's.
+    t.reset()
+    var one = t.alloc(0, 0)
+    var two = t.alloc(1, 0)
+    suite.check(one != two, "two sequences at position zero get two cells")
+    suite.check(
+        t.position(one) == 0 and t.position(two) == 0,
+        "both of which hold position zero",
+    )
+    suite.check(t.cell_of(1, 0) == two, "and each finds its own")
+
+
+def test_cells_errors(mut suite: Suite) raises:
+    suite.group("cell table errors")
+
+    var failed = False
+    try:
+        _ = CellTable(0)
+    except:
+        failed = True
+    suite.check(failed, "a pool with no cells is refused")
+
+    var t = CellTable(4)
+    failed = False
+    try:
+        _ = t.alloc(MAX_SEQS, 0)
+    except:
+        failed = True
+    suite.check(failed, "a sequence the owner word cannot hold is refused")
+
+    suite.check(
+        t.alloc(MAX_SEQS - 1, 0) >= 0, "the last one it can hold is not"
+    )
+
+    failed = False
+    try:
+        _ = t.alloc(-1, 0)
+    except:
+        failed = True
+    suite.check(failed, "and neither is a negative sequence")
+
+    failed = False
+    try:
+        _ = t.alloc(0, -1)
+    except:
+        failed = True
+    suite.check(failed, "a negative position has no cell")
+
+    failed = False
+    try:
+        _ = t.position(4)
+    except:
+        failed = True
+    suite.check(failed, "a cell past the end of the pool is refused")
+
+    failed = False
+    try:
+        _ = t.owns(-1, 0)
+    except:
+        failed = True
+    suite.check(failed, "and so is a negative one")
 
 
 def test_session_step(mut suite: Suite) raises:
