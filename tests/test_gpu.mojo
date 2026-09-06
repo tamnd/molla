@@ -16,14 +16,24 @@ remember to run.
 """
 
 from std.memory import bitcast
-from std.sys.info import has_accelerator
+from std.sys.info import (
+    CompilationTarget,
+    has_accelerator,
+    has_nvidia_gpu_accelerator,
+)
 
 from max.gpu.host import DeviceContext
 
 from harness import Suite
 
 from molla.model.load import DevicePool
-from molla.nn.gpu import check_matvec, device_matvec, device_ready
+from molla.nn.gpu import (
+    DeviceVec,
+    check_matvec,
+    device_matmul_into,
+    device_matvec,
+    device_ready,
+)
 from molla.nn.quant import Q_F32, Q_Q8_0
 from molla.nn.repack import (
     LAYOUT_PLANAR,
@@ -59,6 +69,7 @@ def run(mut suite: Suite) raises:
 
 def run_on_device(mut suite: Suite, ctx: DeviceContext) raises:
     test_matvec(suite, ctx)
+    test_tile(suite, ctx)
     test_pool(suite, ctx)
 
 
@@ -240,6 +251,127 @@ def test_matvec(mut suite: Suite, ctx: DeviceContext) raises:
             nonzero == rows,
             "every row came back, which a freed pool would not have given",
         )
+
+
+comptime TILE_COLS = 128
+comptime TILE_ROWS = 4096
+comptime TILE_TOKENS = 256
+"""A matmul big enough to reach the matrix core kernel on both backends.
+
+Nothing else in the suite does. The batched path is otherwise checked against
+the decode path on a synthetic model of sixty four columns and ninety six rows,
+which is three orders of magnitude below the line `NV_MIN_WORK` draws, so on
+CUDA every batched matmul in every other test runs the ordinary kernel and the
+tensor core tile has no coverage at all. Two hundred and fifty six tokens by
+four thousand and ninety six rows is that line exactly.
+
+A hundred and twenty eight columns rather than sixty four so the reduction loop
+runs twice, because a kernel that stages one step correctly and advances the
+weight pointer wrongly passes at one step.
+"""
+
+
+def test_tile(mut suite: Suite, ctx: DeviceContext) raises:
+    """The batched matmul at a shape that reaches the matrix core kernel.
+
+    The tolerance is per backend and that is the point of the group. Apple
+    simdgroup matrices multiply in float here, so the gate is the one every
+    other kernel in molla is held to. NVIDIA tensor cores take half precision
+    operands and there is no float shape to fall back on, since tf32 has the
+    same ten bit mantissa at half the rate, so a dot product of them agrees with
+    a float one to a few times 1e-4 and no better whatever the kernel does.
+    Holding that path to 1e-5 would be holding it to something the hardware
+    cannot do, and holding it to nothing would be no test, so it is 2e-3 and the
+    number it actually reaches is printed when it fails.
+    """
+    suite.group("device matmul tile")
+
+    comptime if not has_accelerator():
+        return
+    else:
+        var stride = planar_row_bytes(Q_Q8_0, TILE_COLS)
+        var total = stride * TILE_ROWS
+
+        var x = Buffer(TILE_TOKENS * TILE_COLS)
+        for t in range(TILE_TOKENS):
+            for i in range(TILE_COLS):
+                x.data[t * TILE_COLS + i] = (
+                    Float32((i * 11 + t * 5) % 29) - 14.0
+                ) / 7.0
+
+        var pool = ctx.enqueue_create_buffer[DType.uint8](total)
+        var want = Buffer(TILE_TOKENS * TILE_ROWS)
+        with pool.map_to_host() as mapped:
+            var p = RawPtr(unsafe_from_address=Int(mapped.unsafe_ptr()))
+            for r in range(TILE_ROWS):
+                var row = r * stride
+                for i in range(TILE_COLS):
+                    var q = ((i * 7 + r * 13) % 251) - 125
+                    p.unsafe_store(row + i, UInt8(q & 0xFF))
+                for g in range(TILE_COLS // 32):
+                    var scale = Float32(0.02) + Float32((g + r) % 5) * 0.003
+                    var bits = bitcast[DType.uint16, 1](
+                        scale.cast[DType.float16]()
+                    )
+                    for b in range(SCALE_BYTES):
+                        p.unsafe_store(
+                            row + TILE_COLS + g * SCALE_BYTES + b,
+                            UInt8((bits >> UInt16(b * 8)) & 0xFF),
+                        )
+            for t in range(TILE_TOKENS):
+                for r in range(TILE_ROWS):
+                    want.data[t * TILE_ROWS + r] = planar_row_dot(
+                        Q_Q8_0, p, r * stride, x.data, t * TILE_COLS, TILE_COLS
+                    )
+
+        var resident = Tensor(
+            Int(pool.unsafe_ptr()),
+            Q_Q8_0,
+            TILE_COLS,
+            TILE_ROWS,
+            LAYOUT_PLANAR,
+            WHERE_DEVICE,
+        )
+        var d_x = DeviceVec(ctx, TILE_TOKENS * TILE_COLS)
+        var d_o = DeviceVec(ctx, TILE_TOKENS * TILE_ROWS)
+        d_x.upload(x)
+        device_matmul_into(ctx, resident, d_x, d_o, TILE_TOKENS)
+        ctx.synchronize()
+        keep(pool)
+
+        var got = Buffer(TILE_TOKENS * TILE_ROWS)
+        d_o.download(got)
+
+        var peak = Float32(0)
+        var worst = Float32(0)
+        for i in range(TILE_TOKENS * TILE_ROWS):
+            var m = want.data[i] if want.data[i] > 0 else -want.data[i]
+            if m > peak:
+                peak = m
+            var gap = got.data[i] - want.data[i]
+            if gap < 0:
+                gap = -gap
+            if gap > worst:
+                worst = gap
+
+        comptime gate = Float32(1e-5) if _float_tile() else Float32(2e-3)
+        suite.check(peak > 0, "the reference is not all zeros")
+        suite.check(
+            worst <= peak * gate,
+            "and the tile agrees with the host at this backend's precision",
+        )
+        if worst > peak * gate:
+            suite.fail("tile", "worst " + String(worst / peak))
+
+
+def _float_tile() -> Bool:
+    """Whether this build's matrix core kernel multiplies in float.
+
+    Apple's does and NVIDIA's cannot, which is one line here rather than a
+    condition spelled out at the gate, because the day a third backend gets a
+    tile the question it has to answer is this one.
+    """
+    return CompilationTarget.is_macos() or not has_nvidia_gpu_accelerator()
 
 
 def test_pool(mut suite: Suite, ctx: DeviceContext) raises:

@@ -2204,18 +2204,24 @@ def _launch_mma[
     )
 
 
-comptime NV_ROWS = 64
+comptime NV_ROWS = 128
 comptime NV_TOKENS = 64
 """Output rows and output tokens one tensor core block covers.
 
-Square, and both of them twice the token count the first attempt at this used.
 The token count is what decides how many times the weight matrix is read, since
 a block reads the whole reduction of its rows for its tokens and nothing else
 does, so sixty four tokens is half the weight traffic of thirty two. Sixty four
-is also the largest it can be without a second contract to keep: the tail block
+is also the largest it can be, and not for a reason of speed: the tail block
 runs its dead lanes off the end of the chunk and every scratch vector a prefill
 allocates carries `SPAN * MM_GROUPS` rows of slack for exactly that, which is
 sixty four rows.
+
+The row count has no such ceiling and was swept. A hundred and twenty eight rows
+over eight warps is worth 1.20x over sixty four over four on the 8B and 1.06x on
+the 0.5B, measured on gpc. Two hundred and fifty six was not taken, because a
+block would then cover four times the output the sixty four row tile did and the
+occupancy rule in `NV_MIN_BLOCKS` would push the 8B's attention matrices back
+onto the ordinary kernel, which costs more than the wider tile pays.
 """
 
 comptime NV_K = 64
@@ -2232,22 +2238,23 @@ A thread still stages one whole group, because `NV_KPT` is thirty two, so the
 scale and the minimum are read once for its run.
 """
 
-comptime NV_THREADS = 128
+comptime NV_THREADS = 256
 comptime NV_WARPS = NV_THREADS // WARP_SIZE
 comptime NV_WARP_COLS = 2
 comptime NV_WARP_ROWS = NV_ROWS // (NV_WARPS // NV_WARP_COLS)
 comptime NV_WARP_TOKENS = NV_TOKENS // NV_WARP_COLS
 comptime NV_FR = NV_WARP_ROWS // 8
 comptime NV_FT = NV_WARP_TOKENS // 16
-"""Four warps, two by two, each covering thirty two rows and thirty two tokens.
+"""Eight warps, four by two, each covering thirty two rows and thirty two tokens.
 
 The instruction is sixteen by eight by sixteen with the tokens on the sixteen
 side, so a warp's tokens are `NV_FT` fragments and its rows are `NV_FR` of them,
 which is eight accumulators of four floats a lane.
 
 Written in terms of the tile rather than as constants of their own, so that
-sweeping the tile is `NV_ROWS` and `NV_THREADS` and nothing else. A hundred and
-twenty eight rows over eight warps was swept and is in `NV_MIN_BLOCKS`.
+sweeping the tile is `NV_ROWS` and `NV_THREADS` and nothing else. What a sweep
+has to keep is that `NV_KPT` stays inside one quant group, which the kernel
+asserts, and that a warp keeps whole fragments in both directions.
 """
 
 comptime NV_ROW_THREADS = NV_THREADS // NV_ROWS
@@ -2267,11 +2274,13 @@ ordinary kernel covers four rows and sixty four tokens a block, which is sixteen
 times as many blocks for the same output, and below the line that is worth more
 than the instruction is.
 
-Measured on gpc, prefill tokens a second, molla against itself: Llama 3.1 8B at
-Q4_K_M goes 597 to 866 with the tile, Qwen 2.5 0.5B goes 9345 to 8862 and
-SmolLM2 135M goes 18357 to 9885. The 8B is above the line on every matrix it
-has, the 135M is below it on every one, and the 0.5B is above it on the three
-feed forward matrices and below it on the four attention ones.
+Measured on gpc at the sixty four row tile, prefill tokens a second, molla
+against itself with the tile taken everywhere it fits: Llama 3.1 8B at Q4_K_M
+goes 597 to 866, Qwen 2.5 0.5B goes 9345 to 8862 and SmolLM2 135M goes 18357 to
+9885. Two of those three are regressions, and the rule is what turns them back
+into parity. At the tile this file now carries the 8B is above the line on every
+matrix it has, the 135M is below it on every one, and the 0.5B is above it on
+the two wide feed forward matrices and below it on the rest.
 
 One block an SM and not two, because the ordinary kernel is the thing being
 beaten and it is only ahead where the tile leaves cores idle. It is a property
@@ -2342,9 +2351,9 @@ def planar_nvmma_kernel[
     `ld_matrix`, which is one instruction a warp for a whole sixteen by sixteen
     fragment where the obvious version issued twelve four byte loads for every
     multiply. The staged tiles are swizzled by `nv_at`, so those loads take no
-    bank conflicts. And the tile is square at sixty four by sixty four rather
-    than sixty four by thirty two, which halves how many times the weight is
-    read.
+    bank conflicts. And the tile is a hundred and twenty eight rows by sixty
+    four tokens rather than sixty four by thirty two, which is a quarter of the
+    weight traffic and four times the work a block does.
     """
     var cols = Int(cols_dev)
     var stride = Int(stride_dev)
@@ -2377,6 +2386,13 @@ def planar_nvmma_kernel[
     var scales = w.unsafe_bitcast[Float16]()
     var base = _scale_bases[form, with_min](row, cols, groups)
     comptime shift = group_shift(group)
+    constrained[
+        NV_KPT <= group,
+        (
+            "a thread's run of the reduction has to sit inside one quant group,"
+            " since it reads the scale and the minimum once for the whole run"
+        ),
+    ]()
 
     var acc = InlineArray[SIMD[DType.float32, 4], NV_FT * NV_FR](fill=0)
 
@@ -2670,7 +2686,9 @@ def _matmul_forms(
     comptime if (
         not CompilationTarget.is_macos()
     ) and has_nvidia_gpu_accelerator():
-        if g == 32 and tokens * w.rows >= NV_MIN_WORK:
+        # The reduction has to divide by the staged step, since the loop over it
+        # has no tail and a short last step would stage the next row.
+        if g == 32 and w.cols % NV_K == 0 and tokens * w.rows >= NV_MIN_WORK:
             if form == QUANT_U4 and carries_min:
                 _launch_nvmma[32, True, QUANT_U4](ctx, w, p, o, a, epi, tokens)
                 return
