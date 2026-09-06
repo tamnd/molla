@@ -4,6 +4,14 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-09-07
+
+The third of the five stages continuous batching needs, and the first one a single sequence can tell apart, because it is the one that makes a second sequence possible. A forward pass carries tokens of more than one sequence: each token says where it sits and where its sequence's list of cells starts in the index, and the logits come back a row a sequence rather than one row for whichever token finished the chunk.
+
+Two sequences of different lengths run together now give each of them the logits it gets run alone, which is the gate the spec asks for. What cannot happen yet is anything above the pass building that batch, because handing out regions of the index to more than one sequence is admission and admission is the next stage.
+
+The descriptor came out smaller than the spec predicted. One integer a token and not two, since a query reads the positions before its own and so the count is the position plus one, which the token already carries.
+
 ### Added
 
 - Two sequences can share a forward pass. Each token of a chunk now carries its own position and the offset its sequence's list of cells starts at in the index, which is the whole of what a mixed batch needs, and `DevicePaging.mixed` is how a caller fills that in. Logits come back a row a sequence rather than one row for the last token of the chunk, so a batch of four gets four answers out of one pass. That is the third of the five stages in [docs/validation/batching.md](docs/validation/batching.md), and the check is the one the spec asks for: two sequences of different lengths run together give each of them the logits it gets run alone, and greedy picks the same token for both.
