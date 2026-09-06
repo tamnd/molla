@@ -40,7 +40,7 @@ Four, in this order, because each one is testable on its own and the first is wo
 
 **Cells.** The pool is addressed by cell rather than by position. `slot_of` stops being the identity and becomes a search over a free list, the metadata table appears on the host with a position and an owner set a cell, and the per step index vector appears as a device buffer that the store scatters through. A sequence now occupies what it has written rather than what it reserved.
 
-**The mask.** Attention stops deriving causality from the range and takes a mask built from the cell metadata, over a window rounded up so the launch shape stops changing every token. This is the stage that costs something, and what it costs has to be measured before the stage after it is worth doing. The form the mask takes is below, because it is not the form llama.cpp uses and the difference is worth the paragraph.
+**The mask.** Attention stops deriving causality from the range and takes a mask built from the cell metadata, over a window rounded up so the launch shape stops changing every token. This is the stage that costs something, and what it costs is measured below rather than guessed at. The form the mask takes is below as well, because it is not the form llama.cpp uses and the difference is worth the paragraph.
 
 **Sharing and eviction.** `seq_cp` as a bit set on a range, `seq_rm` as a bit cleared with the cell freed when the set empties, and an eviction policy over cells no sequence owns. Sliding window and sink models get a bounded ring with the sink cells pinned, which the cell form expresses directly.
 
@@ -57,6 +57,24 @@ Three things come out of the same entry. Causality is the entry against the quer
 The size is the point. A vector of positions does not grow with the batch, so a chunk of 256 tokens against 4096 cells is 16 KiB rather than a megabyte, and a batch of sixteen sequences is one vector a sequence rather than one entry a token a cell. It is also the host table nearly unchanged, which means there is one place a cell's position is written and one place it is read.
 
 What molla gives up for that is generality. A mask matrix can express anything, including the cross attention and the custom masks llama.cpp supports and molla does not. Every model molla runs is causal with an optional window and optional sinks, and all three of those are functions of a position, so the general form would be paying a megabyte a chunk to express something nothing asks for.
+
+## What the mask costs
+
+Eight per cent of decode attention, flat over context. That is the fourth table of `scripts/attend_probe.mojo` on the 4090, at the 8B's decode geometry of 32 query heads over 8 key heads of 128, one token, keys at float16.
+
+| context | a run | a pool | ratio | 32 layers |
+| --- | --- | --- | --- | --- |
+| 64 | 10 us | 11 us | 1.05x | 0.36 ms |
+| 256 | 20 us | 22 us | 1.08x | 0.70 ms |
+| 512 | 21 us | 22 us | 1.08x | 0.73 ms |
+| 1185 | 25 us | 27 us | 1.09x | 0.88 ms |
+| 2048 | 37 us | 40 us | 1.08x | 1.29 ms |
+
+The pool in that table is exactly as large as the context and every cell in it belongs to the sequence, so both columns read the same bytes and run the same grid. What is left in the difference is the mask on its own: one int32 a cell loaded, and a comparison of two positions where the run got its causality from where the loop stopped.
+
+Eight per cent, and it does not grow. That is the number the stage after this is worth measuring against, and it is small for a reason worth writing down: the kernel was already reading a key row of 128 halves for every entry it masks, so one more four byte load against 256 bytes is three per cent of the traffic and the rest is the compare. A mask matrix would have been reading a float a pair over the same rows, which is the same three per cent multiplied by the number of tokens in the batch.
+
+What the table does not measure is the fragmentation. Every cell here is live, and a real pool asked for a window rounded up to a pad holds cells that belong to nobody, which are read and thrown away. That cost is set by `CellTable.window` and by how full the pool is, not by the kernel, and it is the thing stage four's eviction policy exists to keep small.
 
 ## What done means
 
