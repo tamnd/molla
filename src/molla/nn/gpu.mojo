@@ -614,6 +614,17 @@ struct DevicePaging(Movable):
     var spots: List[Int32]
     """The host side of `seats`."""
 
+    var bases: DeviceInts
+    """One entry a token of the chunk: where that token's sequence's list starts
+    in `index`.
+
+    Zero for every token while there is one sequence, because its list starts at
+    the front of a buffer it has to itself. A batch gives each sequence a region
+    and this is which one a token reads."""
+
+    var firsts: List[Int32]
+    """The host side of `bases`."""
+
     var reach: Int
     """How many entries of `order` the host has written, which is the sequence's
     length. Everything above it is negative, which is what lets a decode round
@@ -642,13 +653,19 @@ struct DevicePaging(Movable):
         self.cells = DeviceInts(ctx, chunk)
         self.index = DeviceInts(ctx, pool)
         self.seats = DeviceInts(ctx, chunk)
+        self.bases = DeviceInts(ctx, chunk)
         self.slots = List[Int32](length=chunk, fill=0)
         self.order = List[Int32](length=pool, fill=-1)
         self.spots = List[Int32](length=chunk, fill=0)
+        self.firsts = List[Int32](length=chunk, fill=0)
         self.reach = 0
         self.sent = 0
         self.on = False
         self.ragged = False
+        # Every token's list starts at the front until a batch says otherwise,
+        # and this is sent once because a pass that is not ragged never changes
+        # it. `mixed` is what sends something else.
+        self.bases.queue_in(self.firsts)
         # The card gets the negatives once, here, because from now on it only
         # gets the spans a step wrote and a buffer that starts as whatever the
         # driver left is a query reading a cell nobody gave it. A decode scans
@@ -709,7 +726,68 @@ struct DevicePaging(Movable):
             )
         for i in range(count):
             self.spots[i] = Int32(base + i)
+            self.firsts[i] = Int32(0)
+        self.ragged = False
         self.seats.queue_in(self.spots)
+        self.bases.queue_in(self.firsts)
+
+    def mixed(
+        mut self, spots: List[Int32], firsts: List[Int32], count: Int
+    ) raises:
+        """Fill the positions and the list starts for a batch of sequences.
+
+        What `steady` does when the tokens of a step belong to one sequence and
+        the positions run. Here they do not: token `i` sits at `spots[i]` for
+        whichever sequence owns it and reads that sequence's list, which starts
+        at `firsts[i]`. Two tokens of the same sequence carry the same start, and
+        that repetition is what makes this one integer a token rather than a
+        second structure saying which sequence a token belongs to.
+
+        A ragged pass is a paged pass. Two sequences cannot both be the cache's
+        leading run, so the moment a step carries tokens of more than one there
+        is an index to read them through, and the caller has turned paging on
+        before it gets here.
+        """
+        if count < 1 or count > self.chunk():
+            raise Error(
+                "a step of "
+                + String(count)
+                + " tokens does not fit a chunk of "
+                + String(self.chunk())
+            )
+        if len(spots) < count or len(firsts) < count:
+            raise Error(
+                "a step of "
+                + String(count)
+                + " tokens got "
+                + String(len(spots))
+                + " positions and "
+                + String(len(firsts))
+                + " list starts"
+            )
+        for i in range(count):
+            var p = Int(spots[i])
+            var f = Int(firsts[i])
+            if p < 0:
+                raise Error(
+                    "token " + String(i) + " sits at position " + String(p)
+                )
+            if f < 0 or f + p >= self.pool():
+                raise Error(
+                    "token "
+                    + String(i)
+                    + " reads position "
+                    + String(p)
+                    + " of a list at "
+                    + String(f)
+                    + ", which runs past a pool of "
+                    + String(self.pool())
+                )
+            self.spots[i] = spots[i]
+            self.firsts[i] = firsts[i]
+        self.ragged = True
+        self.seats.queue_in(self.spots)
+        self.bases.queue_in(self.firsts)
 
 
 comptime EPI_NONE = 0

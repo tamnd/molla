@@ -39,7 +39,7 @@ from max.gpu.host import DeviceContext
 from harness import Suite
 
 from molla.nn.attention import AttnSpec, attend
-from molla.nn.gpu import DeviceHalf, DeviceInts, DeviceVec
+from molla.nn.gpu import DeviceHalf, DeviceInts, DevicePaging, DeviceVec
 from molla.nn.gpu_ops import (
     attend_partials,
     device_add_into,
@@ -718,36 +718,55 @@ def test_attend_paged(mut suite: Suite, ctx: DeviceContext) raises:
         var o = DeviceVec(ctx, 4 * 32)
         var s = DeviceVec(ctx, 4 * 40)
         var part = DeviceVec(ctx, attend_partials(short, 1, 40))
-        var indexv = DeviceInts(ctx, 40)
-        var host = List[Int32]()
-        for i in range(20):
-            host.append(Int32(i))
-        device_attend_paged(
-            ctx, short, q, k, v, host, indexv, 40, 39, o, s, part
-        )
+        var paging = DevicePaging(ctx, 1, 20)
+        device_attend_paged(ctx, short, q, k, v, paging, 40, 39, o, s, part)
     except:
         raised = True
-    suite.check(raised, "a host run shorter than the one asked for is refused")
+    suite.check(raised, "a run past the end of the pool is refused")
 
-    raised = False
+    # The descriptor a batch fills, and the three ways of filling it wrong. Each
+    # of these is a token reading somebody else's key or reading off the end of
+    # the buffer, and a kernel is a bad place to find that out.
+    var wide = DevicePaging(ctx, 4, 20)
+    var spots = List[Int32](length=4, fill=0)
+    var firsts = List[Int32](length=4, fill=0)
+    var too_many = False
     try:
-        var short = AttnSpec(4, 2, 32)
-        var q = DeviceVec(ctx, 4 * 32)
-        var k = DeviceHalf(ctx, 40 * 2 * 32)
-        var v = DeviceHalf(ctx, 40 * 2 * 32)
-        var o = DeviceVec(ctx, 4 * 32)
-        var s = DeviceVec(ctx, 4 * 40)
-        var part = DeviceVec(ctx, attend_partials(short, 1, 40))
-        var indexv = DeviceInts(ctx, 20)
-        var host = List[Int32]()
-        for i in range(40):
-            host.append(Int32(i))
-        device_attend_paged(
-            ctx, short, q, k, v, host, indexv, 40, 39, o, s, part
-        )
+        wide.mixed(spots, firsts, 5)
     except:
-        raised = True
-    suite.check(raised, "and so is a device run that does not reach it")
+        too_many = True
+    suite.check(too_many, "a batch wider than the chunk is refused")
+
+    var backwards = False
+    spots[1] = Int32(-1)
+    try:
+        wide.mixed(spots, firsts, 2)
+    except:
+        backwards = True
+    suite.check(backwards, "and a token at a negative position")
+    spots[1] = Int32(0)
+
+    var overrun = False
+    spots[1] = Int32(7)
+    firsts[1] = Int32(16)
+    try:
+        wide.mixed(spots, firsts, 2)
+    except:
+        overrun = True
+    suite.check(overrun, "and a list that runs off the end of the index")
+
+    spots[1] = Int32(3)
+    firsts[1] = Int32(10)
+    wide.mixed(spots, firsts, 2)
+    suite.check(
+        wide.ragged and Int(wide.firsts[1]) == 10,
+        "a batch that fits is taken and says the pass is ragged",
+    )
+    wide.steady(0, 2)
+    suite.check(
+        not wide.ragged and Int(wide.firsts[1]) == 0,
+        "and one sequence takes the pass back to the front of the index",
+    )
 
 
 def _attend_paged_case(
@@ -875,13 +894,18 @@ def _attend_paged_case(
     var dout = DeviceVec(ctx, width)
     var dscores = DeviceVec(ctx, spec.heads * pool)
     var dpart = DeviceVec(ctx, attend_partials(spec, 1, pool))
-    var indexv = DeviceInts(ctx, pool)
-    indexv.queue_in(order)
+    # The index and its host copy come as a pair now, because the two are the
+    # same list and a call that was handed one of each was a call that could be
+    # handed two different ones.
+    var paging = DevicePaging(ctx, 1, pool)
+    for i in range(pool):
+        paging.order[i] = order[i]
+    paging.index.queue_in(paging.order)
     dq.upload(q)
     dk.upload_run(keys, 0, pool * kv_width)
     dv.upload_run(values, 0, pool * kv_width)
     device_attend_paged(
-        ctx, spec, dq, dk, dv, order, indexv, count, pos, dout, dscores, dpart
+        ctx, spec, dq, dk, dv, paging, count, pos, dout, dscores, dpart
     )
     ctx.synchronize()
     var got = Buffer(width)

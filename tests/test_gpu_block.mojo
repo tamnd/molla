@@ -46,6 +46,7 @@ from molla.nn.gpu_block import (
 from molla.nn.model import ModelWeights, forward
 from molla.nn.quant import Q_F32, Q_Q8_0
 from molla.nn.repack import (
+    CACHE_F16,
     CACHE_Q8,
     LAYOUT_PLANAR,
     SCALE_BYTES,
@@ -955,6 +956,201 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                     if gap > cache_worst:
                         cache_worst = gap
 
+        # Two sequences in one pass, which is the gate #32 stage three is for.
+        # One pool holds both of them. Sequence zero's list of cells sits at the
+        # front of the index and sequence one's at the halfway mark, and a token
+        # says which list is its own by carrying the offset that list starts at.
+        # That offset is the whole descriptor, because the number of entries a
+        # token reads is its own position plus one and it already carries its
+        # position.
+        #
+        # Nothing here goes through `DeviceKvCache.place`, and that is on
+        # purpose. `place` writes one sequence's list at the front of the index
+        # and hands out the cells for one sequence, which is right for the
+        # session that owns the cache and is exactly what the scheduler in stage
+        # four replaces. What is under test here is the pass, so the cells and
+        # the two regions are laid out by hand and `CellTable.route` fills each
+        # region the way it was written to.
+        var mid = CONTEXT // 2
+        var duo = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, 4, 2)
+        var duox = DeviceVec(ctx, (4 + SPAN * MM_GROUPS) * WIDTH)
+        var solo = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, 4)
+        var solox = DeviceVec(ctx, (4 + SPAN * MM_GROUPS) * WIDTH)
+        var shared = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+        var starts = List[Int]()
+        starts.append(0)
+        starts.append(mid)
+        var spots = List[Int32](length=4, fill=0)
+        var firsts = List[Int32](length=4, fill=0)
+        var alone = Buffer(2 * VOCAB)
+        var together = Buffer(2 * VOCAB)
+        var one_out = Buffer(VOCAB)
+        var pair_prefill = 0
+        for q in range(2):
+            # Different lengths and different tokens, so that a batch which
+            # quietly gave both sequences the longer one's answer would show up
+            # rather than agreeing by accident.
+            var n = 4 - q
+            var prompt = List[Int]()
+            for i in range(n):
+                prompt.append(tokens[q * 8 + i])
+            var next = List[Int]()
+            next.append(tokens[q * 8 + n])
+
+            # What this sequence gets on its own: its own cache, its own pool,
+            # the ordinary contiguous path, a prefill and then a decode.
+            var own = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+            var at = own.place(0, n, False)
+            device_forward(
+                ctx,
+                model,
+                solo,
+                solox,
+                prompt,
+                0,
+                at,
+                own.keys,
+                own.values,
+                own.paging,
+            )
+            at = own.place(n, 1, False)
+            device_forward(
+                ctx,
+                model,
+                fone,
+                fonex,
+                next,
+                n,
+                at,
+                own.keys,
+                own.values,
+                own.paging,
+            )
+            ctx.synchronize()
+            fone.logits.download(one_out)
+            for i in range(VOCAB):
+                alone.data[q * VOCAB + i] = one_out.data[i]
+
+            # And the same prompt into the shared pool, in its own region. The
+            # index goes up whole rather than a span at a time because the two
+            # regions are not next to each other, and a scheduler that appends a
+            # token to each of sixteen sequences has sixteen spans to send. That
+            # is stage four's problem and it does not change what the kernels
+            # read.
+            for i in range(n):
+                var cell = shared.table.alloc(q, i)
+                shared.paging.slots[i] = Int32(cell)
+                spots[i] = Int32(i)
+                firsts[i] = Int32(starts[q])
+            shared.table.route(q, n, shared.paging.order, starts[q])
+            shared.paging.on = True
+            shared.paging.cells.queue_in(shared.paging.slots)
+            shared.paging.index.queue_in(shared.paging.order)
+            shared.paging.mixed(spots, firsts, n)
+            if shared.paging.ragged:
+                pair_prefill += 1
+            device_forward(
+                ctx,
+                model,
+                duo,
+                duox,
+                prompt,
+                n - 1,
+                0,
+                shared.keys,
+                shared.values,
+                shared.paging,
+            )
+
+        # One step carrying a decode of each. The positions are four and three,
+        # the list starts are zero and the halfway mark, and `pos` is the deeper
+        # of the two positions because all it does now is size the scratch for
+        # the token that needs the most of it.
+        var both = List[Int]()
+        for q in range(2):
+            var n = 4 - q
+            var cell = shared.table.alloc(q, n)
+            shared.paging.slots[q] = Int32(cell)
+            shared.paging.order[starts[q] + n] = Int32(cell)
+            spots[q] = Int32(n)
+            firsts[q] = Int32(starts[q])
+            both.append(tokens[q * 8 + n])
+        shared.paging.cells.queue_in(shared.paging.slots)
+        shared.paging.index.queue_in(shared.paging.order)
+        shared.paging.mixed(spots, firsts, 2)
+        var want_rows = List[Int]()
+        want_rows.append(0)
+        want_rows.append(1)
+        device_forward(
+            ctx,
+            model,
+            duo,
+            duox,
+            both,
+            4,
+            0,
+            shared.keys,
+            shared.values,
+            shared.paging,
+            CACHE_F16,
+            want_rows,
+        )
+        ctx.synchronize()
+        duo.logits.download(together)
+
+        var pair_worst = Float32(0)
+        var pair_picks = 0
+        var pair_apart = 0
+        for q in range(2):
+            var mark = q * VOCAB
+            var top = 0
+            var want = 0
+            for i in range(VOCAB):
+                if together.data[mark + i] > together.data[mark + top]:
+                    top = i
+                if alone.data[mark + i] > alone.data[mark + want]:
+                    want = i
+                var gap = together.data[mark + i] - alone.data[mark + i]
+                if gap < 0:
+                    gap = -gap
+                if gap > pair_worst:
+                    pair_worst = gap
+            if top == want:
+                pair_picks += 1
+        # And the two rows are not the same row. A batch that wrote one
+        # sequence's logits twice would pass everything above if the two
+        # sequences happened to agree, so this says out loud that they do not.
+        for i in range(VOCAB):
+            if together.data[i] != together.data[VOCAB + i]:
+                pair_apart += 1
+
+        # A batch a scratch has no room for, which is the check that the row
+        # list and the sequence count are the same number. The pass runs and
+        # then refuses, because the layers do not know how many answers are
+        # wanted and there is nothing to gain by teaching them.
+        var pair_over = False
+        var three = List[Int]()
+        three.append(0)
+        three.append(1)
+        three.append(0)
+        try:
+            device_forward(
+                ctx,
+                model,
+                solo,
+                solox,
+                both,
+                4,
+                0,
+                shared.keys,
+                shared.values,
+                shared.paging,
+                CACHE_F16,
+                three,
+            )
+        except:
+            pair_over = True
+
         keep(pool)
         keep(blob)
         keep(gains)
@@ -1150,3 +1346,27 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         )
         if fuzz_worst > peak * Float32(2e-5):
             suite.fail("fuzz logits", "worst " + String(fuzz_worst / peak))
+
+        suite.group("two sequences in one pass")
+        suite.check(
+            pair_prefill == 2,
+            "a token that carries its own list start makes the pass ragged",
+        )
+        suite.check(
+            pair_worst <= peak * Float32(2e-5),
+            "a batch of two gives each sequence what it gets on its own",
+        )
+        if pair_worst > peak * Float32(2e-5):
+            suite.fail("batch pair", "worst " + String(pair_worst / peak))
+        suite.check(
+            pair_picks == 2,
+            "and greedy picks the same token for each of them",
+        )
+        suite.check(
+            pair_apart > 0,
+            "and the two answers are two answers and not one written twice",
+        )
+        suite.check(
+            pair_over,
+            "a batch wanting more answers than the scratch holds is refused",
+        )

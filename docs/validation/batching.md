@@ -42,7 +42,7 @@ A cell for each token of the step, which is what the store scatters through. Thi
 
 A position for each token of the step. Today this is one integer for the pass.
 
-For each token, where its sequence's index list starts and how long it is. Two integers a token, or one if the lists are laid out so that the start is a multiple of a fixed stride, which they are not going to be.
+For each token, where its sequence's index list starts. One integer a token and not the two this used to predict, because the length is not something a token has to be told. The entries a query reads are the positions before its own, so the count is the position plus one and the position is already in the descriptor. The second integer was there to carry a length that turned out to be arithmetic.
 
 The index lists themselves, which live on the card between steps and are appended to rather than rewritten.
 
@@ -100,6 +100,20 @@ Prefill is the other direction, and the size of the difference is why the roundi
 So `SCAN_PAD` rounds the scan up when the chunk is a single token and leaves it alone otherwise. That splits cleanly along the decode and prefill line without asking the caller which it is doing, because a chunk of one token is what a decode is.
 
 The pad costs an invariant. A scan that runs past the end of a sequence reads index entries the sequence does not own, so those entries have to be negative rather than whatever was there before, and a negative entry has to be skipped by the value loop rather than trusted to carry a zero weight. `DeviceKvCache.place` clears the entries a rewind leaves above the new end, `DevicePaging.forget` clears the whole list, and both the host list and the card's copy start negative, because from the turnaround on only the written span is uploaded and an entry nobody wrote is an entry nobody sent.
+
+## What the batch descriptor came out as
+
+Stage three is in, so this is what a pass carries rather than what it was going to.
+
+Two vectors, both one entry a token of the chunk. `DevicePaging.seats` is where each token sits, which stage one added, and `DevicePaging.bases` is where each token's sequence's list starts in the index. `steady` fills them for a run of one sequence, which is a base and its successors and a start of zero, and `mixed` fills them for a batch. A pass that calls neither is a pass that has not said anything, so `device_forward` calls `steady` for any caller that has not already called `mixed`.
+
+`pos` survives as an argument and stops meaning what it meant. Everything positional now reads the descriptor, so what the argument is left doing is sizing the scratch for the deepest token in the batch. That is a real job and it is not the same job, which is why it is worth saying rather than leaving a caller to infer.
+
+Logits are a row a sequence. `device_forward` takes a list of token indices whose logits somebody wants, one per sequence, and writes them into the scratch in that order at a vocabulary apiece. An empty list is the run's last token, which is what a single sequence wants and what every caller wanted before there was a batch. `DeviceScratch` is told how many sequences it has to hold answers for, and a pass wanting more than that is refused rather than writing past the end.
+
+The final norm needed one word of help. It reads one row out of the residual stream, and its check for a caller that wired the wrong gain in keys off the row being the whole vector, which the first row of a wide stream also looks like. So the caller says which it means. That is the whole of the change outside the descriptor.
+
+What is not here is the scheduler. `DeviceKvCache.place` still allocates for one sequence and writes its list at the front of the index, because handing out regions of the index and cells to more than one sequence is stage four's job and there is no admission to do it under yet. The gate lays out two regions by hand and drives `CellTable` directly, which is the honest way to test a pass that nothing above it can yet build.
 
 ## What done means
 

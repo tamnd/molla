@@ -4,6 +4,16 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Added
+
+- Two sequences can share a forward pass. Each token of a chunk now carries its own position and the offset its sequence's list of cells starts at in the index, which is the whole of what a mixed batch needs, and `DevicePaging.mixed` is how a caller fills that in. Logits come back a row a sequence rather than one row for the last token of the chunk, so a batch of four gets four answers out of one pass. That is the third of the five stages in [docs/validation/batching.md](docs/validation/batching.md), and the check is the one the spec asks for: two sequences of different lengths run together give each of them the logits it gets run alone, and greedy picks the same token for both.
+
+### Changed
+
+- The per token descriptor is one integer a token and not the two the spec predicted. A query reads the positions before its own, so the number of entries it reads is its position plus one, and the position is already in the descriptor. The length that was going to be the second integer is arithmetic.
+- `pos` no longer says where a pass is. Everything positional reads the descriptor now, so what the argument is left doing is sizing the scratch for the deepest token in the batch.
+- The final norm takes a word from its caller saying whether it covers the whole residual stream. It reads one row out of a chunk, and the check that catches a caller wiring the wrong gain in cannot otherwise tell the first row of a wide stream from a whole narrow one, which is exactly what a batch answering the sequence packed first looks like.
+
 ## [0.5.4] - 2026-09-07
 
 The first two of the five stages continuous batching needs, both of them changes a single sequence cannot tell apart. Rope reads a position for each token out of a vector rather than adding the token's index to a base, and the paged index turns around from a vector over the cell pool to a vector over one sequence's own positions.
