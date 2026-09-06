@@ -840,6 +840,8 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                 " them"
             ),
         )
+        if batch_worst > peak * Float32(2e-4):
+            suite.fail("batch logits", "worst " + String(batch_worst / peak))
         suite.check(
             batch_top == want_last,
             "and greedy picks the same token off them",
@@ -849,7 +851,13 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             cache_worst <= cache_peak * Float32(2e-4),
             "and the chunk leaves the same keys and values in it",
         )
+        if cache_worst > cache_peak * Float32(2e-4):
+            suite.fail(
+                "batch cache", "worst " + String(cache_worst / cache_peak)
+            )
         suite.check(
             split_worst <= peak * Float32(2e-4),
             "and a prompt split across two chunks reaches the same logits",
         )
+        if split_worst > peak * Float32(2e-4):
+            suite.fail("split logits", "worst " + String(split_worst / peak))
