@@ -487,7 +487,10 @@ def _rope_case(
     var dx = DeviceVec(ctx, n)
     dx.upload(x)
     var tables = RopeTables(ctx, spec, factors, use_factors)
-    device_rope(ctx, spec, dx, 0, heads, head_dim, pos, tables)
+    var seats = DeviceInts(ctx, 1)
+    var spots: List[Int32] = [Int32(pos)]
+    seats.queue_in(spots)
+    device_rope(ctx, spec, dx, 0, heads, head_dim, seats, tables)
     ctx.synchronize()
     var got = Buffer(n)
     dx.download(got)
@@ -1196,16 +1199,19 @@ def test_refusals(mut suite: Suite, ctx: DeviceContext) raises:
     var spec = RopeSpec(64, Float32(10000.0))
     var none = List[Float32]()
     var tables = RopeTables(ctx, spec, none, False)
+    var zero = DeviceInts(ctx, 1)
+    var at_zero: List[Int32] = [Int32(0)]
+    zero.queue_in(at_zero)
     raised = False
     try:
-        device_rope(ctx, spec, a, 0, 2, 64, 0, tables)
+        device_rope(ctx, spec, a, 0, 2, 64, zero, tables)
     except:
         raised = True
     suite.check(raised, "rope over more heads than the vector holds is refused")
 
     raised = False
     try:
-        device_rope(ctx, spec, a, 0, 1, 32, 0, tables)
+        device_rope(ctx, spec, a, 0, 1, 32, zero, tables)
     except:
         raised = True
     suite.check(raised, "and a rotary dimension wider than the head")
@@ -1228,10 +1234,20 @@ def test_refusals(mut suite: Suite, ctx: DeviceContext) raises:
         var narrow = RopeTables(
             ctx, RopeSpec(16, Float32(10000.0)), none, False
         )
-        device_rope(ctx, spec, a, 0, 1, 64, 0, narrow)
+        device_rope(ctx, spec, a, 0, 1, 64, zero, narrow)
     except:
         raised = True
     suite.check(raised, "and tables built for a narrower rotary dimension")
+
+    # A chunk longer than the positions it was given. The one new way to get
+    # rope wrong now that the angle comes out of a vector rather than a base,
+    # and the failure it would otherwise be is a read past the end.
+    raised = False
+    try:
+        device_rope(ctx, spec, a, 0, 1, 64, zero, tables, 2, 64)
+    except:
+        raised = True
+    suite.check(raised, "and a chunk longer than the positions it was given")
 
     var attn = AttnSpec(2, 1, 32)
     var q = DeviceVec(ctx, 64)

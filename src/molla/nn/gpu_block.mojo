@@ -761,7 +761,7 @@ def device_attention(
         0,
         spec.attn.heads,
         spec.attn.head_dim,
-        pos,
+        paging.seats,
         w.rope,
         tokens,
         spec.q_width(),
@@ -773,7 +773,7 @@ def device_attention(
         0,
         spec.attn.kv_heads,
         spec.attn.head_dim,
-        pos,
+        paging.seats,
         w.rope,
         tokens,
         kv_width,
@@ -1598,7 +1598,7 @@ def device_forward(
     slot: Int,
     mut keys: List[DeviceHalf],
     mut values: List[DeviceHalf],
-    paging: DevicePaging,
+    mut paging: DevicePaging,
     form: Int = CACHE_F16,
 ) raises:
     """A run of tokens through the whole stack, logits left on the device.
@@ -1636,6 +1636,9 @@ def device_forward(
             + String(paging.chunk())
             + " cells"
         )
+
+    if not paging.ragged:
+        paging.steady(pos, len(tokens))
 
     var run = _embed(ctx, m, s, x, tokens, pos)
     for i in range(count):
