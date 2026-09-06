@@ -4,6 +4,12 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-06
+
+The paged cache stops being a thing on the side and becomes the cache. A step takes cells from the table, the store scatters, and attention masks by the position each cell holds, so which row of the cache a token lands in is no longer decided by its position.
+
+Nothing about a single sequence changes. The free list hands cells out in order, every cell is its own position, and the path a token takes today is the path it took yesterday. What it measured on the 4090 is three to four per cent faster decode rather than the small loss the design expected, because a paged step scans the same number of cells every token where a contiguous one grows its grid by one key a step, and holding the launch shape still is worth more than the extra cells cost.
+
 ### Added
 
 - The paged cache is wired into a forward pass. A step takes a cell from the table for each of its tokens, the store scatters through the vector of cell indices, and attention masks by the position each cell holds, so which row of the cache a token lands in is no longer decided by its position. Whether a step is paged is reported by the allocation rather than chosen by the caller: a pass over cells that are not the positions they hold has to be paged, and while one sequence has the whole pool to itself the free list hands out cells in order and the answer is no, which is what makes this bit identical on the path a token takes today. The fused decode asks the same question, since it reads a run and has no mask, and falls back to the unfused path when the cells do not allow it. What it buys is that the second sequence is a scheduler away rather than a rewrite away, which is #32.
