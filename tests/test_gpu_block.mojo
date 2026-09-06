@@ -67,6 +67,31 @@ comptime LAYERS = 2
 comptime VOCAB = 96
 comptime CONTEXT = 24
 
+
+struct Rng(Movable):
+    """The same small generator the cache tests use, so a layout is a seed.
+
+    A fuzz over pool layouts is only worth running if a failure can be run
+    again, and a fixed seed is what makes the twentieth trial of a bad run
+    reachable without capturing anything.
+    """
+
+    var state: UInt64
+
+    def __init__(out self, seed: UInt64):
+        self.state = seed
+
+    def next(mut self) -> UInt64:
+        self.state ^= self.state << 13
+        self.state ^= self.state >> 7
+        self.state ^= self.state << 17
+        return self.state
+
+    def upto(mut self, n: Int) -> Int:
+        """A number in `[0, n)`, which is all this is ever asked for."""
+        return Int(self.next() % UInt64(n))
+
+
 comptime MATRICES = 2 + LAYERS * 7
 """The embedding, the head, and seven per layer, in the order `_shapes` lists
 them."""
@@ -768,6 +793,106 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             if gap > paged_worst:
                 paged_worst = gap
 
+        # And the same claim over layouts nobody picked. The pool gets a decoy
+        # of a random length that then gives a random half of itself back, so
+        # the cells this prompt lands in have holes in them rather than being
+        # the same run moved along, and the prompt is cut into chunks of a
+        # random length so a step is not always the same size. Both routes run
+        # the same chunks over the same tokens and the only thing that differs
+        # between them is which cell a position went in.
+        #
+        # A dozen tokens and not twenty, so that a decoy long enough to matter
+        # still leaves room for the prompt in a pool of `CONTEXT`.
+        var rng = Rng(0x2E31D0)
+        var fuzz_n = 12
+        var fuzz_worst = Float32(0)
+        var fuzz_paged = 0
+        var fuzz_trials = 8
+        var paged_out2 = Buffer(VOCAB)
+        var plain_out = Buffer(VOCAB)
+        # A scratch of its own, because the trace on the one the decodes used
+        # is compared by length further down and a fuzz would lengthen it. A
+        # chunk of one token norms through a vector the width of the residual
+        # stream and a longer chunk norms through the wide one, which is the
+        # same choice a session makes and the reason both are here.
+        var fone = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB)
+        var fonex = DeviceVec(ctx, WIDTH)
+        for _ in range(fuzz_trials):
+            var sizes = List[Int]()
+            var cut = 0
+            while cut < fuzz_n:
+                var n = 1 + rng.upto(4)
+                if cut + n > fuzz_n:
+                    n = fuzz_n - cut
+                sizes.append(n)
+                cut += n
+            var last = sizes[len(sizes) - 1]
+
+            var holed = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+            var junk = List[Int]()
+            var take = 1 + rng.upto(CONTEXT - fuzz_n)
+            holed.table.alloc_run(1, 0, take, junk)
+            for i in range(take):
+                if rng.upto(2) == 0:
+                    _ = holed.table.release(1, i, i + 1)
+
+            var plain = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+            for route in range(2):
+                var seen = 0
+                for c in range(len(sizes)):
+                    var n = sizes[c]
+                    var run = List[Int]()
+                    for i in range(n):
+                        run.append(tokens[seen + i])
+                    if route == 0:
+                        var slot = holed.place(seen, n, False)
+                        if holed.paging.on:
+                            fuzz_paged += 1
+                        device_forward(
+                            ctx,
+                            model,
+                            batch if n > 1 else fone,
+                            bx if n > 1 else fonex,
+                            run,
+                            seen,
+                            slot,
+                            holed.keys,
+                            holed.values,
+                            holed.paging,
+                        )
+                    else:
+                        var slot = plain.place(seen, n, False)
+                        device_forward(
+                            ctx,
+                            model,
+                            batch if n > 1 else fone,
+                            bx if n > 1 else fonex,
+                            run,
+                            seen,
+                            slot,
+                            plain.keys,
+                            plain.values,
+                            plain.paging,
+                        )
+                    seen += n
+                ctx.synchronize()
+                if route == 0:
+                    if last > 1:
+                        batch.logits.download(paged_out2)
+                    else:
+                        fone.logits.download(paged_out2)
+                else:
+                    if last > 1:
+                        batch.logits.download(plain_out)
+                    else:
+                        fone.logits.download(plain_out)
+            for i in range(VOCAB):
+                var gap = paged_out2.data[i] - plain_out.data[i]
+                if gap < 0:
+                    gap = -gap
+                if gap > fuzz_worst:
+                    fuzz_worst = gap
+
         # The cache the two runs left, row for row, offset by the shift. Bytes
         # and not a tolerance: the store writes the same rows either way and
         # the only thing that changed is which cell it wrote them to, so a
@@ -1015,3 +1140,13 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             paged_diff == 0,
             "and leaves the same rows in the cells it was given",
         )
+        suite.check(
+            fuzz_paged > 0,
+            "a pool with holes in it pages without being asked to",
+        )
+        suite.check(
+            fuzz_worst <= peak * Float32(2e-5),
+            "and every layout the fuzz picked reaches the same logits",
+        )
+        if fuzz_worst > peak * Float32(2e-5):
+            suite.fail("fuzz logits", "worst " + String(fuzz_worst / peak))
