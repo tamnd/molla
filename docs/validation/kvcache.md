@@ -51,6 +51,22 @@ And the projections stopped needing an `EPI_HALF` epilogue, which is the compile
 
 The cost is the extra barrier and the extra pass. The pass is `kv_width` elements a layer against the projections that produced them, which are `kv_width` rows of a `cols` wide matrix, so it is one part in `cols`. The barrier is the term to watch and it is what the measurement below is for.
 
+## What the barrier cost
+
+A 4090, the 8B at Q4_K_M, 128 decode tokens, five alternating pairs at a short prompt and three at a long one, best of each. Alternating the two builds rather than running one after the other is what stops a machine that was never fully idle from deciding the answer, and the one minute load sat between 2.5 and 6.3 throughout with both halves of every pair a few seconds apart.
+
+| measurement | before | after |
+| --- | --- | --- |
+| decode, 6 token prompt | 1062 ms | 1085 ms |
+| prefill, 1801 tokens | 3164 ms | 3171 ms |
+| decode, at 1801 of context | 1209 ms | 1227 ms |
+
+The prefill difference is 7 ms in 3164, which is a fifth of a per cent and smaller than the spread within either build. That is what should happen. Prefill runs a chunk of tokens through a layer at a time, so the barrier is paid once for a chunk rather than once for a token, and the pass is `chunk * kv_width` elements against a matmul of that same chunk over a `cols` wide matrix.
+
+Decode pays it once a token and it costs about 20 ms in 128 tokens at both ends of the context sweep, so 0.16 ms a token over 32 layers, which is 5 microseconds a layer for the two stores and the two barriers together. A decode token is 8.3 ms at the short context, so a layer is 260 microseconds and this is 2 per cent of it.
+
+Not measured on Metal. This laptop has not been under a load of 25 at any point while this was being written, so a timing taken here would report the load rather than the change. Metal has the correctness side, which is the suite and the logit corpus, and it will get the timing when there is a quiet window.
+
 ## Then the quantization
 
 With one writer the encode is local. A thread owns a block of thirty two elements of the finished row, reduces the maximum absolute value over them, and writes thirty two bytes and one float16.
