@@ -101,7 +101,31 @@ So it is 53 per cent of the memory and it costs 24 per cent of a decode at this 
 
 The direction is the surprise and the reason is not bandwidth. A q8 row is 6.9 MB a layer at this context against 12.9, so it is less traffic and it is still slower, which is what a read that has stopped being bandwidth bound looks like. Per element the f16 path is one half load and a convert, and the q8 path is a byte load, a factor load, two converts and a multiply. The factor load is a broadcast across the warp and costs almost nothing, so what is left is the arithmetic, and there is twice as much of it.
 
-That is fixable and it is not fixed here. A lane owns one element of a block at a time, because `key_dot` gives a warp to a key and the lanes stride the head dimension by the warp width. Four consecutive elements a lane would make the quant read one thirty two bit load, would amortize the factor over four elements instead of one, and would cost the reduction order, which only has to stay consistent between the fused path and the unfused one at the same form. That is #258.
+That is fixable, it was #258, and the next section is the fix.
+
+## Four elements a lane, and where the twenty four per cent went
+
+A lane owned one element of a block at a time, because `key_dot` gives a warp to a key and the lanes stride the head dimension by the warp width. So every element paid a byte load, a factor load, two converts and a multiply, and a head of 128 was four rounds of that.
+
+Four adjacent elements a lane instead. They are one aligned thirty two bit word of quants, which is the load `coherent_load_i8` was already doing and throwing three quarters of away. They are inside one block, so they share a factor, and the factor multiplies their partial sum once rather than multiplying each of them. A head of 128 goes from four rounds of about six operations to one round of about eleven, with the same lanes doing the same total work.
+
+It costs the order the products of a key are added in, which is allowed here for the reason `ALANES` gives: the order only has to agree between the fused path and the unfused one at the same form, and both of them are this one function.
+
+Four at a time needs the head to start on a multiple of four and to be a multiple of four long. Every model molla has met is both. One that is not goes down the one at a time path rather than being refused, and the condition is a model constant, so the branch is uniform across the warp.
+
+A 4090, the 8B at Q4_K_M, a context of 4096, a 3003 token prompt, four alternating rounds of the three, best of each. The load average sat between 10.9 and 13.2 throughout, which is higher than a timing should be taken at, and the spread within a column was under one per cent because all three columns were interleaved rather than run one after another.
+
+| measurement | f16 | q8_0 before | q8_0 after |
+| --- | --- | --- | --- |
+| prefill, 3003 tokens | 5570 ms | 5986 ms | 5700 ms |
+| decode, 128 tokens at 3003 of context | 1352 ms | 1673 ms | 1406 ms |
+| decode, against f16 | | 23.7 per cent slower | 4.0 per cent slower |
+
+So 83 per cent of what q8_0 cost a decode is gone, and prefill went from 7.5 per cent over f16 to 2.3. The soak says the accuracy did not move: over the same 8192 positions the two forms now agree on 0.992 to 0.995 of the tokens in every eighth against 0.990 to 0.997 before, the divergence is 1.4e-4 early and 1.9e-4 late where it was 1.3e-4 and 1.9e-4, and the f16 top token is still the q8_0 top token at every checkpoint. The whole stepped 8192 position pass is 95950 ms against f16's 92688, where before the change it was 119122.
+
+The cache bytes did not change, because the store side did not. The suite compares the two allocations bit for bit over the live halves of every row and that is what says so.
+
+The four per cent that is left is the value fold, and it does not take the same treatment. There the inner loop walks keys with the element fixed, so every iteration is a different row and a different factor and there is nothing to hoist. Four elements a thread would cut the loads, and it would also cut the threads doing the fold by four, from 128 of a 256 thread block down to 32, which is the shape #234 and #239 were fixed to get away from. Making that pay needs four times the key splits to go with it, which changes the reduction order and the split tuning together, and it wants a quiet machine to measure. #258 stays open for it.
 
 ## The flag
 

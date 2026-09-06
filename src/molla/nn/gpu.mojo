@@ -780,6 +780,33 @@ def coherent_load_i8[
 
 
 @always_inline
+def coherent_load_i8x4[
+    coherent: Bool
+](p: Pointer[Int8, MutAnyOrigin], i: Int) -> SIMD[DType.int8, 4]:
+    """The four quant bytes at `i`, which are one aligned word.
+
+    `coherent_load_i8` already loads this whole word and throws three of its
+    bytes away, because the smallest device scope atomic either backend has is
+    thirty two bits. A reader that wants all four is therefore the same load and
+    not four of them, and that is most of what #258 is about.
+
+    `i` has to be a multiple of four and `key_dot` is the only caller, which
+    checks. All four bytes belong to the same block of the same row and were
+    written by the same thread of `OP_STORE`, so there is never a partner in
+    flight.
+    """
+    var q = p.unsafe_bitcast[Int32]()
+    comptime if coherent and CompilationTarget.is_macos():
+        return bitcast[DType.int8, 4](
+            _dev32.load[ordering=Ordering.RELAXED](
+                Pointer[Int32, MutAnyOrigin](to=q[unsafe_offset=i >> 2])
+            )
+        )
+    else:
+        return bitcast[DType.int8, 4](q[unsafe_offset=i >> 2])
+
+
+@always_inline
 def cache_load[
     form: Int, coherent: Bool
 ](
@@ -794,8 +821,11 @@ def cache_load[
 
     The block index is `e / CACHE_BLOCK` over the whole row rather than over the
     head, so a head whose width is not a multiple of the block still reads the
-    right scale. In `key_dot` the thirty two lanes of a warp are thirty two
-    consecutive elements, so they take the same scale and the load is a broadcast.
+    right scale.
+
+    One element at a time, which is what the value fold wants and what `key_dot`
+    falls back to. A reader of four adjacent elements should use
+    `coherent_load_i8x4` and one scale, which is #258 and which `key_dot` does.
     """
     comptime if form == CACHE_F16:
         return coherent_load_half[coherent](p, row + e)
@@ -857,8 +887,45 @@ def key_dot[
     kernel. `row` is where this key's row starts and `ka` is where its head starts
     inside the row, which are two arguments rather than one because at `CACHE_Q8`
     the row is measured in halves and the offset inside it is measured in values.
+
+    A q8 lane takes four adjacent elements rather than one, which is #258. One
+    element a lane pays a byte load, a factor load, two converts and a multiply
+    for every element, and that arithmetic and not the traffic is why a q8 decode
+    was 24 per cent slower than a float16 one while moving half the bytes. Four
+    adjacent elements are one aligned word of quants, they are inside one block
+    so they share a factor, and the factor multiplies their partial sum once
+    instead of multiplying each of them, so a head of 128 goes from four rounds
+    of six operations to one round of eleven.
+
+    It changes the order the products of a key are added in, which is allowed
+    because the order only has to agree between the fused path and the unfused
+    one at the same form, and both of them are this function.
+
+    Four at a time needs the head to start on a multiple of four and to be a
+    multiple of four long, which every model molla has met is. A head that is not
+    goes down the one at a time path rather than being refused, and the condition
+    is a model constant so the branch is uniform across the warp.
     """
     var part = Float32(0)
+    comptime if form == CACHE_Q8:
+        if (ka & 3) == 0 and (head_dim & 3) == 0:
+            var quants = keys.unsafe_bitcast[Int8]()
+            var fa = row + kv_width // 2
+            var d = lane * 4
+            while d < head_dim:
+                var e = ka + d
+                var four = coherent_load_i8x4[coherent](quants, row * 2 + e)
+                var dot = Float32(0)
+                comptime for k in range(4):
+                    dot += coherent_load[coherent](q, qa + d + k) * Float32(
+                        four[k]
+                    )
+                part += dot * coherent_load_half[coherent](
+                    keys, fa + e // CACHE_BLOCK
+                )
+                d += ALANES * 4
+            return lane_group_sum[num_lanes=ALANES](part)
+
     var d = lane
     while d < head_dim:
         part += coherent_load[coherent](q, qa + d) * cache_load[form, coherent](
