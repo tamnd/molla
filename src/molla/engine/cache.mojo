@@ -28,6 +28,33 @@ them. That is the same argument the paragraph above makes about `slot_for` being
 a method, one level up: the day a slot stops being a position, one function
 changes and both caches follow, rather than one of them being updated and the
 other quietly staying correct for a while.
+
+`CellTable` below is the start of the day that paragraph is about. It is stage
+two of #31 and `docs/validation/paging.md` is the argument for its shape: the
+pool is addressed by cell rather than by position, a cell holds one token, and
+which cell a position went in is host side bookkeeping that no kernel walks.
+Nothing calls it yet. It lands first on its own because a free list and an owner
+set are the part of paging that can be tested to exhaustion without a card, and
+because the stage after it wants to be a change to attention alone.
+"""
+
+comptime CELL_FREE = -1
+"""The position held by a cell nothing has written.
+
+Negative rather than a separate flag vector, which is what llama.cpp does, for
+the same reason: the free question and the position question are then one load
+rather than two, and a position can never be negative anyway.
+"""
+
+comptime MAX_SEQS = 64
+"""How many sequences a pool can hold at once.
+
+llama.cpp carries a `std::bitset<256>` a cell and so allows 256. One machine
+word allows 64, costs eight bytes a cell rather than thirty two, and tests with
+a shift instead of a loop. M3 asks for sixteen concurrent streams, so 64 is the
+honest size until something asks for more, and the day it does this becomes a
+short array of words with no caller above it noticing, because no caller above
+it sees the word.
 """
 
 
@@ -69,6 +96,223 @@ def check_room(count: Int, room: Int, context: Int) raises:
             + " left of "
             + String(context)
         )
+
+
+struct CellTable(Movable):
+    """Which position each cell of a pool holds, and which sequences own it.
+
+    Two parallel vectors over the pool, host side, never uploaded. A cell is a
+    token, so there is no block size to choose, no partial block to copy when
+    two sequences diverge, and no table for a kernel to walk. What reaches the
+    device is a vector of cell indices computed once a step, and that is a later
+    commit in this stage.
+
+    The whole table is small enough not to think about. A pool big enough for
+    an 8B to hold 147000 tokens is 147000 positions and 147000 owner words,
+    which is 2.4 MiB beside 18 GiB of cells.
+
+    Everything here is a range of positions rather than a range of cells,
+    because a caller thinks in positions and only the table knows where they
+    went. The one exception is `owns` and `position`, which are how a mask gets
+    built and are asked cell by cell.
+    """
+
+    var pos: List[Int]
+    """`CELL_FREE`, or the position this cell holds in its owners' sequences."""
+
+    var owners: List[UInt64]
+    """A bit a sequence. Zero exactly when `pos` is `CELL_FREE`."""
+
+    var live: Int
+    """How many cells are not free.
+
+    Kept rather than counted. The fit question is asked once a step and the
+    count would be over the whole pool, which is the one loop in here that
+    would show up.
+    """
+
+    var head: Int
+    """Where the next search starts.
+
+    A hint and not state. Every search wraps and scans the whole pool before it
+    gives up, so a head pointing at a taken cell costs a few loads and nothing
+    else. llama.cpp keeps the same hint for the same reason: allocation is
+    almost always at the end of what was allocated last, and starting from zero
+    every time turns a decode step into a scan of the pool.
+    """
+
+    def __init__(out self, cells: Int) raises:
+        """A pool of `cells` cells, all free."""
+        if cells <= 0:
+            raise Error("a cell table needs at least one cell")
+        self.pos = List[Int](length=cells, fill=CELL_FREE)
+        self.owners = List[UInt64](length=cells, fill=0)
+        self.live = 0
+        self.head = 0
+
+    def size(self) -> Int:
+        return len(self.pos)
+
+    def free(self) -> Int:
+        return self.size() - self.live
+
+    def reset(mut self):
+        """Give every cell back, forgetting every sequence."""
+        for i in range(self.size()):
+            self.pos[i] = CELL_FREE
+            self.owners[i] = 0
+        self.live = 0
+        self.head = 0
+
+    def position(self, cell: Int) raises -> Int:
+        """What position `cell` holds, or `CELL_FREE`."""
+        self._check_cell(cell)
+        return self.pos[cell]
+
+    def owns(self, cell: Int, seq: Int) raises -> Bool:
+        """Whether `seq` may read `cell`."""
+        self._check_cell(cell)
+        return (self.owners[cell] & _bit_of(seq)) != 0
+
+    def alloc(mut self, seq: Int, at: Int) raises -> Int:
+        """Take a free cell for `seq` at position `at`, and say which one.
+
+        No check that `seq` does not already hold `at`. A sequence that writes
+        the same position twice has a bug one level up, and a table that
+        searched for a duplicate on every token would be paying for that bug
+        once a token forever.
+        """
+        if at < 0:
+            raise Error("a position cannot be negative")
+        var bit = _bit_of(seq)
+        var n = self.size()
+        for i in range(n):
+            var cell = self.head + i
+            if cell >= n:
+                cell -= n
+            if self.pos[cell] == CELL_FREE:
+                self.pos[cell] = at
+                self.owners[cell] = bit
+                self.live += 1
+                self.head = cell + 1 if cell + 1 < n else 0
+                return cell
+        raise Error("the cell pool is full at " + String(n) + " cells")
+
+    def alloc_run(
+        mut self, seq: Int, first: Int, count: Int, mut cells: List[Int]
+    ) raises:
+        """Take `count` cells for `seq` at `first` onward, appending each one.
+
+        The room check comes first so that a run either happens or does not.
+        Half a prompt written into the pool with the other half refused would
+        leave cells owned by a sequence that is about to be thrown away, and
+        the caller that got the error is the one caller not in a position to
+        clean that up.
+        """
+        check_room(count, self.free(), self.size())
+        for i in range(count):
+            cells.append(self.alloc(seq, first + i))
+
+    def share(mut self, src: Int, dst: Int, p0: Int, p1: Int) raises -> Int:
+        """Give `dst` a second claim on the cells `src` holds in `[p0, p1)`.
+
+        A negative `p1` means the rest of the sequence. Returns how many cells
+        changed hands, which is what a caller reports as a prefix hit.
+
+        No copy. That is the whole point of an owner set: two sequences sharing
+        a prompt share its cells until one of them writes, and the write goes
+        to a new cell because it is at a position neither holds yet.
+        """
+        var add = _bit_of(dst)
+        var keep = _bit_of(src)
+        var shared = 0
+        for i in range(self.size()):
+            if self.pos[i] == CELL_FREE:
+                continue
+            if (self.owners[i] & keep) == 0:
+                continue
+            if self.pos[i] < p0:
+                continue
+            if p1 >= 0 and self.pos[i] >= p1:
+                continue
+            self.owners[i] |= add
+            shared += 1
+        return shared
+
+    def release(mut self, seq: Int, p0: Int, p1: Int) raises -> Int:
+        """Drop `seq`'s claim on `[p0, p1)`, freeing what nobody else holds.
+
+        A negative `p1` means the rest of the sequence. Returns how many cells
+        became free, which is not how many were released, because a cell two
+        sequences hold survives the first of them leaving.
+        """
+        var bit = _bit_of(seq)
+        var freed = 0
+        for i in range(self.size()):
+            if self.pos[i] == CELL_FREE:
+                continue
+            if (self.owners[i] & bit) == 0:
+                continue
+            if self.pos[i] < p0:
+                continue
+            if p1 >= 0 and self.pos[i] >= p1:
+                continue
+            self.owners[i] &= ~bit
+            if self.owners[i] == 0:
+                self.pos[i] = CELL_FREE
+                self.live -= 1
+                freed += 1
+        return freed
+
+    def release_all(mut self, seq: Int) raises -> Int:
+        """Drop every claim `seq` has, which is what ending a session does."""
+        return self.release(seq, 0, -1)
+
+    def cell_of(self, seq: Int, at: Int) raises -> Int:
+        """Which cell holds `at` for `seq`, or `CELL_FREE`.
+
+        A scan, and it stays one. Nothing on the decode path asks this: a
+        sequence keeps the cells it was handed, in order, and asks the table
+        only when it wants a position it has not written. This is here for the
+        checks that compare two routes position by position, and for a prefix
+        lookup that already costs more than a scan.
+        """
+        var bit = _bit_of(seq)
+        for i in range(self.size()):
+            if self.pos[i] == at and (self.owners[i] & bit) != 0:
+                return i
+        return CELL_FREE
+
+    def held_by(self, seq: Int) raises -> Int:
+        """How many cells `seq` holds, shared or not."""
+        var bit = _bit_of(seq)
+        var count = 0
+        for i in range(self.size()):
+            if (self.owners[i] & bit) != 0:
+                count += 1
+        return count
+
+    def _check_cell(self, cell: Int) raises:
+        if cell < 0 or cell >= self.size():
+            raise Error(
+                "cell "
+                + String(cell)
+                + " is outside a pool of "
+                + String(self.size())
+            )
+
+
+def _bit_of(seq: Int) raises -> UInt64:
+    """The owner bit for a sequence, refusing one the word cannot hold."""
+    if seq < 0 or seq >= MAX_SEQS:
+        raise Error(
+            "sequence "
+            + String(seq)
+            + " is outside the "
+            + String(MAX_SEQS)
+            + " a cell pool tracks"
+        )
+    return UInt64(1) << UInt64(seq)
 
 
 struct KvCache(Movable):
