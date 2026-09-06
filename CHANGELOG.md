@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.4.19] - 2026-09-06
+
+The KV cache can be held at q8_0 behind `--cache-type`, which is 53 per cent of the memory a float16 cache takes and costs 24 per cent of a decode at a long context. Off by default. The logit corpus agrees with llama.cpp on all thirteen device cases on both backends, and the 8B answers a prompt with byte identical text at both forms.
+
 ### Added
 
 - `--cache-type f16|q8_0` on `generate` and `serve`, which is what the keys and values are held as on a card. A q8_0 row is a byte a value plus a float16 factor every thirty two of them, so it is 1.0625 bytes a value against 2, and an 8B at a context of 2048 holds 136 MiB of cache rather than 256. It is a little over half and not a quarter, and the difference is the factors. Off by default. See docs/validation/kvcache.md.
