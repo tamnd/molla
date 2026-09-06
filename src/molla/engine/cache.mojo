@@ -15,13 +15,11 @@ position it was given. The day it stops doing that is the day every caller that
 had inlined the identity becomes a bug, and there are no such callers because
 there is a method.
 
-Everything is float32. The keys and values feed a softmax and the accumulation
-into it has to be wider than the weights are, and a cache in float16 is the
-known cause of long context degradation that shows up as a model that is fine
-for two thousand tokens and vague after eight. Half the memory for a defect
-that only appears in the cases people bought the long context for is not a
-trade this makes. Quantizing the cache is a real option later and it is a
-measured one, not a default.
+This one is float32 and stays there. It is the reference the device cache is
+checked against, and a reference that rounds the same way the thing it is
+checking rounds has stopped being one. The device cache holds float16 by default
+and q8_0 when asked, and what that means to a byte is `CACHE_F16`, `CACHE_Q8` and
+`cache_row` in `molla.nn.repack`, beside the weight layout they follow.
 
 There are two caches now, this one and the device one in `molla.engine.device`,
 and they differ only in which memory the floats are in. So the two questions

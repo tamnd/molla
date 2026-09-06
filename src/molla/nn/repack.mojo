@@ -171,6 +171,93 @@ are laid out back to back, so this is the alignment of every row and not just
 the first.
 """
 
+comptime CACHE_F16 = 0
+"""A key and value cache that holds a float16 a value, which is the default.
+
+llama.cpp has defaulted here for years and molla's logit corpus agrees with it
+on both backends, so this is the form that needs no argument made for it.
+"""
+
+comptime CACHE_Q8 = 1
+"""A cache that holds a q8_0 block: thirty two signed bytes and one float16.
+
+Half the bytes of a float16 cache and half the traffic through attention, at the
+cost of rounding every key and value on the way in. The rounding is why this is a
+flag rather than a default: what it costs is not visible in a short prompt, and
+the evidence that would settle it is a long soak. See
+[docs/validation/kvcache.md](../../../docs/validation/kvcache.md).
+
+Here rather than in `molla.engine.cache` because it is a layout and not a policy.
+A cache row at this form is the same shape a planar weight row is, which is a
+quant plane followed by a scale plane, and the read side is the same read.
+"""
+
+comptime CACHE_BLOCK = 32
+"""Values a q8_0 block, which is the block size the format is named for."""
+
+comptime CACHE_ALIGN = 8
+"""Halves a cache row is rounded up to, so every row starts on sixteen bytes.
+
+The same sixteen `ROW_ALIGN` gives a planar weight row and for the same reason.
+Nothing reads a cache row with a vector load yet. This costs at most fourteen
+bytes a row and it means the day something does, the address is already right.
+"""
+
+
+@always_inline
+def cache_stride(form: Int, kv_width: Int) -> Int:
+    """The arithmetic of `cache_row` with nothing checked.
+
+    A kernel wants this and a kernel cannot raise, so the checks live in
+    `cache_row`, which is what every host side caller goes through, and the two
+    agree because the second calls the first.
+    """
+    if form == CACHE_F16:
+        return kv_width
+    var halves = kv_width // 2 + kv_width // CACHE_BLOCK
+    return (halves + CACHE_ALIGN - 1) // CACHE_ALIGN * CACHE_ALIGN
+
+
+def cache_row(form: Int, kv_width: Int) raises -> Int:
+    """Halves one position of one layer occupies at this form.
+
+    Halves rather than bytes or values, because a q8_0 cache is held in the same
+    float16 buffer a float16 one is: the two forms differ in how a row is read
+    and not in what owns it, which keeps one allocation, one pointer and one
+    plan space rather than two of each. A q8_0 row is `kv_width` signed bytes,
+    which is `kv_width / 2` halves, then `kv_width / 32` float16 scales, rounded
+    up to `CACHE_ALIGN`.
+    """
+    if kv_width <= 0:
+        raise Error("a cache row needs a positive width")
+    if form != CACHE_F16 and form != CACHE_Q8:
+        raise Error("unknown cache type " + String(form))
+    if form == CACHE_Q8 and kv_width % CACHE_BLOCK != 0:
+        raise Error(
+            "a q8_0 cache needs a key width that is a multiple of "
+            + String(CACHE_BLOCK)
+            + " and this model's is "
+            + String(kv_width)
+        )
+    return cache_stride(form, kv_width)
+
+
+def parse_cache_type(text: String) raises -> Int:
+    """`f16` or `q8_0`, and a refusal that names both for anything else."""
+    if text == "f16":
+        return CACHE_F16
+    if text == "q8_0":
+        return CACHE_Q8
+    raise Error(String("'") + text + "' is not a cache type. It is f16 or q8_0")
+
+
+def cache_type_name(form: Int) -> String:
+    """What to print in the run header, which is where anyone will look."""
+    if form == CACHE_Q8:
+        return String("q8_0")
+    return String("f16")
+
+
 comptime LAYOUT_VERSION = 5
 """Bumped whenever the meaning of a planar byte changes.
 

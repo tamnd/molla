@@ -39,6 +39,10 @@ from molla.nn.quant import (
     dequant_run,
 )
 from molla.nn.repack import (
+    CACHE_ALIGN,
+    CACHE_BLOCK,
+    CACHE_F16,
+    CACHE_Q8,
     LAYOUT_GGML,
     LAYOUT_PLANAR,
     LAYOUT_VERSION,
@@ -54,8 +58,11 @@ from molla.nn.repack import (
     block_groups,
     block_scaled,
     block_shift,
+    cache_row,
+    cache_type_name,
     group_size,
     has_min,
+    parse_cache_type,
     planar_groups,
     planar_quant_bytes,
     planar_row_bytes,
@@ -201,6 +208,7 @@ def run(mut suite: Suite) raises:
     test_round_trip(suite)
     test_planar_dot(suite)
     test_planar_matvec(suite)
+    test_cache_rows(suite)
     test_refusals(suite)
 
 
@@ -548,6 +556,80 @@ def test_planar_matvec(mut suite: Suite) raises:
             + _label(kind)
             + " matches the same weight read as blocks",
         )
+
+
+def test_cache_rows(mut suite: Suite) raises:
+    """What a cache row costs at each form, which is the whole of the saving.
+
+    A float16 row is the width and nothing else. A q8 row is a byte a value plus
+    a float16 factor every `CACHE_BLOCK` of them, rounded up so the next row
+    starts on a boundary a thirty two bit store can own, and the check that
+    matters is that it is comfortably under two thirds of the float16 row at
+    every width a real model has.
+    """
+    suite.group("nn.repack cache rows")
+
+    suite.check(
+        cache_row(CACHE_F16, 1024) == 1024,
+        "a float16 row is one half a value",
+    )
+    # A thousand and twenty four bytes of quants is 512 halves, and 32 factors
+    # on top of that is 544, which is already a multiple of the alignment. So a
+    # value costs 1.0625 bytes here against 2, and that ratio is the whole of
+    # the saving: it is a bit over half and it is nowhere near a quarter.
+    suite.check(
+        cache_row(CACHE_Q8, 1024) == 544,
+        "and a q8 row is a byte a value and a factor a block",
+    )
+    suite.check(
+        cache_row(CACHE_Q8, 1024) * 8 < cache_row(CACHE_F16, 1024) * 5,
+        "which is under five eighths of what the float16 row costs",
+    )
+    for heads in range(1, 17):
+        var width = heads * 128
+        var row = cache_row(CACHE_Q8, width)
+        suite.check(
+            row % CACHE_ALIGN == 0,
+            "a q8 row of " + String(width) + " ends on a boundary",
+        )
+        suite.check(
+            row * 8 < cache_row(CACHE_F16, width) * 5,
+            "and stays under five eighths of the float16 row",
+        )
+
+    suite.check(
+        parse_cache_type(String("f16")) == CACHE_F16,
+        "f16 is what the flag calls the default",
+    )
+    suite.check(
+        parse_cache_type(String("q8_0")) == CACHE_Q8,
+        "and q8_0 is the name ggml gives the other one",
+    )
+    suite.check(
+        cache_type_name(CACHE_Q8) == String("q8_0"),
+        "and the name comes back out for the run header",
+    )
+
+    var raised = False
+    try:
+        _ = parse_cache_type(String("q4_0"))
+    except:
+        raised = True
+    suite.check(raised, "a type molla has no cache for is refused by name")
+
+    raised = False
+    try:
+        _ = cache_row(CACHE_Q8, CACHE_BLOCK + 1)
+    except:
+        raised = True
+    suite.check(raised, "and a width that is not whole blocks has no q8 row")
+
+    raised = False
+    try:
+        _ = cache_row(CACHE_F16, 0)
+    except:
+        raised = True
+    suite.check(raised, "and a row of nothing is not a row")
 
 
 def test_refusals(mut suite: Suite) raises:

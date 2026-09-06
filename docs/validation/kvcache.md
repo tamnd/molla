@@ -71,15 +71,21 @@ Not measured on Metal. This laptop has not been under a load of 25 at any point 
 
 With one writer the encode is local. A thread owns a block of thirty two elements of the finished row, reduces the maximum absolute value over them, and writes thirty two bytes and one float16.
 
-The row layout is the same planar shape the weights use, because there is no reason for the cache to have a second one:
+The row is the same planar shape the weights use, a plane of quant bytes and then a plane of scales, because there is no reason for the cache to have a second one:
 
 ```text
-row = [ kv_width quant bytes ][ kv_width / 32 float16 scales ]
+row = [ kv_width quant bytes ][ kv_width / 32 float16 scales ][ pad ]
 ```
 
-On Metal a thread owns two adjacent blocks rather than one, so the two scales it writes are an aligned word and the quant bytes it writes are eight aligned words. That is the same answer `PAIRED` gives everywhere else and it is asked in the same place.
+It lives in the same float16 buffer an f16 cache lives in, and that is the decision the whole implementation turns on. The alternative is a second cache type carried down every signature that touches keys and values, and there is nothing to gain from it: what changes at q8_0 is how a row is read, not what holds it. So there is still one allocation a layer, one pointer to hand a kernel and one space in the fused plan, and a row is measured in halves at both forms. `cache_row` in `molla.nn.repack` is the arithmetic and `CACHE_F16` and `CACHE_Q8` are the two answers. It sits in `repack.mojo` beside `SCALE_BYTES` and `LAYOUT_VERSION` because `molla.nn` cannot import `molla.engine`, and the engine's cache needs the number too.
 
-The read side is the weight matvec's read side with a group size of thirty two and no minimum, so it is `_group_scale`'s plain branch over a byte plane, and the three readers are `attend_kernel`, `attend_split_kernel` and the fused `OP_ATTEND`.
+The padding rounds a row up to eight halves, so that the next row starts somewhere a thirty two bit store can own. Without it a row of an odd number of scales puts the next row's first byte in the middle of a word, and two positions written at once would then be two threads reading and writing the same word.
+
+On Metal a thread owns two adjacent blocks rather than one, so the two scales it writes are an aligned word. The quant bytes need no pairing of their own at either form, because a block is thirty two bytes and therefore eight whole words. That is the same answer `PAIRED` gives everywhere else and it is asked in the same place.
+
+The read side is `cache_load`, which takes the form as a compile time parameter and is the one function all three readers call: `attend_kernel`, `attend_split_kernel` and the fused `OP_ATTEND`. The branch on the form is outside the loop over the head dimension in every one of them, so a form costs a uniform branch a key rather than a branch an element.
+
+A note on what this saves, because it is easy to overstate. A value costs 1.0625 bytes here against 2, so a q8_0 cache is 53 per cent of an f16 one and not 25. The saving is a byte a value and the scales are the rest.
 
 ## The flag
 

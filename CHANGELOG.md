@@ -4,6 +4,12 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Added
+
+- `--cache-type f16|q8_0` on `generate` and `serve`, which is what the keys and values are held as on a card. A q8_0 row is a byte a value plus a float16 factor every thirty two of them, so it is 1.0625 bytes a value against 2, and an 8B at a context of 2048 holds 136 MiB of cache rather than 256. It is a little over half and not a quarter, and the difference is the factors. Off by default. See docs/validation/kvcache.md.
+- A q8_0 cache lives in the same float16 buffer a float16 cache lives in, because what changes at q8_0 is how a row is read and not what holds it. So there is one allocation a layer at both forms, one pointer to hand a kernel, one space in the fused plan, and a row is measured in halves either way. `cache_row` in `molla.nn.repack` is the arithmetic, and it sits there rather than in the engine because `molla.nn` cannot import `molla.engine` and both sides need the number. A row is rounded up to eight halves so the next row starts where a thirty two bit store can own it.
+- The three readers of the cache go through one function, `cache_load`, which takes the form as a compile time parameter. `attend_kernel`, `attend_split_kernel` and the fused `OP_ATTEND` all branch on the form outside the loop over the head dimension, so a form costs a uniform branch a key rather than a branch an element. The writers are `OP_STORE` in the fused plan and `store_kv_q8_kernel` on the unfused path, and the two are held to writing the same bytes.
+
 ## [0.4.18] - 2026-09-06
 
 The KV cache is written once rather than three times, which is what a quantized cache needs and which on its own deletes a compile time parameter, a refusal and three separate answers to the same Metal constraint. The three largest kernels have half the instantiations they had, so the CUDA binary is 445 KiB smaller and the Metal one 483 KiB. Decode costs 2 per cent for the extra barrier and prefill is unchanged. The logit corpus agrees with llama.cpp on all thirteen device cases on both backends.

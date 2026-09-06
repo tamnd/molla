@@ -27,6 +27,7 @@ from molla.net.echo import run_echo
 from molla.net.soak import run_soak
 from molla.net.soak_http import run_http_soak
 from molla.net.soak_net import run_net_soak
+from molla.nn.repack import CACHE_F16, parse_cache_type
 from molla.ops.config import describe_setting, load_config
 from molla.registry.pull import run_pull
 from molla.sys.device import run_devices
@@ -122,12 +123,16 @@ def print_usage():
         " an index."
     )
     print(
+        "                  --cache-type=f16|q8_0 picks what the kv cache holds"
+        " on a card"
+    )
+    print(
         "  serve <model> <tokenizer.json>  answer OpenAI requests against a"
         " model"
     )
     print(
-        "                  --host --port --ctx --device, and 127.0.0.1:8000"
-        " when nothing says"
+        "                  --host --port --ctx --device --cache-type, and"
+        " 127.0.0.1:8000 when nothing says"
     )
     print(
         "  tokenize <tokenizer.json> <prompt> [--ids]  print how many tokens a"
@@ -512,6 +517,7 @@ def main():
         # through `molla.engine.backend`, which is also what decides whether an
         # unspelled run ends up on a card at all.
         var want = Request()
+        var form = CACHE_F16
         try:
             # The two numbers stay positional and the sampling settings are
             # named, in either order. Nobody is going to remember a ninth
@@ -525,6 +531,9 @@ def main():
                     continue
                 if args[i].startswith("--device="):
                     want = parse_backend(_flag_value(args[i]))
+                    continue
+                if args[i].startswith("--cache-type="):
+                    form = parse_cache_type(_flag_value(args[i]))
                     continue
                 if args[i].startswith("--"):
                     raise Error(
@@ -544,9 +553,21 @@ def main():
             var picked = choose_backend(args[2], want)
             if picked.on_device:
                 run_generate_device(
-                    args[2], args[3], args[4], limit, context, sampling, picked
+                    args[2],
+                    args[3],
+                    args[4],
+                    limit,
+                    context,
+                    sampling,
+                    picked,
+                    form,
                 )
             else:
+                if form != CACHE_F16:
+                    raise Error(
+                        "--cache-type is a device setting and this run is on"
+                        " the host"
+                    )
                 run_generate(
                     args[2], args[3], args[4], limit, context, sampling, picked
                 )
@@ -561,6 +582,7 @@ def main():
         var serve_port: UInt16 = 8000
         var serve_context = 0
         var serve_want = Request()
+        var serve_form = CACHE_F16
         try:
             # Named flags rather than positions, because a host and a port and
             # a context length are three numbers nobody is going to remember
@@ -591,6 +613,8 @@ def main():
                     serve_context = _flag_int(key, val)
                 elif key == "device":
                     serve_want = parse_backend(val)
+                elif key == "cache-type":
+                    serve_form = parse_cache_type(val)
                 else:
                     raise Error(
                         String("'") + arg + "' is not a flag this takes"
@@ -603,6 +627,7 @@ def main():
                     serve_port,
                     serve_context,
                     choose_backend(args[2], serve_want),
+                    serve_form,
                 )
             )
         except e:

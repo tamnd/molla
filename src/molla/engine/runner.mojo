@@ -60,6 +60,7 @@ from molla.model.gguf import Gguf
 from molla.model.load import Weights, load, plan_load
 from molla.model.repack import RepackCache, model_key, open_cache
 from molla.model.spec import read_geometry
+from molla.nn.repack import CACHE_F16
 from molla.sys.clock import unix_time
 from molla.sys.device import Device
 from molla.sys.mem import AllocCounter
@@ -160,6 +161,7 @@ struct Runner(Movable):
         id: String,
         context: Int,
         backend: Backend = Backend(),
+        form: Int = CACHE_F16,
     ) raises:
         var g = Gguf(model_path)
         var dev = backend.device
@@ -186,7 +188,7 @@ struct Runner(Movable):
             # bytes, so the second is a list of addresses and not a second copy
             # of anything.
             b = bind(g, cache, weights.residency())
-            self.device = open_session(ctx, bind(g, cache), b, want)
+            self.device = open_session(ctx, bind(g, cache), b, want, form)
         else:
             # Everything stays in the mapping, because host kernels cannot read
             # a tensor on a card.
@@ -196,6 +198,11 @@ struct Runner(Movable):
             # straight to the cache. This run binds to whatever was there when
             # it opened, which on a miss is the file, so the repack a miss
             # writes is for the next start and not for this one.
+            if form != CACHE_F16:
+                raise Error(
+                    "--cache-type is a device setting and this server is"
+                    " running on the host"
+                )
             var repack_for = String("") if cache.usable else model_path
             weights = load(g, plan_load(g, dev, 0, cache), 0, False, repack_for)
             b = bind(g, cache)

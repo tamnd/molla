@@ -94,6 +94,7 @@ from molla.nn.gpu import (
     DeviceVec,
     activate,
     byte_float,
+    cache_load,
     coherent_load,
     coherent_load_half,
     key_dot,
@@ -102,8 +103,11 @@ from molla.nn.gpu import (
     planar_row_sum,
     row_takes_a_warp,
 )
-from molla.nn.gpu_ops import NEG_INF, _ramp, _reduce_angle, _tanh
+from molla.nn.gpu_ops import NEG_INF, _q8, _ramp, _reduce_angle, _tanh
 from molla.nn.repack import (
+    CACHE_BLOCK,
+    CACHE_F16,
+    CACHE_Q8,
     QUANT_I8,
     QUANT_K4,
     QUANT_K5,
@@ -112,6 +116,7 @@ from molla.nn.repack import (
     QUANT_S6,
     QUANT_U4,
     QUANT_U5,
+    cache_stride,
     group_shift,
     group_size,
     has_min,
@@ -284,9 +289,22 @@ def _put_pair(
     a read modify write on a value another core is holding, and there is no
     sixteen bit atomic on either backend to make that safe.
     """
-    var word = bitcast[DType.int32, 1](
-        SIMD[DType.float16, 2](Float16(a), Float16(b))
+    _put_word(
+        p,
+        j,
+        bitcast[DType.int32, 1](SIMD[DType.float16, 2](Float16(a), Float16(b))),
     )
+
+
+@always_inline
+def _put_word(p: Pointer[Float32, MutAnyOrigin], j: Int, word: Int32):
+    """Write the aligned thirty two bit word at index `j`, whatever is in it.
+
+    `_put` for a word that is not a float. Two halves of the cache are one of
+    these and so are four quant bytes of a q8_0 block, and both want the same
+    store for the same reason, which is that on Metal a plain store never leaves
+    the core that made it.
+    """
     var q = p.unsafe_bitcast[Int32]()
     comptime if CompilationTarget.is_macos():
         dev32.store[ordering=Ordering.RELAXED](
@@ -322,6 +340,39 @@ def _put_half(p: Pointer[Float32, MutAnyOrigin], i: Int, v: Float32):
     backend that both needs one and has one this wide.
     """
     p.unsafe_bitcast[Float16]()[unsafe_offset=i] = Float16(v)
+
+
+@always_inline
+def _put_block(
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    at: Int,
+    word: Int,
+) -> Float32:
+    """One q8_0 block of the work vector into the cache, returning its factor.
+
+    Thirty two floats at `x[at]` become thirty two signed bytes at the eight
+    words starting at `o[word]`, and the factor comes back for the caller to put
+    in the scale plane, because the scale plane is where two threads meet on
+    Metal and the quant plane is not.
+
+    A word at a time rather than a byte at a time for the reason `_put_word`
+    gives, and the eight are aligned because a block is thirty two bytes and a
+    row is rounded up to `CACHE_ALIGN`.
+    """
+    var amax = Float32(0)
+    for k in range(CACHE_BLOCK):
+        var v = _get(x, at + k)
+        var a = v if v >= 0 else -v
+        if a > amax:
+            amax = a
+    var inv = Float32(0) if amax == 0 else Float32(127.0) / amax
+    for w in range(CACHE_BLOCK // 4):
+        var four = SIMD[DType.int8, 4](0)
+        for k in range(4):
+            four[k] = _q8(_get(x, at + w * 4 + k) * inv)
+        _put_word(o, word + w, bitcast[DType.int32, 1](four))
+    return amax / Float32(127.0)
 
 
 comptime SPACE_WORK = 0
@@ -427,9 +478,17 @@ comptime R_SPLIT = 29
 One row of `head_dim + 2` floats a head a slice, which is what lets more than
 one block work on the same head. See `FSPLIT_MAX`.
 """
+comptime R_FORM = 30
+"""Which form the key and value cache is in, `CACHE_F16` or `CACHE_Q8`.
+
+On the two records that touch the cache, which are `OP_STORE` and `OP_ATTEND`.
+It is the same for every record of a plan, and it is in the record rather than a
+kernel argument because that keeps the launch the same shape whatever the flag
+says and because a record already carries everything else a step needs.
+"""
 comptime REC_INTS = 32
 """Fields in a record, rounded up so that a record is a shift rather than a
-multiply. Thirty are used and the table is a few tens of kilobytes for the
+multiply. Thirty one are used and the table is a few tens of kilobytes for the
 largest model in the fleet, so the rounding costs nothing worth counting."""
 
 comptime R_EPS = 0
@@ -895,6 +954,8 @@ def fused_kernel(
         elif op == OP_ATTEND:
             var head_dim = _fi(plan_i, rec, R_HEAD_DIM)
             var kv_width = _fi(plan_i, rec, R_KV)
+            var form = _fi(plan_i, rec, R_FORM)
+            var crow = cache_stride(form, kv_width)
             var group = _fi(plan_i, rec, R_GROUP)
             var window = _fi(plan_i, rec, R_WINDOW)
             var sinks = _fi(plan_i, rec, R_SINKS)
@@ -955,11 +1016,39 @@ def fused_kernel(
                     var visible = j < sinks or window <= 0 or j > pos - window
                     var s = NEG_INF
                     if visible:
-                        var ka = j * kv_width + kvh * head_dim
-                        s = (
-                            key_dot[True](x, keys, qa, ka, head_dim, lane)
-                            * scale
-                        )
+                        # A uniform branch a key, which is one branch against a
+                        # dot product of `head_dim` terms, so the form is a
+                        # compile time parameter of the read without the plan
+                        # having to instantiate this kernel twice.
+                        var ka = kvh * head_dim
+                        if form == CACHE_Q8:
+                            s = (
+                                key_dot[True, CACHE_Q8](
+                                    x,
+                                    keys,
+                                    qa,
+                                    j * crow,
+                                    ka,
+                                    kv_width,
+                                    head_dim,
+                                    lane,
+                                )
+                                * scale
+                            )
+                        else:
+                            s = (
+                                key_dot[True, CACHE_F16](
+                                    x,
+                                    keys,
+                                    qa,
+                                    j * crow,
+                                    ka,
+                                    kv_width,
+                                    head_dim,
+                                    lane,
+                                )
+                                * scale
+                            )
                         if softcap > 0:
                             s = softcap * _tanh(s / softcap)
                     if lane == 0:
@@ -989,11 +1078,23 @@ def fused_kernel(
                 while d < head_dim:
                     var acc = Float32(0)
                     if total > 0:
-                        for j2 in range(lo, hi):
-                            var va = j2 * kv_width + kvh * head_dim
-                            acc += scores[
-                                unsafe_offset=sa + j2
-                            ] * coherent_load_half[True](values, va + d)
+                        # The branch is outside the fold rather than inside it,
+                        # so a slice of a thousand values pays for it once.
+                        var va = kvh * head_dim + d
+                        if form == CACHE_Q8:
+                            for j2 in range(lo, hi):
+                                acc += scores[
+                                    unsafe_offset=sa + j2
+                                ] * cache_load[CACHE_Q8, True](
+                                    values, j2 * crow, kv_width, va
+                                )
+                        else:
+                            for j2 in range(lo, hi):
+                                acc += scores[
+                                    unsafe_offset=sa + j2
+                                ] * cache_load[CACHE_F16, True](
+                                    values, j2 * crow, kv_width, va
+                                )
                     _put(parts, pa + d, acc)
                     d += FTILE
                 if t == 0:
@@ -1066,7 +1167,30 @@ def fused_kernel(
 
         elif op == OP_STORE:
             var n = _fi(plan_i, rec, R_N)
-            if PAIRED:
+            var form = _fi(plan_i, rec, R_FORM)
+            if form == CACHE_Q8:
+                # A block a thread, and two blocks a thread on Metal, because
+                # the two scales a pair of blocks writes are one aligned word and
+                # a half is not a unit a writer there can own. The quant plane
+                # needs no pairing of its own: a block is eight whole words.
+                var per = n // CACHE_BLOCK
+                var step = 2 if PAIRED else 1
+                var i = (b * FTILE + t) * step
+                var stride = blocks * FTILE * step
+                var scales = n // 2
+                while i < per:
+                    var s0 = _put_block(x, o, i * CACHE_BLOCK, i * 8)
+                    if PAIRED:
+                        var s1 = Float32(0)
+                        if i + 1 < per:
+                            s1 = _put_block(
+                                x, o, (i + 1) * CACHE_BLOCK, (i + 1) * 8
+                            )
+                        _put_pair(o, (scales + i) // 2, s0, s1)
+                    else:
+                        _put_half(o, scales + i, s0)
+                    i += stride
+            elif PAIRED:
                 # Two elements a thread, so what it writes is one aligned word.
                 # A cache row is `kv_width` elements and a slot offset is a
                 # multiple of that, and every model molla accepts has an even
