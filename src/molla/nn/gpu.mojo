@@ -51,7 +51,11 @@ from std.gpu import block_idx, thread_idx
 from std.gpu.primitives.warp import WARP_SIZE, lane_group_sum
 from std.math import exp
 from std.memory import AddressSpace, bitcast, stack_allocation
-from std.sys.info import CompilationTarget, has_accelerator
+from std.sys.info import (
+    CompilationTarget,
+    has_accelerator,
+    has_nvidia_gpu_accelerator,
+)
 
 from max.gpu import barrier
 from max.gpu.compute.arch.mma_apple import (
@@ -59,6 +63,7 @@ from max.gpu.compute.arch.mma_apple import (
     apple_mma_load_8x8,
     apple_mma_store_8x8,
 )
+from max.gpu.compute.mma import ld_matrix, mma
 from max.gpu.host import DeviceBuffer, DeviceContext
 
 from molla.nn.block import ACT_GELU, ACT_SILU
@@ -2199,6 +2204,318 @@ def _launch_mma[
     )
 
 
+comptime NV_ROWS = 64
+comptime NV_TOKENS = 64
+"""Output rows and output tokens one tensor core block covers.
+
+Square, and both of them twice the token count the first attempt at this used.
+The token count is what decides how many times the weight matrix is read, since
+a block reads the whole reduction of its rows for its tokens and nothing else
+does, so sixty four tokens is half the weight traffic of thirty two. Sixty four
+is also the largest it can be without a second contract to keep: the tail block
+runs its dead lanes off the end of the chunk and every scratch vector a prefill
+allocates carries `SPAN * MM_GROUPS` rows of slack for exactly that, which is
+sixty four rows.
+"""
+
+comptime NV_K = 64
+"""How far down the reduction one staged tile reaches.
+
+Two quant groups rather than one, and the reason is the swizzle rather than the
+arithmetic. A staged row of sixty four halves is a hundred and twenty eight
+bytes, which is the width of the shared memory banks exactly once, and that is
+what makes `nv_at` conflict free for the sixteen byte fragment loads below. At
+thirty two the same eight lanes of a load phase would land on two banks out of
+thirty two and take an eight way conflict on every fragment.
+
+A thread still stages one whole group, because `NV_KPT` is thirty two, so the
+scale and the minimum are read once for its run.
+"""
+
+comptime NV_THREADS = 128
+comptime NV_WARP_ROWS = NV_ROWS // 2
+comptime NV_WARP_TOKENS = NV_TOKENS // 2
+comptime NV_FR = NV_WARP_ROWS // 8
+comptime NV_FT = NV_WARP_TOKENS // 16
+"""Four warps, two by two, each covering thirty two rows and thirty two tokens.
+
+The instruction is sixteen by eight by sixteen with the tokens on the sixteen
+side, so a warp's tokens are `NV_FT` fragments and its rows are `NV_FR` of them,
+which is eight accumulators of four floats a lane.
+"""
+
+comptime NV_ROW_THREADS = NV_THREADS // NV_ROWS
+comptime NV_KPT = NV_K // NV_ROW_THREADS
+comptime NV_CHUNKS = NV_K // 8
+comptime NV_XV = (NV_TOKENS * NV_K) // 8
+"""How the staging is split: threads to a row, values to a thread, and the
+eight value chunk both tiles are addressed in."""
+
+
+@always_inline
+def nv_at(row: Int, k: Int) -> Int:
+    """Where value `k` of row `row` sits in a staged tile.
+
+    An exclusive or on the chunk index and not a row of padding, because the
+    fragment loads want sixteen byte alignment and padding a row by anything
+    smaller than a chunk breaks it. A row is eight chunks of eight halves, the
+    chunk a row starts at is the row number modulo eight, and every row of a
+    group of eight therefore begins in a different bank.
+
+    What that buys is the load below. `ld_matrix` takes an address a lane and
+    serves eight lanes a phase, and those eight lanes read eight consecutive
+    rows at the same chunk. Unswizzled they are a hundred and twenty eight bytes
+    apart, which is the same four banks eight times over. Swizzled they are the
+    eight distinct chunks of eight consecutive rows, which is all thirty two
+    banks once.
+    """
+    return row * NV_K + (((k >> 3) ^ (row & 7)) << 3) + (k & 7)
+
+
+def planar_nvmma_kernel[
+    group: Int, with_min: Bool, form: Int
+](
+    w: Pointer[UInt8, MutAnyOrigin],
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    cols_dev: Int32,
+    stride_dev: Int32,
+    epi_dev: Int32,
+    rows_dev: Int32,
+    tokens_dev: Int32,
+):
+    """The same product as `planar_matmul_kernel`, on NVIDIA tensor cores.
+
+    `mma` at sixteen by eight by sixteen with half precision operands and a
+    float accumulator, which is the widest shape a 4090 has outside the Hopper
+    only asynchronous form. It is called directly rather than through
+    `layout.tensor_core.TensorCore`, because that wrapper wants both operands as
+    `LayoutTensor` fragments loaded through its own layout algebra and the whole
+    kernel here is one staged tile with a dequantization in the middle of it.
+
+    There is no integer form to reach for. MAX has no `dp4a` and no `s8.s8.s32`
+    anywhere, so the int8 tensor core a 4090 has is reachable only through
+    inline assembly, and that is a separate question that depends on this one
+    landing first.
+
+    Both operands land in shared memory as halves. Unlike the Apple form, half
+    is not a choice here: the float shape on this hardware is tf32, which has
+    the same ten bit mantissa at half the rate, so there is no accuracy to buy
+    by staying wide. `docs/validation/prefill.md` has what that costs and what
+    the numerics gate is on this backend because of it.
+
+    The weight needs no transpose. The instruction takes its second operand
+    column major, and a weight held row major over the reduction already is one,
+    so a thread stages a run of one row and the fragment load reads it in place.
+
+    Three things are different from the first version of this kernel, which
+    measured five per cent of the tensor core peak. The fragments come from
+    `ld_matrix`, which is one instruction a warp for a whole sixteen by sixteen
+    fragment where the obvious version issued twelve four byte loads for every
+    multiply. The staged tiles are swizzled by `nv_at`, so those loads take no
+    bank conflicts. And the tile is square at sixty four by sixty four rather
+    than sixty four by thirty two, which halves how many times the weight is
+    read.
+    """
+    var cols = Int(cols_dev)
+    var stride = Int(stride_dev)
+    var rows = Int(rows_dev)
+    var tokens = Int(tokens_dev)
+
+    var pool = stack_allocation[
+        NV_TOKENS * NV_K + NV_ROWS * NV_K,
+        Float16,
+        address_space=AddressSpace.SHARED,
+    ]()
+    var x_tile = pool
+    var w_tile = pool.unsafe_offset(NV_TOKENS * NV_K)
+
+    var tid = Int(thread_idx.x)
+    var warp = tid // WARP_SIZE
+    var lane = tid % WARP_SIZE
+    var wt0 = (warp // 2) * NV_WARP_TOKENS
+    var wr0 = (warp % 2) * NV_WARP_ROWS
+
+    var t0 = Int(block_idx.x) * NV_TOKENS
+    var r0 = Int(block_idx.y) * NV_ROWS
+
+    var wr = tid // NV_ROW_THREADS
+    var wk = (tid % NV_ROW_THREADS) * NV_KPT
+    var live_row = r0 + wr < rows
+    var row = (r0 + wr) * stride if live_row else 0
+    var groups = cols // group
+    var scales = w.unsafe_bitcast[Float16]()
+    var base = _scale_bases[form, with_min](row, cols, groups)
+    comptime shift = group_shift(group)
+
+    var acc = InlineArray[SIMD[DType.float32, 4], NV_FT * NV_FR](fill=0)
+
+    for k0 in range(0, cols, NV_K):
+        # The token tail reads the slack every scratch vector a prefill uses is
+        # allocated with, for the reason `planar_matmul_kernel` gives. The row
+        # tail cannot do that, since past the last row is past the tensor, so it
+        # stages zeros and the epilogue drops them.
+        for v in range(tid, NV_XV, NV_THREADS):
+            var xt = v // NV_CHUNKS
+            var xk = (v % NV_CHUNKS) * 8
+            x_tile.unsafe_offset(nv_at(xt, xk)).unsafe_store(
+                x.unsafe_offset((t0 + xt) * cols + k0 + xk)
+                .unsafe_load[width=8]()
+                .cast[DType.float16]()
+            )
+
+        var gi = (k0 + wk) >> shift
+        var d = _group_scale[form](
+            scales, w, base[0], base[2], gi
+        ) if live_row else Float32(0)
+        var m = Float32(0)
+        comptime if with_min:
+            if live_row:
+                m = _group_scale[form](scales, w, base[1], base[3], gi)
+        var vals = SIMD[DType.float32, NV_KPT](0)
+        comptime if form == QUANT_I8:
+            var q = w.unsafe_offset(row + k0 + wk).unsafe_load[
+                width=NV_KPT
+            ]() if live_row else SIMD[DType.uint8, NV_KPT](0)
+            comptime for j in range(NV_KPT):
+                vals[j] = d * byte_float(UInt32(q[j])) + m
+        elif quant_high_bits(form) == 0:
+            var q = w.unsafe_offset(row + ((k0 + wk) >> 1)).unsafe_load[
+                width=NV_KPT // 2
+            ]() if live_row else SIMD[DType.uint8, NV_KPT // 2](0)
+            comptime for j in range(NV_KPT // 2):
+                var b = UInt32(q[j])
+                vals[2 * j] = d * nibble_float[form](b & 0xF) + m
+                vals[2 * j + 1] = d * nibble_float[form](b >> 4) + m
+        else:
+            comptime hbits = quant_high_bits(form)
+            comptime hshift = high_shift[form]()
+            comptime hper = 1 << hshift
+            comptime hmask = UInt32((1 << hbits) - 1)
+            var q = w.unsafe_offset(row + ((k0 + wk) >> 1)).unsafe_load[
+                width=NV_KPT // 2
+            ]() if live_row else SIMD[DType.uint8, NV_KPT // 2](0)
+            var hq = w.unsafe_offset(
+                row + (cols >> 1) + ((k0 + wk) >> hshift)
+            ).unsafe_load[width=NV_KPT >> hshift]() if live_row else SIMD[
+                DType.uint8, NV_KPT >> hshift
+            ](
+                0
+            )
+            comptime for j in range(NV_KPT // 2):
+                var b = UInt32(q[j])
+                var h = UInt32(hq[(2 * j) >> hshift])
+                var s0 = UInt32(((2 * j) & (hper - 1)) * hbits)
+                vals[2 * j] = (
+                    d * wide_float[form]((b & 0xF) | (((h >> s0) & hmask) << 4))
+                    + m
+                )
+                vals[2 * j + 1] = (
+                    d
+                    * wide_float[form](
+                        (b >> 4) | (((h >> (s0 + UInt32(hbits))) & hmask) << 4)
+                    )
+                    + m
+                )
+        var staged = vals.cast[DType.float16]()
+        comptime for c in range(NV_KPT // 8):
+            w_tile.unsafe_offset(nv_at(wr, wk + c * 8)).unsafe_store(
+                staged.slice[8, offset=c * 8]()
+            )
+        barrier()
+
+        comptime for kk in range(0, NV_K, 16):
+            # A fragment is sixteen tokens by sixteen values of the reduction,
+            # loaded by the four eight by eight matrices `ld_matrix` reads at
+            # once: lanes zero to fifteen address the sixteen rows at the first
+            # eight values and lanes sixteen to thirty one address the same rows
+            # at the second eight, which is the operand layout of this
+            # instruction exactly and is why there is no shuffle after it.
+            var af = InlineArray[SIMD[DType.float16, 8], NV_FT](
+                fill=SIMD[DType.float16, 8](0)
+            )
+            comptime for i in range(NV_FT):
+                af[i] = ld_matrix[simd_width=8](
+                    x_tile.unsafe_offset(
+                        nv_at(wt0 + i * 16 + (lane % 16), kk + (lane // 16) * 8)
+                    )
+                )
+            comptime for j in range(NV_FR):
+                # The second operand is eight rows by sixteen values, which is
+                # two matrices and so sixteen addresses, from the first sixteen
+                # lanes. The other sixteen are ignored by the instruction and
+                # are given the same addresses rather than an out of range one.
+                var bf = ld_matrix[simd_width=4](
+                    w_tile.unsafe_offset(
+                        nv_at(
+                            wr0 + j * 8 + (lane % 8),
+                            kk + ((lane // 8) & 1) * 8,
+                        )
+                    )
+                )
+                comptime for i in range(NV_FT):
+                    var got = SIMD[DType.float32, 4](0)
+                    mma(got, af[i], bf, acc[i * NV_FR + j])
+                    acc[i * NV_FR + j] = got
+        barrier()
+
+    # The accumulator layout of this instruction is fixed and public, unlike the
+    # Apple one, so the epilogue reads it straight out of the registers: a lane
+    # holds two tokens eight apart and two rows beside each other.
+    var epi = Int(epi_dev)
+    var gr = lane // 4
+    var gc = (lane % 4) * 2
+    comptime for i in range(NV_FT):
+        comptime for j in range(NV_FR):
+            var v4 = acc[i * NV_FR + j]
+            comptime for h in range(2):
+                var t_at = t0 + wt0 + i * 16 + gr + h * 8
+                if t_at < tokens:
+                    comptime for e in range(2):
+                        var r_at = r0 + wr0 + j * 8 + gc + e
+                        if r_at < rows:
+                            write_epilogue(
+                                o,
+                                aux,
+                                epi,
+                                t_at * rows + r_at,
+                                r_at,
+                                v4[h * 2 + e],
+                            )
+
+
+def _launch_nvmma[
+    group: Int, with_min: Bool, form: Int
+](
+    ctx: DeviceContext,
+    w: Tensor,
+    x: Pointer[Float32, MutAnyOrigin],
+    o: Pointer[Float32, MutAnyOrigin],
+    aux: Pointer[Float32, MutAnyOrigin],
+    epi: Int,
+    tokens: Int,
+) raises:
+    """One instantiation of the tensor core form, launched."""
+    ctx.enqueue_function[planar_nvmma_kernel[group, with_min, form]](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=w.device_address()),
+        x,
+        o,
+        aux,
+        Int32(w.cols),
+        Int32(w.row_bytes()),
+        Int32(epi),
+        Int32(w.rows),
+        Int32(tokens),
+        grid_dim=(
+            (tokens + NV_TOKENS - 1) // NV_TOKENS,
+            (w.rows + NV_ROWS - 1) // NV_ROWS,
+            1,
+        ),
+        block_dim=(NV_THREADS, 1, 1),
+    )
+
+
 def _launch_mm[
     tile: Int, group: Int, with_min: Bool, form: Int
 ](
@@ -2313,14 +2630,37 @@ def _matmul_forms(
     var g = group_size(w.kind)
     var carries_min = has_min(w.kind)
     var form = quant_form(w.kind)
-    # The matrix core form first where it exists, which today is Apple only.
-    # `TensorCore` in MAX has no integer case, so the widest thing a 4090
-    # offers here is the half precision tensor core, and #212 has the
-    # measurement that says a tile built on it the same way this one is
-    # loses to the ordinary kernel on two models out of three.
+    # The matrix core form first on the two targets that have one. They are two
+    # kernels and not one parameterized kernel, because the instructions
+    # disagree about everything below the tile: the fragment shape, the lane
+    # layout, whether the second operand needs transposing, and whether half
+    # precision is a choice. What they share is the tile and the epilogue.
     #
     # A group of sixteen stages two groups to a step and is left on the
     # ordinary form until there is a model that wants it.
+    comptime if not CompilationTarget.is_macos() and has_nvidia_gpu_accelerator():
+        if g == 32:
+            if form == QUANT_U4 and carries_min:
+                _launch_nvmma[32, True, QUANT_U4](ctx, w, p, o, a, epi, tokens)
+                return
+            if form == QUANT_S4 and not carries_min:
+                _launch_nvmma[32, False, QUANT_S4](ctx, w, p, o, a, epi, tokens)
+                return
+            if form == QUANT_U5 and carries_min:
+                _launch_nvmma[32, True, QUANT_U5](ctx, w, p, o, a, epi, tokens)
+                return
+            if form == QUANT_S5 and not carries_min:
+                _launch_nvmma[32, False, QUANT_S5](ctx, w, p, o, a, epi, tokens)
+                return
+            if form == QUANT_K4 and carries_min:
+                _launch_nvmma[32, True, QUANT_K4](ctx, w, p, o, a, epi, tokens)
+                return
+            if form == QUANT_K5 and carries_min:
+                _launch_nvmma[32, True, QUANT_K5](ctx, w, p, o, a, epi, tokens)
+                return
+            if form == QUANT_I8 and not carries_min:
+                _launch_nvmma[32, False, QUANT_I8](ctx, w, p, o, a, epi, tokens)
+                return
     comptime if CompilationTarget.is_macos():
         if g == 32:
             if form == QUANT_U4 and carries_min:
