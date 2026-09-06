@@ -838,6 +838,18 @@ def test_store_scatter(mut suite: Suite, ctx: DeviceContext) raises:
         var after = List[Int]()
         pool.download_bits(after)
 
+        # A placed row is compared over the halves a store actually writes,
+        # which at q8 is the quant plane and the scale plane and not the pad
+        # `CACHE_ALIGN` leaves at the end. Nothing writes that pad, on either
+        # path, so on a card whose fresh allocations are not zero the two pools
+        # hold different rubbish there and comparing it would be comparing what
+        # the driver last had in that page. A cell nobody wrote is still
+        # compared over the whole row, because that is the same buffer read
+        # twice and the pad has to come back unchanged like everything else.
+        var live = row
+        if form == CACHE_Q8:
+            live = kv_width // 2 + kv_width // CACHE_BLOCK
+
         var placed = 0
         var kept = 0
         for c in range(cells):
@@ -846,7 +858,8 @@ def test_store_scatter(mut suite: Suite, ctx: DeviceContext) raises:
                 if Int(order[t]) == c:
                     from_row = t
             var same = True
-            for k in range(row):
+            var span = row if from_row < 0 else live
+            for k in range(span):
                 var expect = before[c * row + k]
                 if from_row >= 0:
                     expect = want[from_row * row + k]
