@@ -42,7 +42,7 @@ Four, in this order, because each one is testable on its own and the first is wo
 
 **The mask.** Attention stops deriving causality from the range and takes a mask built from the cell metadata, over a window rounded up so the launch shape stops changing every token. This is the stage that costs something, and what it costs is measured below rather than guessed at. The form the mask takes is below as well, because it is not the form llama.cpp uses and the difference is worth the paragraph.
 
-**Sharing and eviction.** `seq_cp` as a bit set on a range, `seq_rm` as a bit cleared with the cell freed when the set empties, and an eviction policy over cells no sequence owns. Sliding window and sink models get a bounded ring with the sink cells pinned, which the cell form expresses directly.
+**Sharing and eviction.** Sharing as a bit set on a range and releasing as a bit cleared with the cell freed when the set empties, both of which came with the table itself because an owner set is what they are. What this stage adds on top is the two policies: a bounded ring for window and sink models, and an eviction order over the cells no running sequence holds. Both are below.
 
 Continuous batching, #32, sits on top of stage two and does not need stage four. Chunked prefill is not separate work: it is what a cap on the batch does to a long prompt.
 
@@ -75,6 +75,22 @@ The pool in that table is exactly as large as the context and every cell in it b
 Eight per cent, and it does not grow. That is the number the stage after this is worth measuring against, and it is small for a reason worth writing down: the kernel was already reading a key row of 128 halves for every entry it masks, so one more four byte load against 256 bytes is three per cent of the traffic and the rest is the compare. A mask matrix would have been reading a float a pair over the same rows, which is the same three per cent multiplied by the number of tokens in the batch.
 
 What the table does not measure is the fragmentation. Every cell here is live, and a real pool asked for a window rounded up to a pad holds cells that belong to nobody, which are read and thrown away. That cost is set by `CellTable.window` and by how full the pool is, not by the kernel, and it is the thing stage four's eviction policy exists to keep small.
+
+## A window model in constant memory
+
+`CellTable.trim` is the bounded ring, and it is `AttnSpec.sees` negated term for term. Every cell it frees is a cell attention would have masked, so trimming changes how much memory a sequence holds and cannot change a logit. That is what makes it testable without a model: the check is that what the table kept is exactly what a query at the current position can see, asked of the same spec the kernel masks with.
+
+The sinks are pinned by the expression that makes attention read them rather than by a separate rule, which is that a position below the sink count stays visible whatever the window says. So a sink is not a special kind of cell, it is a position the condition never rejects, and the ring gets it for free.
+
+What it buys is that a conversation of any length holds `window + sinks` cells. A hundred tokens through a window of eight with two sinks never holds more than ten, which is the test, and the same arithmetic on a model with a 4096 window is 4096 cells however long the chat runs. Under the current shape the same conversation is refused the moment it passes the context it reserved.
+
+## Retiring, not releasing
+
+A turn that ends does not give its cells back. It stops being running, which leaves the cells where they are holding the positions they held, so the next request that begins with the same tokens can take them with `share` instead of computing them again. That is the difference between `retire` and `release_all`, and it is what #33 gets to build on: a prefix worth caching is a retired sequence's cells, and a hit is a bit set.
+
+The cost of keeping them is that the pool fills with turns nobody came back for, so `evict` takes them back when the next request does not fit. Least recently used, over sequences rather than over cells. A turn's cells were all written at once and are all worth the same to the request after it, so the whole sequence goes and the order is the order the turns finished in. That is 64 stamps to order rather than one number a cell, and one scan of the pool a victim rather than one a cell.
+
+Nothing running is evicted. Preempting a stream that is mid flight is a scheduler's decision and it belongs with #34, and when the scheduler makes it the way it says so is `release_all` and then recomputing. There is no path here that moves a cell to host memory, which is the preference #31 asks for. Swapping a 4096 cell sequence of an 8B out and back is 512 MiB in each direction, about 20 ms a direction over PCIe 4, and it holds the bus while it happens. Recomputing costs a prefill the engine already has a path for. Which is cheaper is worth measuring once there is a scheduler to measure it with, and until then the one that does not need a host buffer, a transfer queue and a policy for what to do when the swap itself does not fit is the one to have.
 
 ## What done means
 
