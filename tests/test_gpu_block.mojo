@@ -29,6 +29,7 @@ from max.gpu.host import DeviceContext
 
 from harness import Suite
 
+from molla.engine.batch import DeviceBatch
 from molla.engine.device import DeviceKvCache
 from molla.model.load import DevicePool
 from molla.model.spec import architecture_id
@@ -1150,6 +1151,133 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         except:
             rejoined = False
 
+        # The step loop, which is what admission was for. Two streams with
+        # prompts of different lengths and a batch cap smaller than the longer
+        # one, so the first stream's prompt is cut in two and the second half of
+        # it rides in the same step as the whole of the other stream's prompt.
+        # That is chunked prefill and there is no separate mechanism for it.
+        var wanted = 4
+        var narrow = 4
+        var plans = List[List[Int]]()
+        for q in range(2):
+            var some = List[Int]()
+            for i in range(5 - 2 * q):
+                some.append(tokens[q * 8 + i])
+            plans.append(some^)
+
+        # What each stream gets on its own, through the ordinary contiguous
+        # path, greedy. This is the reference and it knows nothing about
+        # batching: a prefill, then a token at a time, argmax each time.
+        var refs = List[List[Int]]()
+        var wideref = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, 8)
+        var widerefx = DeviceVec(ctx, (8 + SPAN * MM_GROUPS) * WIDTH)
+        var got_out = Buffer(VOCAB)
+        for q in range(2):
+            var mine = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+            var deep = len(plans[q])
+            var at = mine.place(0, deep, False)
+            device_forward(
+                ctx,
+                model,
+                wideref,
+                widerefx,
+                plans[q],
+                0,
+                at,
+                mine.keys,
+                mine.values,
+                mine.paging,
+            )
+            ctx.synchronize()
+            wideref.logits.download(got_out)
+            var said = List[Int]()
+            var pick = 0
+            for i in range(VOCAB):
+                if got_out.data[i] > got_out.data[pick]:
+                    pick = i
+            said.append(pick)
+            for s in range(wanted - 1):
+                var feed: List[Int] = [pick]
+                at = mine.place(deep + s, 1, False)
+                device_forward(
+                    ctx,
+                    model,
+                    fone,
+                    fonex,
+                    feed,
+                    deep + s,
+                    at,
+                    mine.keys,
+                    mine.values,
+                    mine.paging,
+                )
+                ctx.synchronize()
+                fone.logits.download(got_out)
+                pick = 0
+                for i in range(VOCAB):
+                    if got_out.data[i] > got_out.data[pick]:
+                        pick = i
+                said.append(pick)
+            refs.append(said^)
+
+        # And the same two through the loop, sharing everything.
+        var crowd = DeviceBatch(
+            ctx,
+            DeviceModel(
+                ctx,
+                arch,
+                specs,
+                host_model,
+                dev_model,
+                host_layers,
+                dev_layers,
+                factors,
+            ),
+            KV_HEADS * HEAD_DIM,
+            CONTEXT,
+            3,
+            narrow,
+        )
+        for q in range(2):
+            _ = crowd.admit(plans[q].copy(), wanted)
+
+        # A stream the pool cannot hold, with a slot free so that what refuses
+        # it is the index and not the bookkeeping above it.
+        var pool_full = False
+        try:
+            var big = List[Int]()
+            for i in range(CONTEXT):
+                big.append(tokens[i % len(tokens)])
+            _ = crowd.admit(big^, 1)
+        except:
+            pool_full = True
+
+        var turns = crowd.run()
+        var idle = crowd.working()
+        var same = 0
+        var lengths = 0
+        for q in range(2):
+            var said = crowd.output(q)
+            if len(said) == wanted:
+                lengths += 1
+            var agree = len(said) == len(refs[q])
+            for i in range(len(said)):
+                if i >= len(refs[q]) or said[i] != refs[q][i]:
+                    agree = False
+            if agree:
+                same += 1
+
+        # And the slots, which are what bounds the batch rather than the pool.
+        # The third one is free and takes a stream; the fourth is not.
+        var tiny: List[Int] = [tokens[0]]
+        _ = crowd.admit(tiny^, 1)
+        var slots_full = False
+        try:
+            var extra: List[Int] = [tokens[1]]
+            _ = crowd.admit(extra^, 1)
+        except:
+            slots_full = True
+
         keep(pool)
         keep(blob)
         keep(gains)
@@ -1381,3 +1509,14 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         suite.check(
             rejoined, "and the halves that come back are one region again"
         )
+
+        suite.group("a step loop over two streams")
+        suite.check(
+            same == 2,
+            "a stream in a batch generates what it generates on its own",
+        )
+        suite.check(lengths == 2, "and both streams generate what they owe")
+        suite.check(turns == 5, "and the loop takes the steps that implies")
+        suite.check(idle == 0, "and stops when nothing is left with work")
+        suite.check(pool_full, "a stream the pool has no room for is refused")
+        suite.check(slots_full, "and one with no slot to put it in")

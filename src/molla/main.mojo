@@ -10,6 +10,7 @@ from std.sys import argv, exit
 from molla.build_info import MOJO_PIN, VERSION
 from molla.engine.backend import Backend, Request, choose_backend, parse_backend
 from molla.engine.generate import run_generate
+from molla.engine.generate_batch import run_generate_batch
 from molla.engine.generate_device import run_generate_device
 from molla.engine.sample import SamplerConfig
 from molla.engine.serve import run_serve
@@ -27,6 +28,7 @@ from molla.net.echo import run_echo
 from molla.net.soak import run_soak
 from molla.net.soak_http import run_http_soak
 from molla.net.soak_net import run_net_soak
+from molla.nn.gpu import PREFILL_CHUNK
 from molla.nn.repack import CACHE_F16, parse_cache_type
 from molla.ops.config import describe_setting, load_config
 from molla.registry.pull import run_pull
@@ -125,6 +127,14 @@ def print_usage():
     print(
         "                  --cache-type=f16|q8_0 picks what the kv cache holds"
         " on a card"
+    )
+    print(
+        "  batch <model> <tokenizer.json> <prompt> [streams] [n] [ctx]  run"
+        " several streams at once"
+    )
+    print(
+        "                  the same flags generate takes, plus --cap=N for the"
+        " tokens a step"
     )
     print(
         "  serve <model> <tokenizer.json>  answer OpenAI requests against a"
@@ -573,6 +583,76 @@ def main():
                 )
         except e:
             print("molla generate:", e)
+            exit(1)
+    elif command == "batch":
+        if len(args) < 5:
+            print(
+                "molla batch: expected a gguf file, a tokenizer.json, and a"
+                " prompt"
+            )
+            exit(2)
+        var batch_streams = 4
+        var batch_limit = 0
+        var batch_context = 0
+        var batch_cap = PREFILL_CHUNK
+        var batch_sampling = SamplerConfig()
+        var batch_want = Request()
+        var batch_form = CACHE_F16
+        try:
+            var batch_positional = 0
+            for i in range(5, len(args)):
+                if sampling_flag(batch_sampling, args[i]):
+                    continue
+                if args[i] == "--device":
+                    batch_want = Request()
+                    continue
+                if args[i].startswith("--device="):
+                    batch_want = parse_backend(_flag_value(args[i]))
+                    continue
+                if args[i].startswith("--cache-type="):
+                    batch_form = parse_cache_type(_flag_value(args[i]))
+                    continue
+                if args[i].startswith("--cap="):
+                    batch_cap = atol(_flag_value(args[i]))
+                    continue
+                if args[i].startswith("--"):
+                    raise Error(
+                        String("'") + args[i] + "' is not a flag this takes"
+                    )
+                if batch_positional == 0:
+                    batch_streams = atol(args[i])
+                elif batch_positional == 1:
+                    batch_limit = atol(args[i])
+                elif batch_positional == 2:
+                    batch_context = atol(args[i])
+                else:
+                    raise Error(
+                        String("'")
+                        + args[i]
+                        + "' is one argument more than this takes"
+                    )
+                batch_positional += 1
+            var batch_picked = choose_backend(args[2], batch_want)
+            if not batch_picked.on_device:
+                raise Error(
+                    "a batch run is a device path and this one came out on the"
+                    " host, so there is nothing to share. "
+                    + batch_picked.note
+                )
+            run_generate_batch(
+                args[2],
+                args[3],
+                args[4],
+                batch_streams,
+                batch_limit,
+                batch_context,
+                batch_cap,
+                batch_sampling,
+                batch_picked,
+                batch_form,
+            )
+        except e:
+            print("molla batch:", e)
             exit(1)
     elif command == "serve":
         if len(args) < 4:
