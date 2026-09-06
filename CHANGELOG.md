@@ -4,6 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Changed
+
+- Attention skips a masked key rather than multiplying the row it points at by zero. For a cell holding numbers the two are the same answer, and for a cell nothing has written they are not necessarily, because a fresh allocation comes back zeroed on Metal and full of whatever the driver had on the 4090, half of the wrong bits is an infinity, and zero times an infinity is a nan. Neither target produces that nan today, which was checked both ways on both machines: device code is compiled with the relaxed floating point that folds a multiply by zero to zero. So this is not a fix for a failure that was seen, it is declining to depend on a compiler flag for an invariant, and what it depends on instead is easier to state, which is that a row a query may not read is not read. The paged test now fills the free cells of its pool with an infinity, which passes either way and is the canary for the day a toolchain changes its floating point.
+
 ## [0.5.1] - 2026-09-06
 
 Three of the four stages of the paged KV cache, which is #31 and the first item of M3. None of it is wired in yet, so nothing about how molla runs today has changed, and that is deliberate: each stage is testable on its own and the wiring is where #32 starts.

@@ -794,11 +794,30 @@ def attend_kernel[
     # One thread per element of the head, each walking every key. The other way
     # round would be one thread per key accumulating into `head_dim` outputs,
     # which needs an atomic or a second reduction per element.
+    #
+    # A masked key weighs exactly zero, and the row it points at is skipped
+    # rather than multiplied by that zero. For a cell holding numbers the two
+    # are the same answer. For a cell nothing has written they are not
+    # necessarily: a fresh allocation comes back zeroed on Metal and full of
+    # whatever the driver had on the 4090, half of the wrong bits is an
+    # infinity, and zero times an infinity is a nan by the arithmetic the rest
+    # of this file is written against.
+    #
+    # Neither target produces that nan today. A pool whose free cells hold an
+    # infinity gives the same answer on the M4 and on the 4090 with this skip
+    # and without it, because device code is compiled with the relaxed floating
+    # point that lets a multiply by zero fold to zero. So this is not a fix for
+    # a failure that was seen. It is declining to depend on a compiler flag for
+    # an invariant, and what it depends on instead is easier to state: a row
+    # this query may not read is not read.
     var d = t
     while d < head_dim:
         var acc = Float32(0)
         for j2 in range(count):
-            acc += scores[unsafe_offset=sa + j2] * cache_load[form, False](
+            var w = scores[unsafe_offset=sa + j2]
+            if w == 0:
+                continue
+            acc += w * cache_load[form, False](
                 values, j2 * row, kv_width, kvh * head_dim + d
             )
         o[unsafe_offset=qa + d] = acc * inv
@@ -1001,11 +1020,17 @@ def attend_split_kernel[
         j += tile
     var total = _block_sum[tile](acc_sum)
 
+    # Skipping the masked keys rather than weighting them zero, for the reason
+    # `attend_kernel` gives at length: a row this query may not read is a row
+    # nothing may have written.
     var d = t
     while d < head_dim:
         var acc = Float32(0)
         for j2 in range(lo, hi):
-            acc += scores[unsafe_offset=sa + j2] * cache_load[form, False](
+            var w = scores[unsafe_offset=sa + j2]
+            if w == 0:
+                continue
+            acc += w * cache_load[form, False](
                 values, j2 * row, kv_width, kvh * head_dim + d
             )
         partials[unsafe_offset=pa + d] = acc

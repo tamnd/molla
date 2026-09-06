@@ -735,7 +735,9 @@ def _attend_paged_case(
     are free and the other half hold a position past the query's, which are the
     two reasons a cell can be invisible and are the two the kernel has to get
     right. A kernel that ignored the mask and walked the pool as a run would
-    still produce a number, and it would not be this one.
+    still produce a number, and it would not be this one. The free half holds
+    an infinity rather than a plausible float, for the reason the loop that
+    writes it gives.
 
     The reference is the host attention given the same window, which is the
     same comparison `_attend_case` makes one level down: the host paged path is
@@ -781,6 +783,24 @@ def _attend_paged_case(
             values[cell * kv_width + d] = Float32(
                 Float16(Float32((at * 17 % 149)) / Float32(149) - Float32(0.5))
             )
+
+    # A free cell holds whatever the driver left there, and half of the wrong
+    # bits is an infinity, so the free cells here hold one. That is what a
+    # fresh allocation on the 4090 can produce and what a Metal one cannot,
+    # since it comes back zeroed. The cells holding another sequence's future
+    # stay finite, because that sequence really did write numbers there.
+    #
+    # This passes whether or not the kernel skips a masked row or multiplies it
+    # by zero, since neither target turns zero times an infinity into a nan
+    # today. It is here as the canary for the day one of them does, which is a
+    # toolchain changing its floating point rather than anything in molla
+    # changing, and the failure it would announce is a nan logit.
+    for c in range(cells):
+        if held[c] != -1:
+            continue
+        for d in range(kv_width):
+            keys[c * kv_width + d] = Float32(1e30)
+            values[c * kv_width + d] = Float32(1e30)
 
     var want = Buffer(width)
     var scratch = List[Float32]()
