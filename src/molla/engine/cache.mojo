@@ -47,6 +47,18 @@ the same reason: the free question and the position question are then one load
 rather than two, and a position can never be negative anyway.
 """
 
+comptime PAGE_PAD = 256
+"""How far a step's window rounds up, in cells.
+
+llama.cpp rounds the prefix it attends to a multiple of 256 and says in the
+source that it is there so the graph shape stops changing between batches. The
+same argument holds here for a coarser reason: a launch whose grid changes every
+token is a launch the driver cannot reuse anything about, and the cells between
+the frontier and the round number are masked off anyway because nothing owns
+them. What it costs is reading up to 255 cells that say nothing, which at a
+context of a few thousand is single digit per cent of the attention.
+"""
+
 comptime MAX_SEQS = 64
 """How many sequences a pool can hold at once.
 
@@ -236,7 +248,9 @@ struct CellTable(Movable):
             n = self.size()
         return n
 
-    def held(self, seq: Int, upto: Int, mut out: List[Int]) raises:
+    def held(
+        self, seq: Int, upto: Int, mut out: List[Int32], at: Int = 0
+    ) raises:
         """The position each of the first `upto` cells holds for `seq`.
 
         `CELL_FREE` for a cell `seq` does not own, whether that is because it is
@@ -247,8 +261,15 @@ struct CellTable(Movable):
         causality that would be baked into a two dimensional mask is a compare
         against the query's own position instead.
 
-        Appended rather than assigned, so a caller building the window for a
-        batch of sequences fills one list back to back.
+        Written at `at` into a list the caller already sized, rather than
+        appended to an empty one. What reads this is a device buffer that was
+        allocated once at the size of the pool and is filled again every step,
+        and a list that grew a step would be an allocation a step on the path a
+        token takes. The offset is what lets a batch of sequences write their
+        windows back to back into that one buffer.
+
+        Int32 because that is the width the buffer is. See `DeviceInts` for why
+        it is not the host `Int`.
         """
         if upto < 0 or upto > self.size():
             raise Error(
@@ -257,12 +278,21 @@ struct CellTable(Movable):
                 + " does not fit a pool of "
                 + String(self.size())
             )
+        if at < 0 or at + upto > len(out):
+            raise Error(
+                "a window of "
+                + String(upto)
+                + " at "
+                + String(at)
+                + " does not fit a list of "
+                + String(len(out))
+            )
         var bit = _bit_of(seq)
         for i in range(upto):
             if (self.owners[i] & bit) != 0:
-                out.append(self.pos[i])
+                out[at + i] = Int32(self.pos[i])
             else:
-                out.append(CELL_FREE)
+                out[at + i] = Int32(CELL_FREE)
 
     def position(self, cell: Int) raises -> Int:
         """What position `cell` holds, or `CELL_FREE`."""

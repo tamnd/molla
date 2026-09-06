@@ -4,6 +4,11 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Added
+
+- The paged cache is wired into a forward pass. A step takes a cell from the table for each of its tokens, the store scatters through the vector of cell indices, and attention masks by the position each cell holds, so which row of the cache a token lands in is no longer decided by its position. Whether a step is paged is reported by the allocation rather than chosen by the caller: a pass over cells that are not the positions they hold has to be paged, and while one sequence has the whole pool to itself the free list hands out cells in order and the answer is no, which is what makes this bit identical on the path a token takes today. The fused decode asks the same question, since it reads a run and has no mask, and falls back to the unfused path when the cells do not allow it. What it buys is that the second sequence is a scheduler away rather than a rewrite away, which is #32.
+- `MOLLA_PAGED=1` sends every step down the paged path whether or not the cells make it necessary. Nothing sets it in production. It is there so the cost of the indirection can be measured on the same models and cards as everything else before #32 makes paging the only way.
+
 ## [0.5.2] - 2026-09-06
 
 The last stage of the paged KV cache, which is the two policies over the cell table that 0.5.1 introduced. A window model now gives back what it has walked past, so a conversation of any length holds the window plus the sinks instead of being refused when it passes the context it reserved, and the pool has an order to take cells back in when the next request does not fit.

@@ -410,6 +410,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                 step,
                 cache.keys,
                 cache.values,
+                cache.paging,
             )
             ctx.synchronize()
             dscratch.logits.download(got)
@@ -584,6 +585,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                 step,
                 qcache.keys,
                 qcache.values,
+                qcache.paging,
                 CACHE_Q8,
             )
             ctx.synchronize()
@@ -663,7 +665,16 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         var bx = DeviceVec(ctx, (len(tokens) + SPAN * MM_GROUPS) * WIDTH)
         var bcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
         device_forward(
-            ctx, model, batch, bx, tokens, 0, 0, bcache.keys, bcache.values
+            ctx,
+            model,
+            batch,
+            bx,
+            tokens,
+            0,
+            0,
+            bcache.keys,
+            bcache.values,
+            bcache.paging,
         )
         ctx.synchronize()
         var batched = Buffer(VOCAB)
@@ -685,7 +696,16 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         var px = DeviceVec(ctx, (len(tokens) + SPAN * MM_GROUPS) * WIDTH)
         var pcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
         device_forward(
-            ctx, model, pair, px, head_run, 0, 0, pcache.keys, pcache.values
+            ctx,
+            model,
+            pair,
+            px,
+            head_run,
+            0,
+            0,
+            pcache.keys,
+            pcache.values,
+            pcache.paging,
         )
         device_forward(
             ctx,
@@ -697,6 +717,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
             split,
             pcache.keys,
             pcache.values,
+            pcache.paging,
         )
         ctx.synchronize()
         var split_out = Buffer(VOCAB)
@@ -708,6 +729,66 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
                 gap = -gap
             if gap > split_worst:
                 split_worst = gap
+
+        # And once more through the cell table, which is the whole prompt again
+        # but with the cache addressed by cell rather than by position. It is
+        # only worth running if the two disagree about where a token goes, so a
+        # decoy sequence takes the front of the pool before this one starts and
+        # every token here lands four cells past where its position would have
+        # put it. The store has to scatter, the mask has to hide the decoy's
+        # four cells, and the logits have to come out where the contiguous run
+        # left them.
+        var gcache = DeviceKvCache(ctx, LAYERS, CONTEXT, KV_HEADS * HEAD_DIM)
+        var decoy = List[Int]()
+        gcache.table.alloc_run(1, 0, 4, decoy)
+        var grid = DeviceScratch(ctx, specs[0], CONTEXT, VOCAB, len(tokens))
+        var gx = DeviceVec(ctx, (len(tokens) + SPAN * MM_GROUPS) * WIDTH)
+        var shift = gcache.place(0, len(tokens), True)
+        var paged_on = gcache.paging.on
+        device_forward(
+            ctx,
+            model,
+            grid,
+            gx,
+            tokens,
+            0,
+            shift,
+            gcache.keys,
+            gcache.values,
+            gcache.paging,
+        )
+        ctx.synchronize()
+        var paged_out = Buffer(VOCAB)
+        grid.logits.download(paged_out)
+        var paged_worst = Float32(0)
+        for i in range(VOCAB):
+            var gap = paged_out.data[i] - batched.data[i]
+            if gap < 0:
+                gap = -gap
+            if gap > paged_worst:
+                paged_worst = gap
+
+        # The cache the two runs left, row for row, offset by the shift. Bytes
+        # and not a tolerance: the store writes the same rows either way and
+        # the only thing that changed is which cell it wrote them to, so a
+        # difference here is an index and not a rounding.
+        var row = KV_HEADS * HEAD_DIM
+        var here = Buffer(CONTEXT * row)
+        var there = Buffer(CONTEXT * row)
+        var paged_diff = 0
+        for l in range(LAYERS):
+            for half in range(2):
+                if half == 0:
+                    gcache.keys[l].download(here)
+                    bcache.keys[l].download(there)
+                else:
+                    gcache.values[l].download(here)
+                    bcache.values[l].download(there)
+                for r in range(len(tokens)):
+                    for i in range(row):
+                        var mine = here.data[(shift + r) * row + i]
+                        if mine != there.data[r * row + i]:
+                            paged_diff += 1
 
         var batch_worst = Float32(0)
         var batch_top = 0
@@ -920,3 +1001,17 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         )
         if split_worst > peak * Float32(2e-4):
             suite.fail("split logits", "worst " + String(split_worst / peak))
+
+        suite.group("a paged cache against a contiguous one")
+        suite.check(paged_on, "cells a position would not have picked page")
+        suite.check(shift == 4, "and the run starts where the decoy left off")
+        suite.check(
+            paged_worst <= peak * Float32(2e-5),
+            "a scattered prompt reaches the logits a contiguous one does",
+        )
+        if paged_worst > peak * Float32(2e-5):
+            suite.fail("paged logits", "worst " + String(paged_worst / peak))
+        suite.check(
+            paged_diff == 0,
+            "and leaves the same rows in the cells it was given",
+        )
