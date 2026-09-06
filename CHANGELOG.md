@@ -4,6 +4,15 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Added
+
+- Several sequences can hold one KV pool. A sequence is admitted for a number of positions and gets a region of the index that long, and that region is the whole reservation, because a sequence can hold at most as many cells as it has index entries to name them with. So admitting the region is admitting the cells and there is nothing to keep in step. Regions are handed out first fit and joined back up with their neighbours when a sequence is evicted, so a pool that has been drained is one region again whatever order the sequences left in. That is the first half of the fourth of the five stages in [docs/validation/batching.md](docs/validation/batching.md).
+- `DeviceKvCache.place_for` takes the cells for one sequence's share of a step and fills that share of the batch descriptor at the same time, at whatever offset in the chunk the sequence's tokens sit. A batch of sixteen is sixteen of those calls and one `DevicePaging.mixed` to commit what they wrote, which means nothing walks the batch a second time to work out what the first walk already knew.
+
+### Changed
+
+- A fresh cache gives its whole index to the sequence a session owns, so the single sequence path is the path it always was and nothing outside a scheduler sees admission at all. Taking that region back is a scheduler's first move.
+
 ## [0.5.5] - 2026-09-07
 
 The third of the five stages continuous batching needs, and the first one a single sequence can tell apart, because it is the one that makes a second sequence possible. A forward pass carries tokens of more than one sequence: each token says where it sits and where its sequence's list of cells starts in the index, and the logits come back a row a sequence rather than one row for whichever token finished the chunk.
