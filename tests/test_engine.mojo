@@ -146,6 +146,7 @@ def run(mut suite: Suite) raises:
     test_cache_errors(suite)
     test_cells(suite)
     test_cells_sharing(suite)
+    test_cells_window(suite)
     test_cells_errors(suite)
     test_session_step(suite)
     test_prefill_matches_decode(suite)
@@ -350,6 +351,79 @@ def test_cells_sharing(mut suite: Suite) raises:
         "both of which hold position zero",
     )
     suite.check(t.cell_of(1, 0) == two, "and each finds its own")
+
+
+def test_cells_window(mut suite: Suite) raises:
+    """How far attention reads, and what it finds when it gets there.
+
+    The window is the one number a step has to get right for the mask to be
+    cheap. Too short and a sequence loses the tail of its own context silently,
+    too long and every token pays for cells that hold nothing.
+    """
+    suite.group("cell window")
+
+    var t = CellTable(16)
+    suite.check(t.top == 0, "an empty pool has nothing to read")
+    suite.check(t.window(4) == 4, "and a window still rounds up to the pad")
+
+    var a = List[Int]()
+    t.alloc_run(0, 0, 5, a)
+    suite.check(t.top == 5, "the frontier follows the highest cell taken")
+    suite.check(t.window(4) == 8, "and the window rounds it up")
+    suite.check(t.window(1) == 5, "a pad of one is the frontier itself")
+    suite.check(t.window(32) == 16, "and a pad past the pool is the pool")
+
+    # A release at the top pulls the frontier back with it, which is what keeps
+    # a finished conversation from being read forever by the ones after it.
+    suite.check(t.release(0, 3, -1) == 2, "releasing the tail frees two")
+    suite.check(t.top == 3, "and the frontier comes back")
+    suite.check(t.release(0, 0, 1) == 1, "releasing the front frees one")
+    suite.check(
+        t.top == 3, "and leaves the frontier where the highest cell still is"
+    )
+
+    t.reset()
+    var b = List[Int]()
+    t.alloc_run(0, 0, 3, b)
+    var c = List[Int]()
+    t.alloc_run(1, 0, 2, c)
+
+    var win = List[Int]()
+    t.held(0, t.top, win)
+    suite.check(len(win) == 5, "a window is one entry a cell")
+    suite.check(
+        win[0] == 0 and win[1] == 1 and win[2] == 2,
+        "each of a sequence's cells says which position it holds",
+    )
+    suite.check(
+        win[3] == CELL_FREE and win[4] == CELL_FREE,
+        "and another sequence's cells say nothing at all",
+    )
+
+    var other = List[Int]()
+    t.held(1, t.top, other)
+    suite.check(
+        other[3] == 0 and other[4] == 1 and other[0] == CELL_FREE,
+        "the same cells read the other way round for the other sequence",
+    )
+
+    # A shared prefix is in both windows at once, which is the property the
+    # whole thing exists for and the one a copy would have hidden.
+    _ = t.share(0, 2, 0, 2)
+    var shared = List[Int]()
+    t.held(2, t.top, shared)
+    suite.check(
+        shared[0] == 0 and shared[1] == 1 and shared[2] == CELL_FREE,
+        "a shared prefix is in the sharer's window and the rest is not",
+    )
+
+    var failed = False
+    try:
+        var over = List[Int]()
+        t.held(0, 17, over)
+    except:
+        failed = True
+    suite.check(failed, "a window past the end of the pool is refused")
 
 
 def test_cells_errors(mut suite: Suite) raises:

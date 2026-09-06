@@ -42,6 +42,7 @@ def run(mut suite: Suite) raises:
     test_math(suite)
     test_grouped(suite)
     test_window(suite)
+    test_paged(suite)
     test_softcap(suite)
     test_errors(suite)
 
@@ -121,6 +122,25 @@ def test_visible(mut suite: Suite) raises:
         sunk.visible(0, 100) and sunk.visible(1, 100),
         "sink tokens stay visible however far the window has moved",
     )
+    # `sees` is the same question over a cell, with the two things a run says
+    # by construction said out loud instead.
+    suite.check(
+        open.sees(0, 5) and open.sees(5, 5),
+        "a cell holding a position at or before the query is visible",
+    )
+    suite.check(
+        not open.sees(6, 5),
+        "a cell holding a later position is another sequence's future",
+    )
+    suite.check(
+        not open.sees(-1, 5),
+        "and a cell this sequence does not own holds nothing it can see",
+    )
+    suite.check(
+        sunk.sees(0, 100) and not sunk.sees(2, 100),
+        "and the window and the sinks are counted the same way",
+    )
+
     suite.check(
         not sunk.visible(2, 100),
         "and the third token is not a sink and falls outside",
@@ -256,6 +276,85 @@ def test_window(mut suite: Suite) raises:
         and _close(out.data[1], 1.2552348, 1e-6),
         "and one sink token puts the first key back in without the second",
     )
+
+
+def test_paged(mut suite: Suite) raises:
+    """The same four keys again, scattered over six cells out of order.
+
+    The numbers are the ones `test_window` worked out, and that is the point of
+    doing it this way rather than with a fresh set. A window on a pool has to
+    give the answer the contiguous run gives, to the last digit, or a
+    conversation returns different text depending on where in the pool its
+    cells happened to land, which is not a difference anybody could debug from
+    the output.
+
+    Two of the six cells are not this sequence's and they are not its for the
+    two different reasons a cell can be invisible. One holds nothing, which is
+    a free cell or another sequence's, and one holds a position past the query,
+    which is another sequence's future. Both carry a value large enough that
+    any leak into the mix would move the answer well outside the tolerance.
+    """
+    suite.group("attention over a window")
+
+    var q = Buffer(2)
+    q.data[0] = 1.0
+    q.data[1] = 0.0
+
+    # Cells 4, 0, 5, 2 hold positions 0, 1, 2, 3 in that order.
+    var keys = _list(
+        0.0, 1.0, 9.0, 9.0, 2.0, 0.0, -7.0, -7.0, 1.0, 0.0, 1.0, 1.0
+    )
+    var values = _list(
+        0.0, 1.0, 9.0, 9.0, 0.0, 2.0, -7.0, -7.0, 1.0, 0.0, 1.0, 1.0
+    )
+    var held = List[Int]()
+    held.append(1)
+    held.append(7)
+    held.append(3)
+    held.append(-1)
+    held.append(0)
+    held.append(2)
+
+    var out = Buffer(2)
+    var scores = _scratch(6)
+
+    var open = AttnSpec(1, 1, 2)
+    attend(open, q, keys, values, 6, 3, out, scores, held)
+    suite.check(
+        _close(out.data[0], 0.4423620, 1e-6)
+        and _close(out.data[1], 1.2273995, 1e-6),
+        "a scattered window gives what the run gave",
+    )
+
+    var windowed = AttnSpec(1, 1, 2)
+    windowed.window = 2
+    attend(windowed, q, keys, values, 6, 3, out, scores, held)
+    suite.check(
+        _close(out.data[0], 0.3302385, 1e-6)
+        and _close(out.data[1], 1.6697615, 1e-6),
+        "and a window of two still counts positions and not cells",
+    )
+
+    var sunk = AttnSpec(1, 1, 2)
+    sunk.window = 2
+    sunk.sinks = 1
+    attend(sunk, q, keys, values, 6, 3, out, scores, held)
+    suite.check(
+        _close(out.data[0], 0.4965102, 1e-6)
+        and _close(out.data[1], 1.2552348, 1e-6),
+        "and the sink is the cell holding position zero, wherever it is",
+    )
+
+    # A window shorter than the run it is supposed to describe is refused
+    # rather than read past, since the entry it would read is another cell's.
+    var short = List[Int]()
+    short.append(0)
+    var raised = False
+    try:
+        attend(open, q, keys, values, 6, 3, out, scores, short)
+    except:
+        raised = True
+    suite.check(raised, "a window shorter than the cells it covers is refused")
 
 
 def test_softcap(mut suite: Suite) raises:

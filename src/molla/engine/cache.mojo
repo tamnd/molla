@@ -141,6 +141,16 @@ struct CellTable(Movable):
     every time turns a decode step into a scan of the pool.
     """
 
+    var top: Int
+    """One past the highest live cell, which is how far attention has to read.
+
+    Kept rather than found, because it is asked once a step and finding it is a
+    scan back from the end of the pool. Allocation raises it and is the common
+    case. A release only lowers it when what it freed was at the top, and then
+    the scan back is over the cells that were just freed rather than over the
+    pool.
+    """
+
     def __init__(out self, cells: Int) raises:
         """A pool of `cells` cells, all free."""
         if cells <= 0:
@@ -149,6 +159,7 @@ struct CellTable(Movable):
         self.owners = List[UInt64](length=cells, fill=0)
         self.live = 0
         self.head = 0
+        self.top = 0
 
     def size(self) -> Int:
         return len(self.pos)
@@ -163,6 +174,55 @@ struct CellTable(Movable):
             self.owners[i] = 0
         self.live = 0
         self.head = 0
+        self.top = 0
+
+    def window(self, pad: Int) raises -> Int:
+        """How many cells a step reads, `top` rounded up to `pad`.
+
+        The rounding is llama.cpp's and the reason it gives is the reason to
+        take it: a launch whose grid changes every token is a launch the driver
+        cannot reuse anything about, and the cells between `top` and the round
+        number are masked off by the window anyway because nothing owns them.
+        What it costs is reading up to `pad - 1` cells that say nothing, which
+        at a pad of 256 and a context of a few thousand is single digit per
+        cent of the attention and buys a constant shape.
+        """
+        if pad <= 0:
+            raise Error("a window has to round up to something positive")
+        var n = (self.top + pad - 1) // pad * pad
+        if n < pad:
+            n = pad
+        if n > self.size():
+            n = self.size()
+        return n
+
+    def held(self, seq: Int, upto: Int, mut out: List[Int]) raises:
+        """The position each of the first `upto` cells holds for `seq`.
+
+        `CELL_FREE` for a cell `seq` does not own, whether that is because it is
+        free or because it belongs to somebody else, so one vector answers both
+        halves of the question attention asks. That is what makes this cheaper
+        than the mask llama.cpp builds: it is one entry a cell rather than one
+        entry a cell a token, so it does not grow with the batch, and the
+        causality that would be baked into a two dimensional mask is a compare
+        against the query's own position instead.
+
+        Appended rather than assigned, so a caller building the window for a
+        batch of sequences fills one list back to back.
+        """
+        if upto < 0 or upto > self.size():
+            raise Error(
+                "a window of "
+                + String(upto)
+                + " does not fit a pool of "
+                + String(self.size())
+            )
+        var bit = _bit_of(seq)
+        for i in range(upto):
+            if (self.owners[i] & bit) != 0:
+                out.append(self.pos[i])
+            else:
+                out.append(CELL_FREE)
 
     def position(self, cell: Int) raises -> Int:
         """What position `cell` holds, or `CELL_FREE`."""
@@ -194,6 +254,8 @@ struct CellTable(Movable):
                 self.pos[cell] = at
                 self.owners[cell] = bit
                 self.live += 1
+                if cell + 1 > self.top:
+                    self.top = cell + 1
                 self.head = cell + 1 if cell + 1 < n else 0
                 return cell
         raise Error("the cell pool is full at " + String(n) + " cells")
@@ -262,6 +324,8 @@ struct CellTable(Movable):
                 self.pos[i] = CELL_FREE
                 self.live -= 1
                 freed += 1
+        while self.top > 0 and self.pos[self.top - 1] == CELL_FREE:
+            self.top -= 1
         return freed
 
     def release_all(mut self, seq: Int) raises -> Int:

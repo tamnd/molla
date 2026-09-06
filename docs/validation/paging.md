@@ -40,11 +40,23 @@ Four, in this order, because each one is testable on its own and the first is wo
 
 **Cells.** The pool is addressed by cell rather than by position. `slot_of` stops being the identity and becomes a search over a free list, the metadata table appears on the host with a position and an owner set a cell, and the per step index vector appears as a device buffer that the store scatters through. A sequence now occupies what it has written rather than what it reserved.
 
-**The mask.** Attention stops deriving causality from the range and takes a mask built from the cell metadata, over a window rounded up so the launch shape stops changing every token. This is the stage that costs something, and what it costs has to be measured before the stage after it is worth doing.
+**The mask.** Attention stops deriving causality from the range and takes a mask built from the cell metadata, over a window rounded up so the launch shape stops changing every token. This is the stage that costs something, and what it costs has to be measured before the stage after it is worth doing. The form the mask takes is below, because it is not the form llama.cpp uses and the difference is worth the paragraph.
 
 **Sharing and eviction.** `seq_cp` as a bit set on a range, `seq_rm` as a bit cleared with the cell freed when the set empties, and an eviction policy over cells no sequence owns. Sliding window and sink models get a bounded ring with the sink cells pinned, which the cell form expresses directly.
 
 Continuous batching, #32, sits on top of stage two and does not need stage four. Chunked prefill is not separate work: it is what a cap on the batch does to a long prompt.
+
+## The mask is a position a cell, not a float a pair
+
+llama.cpp builds the mask as a matrix. It is `n_kv` by the number of tokens in the micro batch, zero where a token may look and minus infinity where it may not, uploaded every micro batch. At a prefill chunk of 256 tokens against 4096 cells that is a megabyte of floats a chunk, and it grows with the batch and with the context together.
+
+molla builds it as a vector instead: one entry a cell, holding the position that cell holds for this sequence, or a negative for a cell the sequence may not read. Attention masks a pair by comparing that entry against the query's own position, which is one compare rather than a load of a precomputed answer.
+
+Three things come out of the same entry. Causality is the entry against the query position. Ownership is the sign, because a cell that is free and a cell that belongs to somebody else are both written as negative and neither is a case attention has to know about. The sliding window and the sink count are arithmetic on the position, which they already were, and they stay counted in positions rather than in cells, which is the thing a block table gets wrong when a sequence's blocks are not in order.
+
+The size is the point. A vector of positions does not grow with the batch, so a chunk of 256 tokens against 4096 cells is 16 KiB rather than a megabyte, and a batch of sixteen sequences is one vector a sequence rather than one entry a token a cell. It is also the host table nearly unchanged, which means there is one place a cell's position is written and one place it is read.
+
+What molla gives up for that is generality. A mask matrix can express anything, including the cross attention and the custom masks llama.cpp supports and molla does not. Every model molla runs is causal with an optional window and optional sinks, and all three of those are functions of a position, so the general form would be paying a megabyte a chunk to express something nothing asks for.
 
 ## What done means
 
