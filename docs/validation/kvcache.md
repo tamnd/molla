@@ -87,6 +87,22 @@ The read side is `cache_load`, which takes the form as a compile time parameter 
 
 A note on what this saves, because it is easy to overstate. A value costs 1.0625 bytes here against 2, so a q8_0 cache is 53 per cent of an f16 one and not 25. The saving is a byte a value and the scales are the rest.
 
+## What it cost
+
+A 4090, the 8B at Q4_K_M, a context of 4096, four alternating pairs, best of each. The prompt is 3152 tokens, so the decode reads a cache that is most of the context rather than a few dozen rows, which is the case this is for.
+
+| measurement | f16 | q8_0 |
+| --- | --- | --- |
+| cache at a context of 4096 | 512 MiB | 272 MiB |
+| prefill, 3152 tokens | 5910 ms | 6369 ms |
+| decode, 128 tokens at 3152 of context | 1355 ms | 1674 ms |
+
+So it is 53 per cent of the memory and it costs 24 per cent of a decode at this context. The 96 greedy tokens off a short prompt are byte identical between the two, and at a short context the decode difference is under one per cent, because there the cache is a few dozen rows and the pass is not what a token spends its time on.
+
+The direction is the surprise and the reason is not bandwidth. A q8 row is 6.9 MB a layer at this context against 12.9, so it is less traffic and it is still slower, which is what a read that has stopped being bandwidth bound looks like. Per element the f16 path is one half load and a convert, and the q8 path is a byte load, a factor load, two converts and a multiply. The factor load is a broadcast across the warp and costs almost nothing, so what is left is the arithmetic, and there is twice as much of it.
+
+That is fixable and it is not fixed here. A lane owns one element of a block at a time, because `key_dot` gives a warp to a key and the lanes stride the head dimension by the warp width. Four consecutive elements a lane would make the quant read one thirty two bit load, would amortize the factor over four elements instead of one, and would cost the reduction order, which only has to stay consistent between the fused path and the unfused one at the same form. That is #258.
+
 ## The flag
 
 `--cache-type f16|q8_0`, default f16, with the accuracy note in the help text rather than in a document nobody reads. llama.cpp spells it `--cache-type-k` and `--cache-type-v` and lets the two differ, which molla should not copy until something asks for it: llama.cpp needs the split because a quantized value cache there requires flash attention and a quantized key cache does not, and molla's attention has no such split.
