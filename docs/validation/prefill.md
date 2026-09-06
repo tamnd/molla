@@ -38,6 +38,34 @@ The reduction is a warp butterfly and not a tree through shared memory. A group 
 
 The reduction loop has to be unrolled. This is the one that does not look like anything. A plain `for k in range(SPAN)` around the reduction indexes the accumulator array with a value the compiler will not treat as constant, and the whole array lands in local memory for the entire kernel, accumulation included. Writing it `comptime for` costs nothing and is worth 55 per cent on SmolLM2 and 64 per cent on Qwen. The loops inside the accumulation are the same shape for the same reason.
 
+## The matrix core form
+
+The kernel above is a good general matmul and it is not the fastest one either card can run, because both of them have an instruction that multiplies a small matrix by a small matrix in one go and neither is reachable from ordinary multiply and add. Apple has `simdgroup_matrix` at eight by eight and NVIDIA has `mma` at sixteen by eight by sixteen. There is one kernel for each, and they are two kernels rather than one parameterized one because everything below the tile disagrees: the fragment shape, which lane holds which element, whether the second operand needs transposing, and whether half precision is a choice.
+
+What they share is worth writing down, because it is what makes them the same change twice. Both stage a tile of the activations and a tile of the dequantized weights into shared memory, both walk the reduction in steps of the staged depth, both hold the output in registers for the whole walk, and both end in the same epilogue as every other matmul in the file.
+
+The tile is where the traffic is. A block covers `ROWS` output rows by `TOKENS` tokens and reads the whole reduction of its rows once, so wider in tokens is less weight traffic and wider in rows is more work for the same activation read. The token side cannot pass 64 on either backend, and not for a reason of speed: the tail block runs its dead lanes off the end of the chunk rather than branching, and the slack every prefill scratch vector is allocated with is exactly 64 rows. The row side has no such ceiling and was swept, and on a 4090 it wants 128 over eight warps, which is worth 1.20 times over 64 over four on the 8B.
+
+Three things separate a tensor core kernel that is worth having from one that is not, and the CUDA one was rebuilt around all three after a first attempt reached five per cent of the card's peak. The fragments come from `ld_matrix`, which is one instruction a warp for a whole fragment where the obvious version issues twelve four byte loads for every multiply. The staged tiles are swizzled, so those loads take no bank conflicts: a staged row of 64 halves is 128 bytes, which is one full pass over the banks, so starting row `r` at chunk `r % 8` puts the eight rows a load phase reads on eight distinct chunks and all 32 banks once. And the tile is wide enough that the staging is amortized.
+
+## Where the tile is not used
+
+A block of the tile covers 8192 outputs on CUDA against the ordinary kernel's 256, which is thirty two times fewer blocks for the same matmul. That is the point of it on a large matrix and it is a loss on a small one, because a 4090 has 128 SMs and a matmul that does not have 128 blocks of work leaves whole SMs idle no matter how good the instruction inside them is.
+
+Measured on gpc with the tile taken everywhere it fits, prefill tokens a second, molla against itself: Llama 3.1 8B at Q4_K_M goes 597 to 866, Qwen 2.5 0.5B goes 9345 to 8862 and SmolLM2 135M goes 18357 to 9885. Two of the three are regressions and the third is the only model with matrices large enough to fill the card.
+
+So the dispatch asks for one block an SM before it takes the tile, which is `tokens * rows` against `128 * ROWS * TOKENS`. At a 256 token chunk the 8B is above that line on every matrix it has, the 0.5B is above it on the two wide feed forward matrices and below it on the rest, and the 135M is below it everywhere and never sees the tile. It is a property of the card rather than of the model, and it is the one number here that would want re measuring on a card with a different core count.
+
+## What the tile agrees with, and how closely
+
+The tile does not have to agree with the ordinary kernel exactly and cannot, so the gate is per backend and the difference is the hardware rather than the code.
+
+Apple's `simdgroup_matrix` multiplies in float and accumulates in float, so the Metal tile is doing the same arithmetic as the kernel it replaces in a different order, and it holds to 2e-4 of the peak logit.
+
+NVIDIA's tensor core takes half precision operands and there is no float shape to fall back to. The float shape on this hardware is tf32, which has the same ten bit mantissa at half the rate, so there is no accuracy to buy by staying wide. A half precision dot product agrees with a float one to a few times 1e-4 and no better, and that is the floor rather than a bug to find: the same tile at the same depth against a host reference lands there and stays there.
+
+`tests/test_gpu.mojo` checks the tile directly against a host reference on a synthetic q8_0 weight wide enough to reach the dispatch, at 1e-5 where the backend multiplies in float and 2e-3 where it multiplies in half.
+
 ## What else has to be batched
 
 The matmul is the interesting one and it is not the only one.
@@ -83,6 +111,18 @@ It is also what makes the 8B testable at all. At the old rate a 512 token prompt
 
 ## What is left
 
-llama.cpp on the same 4090 and the same prompt does 27000 to 44000 tokens a second on the two small models and about 10000 on the 8B, so molla is three times behind on SmolLM2, six times behind on Qwen and twenty seven times behind on the 8B. Molla holds the memory side comfortably, at 282 MiB against 444 on SmolLM2 and 1000 MiB against 4900 on the 8B.
+llama.cpp on the same 4090 and the same prompt does 27000 to 44000 tokens a second on the two small models and about 10000 on the 8B. That was three times behind on SmolLM2, six times behind on Qwen and twenty seven times behind on the 8B when the ordinary kernel was all there was. Molla holds the memory side comfortably throughout, at 282 MiB against 444 on SmolLM2 and 1000 MiB against 4900 on the 8B.
 
-The 8B is where the remaining work is, and the number that says why is the arithmetic rate. At 369 tokens a second a chunk of 64 is 173 ms for about a teraflop of work and one pass over 4.6 GiB of weights, which is 6 TFLOP/s and 27 GB/s. Neither is close to a 4090, so the kernel is bound by neither the weights nor the multiplies, and what is left is the dequantization work and the latency the accumulation cannot hide. Closing that means staging weights through shared memory and feeding wider multiplies, which is a different kernel and its own issue.
+The tile is what closed the 8B end of that. On gpc, best of three alternating rounds, a 512 token prompt, molla against itself:
+
+| model | ordinary | tile |
+| --- | --- | --- |
+| Llama 3.1 8B Q4_K_M | 598.8 tok/s | 1086.5 tok/s |
+| Qwen 2.5 0.5B Q4_K_M | 9017.5 tok/s | 11173.9 tok/s |
+| SmolLM2 135M Q8_0 | 18357.1 tok/s | 18357.1 tok/s |
+
+1.81 times on the 8B, 1.24 on Qwen, and parity on the 135M, which never reaches the tile and is the same kernel measured twice. Time to first token on the 8B goes from 860 ms to 474. Card memory is identical on all three, since the tile stages through shared memory and allocates nothing. Decode on the 8B is 111.1 against 111.6, which is unchanged as it has to be, since decode is a matvec and none of this is on that path. Decode on the two small models moves by less than the spread those models show between rounds of the same build.
+
+The arithmetic rate says what is left. At 1086 tokens a second a chunk of 256 through the 8B is 235 ms for about 4.1 TFLOP of work and one pass over 4.6 GiB of weights, which is 17 TFLOP/s and 20 GB/s. The bandwidth is nowhere near the card and 17 is about a tenth of what a 4090 does in half precision with a float accumulator, so the kernel is still bound by neither the weights nor the peak of the instruction.
+
+What it is bound by is that the staging and the multiplying take turns. A step stages a tile, waits on a barrier, multiplies it, waits again, and the two phases are close enough in cost that overlapping them is worth most of another factor. Doing that means a second set of shared buffers and a loop that stages step `n + 1` while multiplying step `n`, which is a change to this kernel rather than another kernel, and it is what is left open on the issue.

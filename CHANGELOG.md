@@ -4,6 +4,11 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Changed
+
+- The CUDA prefill matmul runs on tensor cores where the matmul is large enough to fill the card, which is 1.81 times the prefill on Llama 3.1 8B at Q4_K_M and 1.24 on Qwen 2.5 0.5B. This is the kernel #212 recorded as a failed experiment, rebuilt around the three things the numbers there said were missing. The fragments come from `ld_matrix`, one instruction a warp, where the first version issued twelve four byte loads for every multiply. The staged tiles are swizzled so those loads take no bank conflicts, which is what makes the staged depth 64 rather than 32, since a 128 byte row is one full pass over the shared memory banks. And the tile is 128 output rows by 64 tokens rather than 64 by 32, which is a quarter of the weight traffic. It reaches about 17 TFLOP/s where the first version reached 8.2. Decode is untouched. See docs/validation/prefill.md.
+- The tile is used only where the matmul has at least one block for every SM, which is `tokens * rows` against 128 blocks worth of output. Without that rule the tile is a regression on both small models, since a block covers thirty two times the output the ordinary kernel's block does and a small matrix does not have enough of it to go round. With it, the 8B takes the tile on every matrix, the 0.5B on its two wide feed forward matrices, and SmolLM2 135M on none, which is parity rather than the 0.54 times it would otherwise be.
+
 ## [0.4.20] - 2026-09-06
 
 A q8_0 cache now costs 4 per cent of a decode where it cost 24, for the same bytes and the same answers, because a key read takes four adjacent elements a lane rather than one. And there is now a long soak that says the form is safe over thousands of positions, which is the thing #204 was really waiting on and which nothing in the suite could see.
