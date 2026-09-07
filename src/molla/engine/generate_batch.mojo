@@ -146,8 +146,20 @@ def run_generate_batch(
         cache.close()
         g.close()
 
+        # Timed, because admission is per request work that a server does on
+        # the thread that also has to run the steps, and #292 is the question
+        # of how much of it there is.
+        var admitting = monotonic_ms()
         for _ in range(streams):
             _ = batch.admit(ids.copy(), take, eos, sampling)
+        print(
+            "admit:    ",
+            monotonic_ms() - admitting,
+            "ms for",
+            streams,
+            "streams",
+        )
+        print()
 
         # A stamp per stream per token, taken after the step that produced it.
         # Held rather than summarised as it goes, because the interesting number
