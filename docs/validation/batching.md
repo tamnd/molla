@@ -127,7 +127,36 @@ A fresh cache gives its whole index to sequence zero. So a session that has neve
 
 `place_for` is `place` with two more arguments and it is where the descriptor gets filled. It takes the sequence, and it takes where that sequence's tokens sit in the step's chunk. Everything a token says about itself is written at that subscript by the call that allocated its cell, because that call is the one thing that knows both the token's position and where its region starts. Committing the descriptor is separate and happens once a step. So a batch of sixteen is sixteen `place_for` calls and one `mixed`, and nothing walks the batch a second time to work out what the first walk already knew.
 
-What is still ahead is the step loop itself: which sequences go into a batch, how a prompt too long for the cap is cut, and what happens when a sequence finishes mid batch.
+## What the loop came out as
+
+Stage four's second half, which is the thing admission was for.
+
+`DeviceSession` is one sequence with a cache of its own and its loop is a token at a time down one stream. `DeviceBatch` is the other shape: several streams over one pool, one scratch and one pass, and its loop is a step at a time over all of them. Both exist, because a single request answered on an idle card does not want a batch's overheads and a server does not want a session per request.
+
+A step is filled from every stream that has work, in slot order, until the cap is full. A stream reading its prompt gives as much of it as the cap has room for. A stream generating gives the one token it last produced, which is what makes a decode one token rather than two: the token sampled from this step's logits is the token that stream contributes to the next. So chunked prefill needed no mechanism of its own, exactly as the section above predicted. The cap the batch has anyway is what cuts a long prompt up, and the streams that are decoding decode in between the pieces.
+
+A stream still owing prompt gets no answer, because the logits of a token in the middle of a prompt are a prediction nobody asked for. One that has just finished its prompt gets the answer the single sequence path samples its first token from. So the rows a step asks for are the streams that reached the end of what they owed, and that is usually all of them and occasionally none.
+
+One thing did not fall out and had to be said. A step that turns out to carry a single token, which is the tail of any run and the whole of a run with one stream, needs a scratch sized for one token and a residual stream one row wide. The batch holds both sizes for the same reason a session does: the attention scores scale with the chunk and the context together, and the final norm reads a vector the width of what it was handed.
+
+`molla batch` is what a person runs to see this. Several copies of a prompt at once, and it reports aggregate tokens a second, time to first token per stream, and the spread of inter token latency, which are the three numbers a single stream run has no version of. Every stream gets the same prompt and greedy settings, so every stream has to write the same tokens, and the command checks that rather than leaving it to whoever reads the text. Two sequences whose cells got mixed up would disagree there, and so would a batch that wrote one stream's logits into another's row.
+
+## What the loop measures
+
+On the 4090 with Qwen 2.5 0.5B Q4_K_M, a short prompt and 128 tokens a stream, one run a row:
+
+| streams | aggregate tok/s | median | p95 | worst |
+| --- | --- | --- | --- | --- |
+| 1 | 335 | 3 ms | 4 ms | 5 ms |
+| 2 | 378 | 5 ms | 6 ms | 6 ms |
+| 4 | 619 | 6 ms | 8 ms | 12 ms |
+| 8 | 994 | 8 ms | 9 ms | 9 ms |
+| 16 | 1349 | 12 ms | 13 ms | 13 ms |
+| 32 | 1790 | 18 ms | 19 ms | 28 ms |
+
+Sixteen streams produce four times the tokens one stream does and each of them waits four times as long between tokens, which is what sharing a card is. What the criterion asks about is collapse, and the shape here is the opposite of collapse: the total rises at every count, and the ninety fifth percentile sits within a millisecond or two of the median all the way up, so no stream is being served late while the others are served on time. Every count agreed token for token across all its streams.
+
+The one place the curve is not smooth is one stream to two, where the total goes up by a tenth rather than close to double. That is not the scheduler. A step carrying one token goes down the single token path and a step carrying two goes down the general one, and the second is about twice the work for the first token it carries. After that the marginal cost of a stream is small: a step is under five milliseconds at two streams and about sixteen at thirty two, so sixteen more streams cost less than the first two did. Which says the batching is doing what batching is for, and that the crossover between the two paths is the thing to look at if the low end matters.
 
 ## What done means
 
