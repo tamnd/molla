@@ -4,6 +4,16 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-09-07
+
+The fourth of the five stages continuous batching needs, which is the one that makes a batch a thing rather than a shape a pass can take. A sequence is admitted for a number of positions and gets a region of the index that long, and a loop above that fills each step from every stream that has work.
+
+Chunked prefill came out of it for free, which is what the spec predicted and is the nicest part. There is no mechanism for cutting a long prompt up, because the cap a batch has anyway is that mechanism, and the streams that are decoding decode in between the pieces of somebody else's prompt without anything having to arrange it.
+
+`molla batch` is the new command. On the 4090 with Qwen 2.5 0.5B Q4_K_M, sixteen streams produce 1349 aggregate tokens a second against 335 for one, at 12 ms median inter token latency and 13 ms at the ninety fifth percentile, and thirty two streams still scale to 1790. The total rises at every count and the percentile never drifts far from the median, so nothing is being starved. docs/validation/batching.md carries the table and names the one place the curve is not smooth, which is the crossover between the single token path and the general one and not the scheduler.
+
+Nothing here is wired into the server yet. A single request answered on an idle card takes the path it took yesterday.
+
 ### Added
 
 - Several sequences can hold one KV pool. A sequence is admitted for a number of positions and gets a region of the index that long, and that region is the whole reservation, because a sequence can hold at most as many cells as it has index entries to name them with. So admitting the region is admitting the cells and there is nothing to keep in step. Regions are handed out first fit and joined back up with their neighbours when a sequence is evicted, so a pool that has been drained is one region again whatever order the sequences left in. That is the first half of the fourth of the five stages in [docs/validation/batching.md](docs/validation/batching.md).
