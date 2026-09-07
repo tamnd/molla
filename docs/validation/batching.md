@@ -172,6 +172,28 @@ Whichever connection asks for its next token steps the batch. A step carries eve
 
 Two things came out of wiring it that the loop did not need on its own. A slot has to come back when a request finishes, since a server admits one for every one it answers and a batch whose slots only ever ran out would serve four requests and refuse forever. And ending a stream is two things rather than one: a caller that matched a stop string wants the stream to stop generating while it is still reading what the stream wrote, so `halt` stops the generating and `drop` hands the region back, and the connection does the second when it closes.
 
+## What the server measures
+
+The same 4090 and the same model, through HTTP this time. Streaming completions, a short prompt, 128 tokens a stream, a pool of 16384 positions and a client on the same machine:
+
+| streams | aggregate tok/s | median | p95 | worst |
+| --- | --- | --- | --- | --- |
+| 1 | 154 | 6 ms | 8 ms | 8 ms |
+| 2 | 242 | 8 ms | 9 ms | 9 ms |
+| 4 | 433 | 9 ms | 10 ms | 28 ms |
+| 8 | 671 | 11 ms | 12 ms | 68 ms |
+| 16 | 959 | 15 ms | 16 ms | 46 ms |
+| 32 | 1217 | 23 ms | 25 ms | 382 ms |
+| 64 | 1555 | 34 ms | 39 ms | 1411 ms |
+
+Sixteen concurrent streams through the server produce six times the tokens one stream does at two and a half times the inter token latency, and the ninety fifth percentile is a millisecond off the median at every count up to sixty four. Every count agreed token for token across all its streams, so no request read another's logits. That is the exit criterion, taken where the criterion asks for it rather than in the benchmark command.
+
+The totals are below what `molla batch` reports for the same counts, by about a third at sixteen. Framing, JSON, the event stream and a Python client on the same box are all in this number and none of them are in the other one. The shape is what matters here and the shape is the same.
+
+The worst column is the interesting one and it is stage five's argument. At thirty two and sixty four streams there is a gap of hundreds of milliseconds in the middle of somebody's stream, while the p95 stays where it was. That is one stream waiting behind a wave of prompts: a step is filled in slot order, so the last request admitted has its prefill cut into pieces that land after everybody else's, and a stream that was already decoding waits through it. Nothing is starving, since every stream finished and the percentile did not move, but the tail is not fair yet and a round robin by sequence is what makes it fair.
+
+The pool being shared is visible in the failures rather than in the table. Thirty two streams against a pool of 4096 positions is 32 times 139 positions asked for and 4096 to hand out, and the three requests that did not fit got a 503 saying so. The same thirty two against 16384 all fit. That is the trade this made: a server can refuse a request it would have had room for under a fixed division, and it can also admit one that a fixed division would have refused, and the second happens far more often.
+
 ## What done means
 
 Sixteen concurrent streams on the 4090 without latency collapse, which is M3's exit criterion as well as this issue's, and preempt and resume producing output identical to an uninterrupted greedy run.

@@ -4,6 +4,8 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+The stage that makes the batch a server rather than a benchmark. On the 4090 with Qwen 2.5 0.5B Q4_K_M, sixteen concurrent streaming completions through HTTP produce 959 aggregate tokens a second against 154 for one, at 15 ms median inter token latency and 16 ms at the ninety fifth percentile, and sixty four streams still scale to 1555. Every count agreed token for token across all its streams. That is M3's exit criterion measured where the criterion asks for it rather than in the benchmark command.
+
 ### Added
 
 - `molla serve --slots=N` answers N requests at once over one batch, which is the third and last part of the fourth of the five stages in [docs/validation/batching.md](docs/validation/batching.md). The requests share one pool rather than getting a fixed share of it each, because a server that had divided its pool four ways would refuse a long request while three quarters of the card sat idle. Whichever connection asks for its next token steps the batch, which carries every request that has work, so one connection pays for the step and the others find their token already written. The default is one, so a server nobody asked behaves the way it did.
