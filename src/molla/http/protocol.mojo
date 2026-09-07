@@ -271,6 +271,12 @@ struct ConnState(Movable):
     var at_admit: Int
     """When the prompt behind this connection was admitted to the batch."""
 
+    var just_admitted: Bool
+    """Whether this stream was admitted on this turn and has not produced yet.
+
+    Set where the prompt is admitted and cleared by the pump, and what it buys
+    is one trip back to the reactor in between. See `_pump`."""
+
     def __init__(out self, counter: Int, max_body: Int):
         self.writer = ResponseWriter(counter)
         self.out_at = 0
@@ -304,6 +310,7 @@ struct ConnState(Movable):
         self.api_created = 0
         self.at_open = 0
         self.at_admit = 0
+        self.just_admitted = False
 
     def reset(mut self):
         """Ready for a new connection in this slot, keeping every buffer."""
@@ -340,6 +347,7 @@ struct ConnState(Movable):
         self.api_created = 0
         self.at_open = 0
         self.at_admit = 0
+        self.just_admitted = False
 
     def method(self) -> Span[UInt8, MutAnyOrigin]:
         return Span[UInt8, MutAnyOrigin](
@@ -675,6 +683,23 @@ struct HttpProtocol(Movable, Protocol):
                 return True
 
             if self.states[slot].streaming:
+                if self.states[slot].just_admitted:
+                    # Admitted on this turn, so hand the reactor back before
+                    # generating anything. A step carries every stream in the
+                    # batch, so the first token of a prompt admitted a moment
+                    # ago is nearly free once the step is running, and the
+                    # expensive thing is being the reason a step runs. Without
+                    # this, a worker that has just read one request out of
+                    # sixty four readable sockets runs a whole forward pass for
+                    # that one before it reads the second, and the sixty fourth
+                    # client waits for sixty three passes it could have ridden
+                    # along with. See #292: it was a second on a 4090 with a
+                    # half billion parameter model.
+                    self.states[slot].just_admitted = False
+                    conn.produce(True)
+                    conn.yield_now()
+                    self._meter_bytes(slot, conn)
+                    return True
                 # The headers are out and the body is still being made. Run it
                 # until it finishes or until the reader stops keeping up.
                 if not self._pump_stream(slot, conn):
@@ -1629,6 +1654,7 @@ struct HttpProtocol(Movable, Protocol):
         # ends the stream is `STAGE_DONE`, and this is only here so that a bug
         # in the stages cannot turn into a connection that produces forever.
         self.states[slot].stream_left = req.max_tokens + API_SLACK
+        self.states[slot].just_admitted = True
 
     def _build_chunk(mut self, slot: Int, role: Bool, last: Bool) -> Bool:
         """One chunk of a streaming completion, into the JSON writer."""
