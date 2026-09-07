@@ -66,6 +66,8 @@ staging buffer, so the pump has to stop on `STREAM_FULL` and hand back to the
 reactor rather than growing the buffer until the reader catches up.
 """
 
+from std.os.env import getenv
+
 from molla.api.openai import (
     ApiRequest,
     add_text_choice,
@@ -262,6 +264,13 @@ struct ConnState(Movable):
     var api_id: String
     var api_created: Int
 
+    var at_open: Int
+    """When this connection was accepted, on the monotonic clock in
+    milliseconds. Only read when the trace is on. See `Http.tracing`."""
+
+    var at_admit: Int
+    """When the prompt behind this connection was admitted to the batch."""
+
     def __init__(out self, counter: Int, max_body: Int):
         self.writer = ResponseWriter(counter)
         self.out_at = 0
@@ -293,6 +302,8 @@ struct ConnState(Movable):
         self.api_delta = String("")
         self.api_id = String("")
         self.api_created = 0
+        self.at_open = 0
+        self.at_admit = 0
 
     def reset(mut self):
         """Ready for a new connection in this slot, keeping every buffer."""
@@ -327,6 +338,8 @@ struct ConnState(Movable):
         self.api_delta = String("")
         self.api_id = String("")
         self.api_created = 0
+        self.at_open = 0
+        self.at_admit = 0
 
     def method(self) -> Span[UInt8, MutAnyOrigin]:
         return Span[UInt8, MutAnyOrigin](
@@ -497,6 +510,15 @@ struct HttpProtocol(Movable, Protocol):
     """One of each per worker, reused across requests, because a completion
     body is built once and a chunk is built once per token."""
 
+    var tracing: Bool
+    """Whether to print a line per request saying when it was accepted, when it
+    was admitted and when its first token went out.
+
+    Off unless `MOLLA_TRACE=1` is in the environment, and read once at startup
+    rather than per request. It exists because the question of where a second
+    goes between a socket and a first token is not answerable from the outside,
+    and a percentile of the whole is what hid it."""
+
     def __init__(out self):
         self.states = List[ConnState]()
         self.req = Request()
@@ -520,6 +542,7 @@ struct HttpProtocol(Movable, Protocol):
         self.json = Writer(0, 8192)
         self.doc = Document(0, 256)
         self.reader = Reader(0, 4096)
+        self.tracing = getenv("MOLLA_TRACE") == "1"
 
     def configure_engine(mut self, engine: Int):
         """Hand this worker the model it answers with.
@@ -576,6 +599,8 @@ struct HttpProtocol(Movable, Protocol):
     def on_open(mut self, mut conn: Connection):
         self._ensure(conn.slot)
         self.states[conn.slot].reset()
+        if self.tracing:
+            self.states[conn.slot].at_open = monotonic_ms()
         self.opened += 1
         self.meter.inc(M_CONNECTIONS_ACCEPTED)
         self.meter.inc(M_CONNECTIONS_OPEN)
@@ -1427,7 +1452,9 @@ struct HttpProtocol(Movable, Protocol):
         lets it ride along with the decodes already running.
         """
         var runner = runner_at(self.engine)
+        var read_at = monotonic_ms() if self.tracing else 0
         var prompt = self._prompt_of(chat, req, index)
+        var coded_at = monotonic_ms() if self.tracing else 0
         var job = runner[].start(
             prompt,
             req.sampling,
@@ -1437,6 +1464,21 @@ struct HttpProtocol(Movable, Protocol):
             req.stops.copy(),
         )
         self.states[slot].api_job = job
+        if self.tracing:
+            self.states[slot].at_admit = monotonic_ms()
+            print(
+                "trace job",
+                job,
+                "accepted at",
+                self.states[slot].at_open,
+                "read",
+                read_at - self.states[slot].at_open,
+                "encode",
+                coded_at - read_at,
+                "admit",
+                self.states[slot].at_admit - coded_at,
+                "ms after accept",
+            )
         return job
 
     def _full(mut self, slot: Int, keep: Bool, head: Bool):
@@ -1696,6 +1738,18 @@ struct HttpProtocol(Movable, Protocol):
                 )
                 if rc == STREAM_OK:
                     self.states[slot].api_delta = String("")
+                    if self.tracing and self.states[slot].at_admit > 0:
+                        # Once a stream, which is why the stamp is cleared.
+                        print(
+                            "trace job",
+                            self.states[slot].api_job,
+                            "first token",
+                            monotonic_ms() - self.states[slot].at_admit,
+                            "ms after admit,",
+                            monotonic_ms() - self.states[slot].at_open,
+                            "ms after accept",
+                        )
+                        self.states[slot].at_admit = 0
                 return rc
             self.states[slot].api_stage = STAGE_FINAL
 
