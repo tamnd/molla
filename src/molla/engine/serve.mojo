@@ -7,22 +7,23 @@ been generating tokens since #28. What this file does is put a loaded model
 where the protocol can reach it and then get out of the way, which is about
 forty lines of real work and a lot of printing.
 
-## One worker
+## One worker, several requests
 
-The context is built with one worker on purpose. There is one model, one
-session and one sampler behind these routes, so a second worker would be a
-second thread contending for a lock that does not exist. When the scheduler
-lands in M3 this becomes a real number and the runner becomes a list, and until
-then the honest thing is to run one thread and refuse a second request rather
-than to run four and corrupt a cache. See the docstring on
+The context is built with one worker on purpose, and that is not the same
+number as the slot count. There is one model and one pool behind these routes,
+so a second worker would be a second thread reaching into one cache without a
+lock. What serves several requests at once is the batch, not a second thread:
+one reactor holds every connection, and whichever of them asks for its next
+token steps the batch, which carries all of them. See the docstring on
 `molla.engine.runner`.
 
 The cost is visible and worth saying out loud: a request that is not streaming
-holds the server for its whole generation, so a health check behind a long
-completion waits for it. A streaming request hands the reactor back after every
-token, so the admin routes stay answerable through one at the cost of about one
-token of delay. See `Connection.yield_now` for what makes that a token rather
-than eight of them.
+holds the worker for its whole generation, so a health check behind a long
+completion waits for it. It drives the batch while it waits, so the streaming
+connections keep producing. A streaming request hands the reactor back after
+every token, so the admin routes stay answerable through one at the cost of
+about one token of delay. See `Connection.yield_now` for what makes that a
+token rather than eight of them.
 
 ## The model is a local
 
@@ -34,7 +35,7 @@ is what stops Mojo from deciding otherwise.
 """
 
 from molla.engine.backend import Backend
-from molla.engine.runner import Runner, address_of
+from molla.engine.runner import DEFAULT_SLOTS, Runner, address_of
 from molla.http.protocol import HttpProtocol
 from molla.net.context import ServerContext
 from molla.net.listener import ListenAddress
@@ -75,6 +76,7 @@ def run_serve(
     context: Int,
     backend: Backend = Backend(),
     form: Int = CACHE_F16,
+    slots: Int = DEFAULT_SLOTS,
 ) raises -> Int:
     """Load a model and answer OpenAI requests against it until a signal."""
     _ = ignore_sigpipe()
@@ -82,10 +84,11 @@ def run_serve(
     var started = monotonic_ms()
     print("loading", model_path)
     var runner = Runner(
-        model_path, tokenizer_path, model_path, context, backend, form
+        model_path, tokenizer_path, model_path, context, backend, form, slots
     )
     print("  model         ", runner.describe())
     print("  backend       ", runner.running_on())
+    print("  slots         ", slots, "requests at once, sharing the pool")
     if backend.on_device:
         print("  kv cache      ", cache_type_name(form))
     print("  tokenizer     ", tokenizer_path)
@@ -125,7 +128,13 @@ def run_serve(
     print("  GET  /v1/models")
     print("  GET  /molla/health, /molla/version, /molla/metrics")
     print()
-    print("one sequence at a time. a second request in flight gets a 503.")
+    if slots == 1:
+        print("one request at a time. a second one in flight gets a 503.")
+    else:
+        print(
+            String(slots),
+            "requests at a time, sharing one pool. one more gets a 503.",
+        )
     print("ctrl-c to stop.")
 
     server.start()

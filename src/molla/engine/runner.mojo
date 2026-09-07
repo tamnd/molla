@@ -6,29 +6,50 @@ start a generation, take a token, and say what the last one produced. What a
 GGUF is, what a template is, and how a token becomes bytes stay on this side of
 that line.
 
-## One sequence
+## Several requests, one pool
 
-There is one session, one sampler and one set of counters here, because M2
-decodes one sequence at a time. A second request arriving while one is running
-is refused rather than queued or interleaved, which is a worse server and an
-honest one: queueing without a scheduler means a client waiting on a socket with
-no idea it is second, and interleaving without paging means two sequences
-writing over each other's cache. The scheduler is M3 and it is the thing that
-makes this a `List` instead of a field.
+A request in flight is a job, and there are as many of them as the server was
+started with slots. The tokens live in the batch below, which is where the model
+can reach them. What a job holds is the part of a request that is text rather
+than tokens: what has been decoded, how much of it has gone out, the stop
+strings, and why it ended. A batch has no business knowing any of that and a
+protocol has no business knowing what a cell is.
 
-`busy` is only ever observed across a streaming response, since a streaming
-request goes back to the event loop between tokens and another connection can be
-serviced in the gap. A request that is not streaming holds the worker for its
-whole generation, which is the same statement said less politely.
+The pool is shared rather than divided. A request is admitted for its prompt
+plus everything it is allowed to generate, and it is refused when the pool has
+no room for that, so one long request can have the whole pool while it lasts and
+several short ones fit alongside each other. Dividing the context by the slot
+count up front would refuse a long request on an idle server, which is the
+worse of the two failures.
 
-## Two sessions, one of them present
+A job's handle is the slot it sits in, and it is valid until `finish`. After
+that the slot is free and whatever is read off it belongs to whoever came next.
 
-The sequence lives in a host session or in a device session and never in both,
-so both are optionals and exactly one is filled. A variant would be tidier and
-Mojo has no shape for one that does not cost more than this does. What it buys
-is that a server started on the host does not allocate a device cache and a
-server started on a card does not allocate a host one, and a kv cache at four
-bytes an element is not a thing to allocate twice for the sake of a field.
+## Who drives the loop
+
+Whichever connection calls `advance` steps the batch, and a step carries every
+job that has work. So a connection asking for its own next token pays for
+everybody's, and the jobs it advanced find their tokens waiting when their own
+connections come round. That is what makes this interleave without a thread: the
+reactor already hands control back between tokens, and the step that happens in
+one connection's turn is the step all of them needed.
+
+A request that is not streaming still holds the worker for its whole generation.
+It drives the batch while it does, so the streaming connections behind it keep
+producing, but nothing else on that worker is answered until it is done.
+
+## Two backends, one of them present
+
+The sequence lives in a host session or in a device batch and never in both, so
+both are optionals and exactly one is filled. A variant would be tidier and Mojo
+has no shape for one that does not cost more than this does. What it buys is
+that a server started on the host does not allocate a device cache and a server
+started on a card does not allocate a host one, and a kv cache at four bytes an
+element is not a thing to allocate twice for the sake of a field.
+
+The host path is one job whatever the slot count, because the host has no batch
+and never had one. A server started on the host with room for more is told so
+rather than quietly serving one at a time.
 
 Which one it is was decided before the file was opened, by
 `molla.engine.backend`, and it is printed at startup and served on
@@ -46,13 +67,9 @@ assuming one token is one chunk.
 """
 
 from molla.engine.backend import Backend
+from molla.engine.batch import DeviceBatch, open_batch
 from molla.engine.bind import Bound, bind
-from molla.engine.device import (
-    DeviceSession,
-    device_context,
-    load_on_device,
-    open_session,
-)
+from molla.engine.device import device_context, load_on_device
 from molla.engine.sample import Sampler, SamplerConfig
 from molla.engine.session import Session as Decode
 from molla.jinja.template import Template
@@ -60,6 +77,7 @@ from molla.model.gguf import Gguf
 from molla.model.load import Weights, load, plan_load
 from molla.model.repack import RepackCache, model_key, open_cache
 from molla.model.spec import read_geometry
+from molla.nn.gpu import PREFILL_CHUNK
 from molla.nn.repack import CACHE_F16
 from molla.sys.clock import unix_time
 from molla.sys.device import Device
@@ -75,6 +93,15 @@ comptime DEFAULT_CONTEXT = 4096
 """Positions to make room for when nobody says. The cache is four bytes an
 element, so allocating whatever the file allows would be gigabytes for a
 conversation of two lines."""
+
+comptime DEFAULT_SLOTS = 1
+"""Requests in flight when nobody says.
+
+One, so that a server nobody configured behaves the way it did before there was
+a batch: the whole pool is available to the one request being answered, and
+memory is what it was. Asking for more is asking to share the pool, and that is
+a decision about a machine rather than a default anything can be given.
+"""
 
 comptime RunnerPtr = Pointer[Runner, MutAnyOrigin]
 """How the protocol reaches the runner.
@@ -93,6 +120,102 @@ def runner_at(address: Int) -> RunnerPtr:
 
 def address_of(ref runner: Runner) -> Int:
     return Int(Pointer(to=runner))
+
+
+struct Job(Movable):
+    """One request in flight, in the terms a protocol answers in.
+
+    Everything here is about text. The tokens are in the batch, and the only
+    number that crosses between the two is `taken`, which says how much of what
+    the stream has written this job has turned into text already.
+    """
+
+    var live: Bool
+    var at: Int
+    """Which stream of the batch this job is, which is its own handle on the
+    device path and zero on the host one."""
+
+    var decoder: DecodeStream
+    var text: String
+    """Everything this generation has decoded, truncated at a stop string once
+    one has been seen."""
+
+    var emitted: Int
+    """Bytes of `text` already handed to the client."""
+
+    var taken: Int
+    """Tokens of the stream's output already turned into text."""
+
+    var produced: Int
+    var prompt_tokens: Int
+    var left: Int
+    var reason: Int
+    var stops: List[String]
+
+    def __init__(out self):
+        """A free slot. Every field is set again by `begin`."""
+        self.live = False
+        self.at = -1
+        self.decoder = DecodeStream(True)
+        self.text = String("")
+        self.emitted = 0
+        self.taken = 0
+        self.produced = 0
+        self.prompt_tokens = 0
+        self.left = 0
+        self.reason = REASON_STOP
+        self.stops = List[String]()
+
+    def begin(
+        mut self,
+        at: Int,
+        prompt_tokens: Int,
+        take: Int,
+        var stops: List[String],
+    ):
+        self.live = True
+        self.at = at
+        self.decoder = DecodeStream(True)
+        self.text = String("")
+        self.emitted = 0
+        self.taken = 0
+        self.produced = 0
+        self.prompt_tokens = prompt_tokens
+        self.left = take
+        self.reason = REASON_LENGTH if take == 0 else REASON_STOP
+        self.stops = stops^
+
+    def stop_at(self) -> Int:
+        """Where a stop string begins in the generated text, or minus one."""
+        for i in range(len(self.stops)):
+            if self.stops[i].byte_length() == 0:
+                continue
+            var at = self.text.find(self.stops[i])
+            if at >= 0:
+                return at
+        return -1
+
+    def held(self) -> Int:
+        """Bytes at the end of the text that could still become a stop string.
+
+        The longest suffix of what has been generated that is also a proper
+        prefix of some stop string. Sending those and finding out one token
+        later that they were the first half of a stop is not recoverable, since
+        they have left.
+        """
+        var have = self.text.byte_length()
+        var most = 0
+        for i in range(len(self.stops)):
+            var stop = self.stops[i]
+            var k = stop.byte_length() - 1
+            if k > have:
+                k = have
+            while k > most:
+                if self.text[byte = have - k : have] == stop[byte=0:k]:
+                    most = k
+                    break
+                k -= 1
+        return most
 
 
 struct Runner(Movable):
@@ -116,16 +239,18 @@ struct Runner(Movable):
     route still works and the chat route says why it does not."""
 
     var session: Optional[Decode]
-    var device: Optional[DeviceSession]
-    """The sequence, in host memory or on the card. Exactly one of them is
-    filled and `backend.on_device` says which."""
+    var batch: Optional[DeviceBatch]
+    """The sequences, in host memory or on the card. Exactly one of them is
+    filled and `backend.on_device` says which. The host one holds a sequence and
+    the device one holds as many as there are slots."""
 
     var backend: Backend
     """Where this server computes, and why. Reported at startup and on
     `/molla/version`, because it is not visible in an answer."""
 
     var sampler: Sampler
-    var decoder: DecodeStream
+    """The host path's sampler. The device path keeps one a stream, inside the
+    batch, because the recent window the penalties read is a sequence's own."""
 
     var id: String
     """What `/v1/models` reports and what a request's `model` is matched
@@ -138,19 +263,11 @@ struct Runner(Movable):
     var bos_text: String
     var eos_text: String
 
-    var busy: Bool
-    var left: Int
-    var produced: Int
-    var prompt_tokens: Int
-    var reason: Int
-    var text: String
-    """Everything this generation has decoded, truncated at a stop string once
-    one has been seen."""
+    var jobs: List[Job]
+    """One entry a slot, dead until a request takes it. Fixed length, so a
+    handle is a subscript and nothing has to be looked up."""
 
-    var emitted: Int
-    """Bytes of `text` already handed to the client."""
-
-    var stops: List[String]
+    var slots: Int
     var seq: Int
     """Requests answered, which is what makes a response id unique."""
 
@@ -162,7 +279,16 @@ struct Runner(Movable):
         context: Int,
         backend: Backend = Backend(),
         form: Int = CACHE_F16,
+        slots: Int = DEFAULT_SLOTS,
     ) raises:
+        if slots < 1:
+            raise Error("a server needs room for at least one request")
+        if slots > 1 and not backend.on_device:
+            raise Error(
+                "--slots is a device setting and this server is running on the"
+                " host, where there is one sequence and no batch to put a"
+                " second one in"
+            )
         var g = Gguf(model_path)
         var dev = backend.device
         var geometry = read_geometry(g)
@@ -177,7 +303,7 @@ struct Runner(Movable):
         var weights: Weights
         var b: Bound
         self.session = None
-        self.device = None
+        self.batch = None
 
         if backend.on_device:
             var ctx = device_context(dev.index)
@@ -188,7 +314,9 @@ struct Runner(Movable):
             # bytes, so the second is a list of addresses and not a second copy
             # of anything.
             b = bind(g, cache, weights.residency())
-            self.device = open_session(ctx, bind(g, cache), b, want, form)
+            self.batch = open_batch(
+                ctx, bind(g, cache), b, want, slots, PREFILL_CHUNK, form
+            )
         else:
             # Everything stays in the mapping, because host kernels cannot read
             # a tensor on a card.
@@ -221,7 +349,6 @@ struct Runner(Movable):
 
         self.backend = backend
         self.sampler = Sampler(SamplerConfig(), b.vocab())
-        self.decoder = DecodeStream(True)
         self.context = want
         self.g = g^
         self.weights = weights^
@@ -231,14 +358,10 @@ struct Runner(Movable):
         self.counter = counter
         self.id = id
         self.created = unix_time()
-        self.busy = False
-        self.left = 0
-        self.produced = 0
-        self.prompt_tokens = 0
-        self.reason = REASON_STOP
-        self.text = String("")
-        self.emitted = 0
-        self.stops = List[String]()
+        self.slots = slots
+        self.jobs = List[Job]()
+        for _ in range(slots):
+            self.jobs.append(Job())
         self.seq = 0
 
     def close(mut self):
@@ -362,6 +485,21 @@ struct Runner(Movable):
         a prompt it had sent as token ids."""
         return self.tokenizer.decode(ids, True)
 
+    def free_slot(self) -> Int:
+        """A slot nothing is using, or minus one."""
+        for i in range(len(self.jobs)):
+            if not self.jobs[i].live:
+                return i
+        return -1
+
+    def running(self) -> Int:
+        """Requests in flight, for the line the server prints when it stops."""
+        var n = 0
+        for i in range(len(self.jobs)):
+            if self.jobs[i].live:
+                n += 1
+        return n
+
     def start(
         mut self,
         prompt: List[Int],
@@ -370,12 +508,25 @@ struct Runner(Movable):
         bias_vals: List[Float32],
         limit: Int,
         var stops: List[String],
-    ) raises:
-        """Prefill, and get ready to hand out tokens.
+    ) raises -> Int:
+        """Take a request, and return the handle everything else takes.
+
+        Minus one means the server is full: every slot is answering something,
+        or the pool has no region long enough for what this request could come
+        to hold. That is a refusal and not an error, since the same request
+        would be taken a moment later, and it is why it comes back as a number
+        rather than as a raise. What raises is a request that would be refused
+        however empty the server was.
+
+        Nothing is computed here on the device path. The prompt is admitted and
+        the first pass over it happens on the first `advance`, which is what
+        lets a long prompt ride along with other jobs' decodes rather than
+        stopping them while it prefills.
 
         The prompt goes into the sampler as well as into the model, so the
         penalties see the whole conversation rather than only the part this
-        answer has written.
+        answer has written. `DeviceBatch.admit` does that for a stream and the
+        host path does it here.
         """
         if len(prompt) == 0:
             raise Error("the prompt encoded to no tokens")
@@ -390,128 +541,148 @@ struct Runner(Movable):
         if take > self.context - len(prompt):
             take = self.context - len(prompt)
 
-        self._reset()
-        self.sampler = Sampler(config, self.b.vocab())
-        for i in range(len(bias_ids)):
-            self.sampler.bias(bias_ids[i], bias_vals[i])
-        for i in range(len(prompt)):
-            self.sampler.observe(prompt[i])
-        self.decoder = DecodeStream(True)
-        self.stops = stops^
-        self.text = String("")
-        self.emitted = 0
-        self.produced = 0
-        self.prompt_tokens = len(prompt)
-        self.reason = REASON_LENGTH if take == 0 else REASON_STOP
-        self.left = take
-        self.busy = True
-        self._prefill(prompt)
+        var job = self.free_slot()
+        if job < 0:
+            return -1
 
-    def _reset(mut self) raises:
-        """Put the sequence back to position zero, wherever it lives."""
-        if self.session:
+        var at = 0
+        if self.batch:
+            # A request that would fit on its own and does not fit beside the
+            # ones already running is refused here rather than admitted and
+            # preempted later, which is #32's rule.
+            if not self.batch.value().fits(len(prompt) + take):
+                return -1
+            at = self.batch.value().admit(prompt.copy(), take, self.eos, config)
+            for i in range(len(bias_ids)):
+                self.batch.value().bias(at, bias_ids[i], bias_vals[i])
+        else:
             self.session.value().reset()
-        if self.device:
-            self.device.value().reset()
-
-    def _prefill(mut self, prompt: List[Int]) raises:
-        if self.session:
+            self.sampler = Sampler(config, self.b.vocab())
+            for i in range(len(bias_ids)):
+                self.sampler.bias(bias_ids[i], bias_vals[i])
+            for i in range(len(prompt)):
+                self.sampler.observe(prompt[i])
             self.session.value().prefill(self.b, prompt)
-        elif self.device:
-            self.device.value().prefill(prompt)
+        self.jobs[job].begin(at, len(prompt), take, stops^)
+        return job
 
-    def _pick(mut self) raises -> Int:
-        if self.session:
-            return self.session.value().pick(self.sampler)
-        return self.device.value().pick(self.sampler)
+    def _check(self, job: Int) raises:
+        if job < 0 or job >= len(self.jobs):
+            raise Error("there is no job " + String(job))
+        if not self.jobs[job].live:
+            raise Error("job " + String(job) + " has already been finished")
 
-    def _step(mut self, token: Int) raises:
-        if self.session:
+    def _next(mut self, job: Int) raises -> Int:
+        """The next token for one job, or minus one because there are no more.
+
+        On the device path this is where the batch is stepped, and a step
+        carries every job that has work rather than only this one. So a
+        connection asking for its own token pays for everybody's, and the jobs
+        it advanced find theirs waiting.
+        """
+        var at = self.jobs[job].at
+        if not self.batch:
+            var token = self.session.value().pick(self.sampler)
+            if token == self.eos:
+                return -1
             self.session.value().step(self.b, token)
-        elif self.device:
-            self.device.value().step(token)
+            return token
+        while self.batch.value().produced(at) <= self.jobs[job].taken:
+            if not self.batch.value().busy(at):
+                return -1
+            if self.batch.value().step() == 0:
+                return -1
+        var token = self.batch.value().token(at, self.jobs[job].taken)
+        self.jobs[job].taken += 1
+        return token
 
-    def advance(mut self) raises -> Bool:
-        """One more token, or False because there are no more.
+    def advance(mut self, job: Int) raises -> Bool:
+        """One more token for one job, or False because there are no more.
 
         False is not an error. It means the model asked to stop, a stop string
-        matched, or the budget ran out, and `reason` says which.
+        matched, or the budget ran out, and `reason_of` says which.
         """
-        if self.left <= 0:
-            self.reason = REASON_LENGTH
+        self._check(job)
+        if self.jobs[job].left <= 0:
+            self.jobs[job].reason = REASON_LENGTH
             return False
-        var next = self._pick()
-        if next == self.eos:
-            self.reason = REASON_STOP
+        var next = self._next(job)
+        if next < 0:
+            # The stream ran out. On the device path the batch knows whether the
+            # stop token or the limit is what did it, and on the host path
+            # reaching here at all means the stop token, since the limit is the
+            # check above.
+            var stopped = True
+            if self.batch:
+                stopped = self.batch.value().ended(self.jobs[job].at)
+            self.jobs[job].reason = REASON_STOP if stopped else REASON_LENGTH
             return False
-        self.text += self.decoder.step(self.tokenizer, next)
-        self.produced += 1
-        self.left -= 1
-        var cut = self._stop_at()
+        self.jobs[job].text += self.jobs[job].decoder.step(self.tokenizer, next)
+        self.jobs[job].produced += 1
+        self.jobs[job].left -= 1
+        var cut = self.jobs[job].stop_at()
         if cut >= 0:
-            var kept = String(self.text[byte=0:cut])
-            self.text = kept
-            if self.emitted > cut:
-                self.emitted = cut
-            self.reason = REASON_STOP
+            var kept = String(self.jobs[job].text[byte=0:cut])
+            self.jobs[job].text = kept
+            if self.jobs[job].emitted > cut:
+                self.jobs[job].emitted = cut
+            self.jobs[job].reason = REASON_STOP
+            # The stream is told to stop as well as the job, or it would keep
+            # taking a place in every step until its own limit ran out, decoding
+            # text nobody is going to be sent.
+            if self.batch:
+                self.batch.value().halt(self.jobs[job].at)
             return False
-        self._step(next)
         return True
 
-    def finish(mut self):
-        """Give the model back. Called however the generation ended."""
-        self.busy = False
+    def finish(mut self, job: Int) raises:
+        """Give the slot back. Called however the generation ended.
 
-    def _stop_at(self) -> Int:
-        """Where a stop string begins in the generated text, or minus one."""
-        for i in range(len(self.stops)):
-            if self.stops[i].byte_length() == 0:
-                continue
-            var at = self.text.find(self.stops[i])
-            if at >= 0:
-                return at
-        return -1
-
-    def _held(self) -> Int:
-        """Bytes at the end of the text that could still become a stop string.
-
-        The longest suffix of what has been generated that is also a proper
-        prefix of some stop string. Sending those and finding out one token
-        later that they were the first half of a stop is not recoverable, since
-        they have left.
+        The stream goes with it, which is what hands its region of the pool back
+        for the next request. Nothing may be read off this job afterwards.
         """
-        var have = self.text.byte_length()
-        var most = 0
-        for i in range(len(self.stops)):
-            var stop = self.stops[i]
-            var k = stop.byte_length() - 1
-            if k > have:
-                k = have
-            while k > most:
-                if self.text[byte = have - k : have] == stop[byte=0:k]:
-                    most = k
-                    break
-                k -= 1
-        return most
+        if job < 0 or job >= len(self.jobs):
+            return
+        if not self.jobs[job].live:
+            return
+        if self.batch:
+            self.batch.value().drop(self.jobs[job].at)
+        self.jobs[job].live = False
 
-    def delta(mut self, done: Bool) -> String:
+    def delta(mut self, job: Int, done: Bool) raises -> String:
         """The text a client has not been sent yet and safely can be.
 
         `done` says no more tokens are coming, which is what makes the held
         back tail safe: nothing can extend it into a stop string any more.
         """
-        var end = self.text.byte_length()
+        self._check(job)
+        var end = self.jobs[job].text.byte_length()
         if not done:
-            end -= self._held()
-        if end <= self.emitted:
+            end -= self.jobs[job].held()
+        if end <= self.jobs[job].emitted:
             return String("")
-        var out = String(self.text[byte = self.emitted : end])
-        self.emitted = end
+        var out = String(
+            self.jobs[job].text[byte = self.jobs[job].emitted : end]
+        )
+        self.jobs[job].emitted = end
         return out
 
-    def all_text(self) -> String:
+    def all_text(self, job: Int) raises -> String:
         """Everything generated, which is what a non streaming answer sends."""
-        return self.text
+        self._check(job)
+        return self.jobs[job].text
+
+    def reason_of(self, job: Int) raises -> Int:
+        self._check(job)
+        return self.jobs[job].reason
+
+    def produced_of(self, job: Int) raises -> Int:
+        self._check(job)
+        return self.jobs[job].produced
+
+    def prompt_of(self, job: Int) raises -> Int:
+        self._check(job)
+        return self.jobs[job].prompt_tokens
 
 
 def _token_text(tokenizer: Tokenizer, id: Int) -> String:

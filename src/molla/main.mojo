@@ -13,6 +13,7 @@ from molla.engine.generate import run_generate
 from molla.engine.generate_batch import run_generate_batch
 from molla.engine.generate_device import run_generate_device
 from molla.engine.sample import SamplerConfig
+from molla.engine.runner import DEFAULT_SLOTS
 from molla.engine.serve import run_serve
 from molla.host import detect
 from molla.http.server import run_http
@@ -143,6 +144,9 @@ def print_usage():
     print(
         "                  --host --port --ctx --device --cache-type, and"
         " 127.0.0.1:8000 when nothing says"
+    )
+    print(
+        "                  --slots=N for requests at once, sharing the one pool"
     )
     print(
         "  tokenize <tokenizer.json> <prompt> [--ids]  print how many tokens a"
@@ -663,6 +667,7 @@ def main():
         var serve_context = 0
         var serve_want = Request()
         var serve_form = CACHE_F16
+        var serve_slots = DEFAULT_SLOTS
         try:
             # Named flags rather than positions, because a host and a port and
             # a context length are three numbers nobody is going to remember
@@ -695,6 +700,8 @@ def main():
                     serve_want = parse_backend(val)
                 elif key == "cache-type":
                     serve_form = parse_cache_type(val)
+                elif key == "slots":
+                    serve_slots = _flag_int(key, val)
                 else:
                     raise Error(
                         String("'") + arg + "' is not a flag this takes"
@@ -708,6 +715,7 @@ def main():
                     serve_context,
                     choose_backend(args[2], serve_want),
                     serve_form,
+                    serve_slots,
                 )
             )
         except e:

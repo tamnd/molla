@@ -381,6 +381,16 @@ struct DeviceKvCache(Movable):
             n += self.free_len[i]
         return n
 
+    def largest(self) -> Int:
+        """The longest region a request could be given, which is what admission
+        actually turns on. A caller that wants to refuse politely rather than
+        catch a refusal asks this first."""
+        var most = 0
+        for i in range(len(self.free_len)):
+            if self.free_len[i] > most:
+                most = self.free_len[i]
+        return most
+
     def admit(mut self, room: Int) raises -> Int:
         """Take a region of the index `room` positions long, and say for whom.
 
