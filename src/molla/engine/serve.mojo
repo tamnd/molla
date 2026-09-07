@@ -77,6 +77,7 @@ def run_serve(
     backend: Backend = Backend(),
     form: Int = CACHE_F16,
     slots: Int = DEFAULT_SLOTS,
+    fair: Bool = False,
 ) raises -> Int:
     """Load a model and answer OpenAI requests against it until a signal."""
     _ = ignore_sigpipe()
@@ -84,11 +85,25 @@ def run_serve(
     var started = monotonic_ms()
     print("loading", model_path)
     var runner = Runner(
-        model_path, tokenizer_path, model_path, context, backend, form, slots
+        model_path,
+        tokenizer_path,
+        model_path,
+        context,
+        backend,
+        form,
+        slots,
+        fair,
     )
     print("  model         ", runner.describe())
     print("  backend       ", runner.running_on())
     print("  slots         ", slots, "requests at once, sharing the pool")
+    if slots > 1:
+        print(
+            "  order         ",
+            (
+                "fair, decodes first and prefills in turn" if fair else "slot order, first admitted first served"
+            ),
+        )
     if backend.on_device:
         print("  kv cache      ", cache_type_name(form))
     print("  tokenizer     ", tokenizer_path)

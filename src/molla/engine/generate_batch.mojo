@@ -49,6 +49,7 @@ def run_generate_batch(
     sampling: SamplerConfig = SamplerConfig(),
     backend: Backend = Backend(),
     form: Int = CACHE_F16,
+    fair: Bool = False,
 ) raises:
     """Load, admit `streams` copies of the prompt, and step until they are done.
 
@@ -116,7 +117,7 @@ def run_generate_batch(
             )
 
         var eos = g.uint_or("tokenizer.ggml.eos_token_id", -1)
-        var opened = open_batch(ctx, host, b, want, streams, cap, form)
+        var opened = open_batch(ctx, host, b, want, streams, cap, form, fair)
         if not opened:
             raise Error("this build has no device code in it")
         var batch = opened.take()
@@ -134,6 +135,12 @@ def run_generate_batch(
         )
         print("streams:  ", streams, "of", take, "tokens each")
         print("cap:      ", batch.cap, "tokens a step")
+        print(
+            "order:    ",
+            (
+                "fair, decodes first and prefills in turn" if fair else "slot order, first admitted first served"
+            ),
+        )
         print()
 
         cache.close()

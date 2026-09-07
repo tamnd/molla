@@ -138,6 +138,9 @@ def print_usage():
         " tokens a step"
     )
     print(
+        "                  --fair to put decodes ahead of prefills and rotate"
+    )
+    print(
         "  serve <model> <tokenizer.json>  answer OpenAI requests against a"
         " model"
     )
@@ -147,6 +150,9 @@ def print_usage():
     )
     print(
         "                  --slots=N for requests at once, sharing the one pool"
+    )
+    print(
+        "                  --fair to put decodes ahead of prefills and rotate"
     )
     print(
         "  tokenize <tokenizer.json> <prompt> [--ids]  print how many tokens a"
@@ -602,6 +608,7 @@ def main():
         var batch_sampling = SamplerConfig()
         var batch_want = Request()
         var batch_form = CACHE_F16
+        var batch_fair = False
         try:
             var batch_positional = 0
             for i in range(5, len(args)):
@@ -618,6 +625,9 @@ def main():
                     continue
                 if args[i].startswith("--cap="):
                     batch_cap = atol(_flag_value(args[i]))
+                    continue
+                if args[i] == "--fair":
+                    batch_fair = True
                     continue
                 if args[i].startswith("--"):
                     raise Error(
@@ -654,6 +664,7 @@ def main():
                 batch_sampling,
                 batch_picked,
                 batch_form,
+                batch_fair,
             )
         except e:
             print("molla batch:", e)
@@ -668,6 +679,7 @@ def main():
         var serve_want = Request()
         var serve_form = CACHE_F16
         var serve_slots = DEFAULT_SLOTS
+        var serve_fair = False
         try:
             # Named flags rather than positions, because a host and a port and
             # a context length are three numbers nobody is going to remember
@@ -682,6 +694,11 @@ def main():
                     )
                 var body = arg[byte = 2 : arg.byte_length()]
                 var eq = body.find("=")
+                # The one switch among the settings, so it is taken before the
+                # rule that a flag on this command carries a value.
+                if eq < 0 and String(body.strip()) == "fair":
+                    serve_fair = True
+                    continue
                 if eq < 0:
                     raise Error(
                         String("'") + arg + "' wants a value, as --name=value"
@@ -716,6 +733,7 @@ def main():
                     choose_backend(args[2], serve_want),
                     serve_form,
                     serve_slots,
+                    serve_fair,
                 )
             )
         except e:

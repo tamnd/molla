@@ -20,13 +20,25 @@ The cap is the knob that trades time to first token against inter token latency.
 A large cap gets a prompt in fast and makes every decode behind it late. A small
 one keeps the streams smooth and makes the prompt take longer to start answering.
 
-## What the loop does not do
+## Who is offered the cap
 
-It does not decide who waits. Admission refuses a stream that does not fit and
-that is the whole of the policy here, which is FIFO in the sense that a stream
-that was admitted keeps its region until it is done. A fair mode that round robins
-by session is the stage after this one, and it goes above this rather than inside
-it, because what it changes is which streams are offered and not how a step runs.
+The order a step is filled in is the whole of the policy, because the cap binds
+and whoever is offered it last gets whatever is left. In slot order, which is
+what a batch does unless it is told otherwise, that is FIFO: the lowest slot is
+offered first every step, so a stream in a high slot waits behind everybody
+else's prompt before it is offered anything at all. That is fine when the streams
+arrive together and is not fine when they arrive one at a time, which is what a
+server sees.
+
+Fair mode changes the offer and not the step. Decodes go first, all of them,
+because a decode is one token and every stream in flight decoding at once is
+`slots` tokens, which fits any cap worth having. A stream that is already
+answering is then never displaced by somebody else's prompt. What is left of the
+cap goes to the prefills, and those are offered from a cursor that moves on by
+one a step, so the prompt that did not fit this time is at the head of the queue
+next time. Admission is untouched: a stream that was admitted still keeps its
+region until it is done, and refusing one that does not fit is still the only
+way a request is turned away.
 """
 
 from std.sys.info import has_accelerator
@@ -158,6 +170,14 @@ struct DeviceBatch(Movable):
     var slots: Int
     """The most streams that can be in flight at once."""
 
+    var fair: Bool
+    """Whether a step offers the cap in a rotation with decodes ahead of
+    prefills, or in slot order. See the module docstring."""
+
+    var turn: Int
+    """Where the rotation starts, which moves on by one a step. Meaningless
+    when `fair` is off, and kept anyway rather than made optional."""
+
     var form: Int
 
     def __init__(
@@ -169,6 +189,7 @@ struct DeviceBatch(Movable):
         slots: Int = 16,
         cap: Int = PREFILL_CHUNK,
         form: Int = CACHE_F16,
+        fair: Bool = False,
     ) raises:
         """A model already on the card, and a pool that many sequences share.
 
@@ -216,6 +237,8 @@ struct DeviceBatch(Movable):
         self.solox = DeviceVec(ctx, self.model.width())
         self.logits = Buffer(self.model.vocab(), slots)
         self.streams = List[Stream]()
+        self.fair = fair
+        self.turn = 0
         self.form = form
         # The pool arrives with its whole index handed to the sequence a session
         # would own. Nothing here is that session, so it goes back and every
@@ -371,26 +394,49 @@ struct DeviceBatch(Movable):
             )
         return self.streams[at].out[i]
 
+    def offer(self) -> List[Int]:
+        """Which streams get offered the cap this step, in the order they do.
+
+        Slot order for a plain batch, and decodes before prefills from a moving
+        cursor for a fair one. Only streams with work are in it, so the caller
+        fills from it without asking again.
+        """
+        var order = List[Int]()
+        var n = len(self.streams)
+        if not self.fair:
+            for i in range(n):
+                if self.streams[i].working():
+                    order.append(i)
+            return order^
+        var start = self.turn % n if n > 0 else 0
+        for pass_prefill in range(2):
+            for k in range(n):
+                var i = (start + k) % n
+                if not self.streams[i].working():
+                    continue
+                if self.streams[i].prefilling() == (pass_prefill == 1):
+                    order.append(i)
+        return order^
+
     def step(mut self) raises -> Int:
         """One batch through the stack, and a token for everything that got one.
 
         Returns how many tokens the batch carried, which is zero when there was
         no work, and that is how a caller knows to stop.
 
-        The batch is filled in stream order until the cap is reached. A stream
-        that does not fit this step is not skipped in any lasting sense, because
-        the streams before it shrink as they finish and it moves up. What it
-        does mean is that a long prompt admitted first delays a short one behind
-        it, and that is what the fair mode in the stage after this exists to
-        change.
+        The batch is filled from `offer` until the cap is reached. A stream that
+        does not fit this step is not skipped in any lasting sense, because the
+        streams before it shrink as they finish and it moves up. What it does
+        mean, in slot order, is that a long prompt admitted first delays a short
+        one behind it, and that is what fair mode changes.
         """
         var tokens = List[Int]()
         var rows = List[Int]()
         var answered = List[Int]()
+        var order = self.offer()
         var deepest = 0
-        for i in range(len(self.streams)):
-            if not self.streams[i].working():
-                continue
+        for k in range(len(order)):
+            var i = order[k]
             if len(tokens) >= self.cap:
                 break
             var take = 1
@@ -433,6 +479,10 @@ struct DeviceBatch(Movable):
                 answered.append(i)
         if len(tokens) == 0:
             return 0
+        # The cursor moves on a step and not a stream, so a prefill that had the
+        # head of the queue gives it up whether or not it finished, and one that
+        # kept being cut off by the cap gets it back within a lap.
+        self.turn = (self.turn + 1) % len(self.streams)
 
         self.cache.paging.mixed(len(tokens))
         var many = len(tokens) > 1
@@ -512,6 +562,7 @@ def open_batch(
     slots: Int = 16,
     cap: Int = PREFILL_CHUNK,
     form: Int = CACHE_F16,
+    fair: Bool = False,
 ) raises -> Optional[DeviceBatch]:
     """The batch behind the accelerator guard, the way `open_session` is.
 
@@ -538,6 +589,6 @@ def open_batch(
             frequency_factors(host.model),
         )
         return DeviceBatch(
-            ctx, model^, dev.kv_width(), context, slots, cap, form
+            ctx, model^, dev.kv_width(), context, slots, cap, form, fair
         )
     return None

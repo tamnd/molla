@@ -280,6 +280,7 @@ struct Runner(Movable):
         backend: Backend = Backend(),
         form: Int = CACHE_F16,
         slots: Int = DEFAULT_SLOTS,
+        fair: Bool = False,
     ) raises:
         if slots < 1:
             raise Error("a server needs room for at least one request")
@@ -288,6 +289,12 @@ struct Runner(Movable):
                 "--slots is a device setting and this server is running on the"
                 " host, where there is one sequence and no batch to put a"
                 " second one in"
+            )
+        if fair and not backend.on_device:
+            raise Error(
+                "--fair is a device setting and this server is running on the"
+                " host, where there is one sequence and so nothing to be fair"
+                " between"
             )
         var g = Gguf(model_path)
         var dev = backend.device
@@ -315,7 +322,7 @@ struct Runner(Movable):
             # of anything.
             b = bind(g, cache, weights.residency())
             self.batch = open_batch(
-                ctx, bind(g, cache), b, want, slots, PREFILL_CHUNK, form
+                ctx, bind(g, cache), b, want, slots, PREFILL_CHUNK, form, fair
             )
         else:
             # Everything stays in the mapping, because host kernels cannot read

@@ -80,6 +80,8 @@ Five, and the first two are single sequence changes with a bit identical gate, w
 
 **Fairness.** FIFO by default and a round robin by session, so one long generation cannot hold a shared server. The check is that a long stream and a short one interleave.
 
+What that came out as is below, and the short version is that the mechanism is right and the workload it was aimed at was not the one that hurts.
+
 ## The pad survives, for decode only
 
 This spec said the turnaround would let `PAGE_PAD` go, since a sequence that reads its own length has nothing to round up to. The measurement says otherwise, and the measurement wins.
@@ -190,9 +192,39 @@ Sixteen concurrent streams through the server produce six times the tokens one s
 
 The totals are below what `molla batch` reports for the same counts, by about a third at sixteen. Framing, JSON, the event stream and a Python client on the same box are all in this number and none of them are in the other one. The shape is what matters here and the shape is the same.
 
-The worst column is the interesting one and it is stage five's argument. At thirty two and sixty four streams there is a gap of hundreds of milliseconds in the middle of somebody's stream, while the p95 stays where it was. That is one stream waiting behind a wave of prompts: a step is filled in slot order, so the last request admitted has its prefill cut into pieces that land after everybody else's, and a stream that was already decoding waits through it. Nothing is starving, since every stream finished and the percentile did not move, but the tail is not fair yet and a round robin by sequence is what makes it fair.
+The worst column is the interesting one. At thirty two and sixty four streams there is a gap of hundreds of milliseconds in the middle of somebody's stream while the p95 stays where it was, so nothing is starving, since every stream finished and the percentile did not move, and something is still wrong. This was read at the time as one stream waiting behind a wave of prompts, on the argument that a step is filled in slot order and the last request admitted has its prefill land after everybody else's. Stage five was built to test that reading and the reading was wrong. What is actually in the gap is below, under what fairness came out as.
 
 The pool being shared is visible in the failures rather than in the table. Thirty two streams against a pool of 4096 positions is 32 times 139 positions asked for and 4096 to hand out, and the three requests that did not fit got a 503 saying so. The same thirty two against 16384 all fit. That is the trade this made: a server can refuse a request it would have had room for under a fixed division, and it can also admit one that a fixed division would have refused, and the second happens far more often.
+
+## What fairness came out as
+
+Stage five, which is `--fair` on `molla serve` and on `molla batch`, and which changes the offer rather than the step.
+
+The offer is which streams are handed the cap and in what order. In slot order, which is what a batch does unless it is told otherwise, the lowest slot is offered first every step. A prompt admitted into a low slot takes the whole cap and a stream in a higher slot that was already answering gets nothing that step, and since a slot comes back when a request finishes, which slot a new prompt lands in is whatever happened to be free. Fair mode offers the decodes first, all of them, because a decode is one token and every stream in flight decoding at once is `slots` tokens, which fits any cap worth having. What is left of the cap goes to the prefills, offered from a cursor that moves on by one a step, so a prompt that was cut off by the cap is at the head of the queue next time.
+
+The batch level check is a stream in slot one that is answering and a prompt admitted into slot zero that is exactly the cap long. In slot order the answering stream writes nothing on that step. In fair mode it writes its token and the prompt takes what is left. Both modes write the same text as the same stream run on its own, which is the thing an offer order must not change.
+
+### It does not move the server numbers
+
+Three runs of each mode on the 4090 with the same model and the same client, streams arriving together, 128 tokens a stream, 64 slots and a pool of 16384. The median run of the three:
+
+| streams | slot order tok/s | fair tok/s | slot order p95 | fair p95 |
+| --- | --- | --- | --- | --- |
+| 16 | 829 | 819 | 20 ms | 20 ms |
+| 32 | 1127 | 1105 | 28 ms | 28 ms |
+| 64 | 1305 | 1339 | 47 ms | 46 ms |
+
+And the case the fill order was supposed to be worst in, which is churn: twelve clients each sending six requests one after another, 96 tokens a request, so slots are freed and taken again all the way through. Slot order gave 892, 788 and 868 aggregate tokens a second across three runs and fair gave 921, 910 and 764. The run to run spread is larger than the difference between the modes in both tables.
+
+A single measurement of each had shown fair ahead by a tenth, which is why there are three of each here. There was no effect and the first pair was noise.
+
+### Where the tail actually is
+
+The worst column is what stage five was aimed at, and the arithmetic says the offer order was never going to reach it. At sixty four streams the slowest first token is about 1.9 seconds. Sixty four prompts of eleven tokens is 704 tokens of prefill, and 704 tokens at a cap of 256 is three steps. A step that size measures about 45 ms here, taken from a 1200 token prompt answering in 215 ms on an otherwise idle server. So the prefill those requests are waiting on is about a seventh of a second and the other 1.75 seconds is something else. No ordering of prefill chunks moves a cost that is not in the prefill chunks.
+
+The next guess was the client, since a Python client running sixty four threads on the same box as the server is a plausible way to invent one and a half seconds. It is not that either. The same wave driven by sixty four separate `curl` processes, which share no interpreter lock, gives 35 ms median and 49 ms at the ninety fifth percentile against the Python client's 36 and 45, a worst gap of 1485 ms against 1655, and a spread of 1499 ms between the first stream's first token and the last one's. Two clients with nothing in common agreeing to within a few per cent is the server.
+
+So there is a second or more of per request work between the socket and the first step, it is serialized, and it is not the batch. That is #292 rather than a guess here. What stage five is worth in the meantime is what the batch level check shows, which is that a stream already answering is not displaced by a prompt, and the knob is off by default until there is a workload where that is the thing in the way.
 
 ## What done means
 
