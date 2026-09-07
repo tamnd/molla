@@ -4,6 +4,12 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+The fifth and last of the batching stages, and the measurement that says it was aimed at the wrong thing. Fair mode does not move the server numbers on any workload measured here. Three runs of each mode at sixteen, thirty two and sixty four streams differ by less than the run to run spread, and so does the churn case that frees and takes slots all the way through. The arithmetic says why: sixty four short prompts are three steps of prefill and about a seventh of a second, against a slowest first token of about 1.9 seconds, so the cost is not in the prefill chunks and no ordering of them reaches it. It is not the client either, since sixty four separate curl processes give the same numbers as the Python client to within a few per cent. There is a second or more of serialized per request work between the socket and the first step and it is not the batch, which is now the thing to chase. docs/validation/batching.md carries the tables and the reasoning.
+
+### Added
+
+- `--fair` on `molla serve` and `molla batch` changes which streams are offered a step's token budget, which is the fifth of the five stages in [docs/validation/batching.md](docs/validation/batching.md). In slot order the lowest slot is offered first every step, so a prompt admitted into a slot a finished request left takes the whole budget and a stream in a higher slot that was already answering gets nothing that step. Fair mode offers the decodes first, since a decode is one token and every stream in flight decoding at once still fits any budget worth having, and gives what is left to the prefills from a cursor that moves on a step. Off by default.
+
 ## [0.5.7] - 2026-09-07
 
 The stage that makes the batch a server rather than a benchmark. On the 4090 with Qwen 2.5 0.5B Q4_K_M, sixteen concurrent streaming completions through HTTP produce 959 aggregate tokens a second against 154 for one, at 15 ms median inter token latency and 16 ms at the ninety fifth percentile, and sixty four streams still scale to 1555. Every count agreed token for token across all its streams. That is M3's exit criterion measured where the criterion asks for it rather than in the benchmark command.
