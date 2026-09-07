@@ -77,6 +77,14 @@ struct Stream(Movable):
 
     var out: List[Int]
     var live: Bool
+    """Whether this slot holds a stream. False means the slot is free, and a
+    slot is free from the moment its stream is dropped, so what a caller reads
+    off a dropped stream is whatever the next one put there."""
+
+    var stopped: Bool
+    """Whether the stop token is what ended this, rather than the limit. The
+    difference is what a server reports as its finish reason."""
+
     var sampler: Sampler
 
     def __init__(
@@ -96,6 +104,7 @@ struct Stream(Movable):
         self.stop = stop
         self.out = List[Int]()
         self.live = True
+        self.stopped = False
         self.sampler = sampler^
 
     def prefilling(self) -> Bool:
@@ -231,24 +240,52 @@ struct DeviceBatch(Movable):
         The prompt goes into the sampler here as well as into the model, so the
         penalties see the whole text, which is what the single sequence path
         does and what llama.cpp does.
+
+        A slot a dropped stream left is reused, because a server admits a
+        request for every one it answers and a list that only ever grew would
+        run out of slots after `slots` requests rather than after `slots` at
+        once.
         """
         if len(prompt) == 0:
             raise Error("a stream needs a prompt with at least one token")
         if limit < 0:
             raise Error("a stream cannot be asked for a negative number")
-        if len(self.streams) >= self.slots:
+        var at = -1
+        for i in range(len(self.streams)):
+            if not self.streams[i].live:
+                at = i
+                break
+        if at < 0 and len(self.streams) >= self.slots:
             raise Error(
                 "every one of the "
                 + String(self.slots)
                 + " stream slots is taken"
             )
+        # Admission last of the three, because it takes a region of the pool and
+        # the two checks above can refuse without having to give one back.
         var seq = self.cache.admit(len(prompt) + limit)
         var sampler = Sampler(sampling, self.model.vocab())
         for i in range(len(prompt)):
             sampler.observe(prompt[i])
-        var at = len(self.streams)
-        self.streams.append(Stream(seq, prompt^, limit, stop, sampler^))
+        var fresh = Stream(seq, prompt^, limit, stop, sampler^)
+        if at < 0:
+            at = len(self.streams)
+            self.streams.append(fresh^)
+        else:
+            self.streams[at] = fresh^
         return at
+
+    def bias(mut self, at: Int, id: Int, value: Float32) raises:
+        """Push one token up or down for one stream.
+
+        Separate from `admit` because a bias is a list a request may or may not
+        carry, and threading an empty pair of lists through admission for the
+        requests that do not carry one is worse than a call the ones that do
+        make.
+        """
+        if at < 0 or at >= len(self.streams):
+            raise Error("there is no stream " + String(at))
+        self.streams[at].sampler.bias(id, value)
 
     def drop(mut self, at: Int) raises:
         """Give a stream's region and cells back, whether or not it finished."""
@@ -259,6 +296,18 @@ struct DeviceBatch(Movable):
         self.streams[at].live = False
         self.cache.evict(self.streams[at].seq)
 
+    def halt(mut self, at: Int) raises:
+        """Stop generating for a stream without giving its region back.
+
+        For a caller that found its own reason to stop, a stop string being the
+        one this exists for. The region stays because the caller is still
+        reading what the stream wrote, and `drop` is what hands it back.
+        """
+        if at < 0 or at >= len(self.streams):
+            raise Error("there is no stream " + String(at))
+        self.streams[at].want = 0
+        self.streams[at].fed = len(self.streams[at].prompt)
+
     def working(self) -> Int:
         """How many streams have a token for the next step."""
         var n = 0
@@ -266,6 +315,61 @@ struct DeviceBatch(Movable):
             if self.streams[i].working():
                 n += 1
         return n
+
+    def busy(self, at: Int) raises -> Bool:
+        """Whether one stream still has work, which is what a caller waiting on
+        that stream and nobody else needs to know before it steps again."""
+        if at < 0 or at >= len(self.streams):
+            raise Error("there is no stream " + String(at))
+        return self.streams[at].working()
+
+    def taken(self) -> Int:
+        """Slots holding a stream, whether or not it still has work."""
+        var n = 0
+        for i in range(len(self.streams)):
+            if self.streams[i].live:
+                n += 1
+        return n
+
+    def room(self) -> Bool:
+        """Whether another stream could be admitted, slots aside from pool."""
+        return self.taken() < self.slots
+
+    def fits(self, need: Int) -> Bool:
+        """Whether a stream wanting `need` positions would be admitted.
+
+        Slot and pool both, so a caller can refuse politely rather than call
+        `admit` and catch what it says. The answer is only good until the next
+        `admit`, which for a server driven by one reactor is until it acts on
+        it.
+        """
+        return self.room() and self.cache.largest() >= need
+
+    def ended(self, at: Int) raises -> Bool:
+        """Whether the stop token ended this stream rather than its limit."""
+        if at < 0 or at >= len(self.streams):
+            raise Error("there is no stream " + String(at))
+        return self.streams[at].stopped
+
+    def token(self, at: Int, i: Int) raises -> Int:
+        """One token a stream generated, by its place in what it wrote.
+
+        For a caller draining a stream as it goes. `output` copies the whole
+        list, which is right for a run that reads it once at the end and wrong
+        for a server turning tokens into text one at a time.
+        """
+        if at < 0 or at >= len(self.streams):
+            raise Error("there is no stream " + String(at))
+        if i < 0 or i >= len(self.streams[at].out):
+            raise Error(
+                "stream "
+                + String(at)
+                + " has written "
+                + String(len(self.streams[at].out))
+                + " tokens, so there is no token "
+                + String(i)
+            )
+        return self.streams[at].out[i]
 
     def step(mut self) raises -> Int:
         """One batch through the stack, and a token for everything that got one.
@@ -359,6 +463,7 @@ struct DeviceBatch(Movable):
             if token == self.streams[i].stop:
                 self.streams[i].next = -1
                 self.streams[i].want = 0
+                self.streams[i].stopped = True
                 continue
             self.streams[i].out.append(token)
             self.streams[i].next = token

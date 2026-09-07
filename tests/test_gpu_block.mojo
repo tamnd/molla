@@ -1278,6 +1278,44 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         except:
             slots_full = True
 
+        # What a server needs on top of the loop, which is that a slot comes
+        # back. A request is admitted for every one that is answered, so a batch
+        # whose slots only ever ran out would serve three requests and then
+        # refuse forever.
+        crowd.drop(1)
+        var reuses = crowd.admit(plans[1].copy(), 1) == 1
+
+        crowd.drop(0)
+        crowd.drop(1)
+        crowd.drop(2)
+        var whole = crowd.fits(CONTEXT) and not crowd.fits(CONTEXT + 1)
+
+        # The stop token, which is how a stream ends for a reason other than
+        # running out of budget. It is told to stop on the first token the
+        # reference produced, so it stops before writing anything down and the
+        # difference between the two endings is readable.
+        var quiet = crowd.admit(plans[0].copy(), wanted, refs[0][0])
+        _ = crowd.run()
+        var by_stop = crowd.ended(quiet) and crowd.produced(quiet) == 0
+        crowd.drop(quiet)
+
+        # And halting, which is what a caller with a reason of its own does. A
+        # stop string is that reason and the batch cannot see one, since it
+        # deals in tokens and a stop string is text. The stream keeps its region
+        # because the caller is still reading what it wrote.
+        var halted = crowd.admit(plans[0].copy(), wanted)
+        _ = crowd.run(2)
+        var wrote = crowd.produced(halted)
+        crowd.halt(halted)
+        var stops = (
+            wrote == 1
+            and not crowd.busy(halted)
+            and crowd.run() == 0
+            and crowd.produced(halted) == wrote
+            and crowd.token(halted, 0) == refs[0][0]
+        )
+        crowd.drop(halted)
+
         keep(pool)
         keep(blob)
         keep(gains)
@@ -1520,3 +1558,7 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         suite.check(idle == 0, "and stops when nothing is left with work")
         suite.check(pool_full, "a stream the pool has no room for is refused")
         suite.check(slots_full, "and one with no slot to put it in")
+        suite.check(reuses, "and the slot a dropped stream held is handed on")
+        suite.check(whole, "and dropping every stream leaves the whole pool")
+        suite.check(by_stop, "a stream that draws its stop token says so")
+        suite.check(stops, "and one the caller halts keeps what it wrote")

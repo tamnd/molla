@@ -158,6 +158,20 @@ Sixteen streams produce four times the tokens one stream does and each of them w
 
 The one place the curve is not smooth is one stream to two, where the total goes up by a tenth rather than close to double. That is not the scheduler. A step carrying one token goes down the single token path and a step carrying two goes down the general one, and the second is about twice the work for the first token it carries. After that the marginal cost of a stream is small: a step is under five milliseconds at two streams and about sixteen at thirty two, so sixteen more streams cost less than the first two did. Which says the batching is doing what batching is for, and that the crossover between the two paths is the thing to look at if the low end matters.
 
+## What the server does with it
+
+Stage four's third part, which is the loop above answering requests instead of a benchmark.
+
+`molla serve --slots=N` is the whole of the interface. The default is one, so a server nobody asked keeps the behaviour it had, and a second request in flight against it gets the 503 it always got.
+
+The pool is shared rather than divided. A server started with four slots does not give each of them a quarter of the pool: every request is admitted against whatever is free at the time. Dividing would make the failure predictable, which is worth something, but the failure it makes predictable is refusing a long request on a server with nothing else running, and that is worse than the one it prevents.
+
+A request that cannot be admitted gets a 503, and the message says which of the two ran out. Slots is a wait, so retrying is the right thing and the message says so. A pool that is too small for the request is not a wait, and a request longer than the whole context is still a 400 whatever the server is doing, because retrying that one is not going to help.
+
+Whichever connection asks for its next token steps the batch. A step carries every stream that has work, so the connection that paid for it gets one token and the others find theirs already written when they come round. Nothing schedules that: the reactor holds every connection, and one of them being inside a step is the same thing as all of them making progress. It does mean the cost of a step lands on whoever asked first, which the numbers do not show and a profile would.
+
+Two things came out of wiring it that the loop did not need on its own. A slot has to come back when a request finishes, since a server admits one for every one it answers and a batch whose slots only ever ran out would serve four requests and refuse forever. And ending a stream is two things rather than one: a caller that matched a stop string wants the stream to stop generating while it is still reading what the stream wrote, so `halt` stops the generating and `drop` hands the region back, and the connection does the second when it closes.
+
 ## What done means
 
 Sixteen concurrent streams on the 4090 without latency collapse, which is M3's exit criterion as well as this issue's, and preempt and resume producing output identical to an uninterrupted greedy run.
