@@ -1316,6 +1316,83 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         )
         crowd.drop(halted)
 
+        # Fairness, which is who is offered the cap on the step where it binds.
+        # A stream already answering in slot one, and then a prompt admitted
+        # into slot zero that fills the cap on its own. In slot order the prompt
+        # is offered first and takes everything, so the stream that was
+        # answering skips a turn, and that skip is the gap inside a stream that
+        # a percentile never shows.
+        var greedy = List[Int]()
+        for i in range(narrow):
+            greedy.append(tokens[i])
+        var early = crowd.admit(plans[1].copy(), wanted)
+        var later = crowd.admit(plans[1].copy(), wanted)
+        _ = crowd.run(2)
+        crowd.drop(early)
+        var starved = crowd.produced(later)
+        _ = crowd.admit(greedy.copy(), wanted)
+        var order_fifo = crowd.offer()
+        _ = crowd.run(1)
+        var skips = crowd.produced(later) == starved
+        crowd.drop(0)
+        crowd.drop(later)
+
+        # And the same script against a batch told to be fair, where the decode
+        # is offered first because a decode is one token and every stream in
+        # flight decoding at once still fits any cap worth having. What is left
+        # goes to the prompt.
+        var evenly = DeviceBatch(
+            ctx,
+            DeviceModel(
+                ctx,
+                arch,
+                specs,
+                host_model,
+                dev_model,
+                host_layers,
+                dev_layers,
+                factors,
+            ),
+            KV_HEADS * HEAD_DIM,
+            CONTEXT,
+            3,
+            narrow,
+            CACHE_F16,
+            True,
+        )
+        for q in range(2):
+            _ = evenly.admit(plans[q].copy(), wanted)
+        _ = evenly.run()
+        var fair_same = 0
+        for q in range(2):
+            var said = evenly.output(q)
+            var agree = len(said) == len(refs[q])
+            for i in range(len(said)):
+                if i >= len(refs[q]) or said[i] != refs[q][i]:
+                    agree = False
+            if agree:
+                fair_same += 1
+        evenly.drop(0)
+        evenly.drop(1)
+
+        var f_early = evenly.admit(plans[1].copy(), wanted)
+        var f_later = evenly.admit(plans[1].copy(), wanted)
+        _ = evenly.run(2)
+        evenly.drop(f_early)
+        var held = evenly.produced(f_later)
+        _ = evenly.admit(greedy.copy(), wanted)
+        var order_fair = evenly.offer()
+        _ = evenly.run(1)
+        var serves = evenly.produced(f_later) == held + 1
+        var offered = (
+            len(order_fifo) == 2
+            and order_fifo[0] == 0
+            and len(order_fair) == 2
+            and order_fair[0] == f_later
+        )
+        evenly.drop(0)
+        evenly.drop(f_later)
+
         keep(pool)
         keep(blob)
         keep(gains)
@@ -1562,3 +1639,9 @@ def test_forward(mut suite: Suite, ctx: DeviceContext) raises:
         suite.check(whole, "and dropping every stream leaves the whole pool")
         suite.check(by_stop, "a stream that draws its stop token says so")
         suite.check(stops, "and one the caller halts keeps what it wrote")
+        suite.check(
+            fair_same == 2, "a fair batch writes what a plain one writes"
+        )
+        suite.check(offered, "and offers the cap to a decode before a prompt")
+        suite.check(skips, "a prompt that fills the cap stalls a decode behind")
+        suite.check(serves, "and does not when the batch is fair")
