@@ -224,7 +224,25 @@ The worst column is what stage five was aimed at, and the arithmetic says the of
 
 The next guess was the client, since a Python client running sixty four threads on the same box as the server is a plausible way to invent one and a half seconds. It is not that either. The same wave driven by sixty four separate `curl` processes, which share no interpreter lock, gives 35 ms median and 49 ms at the ninety fifth percentile against the Python client's 36 and 45, a worst gap of 1485 ms against 1655, and a spread of 1499 ms between the first stream's first token and the last one's. Two clients with nothing in common agreeing to within a few per cent is the server.
 
-So there is a second or more of per request work between the socket and the first step, it is serialized, and it is not the batch. That is #292 rather than a guess here. What stage five is worth in the meantime is what the batch level check shows, which is that a stream already answering is not displaced by a prompt, and the knob is off by default until there is a workload where that is the thing in the way.
+So there is a second or more of per request work between the socket and the first step, it is serialized, and it is not the batch. That was #292 rather than a guess here, and the section below says what it turned out to be. What stage five is worth in the meantime is what the batch level check shows, which is that a stream already answering is not displaced by a prompt, and the knob is off by default until there is a workload where that is the thing in the way.
+
+## What the tail turned out to be
+
+A stamp at each point on the request path, printed per request behind `MOLLA_TRACE=1`, which is what #292 asked for and is the only way to see this from outside the process. Sixty four streams arriving together on the 4090, and every one of them accepted inside fifty milliseconds. Reading the request took a millisecond, encoding it took none, admitting it took one, and the first token arrived about twenty milliseconds after admission. Every one of those is small and none of them is the second. The second was between being accepted and being read. Job zero was read one millisecond after it was accepted and job sixty three was read 1168 milliseconds after it was accepted, in an even ramp of about nineteen milliseconds a job.
+
+Nineteen milliseconds is a step. The reactor was reading one request, admitting it, and then running a whole forward pass for that one stream before it looked at the second readable socket. Sixty four requests that arrived at the same moment therefore cost sixty four sequential forward passes just to get all sixty four into the batch, and the last client waited for sixty three passes it could have ridden along with. The batch was doing exactly what it was built to do the whole time. Everything above it was feeding it one stream at a time.
+
+The fix is one rule: a stream does not generate in the same turn it was admitted. It hands the reactor back instead, which costs one extra pass through a loop that is already polling with a zero timeout, and the reactor spends that pass reading the next readable socket. So all sixty four are read and admitted before any step runs, and then one step carries all of them.
+
+| streams | slowest ttft before | after | worst gap before | after | aggregate before | after |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16 | 312 ms | 113 ms | 227 ms | 40 ms | 788 tok/s | 850 tok/s |
+| 32 | 706 ms | 208 ms | 520 ms | 79 ms | 1071 tok/s | 1073 tok/s |
+| 64 | 2028 ms | 386 ms | 1789 ms | 109 ms | 1259 tok/s | 1320 tok/s |
+
+The gap column is the longest a stream ever waited between two of its own tokens. A second run of each agrees: 317, 705 and 2061 milliseconds before against 167, 189 and 340 after on the slowest first token, and 1202 against 1391 aggregate at sixty four streams. The median inter token latency and the ninety fifth percentile barely move, which is the shape of the thing. This was never a throughput problem. It was one stream at a time being made to wait behind a queue of forward passes it was not in, and a percentile taken across streams cannot see that because the stalled stream is a different stream every step.
+
+It also says why stage five measured nothing. The worst gap at sixty four streams was 1789 milliseconds and a step is about 45, so the stall a stream suffered was forty steps long, and no ordering of streams inside a step reaches a cost that is forty of them. Fair mode was answering the right question about the wrong layer.
 
 ## What done means
 

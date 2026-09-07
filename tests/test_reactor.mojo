@@ -431,6 +431,114 @@ def _check_yield(mut suite: Suite) raises:
     reactor.shutdown()
 
 
+struct AdmitProtocol(Movable, Protocol):
+    """A protocol that reads a request and hands back before answering it.
+
+    What `Http` does for a streaming completion, in the small. The produce is
+    the expensive part and it carries every connection that is waiting for one,
+    so a worker with several readable sockets is meant to read all of them and
+    then produce once, rather than produce for the first before it has looked
+    at the second. See #292 for what the second shape cost.
+    """
+
+    var read: Int
+    """Requests read."""
+
+    var when_first: Int
+    """How many had been read by the time the first produce happened, which is
+    the whole measurement."""
+
+    var produced: Int
+    var owed: List[Bool]
+    """Whether the connection in this slot has been read and not yet answered.
+    A list rather than a field, because the point of the test is several
+    connections in flight on one protocol object."""
+
+    def __init__(out self):
+        self.read = 0
+        self.when_first = 0
+        self.produced = 0
+        self.owed = List[Bool]()
+
+    def on_open(mut self, mut conn: Connection):
+        while len(self.owed) <= conn.slot:
+            self.owed.append(False)
+        self.owed[conn.slot] = False
+
+    def on_readable(mut self, mut conn: Connection) -> Bool:
+        if conn.input.length == 0:
+            return True
+        conn.input.consume(conn.input.length)
+        self.read += 1
+        self.owed[conn.slot] = True
+        conn.produce(True)
+        conn.yield_now()
+        return True
+
+    def on_writable(mut self, mut conn: Connection) -> Bool:
+        if not self.owed[conn.slot]:
+            return True
+        if self.produced == 0:
+            self.when_first = self.read
+        if conn.queue_str("x") == 1:
+            self.produced += 1
+        self.owed[conn.slot] = False
+        conn.produce(False)
+        return True
+
+    def on_close(mut self, mut conn: Connection):
+        pass
+
+
+def _check_admit_before_produce(mut suite: Suite) raises:
+    suite.group("net.reactor admit before produce")
+
+    var listener = open_listener(ListenAddress(UInt16(0)), False)
+    var port = bound_port(listener)
+    var reactor = Reactor[AdmitProtocol](AdmitProtocol(), 60000, 0)
+    reactor.add_listener(listener)
+
+    var clients = List[Int]()
+    for _ in range(4):
+        clients.append(_client(port))
+    var steps = 0
+    while reactor.accepted < 4 and steps < MAX_STEPS:
+        _ = reactor.poll_once(5)
+        steps += 1
+    suite.check(reactor.accepted == 4, "four connections were accepted")
+
+    # All four write before the reactor is polled again, so what it finds on
+    # its next look is four sockets with a request on each. That is the wave a
+    # server sees when a client fans out, and it is the case the yield is for.
+    var sent = 0
+    for i in range(len(clients)):
+        sent += _send_pattern(clients[i], i, 4)
+    suite.check(sent == 16, "and all four wrote a request")
+
+    # A send returning is not the same as the other end being readable, and on
+    # loopback the gap is short enough that a poll issued straight after the
+    # last send sometimes sees two of the four. That is the kernel and not the
+    # reactor, so the pause is here to keep the test about the reactor. It
+    # waits for something that has already happened rather than for a deadline,
+    # which is why a loaded runner makes it slower and not flakier.
+    _ = sleep_ms(50)
+
+    steps = 0
+    while reactor.proto.produced < 4 and steps < MAX_STEPS:
+        _ = reactor.poll_once(5)
+        steps += 1
+
+    suite.check(reactor.proto.produced == 4, "four connections were answered")
+    suite.check(
+        reactor.proto.when_first == 4,
+        "and all four were read before the first was",
+    )
+
+    for i in range(len(clients)):
+        _ = close(clients[i])
+    reactor.shutdown()
+
+
 def _check_idle_timeout(mut suite: Suite) raises:
     suite.group("net.reactor idle timeout")
 
@@ -575,6 +683,7 @@ def run(mut suite: Suite) raises:
     _check_reactor(suite)
     _check_backpressure(suite)
     _check_yield(suite)
+    _check_admit_before_produce(suite)
     _check_idle_timeout(suite)
     _check_unix_socket(suite)
     _check_server(suite)
