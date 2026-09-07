@@ -4,6 +4,8 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-09-07
+
 The stage that makes the batch a server rather than a benchmark. On the 4090 with Qwen 2.5 0.5B Q4_K_M, sixteen concurrent streaming completions through HTTP produce 959 aggregate tokens a second against 154 for one, at 15 ms median inter token latency and 16 ms at the ninety fifth percentile, and sixty four streams still scale to 1555. Every count agreed token for token across all its streams. That is M3's exit criterion measured where the criterion asks for it rather than in the benchmark command.
 
 ### Added
