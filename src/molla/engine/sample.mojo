@@ -292,21 +292,35 @@ struct Sampler(Movable):
         for i in range(n):
             out[i] = logits.data[i] - top - offset
 
-    def pick(mut self, logits: Buffer) raises -> Int:
+    def pick(mut self, logits: Buffer, row: Int = 0) raises -> Int:
         """One token, through the whole pipeline.
 
         `logits` is read and not written. A caller that wants logprobs asks for
         them from the same buffer afterwards and gets the model's numbers, which
         would not be true if the transforms happened in place.
+
+        `row` is which sequence's logits to read, for a caller holding the
+        answers a batch brought back. A batch writes a row a sequence into one
+        buffer, and a sampler is a sequence's own, so the alternative is copying
+        a row out before every pick. That is a vocabulary of floats a stream a
+        step to move numbers that are already where they need to be.
         """
-        if logits.elements() != self.vocab():
+        if logits.cols != self.vocab():
             raise Error(
                 "the sampler was built for a vocabulary of "
                 + String(self.vocab())
                 + " and got "
-                + String(logits.elements())
+                + String(logits.cols)
                 + " logits"
             )
+        if row < 0 or row >= logits.rows:
+            raise Error(
+                "asked for the logits of sequence "
+                + String(row)
+                + " out of a buffer holding "
+                + String(logits.rows)
+            )
+        var base = row * logits.cols
 
         # Greedy first, before anything is copied. An exact argmax over the
         # penalised logits is the whole computation, and the penalties are the
@@ -314,13 +328,13 @@ struct Sampler(Movable):
         # every filter here are monotonic, so they cannot move the maximum.
         if self.config.greedy():
             if not self.config.penalizing() and not self.biasing():
-                var at = argmax(logits.data, 0, self.vocab())
+                var at = argmax(logits.data, base, self.vocab())
                 if at < 0:
                     raise Error("there are no logits to pick from")
                 self._took(at)
                 return at
 
-        self._load(logits)
+        self._load(logits, base)
         self._mask()
         self._bias()
         self._penalise()
@@ -348,10 +362,10 @@ struct Sampler(Movable):
         self.observe(token)
         self.drawn += 1
 
-    def _load(mut self, logits: Buffer):
+    def _load(mut self, logits: Buffer, base: Int = 0):
         for i in range(self.vocab()):
             self.ids[i] = i
-            self.vals[i] = logits.data[i]
+            self.vals[i] = logits.data[base + i]
         self.kept = self.vocab()
 
     def _mask(mut self):
